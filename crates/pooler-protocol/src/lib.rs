@@ -6,6 +6,7 @@ mod events;
 mod extensions;
 mod json;
 mod model;
+mod openai_chat;
 
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +30,11 @@ pub use model::{
     CacheHints, ContentPart, InputItem, MediaSource, Message, ReasoningBlock, ReasoningConfig,
     ReasoningEffort, Request, RequestValidationError, ResponseFormat, Role, SamplingParameters,
     SemanticRequest, TargetMetadata, ToolCall, ToolChoice, ToolDefinition, ToolResult,
+};
+pub use openai_chat::{
+    decode_chat_request, decode_chat_request_with_report, encode_chat_request, DecodedChatRequest,
+    EncodedChatChunk, EncodedChatRequest, OpenAiChatCodec, OpenAiChatError, OpenAiChatEventDecoder,
+    OpenAiChatEventEncoder, OPENAI_CHAT_UNKNOWN_FIELDS_EXTENSION,
 };
 pub use pooler_core::LossPolicy;
 

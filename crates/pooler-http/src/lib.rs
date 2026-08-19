@@ -12,6 +12,7 @@ mod body;
 mod drain;
 mod headers;
 mod proxy;
+mod sse;
 mod stream;
 
 pub use auth::{
@@ -23,4 +24,8 @@ pub use headers::{
     remove_hop_by_hop_headers, sanitize_headers, strip_hop_by_hop_headers, HOP_BY_HOP_HEADERS,
 };
 pub use proxy::{BoxError, HttpProxy, ProxyBody, ProxyError};
+pub use sse::{
+    SseEncoder, SseError, SseEvent, SseLimits, SseParser, DEFAULT_SSE_MAX_EVENT_BYTES,
+    DEFAULT_SSE_MAX_LINE_BYTES,
+};
 pub use stream::{CommitmentError, RetryError, StreamCommitment, StreamEvent, StreamState};

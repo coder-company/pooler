@@ -1,0 +1,17 @@
+[package]
+name = "adapter-factory"
+description = "Factory language-model semantic request and stream codecs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pooler-http = { path = "../pooler-http" }
+pooler-protocol = { path = "../pooler-protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

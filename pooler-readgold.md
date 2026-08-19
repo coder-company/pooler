@@ -25,7 +25,11 @@ name or advertised without conformance evidence.
   namespaced Cursor preset have local conformance coverage. Evidence from a real
   Cursor client or a current sanitized Cursor fixture remains before compatibility
   can be claimed.
-- Phases 3–8: pending.
+- Phase 3 — semantic events and Factory: in progress. The protocol-neutral model,
+  loss-accounted OpenAI Chat codecs, bounded incremental SSE framing, and grounded
+  Factory LanguageModel V3 request/event codecs are implemented and unit tested.
+  Runtime semantic dispatch and current sanitized Factory fixtures remain.
+- Phases 4–8: pending.
 - First useful release acceptance: pending.
 
 ## Verification gates
