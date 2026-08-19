@@ -1,0 +1,9 @@
+source = "https://github.com/dante-teo/widevin"
+commit = "6c48392052caaecca820ec41df9d87ed818dfc21"
+source_root = "src/devin/proto/source"
+generator = "prost-build 0.13"
+license = "MIT"
+
+# The closure is rooted at the two application services used by Pooler.
+root = "exa/api_server_pb/api_server.proto"
+root = "exa/auth_pb/auth.proto"

@@ -32,7 +32,13 @@ name or advertised without conformance evidence.
   enforcement. Sanitized local-reference fixtures cover text, reasoning, tools, and
   usage. Evidence from a current real Factory client remains before compatibility can
   be claimed.
-- Phases 4–8: pending.
+- Phase 4 — Devin and ConnectRPC: in progress. Pinned Prost generation, shared
+  bounded Connect/gzip framing, Devin metadata/chat codecs, a namespaced preset,
+  sanitized cross-language fixtures, and runtime streaming/cancellation coverage are
+  implemented. The installed Devin client model-list path is evidenced locally; a
+  current real-client tool conversation through Pooler remains before compatibility
+  can be claimed.
+- Phases 5–8: pending.
 - First useful release acceptance: pending.
 
 ## Verification gates

@@ -473,6 +473,8 @@ pub struct MatchConfig {
 pub struct BodyConfig {
     /// Body mode.
     pub mode: Option<BodyMode>,
+    /// Optional framing component applied before semantic decoding.
+    pub framing: Option<String>,
     /// Decoder component.
     pub decoder: Option<String>,
     /// Encoder component.
@@ -851,6 +853,7 @@ fn is_template_segment(segment: &str) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BodyPlan {
     mode: BodyMode,
+    framing: Option<Arc<str>>,
     decoder: Option<Arc<str>>,
     encoder: Option<Arc<str>>,
     inspectors: Vec<Arc<str>>,
@@ -861,6 +864,12 @@ impl BodyPlan {
     #[must_use]
     pub const fn mode(&self) -> BodyMode {
         self.mode
+    }
+
+    /// Framing component.
+    #[must_use]
+    pub fn framing(&self) -> Option<&str> {
+        self.framing.as_deref()
     }
 
     /// Decoder component.
@@ -1717,6 +1726,18 @@ fn compile_body(
 ) -> Result<BodyPlan, ConfigError> {
     let declaration = declaration.cloned().unwrap_or_default();
     let mode = declaration.mode.unwrap_or(default_mode);
+    if declaration.framing.is_some() && field != "ingress" {
+        return Err(invalid(
+            label,
+            &format!("{field} framing is only valid for ingress"),
+        ));
+    }
+    if declaration.framing.is_some() && !mode.is_semantic() {
+        return Err(invalid(
+            label,
+            &format!("{field} framing requires semantic mode"),
+        ));
+    }
     if mode == BodyMode::Opaque
         && (!declaration.inspectors.is_empty() || declaration.decoder.is_some())
     {
@@ -1745,6 +1766,7 @@ fn compile_body(
     }
     Ok(BodyPlan {
         mode,
+        framing: nonempty(declaration.framing),
         decoder: nonempty(declaration.decoder),
         encoder: nonempty(declaration.encoder),
         inspectors: declaration
@@ -2312,6 +2334,80 @@ routes:
         let compiled = compile_yaml("alias.yaml", text).expect("alias");
         assert_eq!(compiled.routes()[0].ingress().mode(), BodyMode::Semantic);
         assert_eq!(compiled.routes()[0].loss_policy(), LossPolicy::Degrade);
+    }
+
+    #[test]
+    fn validates_devin_connect_route_framing_as_ingress_schema() {
+        let text = r#"
+version: 1
+listeners: {devin: {bind: 127.0.0.1:18473}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: devin-chat
+    listen: devin
+    match:
+      methods: [POST]
+      path: /exa.api_server_pb.ApiServerService/GetChatMessage
+      content_types: [application/connect+proto]
+    ingress:
+      mode: semantic
+      framing: decode.connect.envelope
+      decoder: decode.devin.chat
+    target: local
+    response:
+      mode: semantic
+      decoder: decode.openai.chat.events
+      encoder: encode.devin.connect
+    loss_policy: reject
+"#;
+        let compiled = compile_yaml("devin.yaml", text).expect("Devin route");
+        let route = &compiled.routes()[0];
+        assert_eq!(route.ingress().framing(), Some("decode.connect.envelope"));
+        assert_eq!(route.ingress().decoder(), Some("decode.devin.chat"));
+        assert_eq!(route.response().encoder(), Some("encode.devin.connect"));
+    }
+
+    #[test]
+    fn rejects_framing_outside_semantic_ingress() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: opaque
+    listen: local
+    ingress: {mode: opaque, framing: decode.connect.envelope}
+    target: local
+        "#;
+        let error = compile_yaml("invalid-framing.yaml", text).expect_err("opaque framing");
+        assert!(error
+            .to_string()
+            .contains("ingress framing requires semantic mode"));
+
+        let response = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: response-framing
+    listen: local
+    ingress: {mode: semantic}
+    target: local
+    response: {mode: semantic, framing: decode.connect.envelope}
+"#;
+        let error = compile_yaml("response-framing.yaml", response).expect_err("response framing");
+        assert!(error
+            .to_string()
+            .contains("response framing is only valid for ingress"));
+    }
+
+    #[test]
+    fn rejects_unknown_body_schema_fields() {
+        let text = "version: 1\nroutes: [{id: route, ingress: {mode: semantic, framng: decode.connect.envelope}}]\n";
+        let error = parse_yaml("unknown-body-field.yaml", text).expect_err("unknown body field");
+        let rendered = error.to_string();
+        assert!(rendered.contains("unknown field"));
+        assert!(rendered.contains("framng"));
     }
 
     #[test]

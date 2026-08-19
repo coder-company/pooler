@@ -1,0 +1,12 @@
+The Devin/Cascade protobuf bindings in this crate are generated with
+`prost-build` from the vendored widevin application sources listed in
+`proto/SOURCE.lock`.
+
+The source snapshot is widevin commit
+`6c48392052caaecca820ec41df9d87ed818dfc21` from:
+
+https://github.com/dante-teo/widevin
+
+That snapshot records its upstream Devin protocol source as the oh-my-pi
+provider schema. The vendored `.proto` files retain their source package names
+and are included under the widevin MIT license in `LICENSE.widevin`.

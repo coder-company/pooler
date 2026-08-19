@@ -8,11 +8,15 @@ use std::{
     time::Duration,
 };
 
+use adapter_devin::DevinSemanticAdapter;
 use adapter_factory::FactorySemanticAdapter;
-use hyper::{body::Incoming, http::Request, service::service_fn};
+use hyper::{body::Incoming, http, http::Request, service::service_fn};
 use hyper_util::rt::TokioIo;
 use pooler_config::CompiledConfig;
-use pooler_http::{DrainError, HttpProxy, ProxyError};
+use pooler_http::{
+    BoxError, DrainError, HttpProxy, ProxyBody, ProxyError, SemanticAdapter, SemanticRequestBody,
+    SemanticResponseBody,
+};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixListener},
@@ -23,7 +27,63 @@ use tracing::debug;
 
 const FORCE_CANCEL_GRACE: Duration = Duration::from_secs(1);
 
-type RuntimeProxy = HttpProxy<FactorySemanticAdapter>;
+type RuntimeProxy = HttpProxy<RuntimeSemanticAdapter>;
+
+/// Semantic adapters mounted by the concrete HTTP runtime.
+///
+/// The route plan chooses the adapter by its component identifiers. Keeping
+/// this dispatch at the runtime boundary lets Factory and Devin routes share a
+/// listener without making either adapter aware of the other protocol.
+#[derive(Clone, Copy, Debug, Default)]
+struct RuntimeSemanticAdapter;
+
+impl SemanticAdapter for RuntimeSemanticAdapter {
+    fn supports(&self, route: &pooler_config::RoutePlan) -> bool {
+        FactorySemanticAdapter.supports(route) || DevinSemanticAdapter.supports(route)
+    }
+
+    fn encode_request(
+        &self,
+        route: &pooler_config::RoutePlan,
+        headers: &http::HeaderMap,
+        body: &[u8],
+    ) -> Result<SemanticRequestBody, BoxError> {
+        if FactorySemanticAdapter.supports(route) {
+            FactorySemanticAdapter.encode_request(route, headers, body)
+        } else if DevinSemanticAdapter.supports(route) {
+            DevinSemanticAdapter.encode_request(route, headers, body)
+        } else {
+            Err(unsupported_semantic_route(route))
+        }
+    }
+
+    fn sanitize_request_headers(&self, headers: &mut http::HeaderMap) {
+        FactorySemanticAdapter.sanitize_request_headers(headers);
+        DevinSemanticAdapter.sanitize_request_headers(headers);
+    }
+
+    fn decode_response(
+        &self,
+        route: &pooler_config::RoutePlan,
+        body: ProxyBody,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        if FactorySemanticAdapter.supports(route) {
+            FactorySemanticAdapter.decode_response(route, body, cancellation)
+        } else if DevinSemanticAdapter.supports(route) {
+            DevinSemanticAdapter.decode_response(route, body, cancellation)
+        } else {
+            Err(unsupported_semantic_route(route))
+        }
+    }
+}
+
+fn unsupported_semantic_route(route: &pooler_config::RoutePlan) -> BoxError {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("no semantic adapter supports route `{}`", route.id()),
+    ))
+}
 
 /// A listener's concrete address after binding.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,7 +189,7 @@ impl HttpProxyServer {
             let proxy = Arc::new(HttpProxy::with_semantic_adapter(
                 Arc::clone(&config),
                 Arc::clone(&id),
-                FactorySemanticAdapter,
+                RuntimeSemanticAdapter,
             )?);
             let bind = plan.bind();
             if bind.starts_with('/') || bind.starts_with("unix:") {
@@ -607,6 +667,28 @@ mod tests {
             .expect("downstream response bytes")
     }
 
+    async fn send_request_until_idle(
+        address: SocketAddr,
+        request: &[u8],
+        idle_timeout: Duration,
+    ) -> Vec<u8> {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("downstream connects");
+        stream
+            .write_all(request)
+            .await
+            .expect("downstream request bytes");
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match tokio::time::timeout(idle_timeout, stream.read(&mut buffer)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return bytes,
+                Ok(Ok(read)) => bytes.extend_from_slice(&buffer[..read]),
+            }
+        }
+    }
+
     fn header_end(bytes: &[u8]) -> Option<usize> {
         bytes.windows(4).position(|window| window == b"\r\n\r\n")
     }
@@ -636,6 +718,37 @@ mod tests {
             return &[];
         };
         &response[header_end + 4..]
+    }
+
+    fn decode_chunked_body(body: &[u8]) -> Vec<u8> {
+        let mut decoded = Vec::new();
+        let mut offset = 0;
+        while offset < body.len() {
+            let Some(line_end) = body[offset..]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+            else {
+                break;
+            };
+            let line_end = offset + line_end;
+            let Ok(size_text) = std::str::from_utf8(&body[offset..line_end]) else {
+                break;
+            };
+            let Ok(size) = usize::from_str_radix(size_text.trim(), 16) else {
+                break;
+            };
+            offset = line_end + 2;
+            if size == 0 || offset.saturating_add(size) > body.len() {
+                break;
+            }
+            decoded.extend_from_slice(&body[offset..offset + size]);
+            offset += size;
+            if body.get(offset..offset + 2) != Some(b"\r\n") {
+                break;
+            }
+            offset += 2;
+        }
+        decoded
     }
 
     fn has_header(request: &[u8], expected: &str) -> bool {
@@ -1419,6 +1532,201 @@ mod tests {
             serde_json::from_slice(response_body(&upstream_request)).expect("OpenAI JSON");
         assert_eq!(upstream_body["model"], "gpt-test");
         assert_eq!(upstream_body["stream"], true);
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn semantic_devin_route_accepts_compressed_connect_and_streams_fragmented_sse() {
+        use adapter_devin::{encode_connect_frame, proto, ConnectDecoder, ConnectLimits};
+        use prost::Message;
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+            let request = read_request(&mut stream).await.expect("upstream request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("upstream headers");
+            for fragment in [
+                b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{" as &[u8],
+                b"\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+                b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+                b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+                b"data: [DONE]\n\n",
+            ] {
+                for fragment in fragment.chunks(3) {
+                    stream
+                        .write_all(fragment)
+                        .await
+                        .expect("upstream SSE fragment");
+                    tokio::task::yield_now().await;
+                }
+            }
+            request
+        });
+
+        let config = pooler_config::compile_yaml(
+            "semantic-devin.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: devin\n    listen: local\n    match: {{method: POST, path: /exa.api_server_pb.ApiServerService/GetChatMessage, content_types: [application/connect+proto]}}\n    ingress: {{mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}}\n    target: {{provider: local, upstream_path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}}\n    loss_policy: reject\n"
+            ),
+        )
+        .expect("semantic route config");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let request_message = proto::GetChatMessageRequest {
+            metadata: Some(proto::Metadata {
+                api_key: "devin-session-token$test".to_owned(),
+                user_jwt: "jwt".to_owned(),
+                ..Default::default()
+            }),
+            prompt: "system".to_owned(),
+            chat_message_prompts: vec![proto::ChatMessagePrompt {
+                message_id: "message-1".to_owned(),
+                source: proto::ChatMessageSource::User as i32,
+                prompt: "hello".to_owned(),
+                ..Default::default()
+            }],
+            chat_model_uid: "gpt-test".to_owned(),
+            request_type: proto::ChatMessageRequestType::Cascade as i32,
+            cascade_id: "cascade-1".to_owned(),
+            execution_id: "execution-1".to_owned(),
+            ..Default::default()
+        };
+        let body = encode_connect_frame(&request_message.encode_to_vec(), true, false)
+            .expect("compressed Devin request frame");
+        let mut request = format!(
+            "POST /exa.api_server_pb.ApiServerService/GetChatMessage HTTP/1.1\r\nHost: test\r\nContent-Type: application/connect+proto\r\nConnect-Protocol-Version: 1\r\nConnect-Content-Encoding: gzip\r\nConnect-Accept-Encoding: gzip\r\nAccept-Encoding: identity\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&body);
+        let response = send_request_until_idle(address, &request, Duration::from_millis(100)).await;
+        assert_eq!(status(&response), 200);
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text
+            .to_ascii_lowercase()
+            .contains("content-type: application/connect+proto"));
+        let decoded_body = decode_chunked_body(response_body(&response));
+        let mut decoder = ConnectDecoder::with_gzip(ConnectLimits::default());
+        let frames = decoder
+            .push(&decoded_body)
+            .expect("Connect response frames");
+        decoder.finish().expect("complete Connect response");
+        assert!(frames.iter().any(|frame| frame.is_end_stream()));
+        let mut text = String::new();
+        let mut saw_usage = false;
+        for frame in frames.into_iter().filter(|frame| !frame.is_end_stream()) {
+            let message = proto::GetChatMessageResponse::decode(frame.payload.as_slice())
+                .expect("Devin response protobuf");
+            text.push_str(&message.delta_text);
+            saw_usage |= message.usage.is_some();
+        }
+        assert_eq!(text, "hello");
+        assert!(saw_usage);
+
+        let upstream_request = upstream.await.expect("upstream task");
+        assert!(String::from_utf8_lossy(&upstream_request)
+            .to_ascii_lowercase()
+            .contains("post /v1/chat/completions"));
+        assert!(has_header(&upstream_request, "content-type"));
+        assert!(!has_header(&upstream_request, "connect-content-encoding"));
+        let upstream_body: serde_json::Value =
+            serde_json::from_slice(response_body(&upstream_request)).expect("OpenAI JSON");
+        assert_eq!(upstream_body["model"], "gpt-test");
+        assert_eq!(upstream_body["stream"], true);
+        assert_eq!(upstream_body["messages"][1]["content"], "hello");
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn semantic_devin_route_cancels_a_pending_upstream_when_client_disconnects() {
+        use adapter_devin::{encode_connect_frame, proto};
+        use prost::Message;
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+            let _request = read_request(&mut stream).await.expect("upstream request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("upstream headers");
+            let mut buffer = [0_u8; 1];
+            tokio::time::timeout(TEST_TIMEOUT, stream.read(&mut buffer))
+                .await
+                .expect("upstream observes downstream cancellation")
+                .expect("upstream read");
+        });
+        let config = pooler_config::compile_yaml(
+            "semantic-devin-cancel.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: devin\n    listen: local\n    match: {{method: POST, path: /exa.api_server_pb.ApiServerService/GetChatMessage, content_types: [application/connect+proto]}}\n    ingress: {{mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}}\n    target: {{provider: local, upstream_path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}}\n    loss_policy: reject\n"
+            ),
+        )
+        .expect("semantic route config");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let request_message = proto::GetChatMessageRequest {
+            metadata: Some(proto::Metadata::default()),
+            chat_message_prompts: vec![proto::ChatMessagePrompt {
+                source: proto::ChatMessageSource::User as i32,
+                prompt: "cancel me".to_owned(),
+                ..Default::default()
+            }],
+            chat_model_uid: "gpt-test".to_owned(),
+            request_type: proto::ChatMessageRequestType::Cascade as i32,
+            ..Default::default()
+        };
+        let body = encode_connect_frame(&request_message.encode_to_vec(), true, false)
+            .expect("compressed Devin request frame");
+        let mut downstream = TcpStream::connect(address)
+            .await
+            .expect("downstream connects");
+        let request = format!(
+            "POST /exa.api_server_pb.ApiServerService/GetChatMessage HTTP/1.1\r\nHost: test\r\nContent-Type: application/connect+proto\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        downstream
+            .write_all(request.as_bytes())
+            .await
+            .expect("request headers");
+        downstream.write_all(&body).await.expect("request body");
+        let _headers = read_headers(&mut downstream)
+            .await
+            .expect("response headers");
+        drop(downstream);
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                if server.active() == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("semantic request permit released");
+        upstream.await.expect("upstream cancellation task");
         stop_server(&server, runner).await;
     }
 

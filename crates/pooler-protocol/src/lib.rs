@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![doc = "Protocol-neutral semantic values and explicit conversion accounting for Pooler."]
 
+mod connect;
 mod conversion;
 mod events;
 mod extensions;
@@ -10,6 +11,12 @@ mod openai_chat;
 
 use serde::{Deserialize, Serialize};
 
+pub use connect::{
+    decode_connect_envelopes, decode_gzip_payload, encode_connect_envelope, ConnectCompression,
+    ConnectDecoder, ConnectEncoder, ConnectEnvelope, ConnectError, ConnectLimits,
+    CONNECT_ENVELOPE_HEADER_BYTES, CONNECT_FLAG_COMPRESSED, CONNECT_FLAG_END_STREAM,
+    DEFAULT_CONNECT_MAX_DECOMPRESSED_BYTES, DEFAULT_CONNECT_MAX_FRAME_BYTES,
+};
 pub use conversion::{
     ConversionError, ConversionReport, ConversionResult, ConversionWarning, WarningSeverity,
 };

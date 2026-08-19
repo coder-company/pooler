@@ -1,0 +1,23 @@
+{
+  "id": "fx-widevin-devin.connect.v1",
+  "source": {
+    "repository": "https://github.com/dante-teo/widevin",
+    "schema_repository": "https://github.com/can1357/oh-my-pi",
+    "commit": "6c48392052caaecca820ec41df9d87ed818dfc21",
+    "paths": [
+      "rust/tests/chat.rs",
+      "rust/tests/connect.rs",
+      "rust/src/proto.rs"
+    ]
+  },
+  "equivalence": "protobuf_semantic",
+  "request_frame_base64": "AQAAAX8fiwgAAAAAAAD/PVHNSsNAEHarhpr6U4qCrJewCiKYQKKHEkRRVFDwooI/J9Nk2m6b7tbdiW1pC+Jb6Mlzj76Nb+EjmP7OZYaZ75v5Zsa8M7MtLiKdqHLBcJ3DouPRrQjeuLA1aM2lsFHWQeyUeRsTBSwDwjcOHM/xDkoz6oDkJnW71sJC/kkmVqDACqUIuQaHUtNINCjbzRO6epmyLKyCVeZxWnswc0E6SWMgMAVk6OqV1eJxbGkIVFh1vF3TCIM4tt2CMU7RjS57TUB1mM9uL07Pby6cRsT6z1msclHnolKa17xCt00DpUx5+QW6NsYNFSEI1P6kZXHx7ChL8u9kc33v63NovyfuNCh6p3Mj+zu5XjnqgYhkGaGNveOnaf723pyIKizfjfxoK039LsNOE1KFslSDENk+ayrZBIUcNPNnC8xgGlWqnPX7/RfySEqGuRAkKGuZLPkgS2GgwyAC2/0mZEBWpsduyAjiH5KDNoQJDp/l/gNxxWr40gEAAA==",
+  "response_frames_base64": [
+    "AQAAACAfiwgAAAAAAAD/82ItycjMyw5iLs5MBwAKgenfDAAAAA==",
+    "AQAAABsfiwgAAAAAAAD/k2LNSM3JyQcA1tw9/gcAAAA=",
+    "AQAAACwfiwgAAAAAAAD/MxLjYktOzMnRNRRiK05NLErOkGKpVipUAgBrp6lcGAAAAA==",
+    "AQAAAB0fiwgAAAAAAAD/M2KXYrVSqlCqBQALEiZNCQAAAA==",
+    "AQAAACAfiwgAAAAAAAD/0+Cy4hBgkmBWYNVgAQBGXob8DAAAAA==",
+    "AgAAAAA="
+  ]
+}

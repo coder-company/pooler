@@ -136,8 +136,11 @@ impl ConfigLoader {
             } else {
                 let value = expand_preset(import, &canonical)?;
                 let mut origins = collect_origins(&value, &canonical);
-                let preset_source: Arc<str> =
-                    Arc::from(format!("preset:cursor ({})", canonical.display()));
+                let preset_source: Arc<str> = Arc::from(format!(
+                    "preset:{} ({})",
+                    import.preset.as_deref().unwrap_or("unknown"),
+                    canonical.display()
+                ));
                 for origin in origins.values_mut() {
                     *origin = Arc::clone(&preset_source);
                 }
@@ -331,9 +334,14 @@ fn take_imports(document: &mut Value, path: &Path) -> Result<Vec<ImportSpec>, Co
 }
 
 fn expand_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
-    if import.preset.as_deref() != Some("cursor") {
-        return Err(load_error(path, "unknown preset; expected cursor"));
+    match import.preset.as_deref() {
+        Some("cursor") => expand_cursor_preset(import, path),
+        Some("devin") => expand_devin_preset(import, path),
+        _ => Err(load_error(path, "unknown preset; expected cursor or devin")),
     }
+}
+
+fn expand_cursor_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
     let alias = import.alias.as_deref().unwrap_or("cursor");
     if alias.is_empty()
         || !alias
@@ -414,6 +422,129 @@ fn expand_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError>
     Ok(preset)
 }
 
+fn expand_devin_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
+    for key in import.parameters.keys() {
+        if !matches!(key.as_str(), "bind" | "upstream_url" | "secret") {
+            return Err(load_error(
+                path,
+                &format!("unknown devin preset parameter `{key}`"),
+            ));
+        }
+    }
+
+    let mut preset: Value = serde_yml::from_str(include_str!("../../../presets/devin.yaml"))
+        .map_err(|error| load_error(path, &format!("invalid built-in devin preset: {error}")))?;
+    let alias = import.alias.as_deref().unwrap_or("devin");
+    if alias.is_empty()
+        || !alias
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(load_error(path, "invalid preset alias"));
+    }
+    rename_named_key(&mut preset, "listeners", "listener", alias, path)?;
+    rename_named_key(&mut preset, "upstreams", "upstream", alias, path)?;
+    rewrite_devin_routes(&mut preset, alias, path)?;
+    let route = first_route_mut(&mut preset, path)?;
+    route.insert(
+        Value::String("id".to_owned()),
+        Value::String(format!("{alias}-route")),
+    );
+    route.insert(
+        Value::String("listen".to_owned()),
+        Value::String(alias.to_owned()),
+    );
+    let target = route
+        .get_mut(Value::String("target".to_owned()))
+        .and_then(Value::as_mapping_mut)
+        .ok_or_else(|| load_error(path, "devin preset target is invalid"))?;
+    target.insert(
+        Value::String("provider".to_owned()),
+        Value::String(alias.to_owned()),
+    );
+
+    if let Some(value) = import.parameters.get("bind") {
+        set_named_field(
+            &mut preset,
+            "listeners",
+            alias,
+            "bind",
+            string_value(value, path)?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("upstream_url") {
+        set_named_field(
+            &mut preset,
+            "upstreams",
+            alias,
+            "url",
+            string_value(value, path)?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("secret") {
+        let upstream = named_declaration_mut(&mut preset, "upstreams", alias, path)?;
+        let auth = upstream
+            .get_mut(Value::String("auth".to_owned()))
+            .and_then(Value::as_mapping_mut)
+            .ok_or_else(|| load_error(path, "devin preset auth is invalid"))?;
+        auth.insert(
+            Value::String("secret".to_owned()),
+            Value::String(string_value(value, path)?),
+        );
+    }
+    Ok(preset)
+}
+
+fn rewrite_devin_routes(root: &mut Value, alias: &str, path: &Path) -> Result<(), ConfigError> {
+    let routes = root
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(Value::String("routes".to_owned())))
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| load_error(path, "devin preset routes are invalid"))?;
+    for (index, route) in routes.iter_mut().enumerate() {
+        let route = route
+            .as_mapping_mut()
+            .ok_or_else(|| load_error(path, "devin preset route is invalid"))?;
+        let route_id = route
+            .get(Value::String("id".to_owned()))
+            .and_then(Value::as_str)
+            .ok_or_else(|| load_error(path, "devin preset route ID is missing"))?;
+        route.insert(
+            Value::String("id".to_owned()),
+            Value::String(if index == 0 {
+                format!("{alias}-route")
+            } else {
+                format!("{alias}-{route_id}")
+            }),
+        );
+        route.insert(
+            Value::String("listen".to_owned()),
+            Value::String(alias.to_owned()),
+        );
+        if let Some(target) = route.get_mut(Value::String("target".to_owned())) {
+            match target {
+                Value::String(name) if name == "upstream" => *name = alias.to_owned(),
+                Value::Mapping(target) => {
+                    if target
+                        .get(Value::String("provider".to_owned()))
+                        .and_then(Value::as_str)
+                        == Some("upstream")
+                    {
+                        target.insert(
+                            Value::String("provider".to_owned()),
+                            Value::String(alias.to_owned()),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 fn rename_named_key(
     root: &mut Value,
     section: &str,
@@ -425,10 +556,10 @@ fn rename_named_key(
         .as_mapping_mut()
         .and_then(|mapping| mapping.get_mut(Value::String(section.to_owned())))
         .and_then(Value::as_mapping_mut)
-        .ok_or_else(|| load_error(path, "cursor preset section is invalid"))?;
+        .ok_or_else(|| load_error(path, "preset section is invalid"))?;
     let value = section
         .remove(Value::String(old.to_owned()))
-        .ok_or_else(|| load_error(path, "cursor preset declaration is missing"))?;
+        .ok_or_else(|| load_error(path, "preset declaration is missing"))?;
     section.insert(Value::String(new.to_owned()), value);
     Ok(())
 }
@@ -444,7 +575,7 @@ fn named_declaration_mut<'a>(
         .and_then(Value::as_mapping_mut)
         .and_then(|mapping| mapping.get_mut(Value::String(id.to_owned())))
         .and_then(Value::as_mapping_mut)
-        .ok_or_else(|| load_error(path, "cursor preset declaration is invalid"))
+        .ok_or_else(|| load_error(path, "preset declaration is invalid"))
 }
 
 fn set_named_field(
@@ -466,7 +597,7 @@ fn first_route_mut<'a>(root: &'a mut Value, path: &Path) -> Result<&'a mut Mappi
         .and_then(Value::as_sequence_mut)
         .and_then(|routes| routes.first_mut())
         .and_then(Value::as_mapping_mut)
-        .ok_or_else(|| load_error(path, "cursor preset route is invalid"))
+        .ok_or_else(|| load_error(path, "preset route is invalid"))
 }
 
 fn set_cursor_transform_parameter(
@@ -982,6 +1113,63 @@ version: 1
         assert!(config.route("cursor-low-route").is_some());
         assert!(config.route("cursor-high-route").is_some());
         assert_eq!(config.listeners().len(), 2);
+    }
+
+    #[test]
+    fn expands_devin_preset_with_connect_framing_and_parameters() {
+        let dir = TestDir::new();
+        let root = dir.write(
+            "devin.yaml",
+            r#"
+imports:
+  - preset: devin
+    as: devin-local
+    with:
+      bind: 127.0.0.1:9443
+      upstream_url: http://127.0.0.1:9419
+      secret: env:DEVIN_UPSTREAM_KEY
+version: 1
+"#,
+        );
+        let config = load_path(&root)
+            .expect("devin preset")
+            .compile()
+            .expect("compiled");
+        assert_eq!(config.listeners()["devin-local"].bind(), "127.0.0.1:9443");
+        let route = config.route("devin-local-route").expect("preset route");
+        assert_eq!(route.listener(), "devin-local");
+        assert_eq!(route.target().upstream(), "devin-local");
+        assert_eq!(route.ingress().framing(), Some("decode.connect.envelope"));
+        assert_eq!(route.ingress().decoder(), Some("decode.devin.chat"));
+        assert_eq!(route.response().encoder(), Some("encode.devin.connect"));
+        assert_eq!(
+            config.upstreams()["devin-local"]
+                .auth()
+                .expect("preset auth")
+                .secret()
+                .redacted(),
+            "env:DEVIN_UPSTREAM_KEY"
+        );
+
+        let rendered = render_path(root).expect("rendered preset");
+        assert!(rendered.contains("decode.connect.envelope"));
+        assert!(rendered.contains("decode.devin.chat"));
+        assert!(rendered.contains("encode.devin.connect"));
+        assert!(rendered.contains("env:DEVIN_UPSTREAM_KEY"));
+        assert!(!rendered.contains("preset:"));
+    }
+
+    #[test]
+    fn rejects_unknown_devin_preset_parameters() {
+        let dir = TestDir::new();
+        let root = dir.write(
+            "devin-invalid.yaml",
+            "imports: [{preset: devin, with: {model: custom}}]\nversion: 1\n",
+        );
+        let error = load_path(root).expect_err("unknown Devin preset parameter");
+        assert!(error
+            .to_string()
+            .contains("unknown devin preset parameter `model`"));
     }
 
     #[test]

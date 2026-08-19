@@ -1,0 +1,42 @@
+[package]
+name = "adapter-devin"
+description = "Devin ConnectRPC and protobuf semantic codecs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+async-stream = "0.3"
+base64 = "0.22"
+bytes.workspace = true
+flate2.workspace = true
+futures-core = "0.3"
+futures-util = "0.3"
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+pooler-config = { path = "../pooler-config" }
+pooler-core = { path = "../pooler-core" }
+pooler-http = { path = "../pooler-http" }
+pooler-protocol = { path = "../pooler-protocol" }
+prost = "0.13"
+prost-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

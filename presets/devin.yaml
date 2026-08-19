@@ -1,0 +1,80 @@
+version: 1
+
+listeners:
+  listener:
+    bind: 127.0.0.1:18473
+
+upstreams:
+  upstream:
+    url: http://127.0.0.1:8319
+    auth:
+      kind: bearer_secret
+      secret: env:POOLER_UPSTREAM_KEY
+
+routes:
+  - id: route
+    listen: listener
+    match:
+      methods: [POST]
+      path: /exa.api_server_pb.ApiServerService/GetChatMessage
+      content_types: [application/connect+proto]
+    ingress:
+      mode: semantic
+      framing: decode.connect.envelope
+      decoder: decode.devin.chat
+    target:
+      provider: upstream
+      upstream_path: /v1/chat/completions
+    response:
+      mode: semantic
+      decoder: decode.openai.chat.events
+      encoder: encode.devin.connect
+    loss_policy: reject
+
+  - id: model-configs
+    listen: listener
+    match:
+      methods: [POST]
+      path: /exa.api_server_pb.ApiServerService/GetCliModelConfigs
+      content_types: [application/proto, application/protobuf]
+    target: upstream
+
+  - id: user-status
+    listen: listener
+    match:
+      methods: [POST]
+      path: /exa.seat_management_pb.SeatManagementService/GetUserStatus
+      content_types: [application/proto, application/protobuf]
+    target: upstream
+
+  - id: team-settings
+    listen: listener
+    match:
+      methods: [POST]
+      path: /exa.seat_management_pb.SeatManagementService/GetCliTeamSettings
+      content_types: [application/proto, application/protobuf]
+    target: upstream
+
+  - id: user-jwt
+    listen: listener
+    match:
+      methods: [POST]
+      path: /exa.auth_pb.AuthService/GetUserJwt
+      content_types: [application/proto, application/protobuf]
+    target: upstream
+
+  - id: analytics
+    listen: listener
+    match:
+      methods: [POST]
+      path: /exa.product_analytics_pb.ProductAnalyticsService/BatchRecordAnalyticsEvents
+      content_types: [application/proto, application/protobuf]
+    target: upstream
+
+  - id: self
+    listen: listener
+    match:
+      methods: [GET, POST]
+      path: /v3/self
+      content_types: [application/json]
+    target: upstream
