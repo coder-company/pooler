@@ -1,7 +1,7 @@
 //! Pooler's command-line interface.
 
 use std::path::PathBuf;
-use std::{fs, time::Duration};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -62,9 +62,9 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Config {
             command: ConfigCommand::Render,
         } => {
-            let source = read(&cli.config)?;
-            Config::from_yaml(cli.config.display().to_string(), &source)?.compile()?;
-            print!("{source}");
+            let rendered = pooler_config::render_path(&cli.config)?;
+            Config::from_yaml(cli.config.display().to_string(), &rendered)?.compile()?;
+            print!("{rendered}");
             Ok(())
         }
         Command::Routes => {
@@ -88,11 +88,6 @@ pub fn run(cli: Cli) -> Result<()> {
             bail!("credential management is not implemented in the engineering baseline")
         }
     }
-}
-
-fn read(path: &PathBuf) -> Result<String> {
-    fs::read_to_string(path)
-        .with_context(|| format!("failed to read configuration {}", path.display()))
 }
 
 fn load(path: &PathBuf) -> Result<pooler_config::CompiledConfig> {

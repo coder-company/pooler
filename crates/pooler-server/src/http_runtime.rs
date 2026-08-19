@@ -1142,4 +1142,41 @@ mod tests {
         assert_eq!(selected["model"], "private");
         stop_server(&server, runner).await;
     }
+
+    #[tokio::test]
+    async fn cursor_preset_expands_and_patches_a_live_request() {
+        let (upstream_address, upstream) = spawn_one_shot_upstream(b"cursor").await;
+        let upstream_secret = TestSecret::new("cursor-token\n");
+        let config_file = TestSecret::new(&format!(
+            "imports:\n  - preset: cursor\n    as: cursor-test\n    with:\n      bind: 127.0.0.1:0\n      reasoning_effort: high\n      model_prefix: gpt-\n      upstream_url: http://{upstream_address}\n      secret: {}\nversion: 1\n",
+            upstream_secret.reference()
+        ));
+        let config = pooler_config::Config::from_path(&config_file.path)
+            .expect("cursor preset loads")
+            .compile()
+            .expect("cursor preset compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "cursor-test");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"gpt-test","unknown":{"keep":true}}"#;
+        let request = format!(
+            "POST /cursor HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response = send_request(address, request.as_bytes()).await;
+        assert_eq!(response_body(&response), b"cursor");
+        let upstream_request = upstream.await.expect("upstream task");
+        let forwarded: serde_json::Value =
+            serde_json::from_slice(response_body(&upstream_request)).expect("cursor JSON");
+        assert_eq!(forwarded["reasoning_effort"], "high");
+        assert_eq!(forwarded["unknown"]["keep"], true);
+        assert!(String::from_utf8_lossy(&upstream_request)
+            .to_ascii_lowercase()
+            .contains("authorization: bearer cursor-token"));
+        stop_server(&server, runner).await;
+    }
 }

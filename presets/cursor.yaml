@@ -1,0 +1,34 @@
+version: 1
+
+listeners:
+  listener:
+    bind: 127.0.0.1:8333
+
+upstreams:
+  upstream:
+    url: http://127.0.0.1:8319
+    auth:
+      kind: bearer_secret
+      secret: env:POOLER_UPSTREAM_KEY
+
+routes:
+  - id: route
+    listen: listener
+    match:
+      methods: [POST]
+      path_prefix: /
+      content_types: [application/json]
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    request:
+      steps:
+        - use: transform.json.set_when_model_prefix
+          with:
+            prefix: gpt-
+            pointer: /reasoning_effort
+            value: high
+    target:
+      provider: upstream
+    response:
+      mode: opaque

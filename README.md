@@ -1,13 +1,20 @@
 # pooler
 
-Pooler is a composable protocol runtime for AI clients and providers. The
-implementation is currently at the engineering-baseline stage; unsupported
-protocol compatibility is not advertised.
+Pooler is a composable protocol runtime for AI clients and providers. It currently
+supports strict configuration, opaque HTTP proxying, bounded JSON patch routes,
+model-based routing, and composable imports and overlays. Unsupported protocol
+compatibility is not advertised.
 
 Validate the example configuration with:
 
 ```sh
 cargo run -p pooler-cli -- check --config config/pooler.example.yaml
+```
+
+Render a fully expanded configuration, including imports and presets, with:
+
+```sh
+cargo run -p pooler-cli -- --config config/cursor.example.yaml config render
 ```
 
 Run the opaque proxy with:

@@ -21,7 +21,10 @@ name or advertised without conformance evidence.
 - Phase 2 — patch and overlay engine: in progress. Bounded JSON inspection,
   transforms, model declarations, runtime patching, and local E2E coverage are
   implemented, including model-based provider selection and upstream-model
-  rewriting. Overlays, preset rendering, and Cursor compatibility evidence remain.
+  rewriting. Strict imports and overlays, deterministic expanded rendering, and a
+  namespaced Cursor preset have local conformance coverage. Evidence from a real
+  Cursor client or a current sanitized Cursor fixture remains before compatibility
+  can be claimed.
 - Phases 3–8: pending.
 - First useful release acceptance: pending.
 

@@ -27,8 +27,10 @@ use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
 
+mod loader;
 mod route_match;
 
+pub use loader::{load_path, render_path, ConfigLoader, DEFAULT_MAX_IMPORT_DEPTH};
 use route_match::{prefix_matches, template_matches};
 pub use route_match::{RouteMatchError, RouteRequest};
 
@@ -96,11 +98,15 @@ impl Display for SourceLabel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Source {
     name: Arc<str>,
+    origins: Arc<BTreeMap<String, Arc<str>>>,
 }
 
 impl Source {
     fn new(name: impl Into<Arc<str>>, _text: impl Into<Arc<str>>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            origins: Arc::new(BTreeMap::new()),
+        }
     }
 }
 
@@ -257,12 +263,13 @@ impl Config {
 
     /// Parses a configuration file path.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path_ref = path.as_ref();
-        let text = std::fs::read_to_string(path_ref).map_err(|error| ConfigError::Io {
-            path: path_ref.display().to_string(),
-            message: error.to_string(),
-        })?;
-        Self::from_yaml(path_ref.display().to_string(), &text)
+        load_path(path)
+    }
+
+    pub(crate) fn set_origins(&mut self, origins: BTreeMap<String, Arc<str>>) {
+        if let Some(source) = &mut self.source {
+            source.origins = Arc::new(origins);
+        }
     }
 
     /// Validates and compiles with generation one.
@@ -1417,7 +1424,7 @@ fn compile_models(
         }
         let mut targets = Vec::with_capacity(declaration.targets.len());
         for (target_ordinal, target) in declaration.targets.iter().enumerate() {
-            let target_label = model_target_label(source, ordinal, target_ordinal);
+            let target_label = model_target_label(source, ordinal, target_ordinal, &declaration.id);
             let provider = target
                 .provider
                 .as_deref()
@@ -2127,29 +2134,51 @@ fn parse_error(source: &Source, error: serde_yml::Error) -> ConfigError {
 }
 
 fn declaration_label(source: &Source, section: &str, id: &str, _ordinal: usize) -> SourceLabel {
-    SourceLabel::new(source, None, None, format!("{section}.{id}"))
+    let path = format!("{section}.{id}");
+    source_label(source, path)
 }
 
 fn upstream_label(source: &Source, id: &str, ordinal: usize) -> SourceLabel {
     declaration_label(source, "upstreams", id, ordinal)
 }
 
-fn model_label(source: &Source, ordinal: usize, _id: &str) -> SourceLabel {
-    SourceLabel::new(source, None, None, format!("models[{ordinal}]"))
+fn model_label(source: &Source, ordinal: usize, id: &str) -> SourceLabel {
+    let origin_key = format!("models.{id}");
+    let display_path = format!("models[{ordinal}]");
+    source_label_with_key(source, &origin_key, display_path)
 }
 
-fn model_target_label(source: &Source, model_ordinal: usize, target_ordinal: usize) -> SourceLabel {
-    SourceLabel::new(
+fn model_target_label(
+    source: &Source,
+    model_ordinal: usize,
+    target_ordinal: usize,
+    model_id: &str,
+) -> SourceLabel {
+    source_label_with_key(
         source,
-        None,
-        None,
+        &format!("models.{model_id}"),
         format!("models[{model_ordinal}].targets[{target_ordinal}]"),
     )
 }
 
 fn route_label(source: &Source, ordinal: usize, id: &str) -> SourceLabel {
-    let _ = id;
-    SourceLabel::new(source, None, None, format!("routes[{ordinal}]"))
+    let origin_key = format!("routes.{id}");
+    let display_path = format!("routes[{ordinal}]");
+    source_label_with_key(source, &origin_key, display_path)
+}
+
+fn source_label(source: &Source, path: String) -> SourceLabel {
+    source_label_with_key(source, &path, path.clone())
+}
+
+fn source_label_with_key(source: &Source, key: &str, path: String) -> SourceLabel {
+    let name = source.origins.get(key).unwrap_or(&source.name);
+    SourceLabel {
+        source: Arc::clone(name),
+        line: None,
+        column: None,
+        path: Arc::from(path),
+    }
 }
 
 #[cfg(test)]
