@@ -26,8 +26,8 @@ use hyper_util::{
 };
 use pooler_auth::{constant_time_eq, SecretRef as AuthSecretRef, SecretValue};
 use pooler_config::{
-    CompiledConfig, RequestTransform, RouteMatchError, RoutePlan, RouteRequest, SecretRef,
-    UpstreamPlan,
+    CompiledConfig, ModelSource, RequestTransform, RouteMatchError, RoutePlan, RouteRequest,
+    SecretRef, UpstreamPlan,
 };
 use pooler_core::{BodyMode, RouteLimits};
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
@@ -351,7 +351,7 @@ impl HttpProxy {
         request: Request<Incoming>,
         guard: DrainGuard,
     ) -> Result<Response<ProxyBody>, ProxyError> {
-        let upstream = self
+        let mut upstream = self
             .config
             .upstreams()
             .get(route.target().upstream())
@@ -360,22 +360,16 @@ impl HttpProxy {
                 upstream: route.target().upstream().to_owned(),
             })?;
         let started = Instant::now();
-        let request_deadline = started + request_timeout(route.limits(), upstream);
+        let buffer_deadline = started + patch_buffer_timeout(&self.config, route, upstream);
         let cancellation = guard.cancellation_token();
-        let uri = upstream_uri(upstream, route, request.uri())?;
         let method = request.method().clone();
+        let downstream_uri = request.uri().clone();
         let version = request.version();
         let limits = route.limits();
         let mut headers = request.headers().clone();
         strip_hop_by_hop_headers(&mut headers);
         headers.remove(header::HOST);
         headers.remove(header::AUTHORIZATION);
-        apply_upstream_auth(&mut headers, upstream)?;
-        let header_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
-        limits
-            .check_headers(header_count, header_bytes(&headers))
-            .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
-
         let incoming = request.into_body();
         let body = match route.ingress().mode() {
             BodyMode::Opaque => {
@@ -386,7 +380,7 @@ impl HttpProxy {
             BodyMode::Patch => {
                 let bytes = tokio::select! {
                     result = time::timeout_at(
-                        request_deadline,
+                        buffer_deadline,
                         crate::collect_body_limited(
                             incoming,
                             bounded_usize(limits.max_request_body_bytes),
@@ -405,6 +399,15 @@ impl HttpProxy {
                 };
                 let mut document = PreservedJson::from_bytes(bytes.to_vec())
                     .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+                let inspected_model =
+                    if route.target().model_source() == Some(ModelSource::Inspected) {
+                        document
+                            .extract_model()
+                            .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    };
                 for transform in route.request_steps() {
                     match transform {
                         RequestTransform::JsonSet { pointer, value } => {
@@ -432,6 +435,37 @@ impl HttpProxy {
                         }
                     }
                 }
+                if let Some(source) = route.target().model_source() {
+                    let public_model = match source {
+                        ModelSource::Request => document
+                            .require_model()
+                            .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?,
+                        ModelSource::Inspected => inspected_model.as_deref().ok_or_else(|| {
+                            ProxyError::InvalidPatch("request model is missing".to_owned())
+                        })?,
+                    };
+                    let model = self.config.models().get(public_model).ok_or_else(|| {
+                        ProxyError::InvalidPatch(format!("unknown public model `{public_model}`"))
+                    })?;
+                    let target = model.targets().first().ok_or_else(|| {
+                        ProxyError::InvalidPatch("model has no target".to_owned())
+                    })?;
+                    upstream = self
+                        .config
+                        .upstreams()
+                        .get(target.provider())
+                        .ok_or_else(|| ProxyError::MissingUpstream {
+                            route: route.id().to_owned(),
+                            upstream: target.provider().to_owned(),
+                        })?;
+                    document
+                        .set_pointer_bounded(
+                            "/model",
+                            serde_json::Value::String(target.upstream_model().to_owned()),
+                            JsonPatchLimits::default(),
+                        )
+                        .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+                }
                 let bytes = document.bytes().into_owned();
                 limits
                     .check_request_body(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
@@ -447,10 +481,17 @@ impl HttpProxy {
                 });
             }
         };
+        let uri = upstream_uri(upstream, route, &downstream_uri)?;
+        apply_upstream_auth(&mut headers, upstream)?;
+        let header_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
+        limits
+            .check_headers(header_count, header_bytes(&headers))
+            .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
         let mut builder = Request::builder().method(method).uri(uri).version(version);
         *builder.headers_mut().expect("request builder headers") = headers;
         let upstream_request = builder.body(body)?;
 
+        let request_deadline = started + request_timeout(limits, upstream);
         let header_deadline =
             (Instant::now() + connect_timeout(limits, upstream)).min(request_deadline);
         let response = tokio::select! {
@@ -560,6 +601,22 @@ fn request_timeout(limits: &RouteLimits, upstream: &UpstreamPlan) -> Duration {
         .flatten()
         .min()
         .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+}
+
+fn patch_buffer_timeout(
+    config: &CompiledConfig,
+    route: &RoutePlan,
+    fallback: &UpstreamPlan,
+) -> Duration {
+    let mut timeout = request_timeout(route.limits(), fallback);
+    if route.target().model_source().is_some() {
+        for target in config.models().values().flat_map(|model| model.targets()) {
+            if let Some(upstream) = config.upstreams().get(target.provider()) {
+                timeout = timeout.min(request_timeout(route.limits(), upstream));
+            }
+        }
+    }
+    timeout
 }
 
 fn connect_timeout(limits: &RouteLimits, upstream: &UpstreamPlan) -> Duration {
@@ -754,6 +811,38 @@ routes:
         assert_eq!(
             request_timeout(route.limits(), upstream),
             Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn patch_buffer_uses_shortest_selectable_provider_timeout() {
+        let config = compile_yaml(
+            "selection-timeout.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  fallback:
+    transport: {kind: http, base_url: http://127.0.0.1:8319, request_timeout: 10s}
+  selected:
+    transport: {kind: http, base_url: http://127.0.0.1:8320, request_timeout: 1s}
+models:
+  - id: public
+    targets: [{provider: selected, upstream_model: private}]
+routes:
+  - id: route
+    listen: local
+    ingress: {mode: patch, inspectors: [inspect.openai.model]}
+    target: {provider: fallback, model_from: inspected.model}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("selection timeout config");
+        let route = &config.routes()[0];
+        let fallback = &config.upstreams()["fallback"];
+        assert_eq!(
+            patch_buffer_timeout(&config, route, fallback),
+            Duration::from_secs(1)
         );
     }
 }

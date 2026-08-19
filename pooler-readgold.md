@@ -20,8 +20,8 @@ name or advertised without conformance evidence.
   CI evidence is pending the pushed commit.
 - Phase 2 — patch and overlay engine: in progress. Bounded JSON inspection,
   transforms, model declarations, runtime patching, and local E2E coverage are
-  implemented; overlays, preset rendering, model-based target selection, and
-  Cursor compatibility evidence remain.
+  implemented, including model-based provider selection and upstream-model
+  rewriting. Overlays, preset rendering, and Cursor compatibility evidence remain.
 - Phases 3–8: pending.
 - First useful release acceptance: pending.
 

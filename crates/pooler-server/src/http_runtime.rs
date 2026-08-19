@@ -1047,4 +1047,99 @@ mod tests {
         assert_eq!(patched["unknown"]["keep"], serde_json::json!([1, 2]));
         stop_server(&server, runner).await;
     }
+
+    #[tokio::test]
+    async fn request_model_selects_provider_and_rewrites_upstream_model() {
+        let fallback_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fallback binds");
+        let fallback_address = fallback_listener.local_addr().expect("fallback address");
+        let (selected_address, selected_upstream) = spawn_one_shot_upstream(b"selected").await;
+        let selected_secret = TestSecret::new("selected-token\n");
+        let config = pooler_config::compile_yaml(
+            "model-route.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  fallback: {{url: http://{fallback_address}}}\n  selected:\n    url: http://{selected_address}\n    auth: {{secret: {}}}\nmodels:\n  - id: public-model\n    targets:\n      - {{provider: selected, upstream_model: provider-model, capabilities: [text]}}\nroutes:\n  - id: model-route\n    listen: local\n    match: {{method: POST, path: /model}}\n    ingress: {{mode: patch, inspectors: [inspect.openai.model]}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /model, value: mutated-model}}\n    target: {{provider: fallback, model_from: inspected.model}}\n    response: {{mode: opaque}}\n",
+                selected_secret.reference()
+            ),
+        )
+        .expect("model route compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"public-model","unknown":true}"#;
+        let request = format!(
+            "POST /model HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response = send_request(address, request.as_bytes()).await;
+        assert_eq!(response_body(&response), b"selected");
+        let upstream_request = selected_upstream.await.expect("selected upstream");
+        assert!(String::from_utf8_lossy(&upstream_request)
+            .to_ascii_lowercase()
+            .contains("authorization: bearer selected-token"));
+        let forwarded: serde_json::Value =
+            serde_json::from_slice(response_body(&upstream_request)).expect("forwarded JSON");
+        assert_eq!(forwarded["model"], "provider-model");
+        assert_eq!(forwarded["unknown"], true);
+        for invalid_body in [br#"{"model":"unknown"}"#.as_slice(), br#"{}"#.as_slice()] {
+            let invalid_request = format!(
+                "POST /model HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                invalid_body.len(),
+                String::from_utf8_lossy(invalid_body)
+            );
+            let rejected = send_request(address, invalid_request.as_bytes()).await;
+            assert_eq!(status(&rejected), 400);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), fallback_listener.accept())
+                .await
+                .is_err()
+        );
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn patch_model_validation_only_runs_for_the_selected_source() {
+        let (plain_address, plain_upstream) = spawn_one_shot_upstream(b"plain").await;
+        let (selected_address, selected_upstream) = spawn_one_shot_upstream(b"selected").await;
+        let config = pooler_config::compile_yaml(
+            "model-source.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  plain: {{url: http://{plain_address}}}\n  selected: {{url: http://{selected_address}}}\nmodels:\n  - id: public\n    targets: [{{provider: selected, upstream_model: private}}]\nroutes:\n  - id: plain\n    listen: local\n    match: {{method: POST, path: /plain}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /value, value: true}}\n    target: plain\n    response: {{mode: opaque}}\n  - id: request-model\n    listen: local\n    match: {{method: POST, path: /request-model}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /model, value: public}}\n    target: {{provider: plain, model_from: request.model}}\n    response: {{mode: opaque}}\n"
+            ),
+        )
+        .expect("model source config");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        for path in ["/plain", "/request-model"] {
+            let body = br#"{"model":null,"value":false}"#;
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            );
+            let response = send_request(address, request.as_bytes()).await;
+            assert_eq!(status(&response), 200);
+        }
+        let plain_request = plain_upstream.await.expect("plain upstream");
+        let plain: serde_json::Value =
+            serde_json::from_slice(response_body(&plain_request)).expect("plain patch body");
+        assert!(plain["model"].is_null());
+        assert_eq!(plain["value"], true);
+        let selected_request = selected_upstream.await.expect("selected upstream");
+        let selected: serde_json::Value =
+            serde_json::from_slice(response_body(&selected_request)).expect("selected patch body");
+        assert_eq!(selected["model"], "private");
+        stop_server(&server, runner).await;
+    }
 }

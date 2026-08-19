@@ -527,6 +527,9 @@ pub struct TargetConfig {
     /// Upstream path override.
     #[serde(alias = "upstream_path")]
     pub path: Option<String>,
+    /// Extract a public model ID from the JSON request and select its first
+    /// static registry target.
+    pub model_from: Option<String>,
 }
 
 /// Immutable listener plan.
@@ -877,6 +880,16 @@ impl BodyPlan {
 pub struct TargetPlan {
     upstream: Arc<str>,
     path: Option<Arc<str>>,
+    model_source: Option<ModelSource>,
+}
+
+/// JSON model value used for static model-registry selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelSource {
+    /// Model after configured request transforms have run.
+    Request,
+    /// Model captured before any request transform runs.
+    Inspected,
 }
 
 impl TargetPlan {
@@ -890,6 +903,12 @@ impl TargetPlan {
     #[must_use]
     pub fn path(&self) -> Option<&str> {
         self.path.as_deref()
+    }
+
+    /// Whether the request model selects a static model-registry target.
+    #[must_use]
+    pub const fn model_source(&self) -> Option<ModelSource> {
+        self.model_source
     }
 }
 
@@ -1261,6 +1280,23 @@ fn compile_config(
             "response",
         )?;
         let target = compile_target(declaration, &label, &upstreams)?;
+        if target.model_source().is_some() && ingress.mode() != BodyMode::Patch {
+            return Err(invalid(
+                &label,
+                "request model target selection requires patch ingress mode",
+            ));
+        }
+        if target.model_source() == Some(ModelSource::Inspected)
+            && !ingress
+                .inspectors()
+                .iter()
+                .any(|inspector| inspector.as_ref() == "inspect.openai.model")
+        {
+            return Err(invalid(
+                &label,
+                "request model target selection requires inspect.openai.model",
+            ));
+        }
         let downstream_auth =
             compile_downstream_auth(declaration.downstream_auth.as_ref(), &label)?;
         if listener_requires_auth(&listeners[listener]) && downstream_auth.is_none() {
@@ -1720,10 +1756,14 @@ fn compile_target(
     upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
 ) -> Result<TargetPlan, ConfigError> {
     let target = declaration.target.as_ref();
-    let (upstream, path) = match target {
-        Some(TargetValue::Name(name)) => (Some(name.as_str()), None),
-        Some(TargetValue::Config(config)) => (config.upstream.as_deref(), config.path.as_deref()),
-        None => (declaration.upstream.as_deref(), None),
+    let (upstream, path, model_from) = match target {
+        Some(TargetValue::Name(name)) => (Some(name.as_str()), None, None),
+        Some(TargetValue::Config(config)) => (
+            config.upstream.as_deref(),
+            config.path.as_deref(),
+            config.model_from.as_deref(),
+        ),
+        None => (declaration.upstream.as_deref(), None, None),
     };
     let upstream = upstream
         .filter(|name| !name.trim().is_empty())
@@ -1738,9 +1778,21 @@ fn compile_target(
     let path = path
         .map(|value| valid_path(value.to_owned(), label))
         .transpose()?;
+    let model_source = match model_from {
+        None => None,
+        Some("request.model") => Some(ModelSource::Request),
+        Some("inspected.model") => Some(ModelSource::Inspected),
+        Some(_) => {
+            return Err(invalid(
+                label,
+                "target model_from must be request.model or inspected.model",
+            ));
+        }
+    };
     Ok(TargetPlan {
         upstream: Arc::from(upstream),
         path,
+        model_source,
     })
 }
 
@@ -2339,7 +2391,7 @@ routes:
       steps:
         - use: transform.json.set_when_model_prefix
           with: {prefix: gpt-, pointer: /reasoning/effort, value: high}
-    target: local
+    target: {provider: local, model_from: request.model}
     response: {mode: opaque}
 "#;
         let config = compile_yaml("patch.yaml", text).expect("patch config");
@@ -2354,6 +2406,10 @@ routes:
             config.routes()[0].request_steps(),
             [RequestTransform::JsonSetWhenModelPrefix { .. }]
         ));
+        assert_eq!(
+            config.routes()[0].target().model_source(),
+            Some(ModelSource::Request)
+        );
     }
 
     #[test]
