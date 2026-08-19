@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "adapter": "factory",
+      "protocol": "language-model-v3",
+      "version": "v3",
+      "fixture": "../factory/fx-cliproxy-bridge-v3.json",
+      "equivalence": "event_semantic",
+      "status": "sanitized_local_reference",
+      "source": "sanitized fx-cliproxy-bridge local reference",
+      "notes": [
+        "This fixture is not evidence of compatibility with a current Factory client."
+      ]
+    },
+    {
+      "adapter": "factory",
+      "protocol": "language-model-v3",
+      "version": "v3-text",
+      "fixture": "../factory/fx-cliproxy-bridge-text.json",
+      "equivalence": "json_structural",
+      "status": "sanitized_local_reference",
+      "source": "sanitized fx-cliproxy-bridge local reference",
+      "notes": [
+        "This fixture is not evidence of compatibility with a current Factory client."
+      ]
+    },
+    {
+      "adapter": "devin",
+      "protocol": "connect-rpc",
+      "version": "v1",
+      "fixture": "../devin/connect/chat-stream.json",
+      "equivalence": "protobuf_semantic",
+      "status": "sanitized_cross_language",
+      "source": "sanitized widevin and oh-my-pi reference sources",
+      "notes": [
+        "This fixture is not evidence of compatibility with a current Devin client."
+      ]
+    },
+    {
+      "adapter": "cursor",
+      "protocol": "http-json-patch",
+      "version": "preset-v1",
+      "fixture": "../../config/cursor.example.yaml",
+      "equivalence": "config_structural",
+      "status": "not_established",
+      "source": "Pooler preset example",
+      "notes": [
+        "No current Cursor client fixture is committed; compatibility is not claimed."
+      ]
+    },
+    {
+      "adapter": "codex",
+      "protocol": "native-provider",
+      "version": "status-gated-v1",
+      "fixture": "../../config/pooler.example.yaml",
+      "equivalence": "config_structural",
+      "status": "not_established",
+      "source": "Pooler example configuration",
+      "notes": [
+        "No live provider authorization or conformance fixture is committed."
+      ]
+    }
+  ]
+}

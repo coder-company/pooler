@@ -11,12 +11,19 @@ description = "Pooler process lifecycle, immutable configuration generations, an
 adapter-devin = { path = "../adapter-devin" }
 adapter-factory = { path = "../adapter-factory" }
 arc-swap.workspace = true
+bytes.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
 pooler-auth = { path = "../pooler-auth" }
 pooler-config = { path = "../pooler-config" }
 pooler-core = { path = "../pooler-core" }
 pooler-http = { path = "../pooler-http" }
+pooler-observe = { path = "../pooler-observe" }
+pooler-store = { path = "../pooler-store" }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -24,7 +31,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 prost = "0.13"
-serde_json.workspace = true
 
 [lints]
 workspace = true

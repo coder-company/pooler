@@ -1,0 +1,64 @@
+[package]
+name = "pooler-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.83"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+jobserver = "=0.1.32"
+icu_collections = "=1.5.0"
+icu_normalizer = "=1.5.0"
+icu_normalizer_data = "=1.5.1"
+icu_properties = "=1.5.1"
+icu_properties_data = "=1.5.1"
+icu_provider = "=1.5.0"
+idna = "=1.1.0"
+idna_adapter = "=1.2.0"
+pooler-http = { path = "../crates/pooler-http" }
+pooler-protocol = { path = "../crates/pooler-protocol" }
+serde_json = "1.0"
+serde_yml = "=0.0.12"
+uuid = "=1.12.1"
+url = "=2.5.4"
+
+[[bin]]
+name = "sse"
+path = "fuzz_targets/sse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "connect"
+path = "fuzz_targets/connect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_patch"
+path = "fuzz_targets/json_patch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "overlay"
+path = "fuzz_targets/overlay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tool_deltas"
+path = "fuzz_targets/tool_deltas.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

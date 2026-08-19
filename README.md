@@ -23,5 +23,19 @@ Run the opaque proxy with:
 POOLER_UPSTREAM_KEY=... cargo run -p pooler-cli -- serve --config config/pooler.example.yaml
 ```
 
+Replay a deterministic fixture corpus without loading server configuration:
+
+```sh
+cargo run -p pooler-cli -- fixture replay fixtures/factory
+```
+
+Capture a structured fixture to an owner-private file. Bodies are omitted by
+default; retaining bounded, recursively redacted JSON bodies requires the
+explicit flag:
+
+```sh
+cargo run -p pooler-cli -- fixture capture input.json capture.json --include-bodies
+```
+
 See the [delivery index](pooler-readgold.md), [product goal](GOAL.md), and
 [architecture plan](ARCHITECTURE_PLAN.md).

@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 #![doc = "Structured observability primitives for Pooler.\n\nThe types in this crate deliberately keep credentials out of the public data\nmodel. Values that originate in an untrusted request should still be passed\nthrough [`RedactionPolicy`] before they are recorded."]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::{self, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use http::HeaderMap;
 use serde::ser::Serializer;
@@ -636,6 +637,1290 @@ fn now_unix_millis() -> u64 {
         .map_or(0, |duration| {
             duration.as_millis().min(u128::from(u64::MAX)) as u64
         })
+}
+
+const DEFAULT_MAX_METRIC_SERIES: usize = 1_024;
+const DEFAULT_MAX_TRACE_RECORDS: usize = 1_024;
+const MAX_LABEL_LENGTH: usize = 96;
+const MAX_TRACE_ATTRIBUTES: usize = 32;
+const LATENCY_BUCKETS_MS: &[u64] = &[
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
+];
+
+/// Bounded configuration for in-process metrics.
+///
+/// Pooler intentionally keeps metrics in memory.  A deployment can export a
+/// deterministic snapshot or Prometheus text without coupling the request
+/// path to a remote metrics service.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MetricsConfig {
+    /// Maximum number of distinct metric series retained by one registry.
+    #[serde(default = "default_max_metric_series")]
+    pub max_series: usize,
+}
+
+const fn default_max_metric_series() -> usize {
+    DEFAULT_MAX_METRIC_SERIES
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            max_series: DEFAULT_MAX_METRIC_SERIES,
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// Set the maximum number of metric series retained by the registry.
+    #[must_use]
+    pub fn with_max_series(mut self, max_series: usize) -> Self {
+        self.max_series = max_series;
+        self
+    }
+}
+
+/// The stage represented by a Pooler trace span or trace record.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceStage {
+    Request,
+    Match,
+    Authentication,
+    Decode,
+    Transform,
+    Selection,
+    Attempt,
+    StreamBootstrap,
+    Encode,
+    Persistence,
+}
+
+impl fmt::Display for TraceStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Request => "request",
+            Self::Match => "match",
+            Self::Authentication => "authentication",
+            Self::Decode => "decode",
+            Self::Transform => "transform",
+            Self::Selection => "selection",
+            Self::Attempt => "attempt",
+            Self::StreamBootstrap => "stream_bootstrap",
+            Self::Encode => "encode",
+            Self::Persistence => "persistence",
+        };
+        formatter.write_str(value)
+    }
+}
+
+/// A bounded, redacted trace record suitable for diagnostics and tests.
+///
+/// Trace records contain identifiers and configuration labels only.  Bodies,
+/// headers, credential material, and arbitrary request values are not part of
+/// the contract.  Attributes are sanitized again by [`TraceRecorder`].
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct TraceRecord {
+    pub timestamp_ms: u64,
+    pub request_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub stage: Option<TraceStage>,
+    pub route: Option<String>,
+    pub provider: Option<String>,
+    pub attempt: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub outcome: Option<String>,
+    pub attributes: BTreeMap<String, Value>,
+}
+
+impl TraceRecord {
+    /// Start a record at the current wall-clock time.
+    #[must_use]
+    pub fn new(stage: TraceStage) -> Self {
+        Self {
+            timestamp_ms: now_unix_millis(),
+            stage: Some(stage),
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn route(mut self, route: impl Into<String>) -> Self {
+        self.route = Some(route.into());
+        self
+    }
+
+    #[must_use]
+    pub fn provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self
+    }
+
+    #[must_use]
+    pub fn attempt(mut self, attempt: u32) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
+    #[must_use]
+    pub fn duration(mut self, duration: Duration) -> Self {
+        self.duration_ms = Some(duration_to_millis(duration));
+        self
+    }
+
+    #[must_use]
+    pub fn outcome(mut self, outcome: impl Into<String>) -> Self {
+        self.outcome = Some(outcome.into());
+        self
+    }
+
+    #[must_use]
+    pub fn attribute(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        if self.attributes.len() < MAX_TRACE_ATTRIBUTES {
+            self.attributes.insert(key.into(), value.into());
+        }
+        self
+    }
+}
+
+/// A bounded trace snapshot exported by [`TraceRecorder`].
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct TraceSnapshot {
+    pub records: Vec<TraceRecord>,
+    pub dropped: u64,
+}
+
+/// In-process trace record sink with bounded retention.
+#[derive(Clone)]
+pub struct TraceRecorder {
+    state: Arc<Mutex<TraceState>>,
+    max_records: usize,
+    policy: RedactionPolicy,
+}
+
+#[derive(Debug, Default)]
+struct TraceState {
+    records: VecDeque<TraceRecord>,
+    dropped: u64,
+}
+
+impl fmt::Debug for TraceRecorder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TraceRecorder")
+            .field("max_records", &self.max_records)
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for TraceRecorder {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_TRACE_RECORDS, RedactionPolicy::default())
+    }
+}
+
+impl TraceRecorder {
+    /// Construct a bounded recorder using the supplied redaction policy.
+    #[must_use]
+    pub fn new(max_records: usize, policy: RedactionPolicy) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TraceState::default())),
+            max_records,
+            policy,
+        }
+    }
+
+    /// Return a tracing span with only bounded, non-secret fields.
+    #[must_use]
+    pub fn span(&self, stage: TraceStage, route: Option<&str>) -> tracing::Span {
+        let route = route
+            .map(bounded_label)
+            .unwrap_or_else(|| "unknown".to_owned());
+        tracing::debug_span!("pooler", stage = %stage, route = %route)
+    }
+
+    /// Record a sanitized trace event.  The newest records replace the oldest
+    /// once the configured retention bound is reached.
+    pub fn record(&self, mut record: TraceRecord) {
+        if record.timestamp_ms == 0 {
+            record.timestamp_ms = now_unix_millis();
+        }
+        record.request_id = record.request_id.map(|value| bounded_text(&value));
+        record.trace_id = record.trace_id.map(|value| bounded_text(&value));
+        record.route = record.route.map(|value| bounded_label(&value));
+        record.provider = record.provider.map(|value| bounded_label(&value));
+        record.outcome = record.outcome.map(|value| bounded_label(&value));
+        record.attributes = record
+            .attributes
+            .into_iter()
+            .take(MAX_TRACE_ATTRIBUTES)
+            .map(|(key, value)| (bounded_label(&key), self.policy.sanitize_json(&value)))
+            .collect();
+
+        // Sanitize the complete wire shape as a final defense against a value
+        // hidden in a future field being retained by the in-memory recorder.
+        let value = serde_json::to_value(&record).unwrap_or(Value::Null);
+        let value = self.policy.sanitize_json(&value);
+        let Ok(record) = serde_json::from_value::<TraceRecord>(value) else {
+            return;
+        };
+
+        let mut state = lock_unpoisoned(&self.state);
+        if self.max_records == 0 {
+            state.dropped = state.dropped.saturating_add(1);
+            return;
+        }
+        if state.records.len() >= self.max_records {
+            state.records.pop_front();
+            state.dropped = state.dropped.saturating_add(1);
+        }
+        state.records.push_back(record);
+    }
+
+    /// Record a selection decision as a trace record without copying its
+    /// candidate list into a high-cardinality metric.
+    pub fn record_decision(&self, decision: &DecisionRecord) {
+        let mut record = TraceRecord::new(TraceStage::Selection);
+        record.request_id = decision.request_id.clone();
+        record.trace_id = decision.trace_id.clone();
+        record.route = decision.route.clone();
+        record.provider = decision.selected_provider.clone();
+        record.attempt = Some(decision.attempt);
+        record.outcome = decision.outcome.clone();
+        record.attributes.insert(
+            "candidate_count".to_owned(),
+            Value::from(u64::try_from(decision.candidates.len()).unwrap_or(u64::MAX)),
+        );
+        self.record(record);
+    }
+
+    /// Return a deterministic snapshot of retained records.
+    #[must_use]
+    pub fn snapshot(&self) -> TraceSnapshot {
+        let state = lock_unpoisoned(&self.state);
+        TraceSnapshot {
+            records: state.records.iter().cloned().collect(),
+            dropped: state.dropped,
+        }
+    }
+}
+
+/// A normalized attempt outcome used as a bounded metric label.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptResult {
+    Success,
+    Error,
+    Retry,
+    Cancelled,
+    Quota,
+    Cooldown,
+    Unknown,
+}
+
+impl Default for AttemptResult {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl fmt::Display for AttemptResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Success => "success",
+            Self::Error => "error",
+            Self::Retry => "retry",
+            Self::Cancelled => "cancelled",
+            Self::Quota => "quota",
+            Self::Cooldown => "cooldown",
+            Self::Unknown => "unknown",
+        };
+        formatter.write_str(value)
+    }
+}
+
+/// One upstream attempt observation.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AttemptRecord {
+    pub route: String,
+    pub provider: String,
+    pub result: AttemptResult,
+    pub duration_ms: u64,
+}
+
+impl AttemptRecord {
+    #[must_use]
+    pub fn new(route: impl AsRef<str>, provider: impl AsRef<str>, result: AttemptResult) -> Self {
+        Self {
+            route: bounded_label(route.as_ref()),
+            provider: bounded_label(provider.as_ref()),
+            result,
+            duration_ms: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn duration(mut self, duration: Duration) -> Self {
+        self.duration_ms = duration_to_millis(duration);
+        self
+    }
+}
+
+/// One retry or fallback observation.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RetryRecord {
+    pub route: String,
+    pub provider: String,
+    pub reason: String,
+    pub fallback: bool,
+}
+
+/// One cooldown state observation.  `scope` and `outcome` are fixed labels
+/// chosen by policy code, never raw provider response text.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CooldownRecord {
+    pub route: Option<String>,
+    pub provider: Option<String>,
+    pub scope: String,
+    pub outcome: String,
+}
+
+/// One quota state observation.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QuotaRecord {
+    pub route: Option<String>,
+    pub provider: String,
+    pub outcome: String,
+}
+
+/// One OAuth refresh outcome.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OAuthRefreshRecord {
+    pub provider: String,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct StateKey {
+    kind: String,
+    route: Option<String>,
+    provider: Option<String>,
+    scope: Option<String>,
+    outcome: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct AttemptKey {
+    route: String,
+    provider: String,
+    result: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct LatencyKey {
+    route: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct RetryKey {
+    route: String,
+    provider: String,
+    reason: String,
+    fallback: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct CompletionKey {
+    route: String,
+    class: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct UsageKey {
+    route: String,
+    provider: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct DecisionKey {
+    route: String,
+    provider: Option<String>,
+    outcome: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouteState {
+    requests: u64,
+    active: u64,
+    completed: u64,
+}
+
+#[derive(Clone, Debug)]
+struct Histogram {
+    count: u64,
+    sum_ms: u64,
+    max_ms: u64,
+    buckets: Vec<u64>,
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            sum_ms: 0,
+            max_ms: 0,
+            buckets: vec![0; LATENCY_BUCKETS_MS.len() + 1],
+        }
+    }
+}
+
+impl Histogram {
+    fn record(&mut self, value_ms: u64) {
+        self.count = self.count.saturating_add(1);
+        self.sum_ms = self.sum_ms.saturating_add(value_ms);
+        self.max_ms = self.max_ms.max(value_ms);
+        let index = LATENCY_BUCKETS_MS
+            .iter()
+            .position(|bound| value_ms <= *bound)
+            .unwrap_or(LATENCY_BUCKETS_MS.len());
+        for bucket in self.buckets.iter_mut().skip(index) {
+            *bucket = bucket.saturating_add(1);
+        }
+    }
+
+    fn snapshot(&self) -> HistogramSnapshot {
+        let mut buckets = Vec::with_capacity(self.buckets.len());
+        for (index, count) in self.buckets.iter().copied().enumerate() {
+            buckets.push(LatencyBucket {
+                le_ms: LATENCY_BUCKETS_MS.get(index).copied(),
+                count,
+            });
+        }
+        HistogramSnapshot {
+            count: self.count,
+            sum_ms: self.sum_ms,
+            max_ms: self.max_ms,
+            buckets,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetricsState {
+    routes: BTreeMap<String, RouteState>,
+    attempts: BTreeMap<AttemptKey, u64>,
+    latencies: BTreeMap<LatencyKey, Histogram>,
+    completions: BTreeMap<CompletionKey, u64>,
+    retries: BTreeMap<RetryKey, u64>,
+    states: BTreeMap<StateKey, u64>,
+    usage: BTreeMap<UsageKey, UsageMetric>,
+    decisions: BTreeMap<DecisionKey, u64>,
+    series: usize,
+    dropped_series: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UsageMetric {
+    requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+}
+
+struct RequestCompletion {
+    route: String,
+    tracked: bool,
+    headers_ms: Option<u64>,
+    first_event_ms: Option<u64>,
+    end_to_end_ms: u64,
+    class: CompletionClass,
+    usage: Option<Usage>,
+}
+
+/// In-process metrics registry.  It is cloneable and safe to share across
+/// listeners; updates use a short mutex critical section and never perform
+/// I/O or call user code.
+#[derive(Clone)]
+pub struct MetricsRegistry {
+    state: Arc<Mutex<MetricsState>>,
+    config: MetricsConfig,
+}
+
+impl fmt::Debug for MetricsRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetricsRegistry")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self::new(MetricsConfig::default())
+    }
+}
+
+impl MetricsRegistry {
+    /// Construct an empty registry with bounded series retention.
+    #[must_use]
+    pub fn new(config: MetricsConfig) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MetricsState::default())),
+            config,
+        }
+    }
+
+    /// Start tracking one request.  Route labels are normalized and bounded.
+    #[must_use]
+    pub fn begin_request(&self, route: impl AsRef<str>) -> RequestObservation {
+        let route = bounded_label(route.as_ref());
+        let tracked = {
+            let mut state = lock_unpoisoned(&self.state);
+            let exists = state.routes.contains_key(&route);
+            if !exists && !reserve_series(&mut state, false, self.config.max_series) {
+                false
+            } else {
+                let entry = state.routes.entry(route.clone()).or_default();
+                entry.requests = entry.requests.saturating_add(1);
+                entry.active = entry.active.saturating_add(1);
+                true
+            }
+        };
+        RequestObservation {
+            registry: self.clone(),
+            route,
+            started: Instant::now(),
+            headers_ms: None,
+            first_event_ms: None,
+            tracked,
+            completed: false,
+        }
+    }
+
+    /// Record one upstream attempt.
+    pub fn record_attempt(&self, record: AttemptRecord) {
+        let route = bounded_label(&record.route);
+        let provider = bounded_label(&record.provider);
+        let result = record.result.to_string();
+        let mut state = lock_unpoisoned(&self.state);
+        let key = AttemptKey {
+            route: route.clone(),
+            provider,
+            result,
+        };
+        let exists = state.attempts.contains_key(&key);
+        if reserve_series(&mut state, exists, self.config.max_series) {
+            let value = state.attempts.entry(key).or_default();
+            *value = value.saturating_add(1);
+        }
+        record_latency_locked(
+            &mut state,
+            &route,
+            "attempt",
+            record.duration_ms,
+            self.config.max_series,
+        );
+    }
+
+    /// Record a retry or fallback decision.
+    pub fn record_retry(&self, record: RetryRecord) {
+        let key = RetryKey {
+            route: bounded_label(&record.route),
+            provider: bounded_label(&record.provider),
+            reason: bounded_label(&record.reason),
+            fallback: record.fallback,
+        };
+        let mut state = lock_unpoisoned(&self.state);
+        let exists = state.retries.contains_key(&key);
+        if reserve_series(&mut state, exists, self.config.max_series) {
+            let value = state.retries.entry(key).or_default();
+            *value = value.saturating_add(1);
+        }
+    }
+
+    /// Record a scoped cooldown transition.
+    pub fn record_cooldown(&self, record: CooldownRecord) {
+        self.record_state(StateKey {
+            kind: "cooldown".to_owned(),
+            route: record.route.map(|value| bounded_label(&value)),
+            provider: record.provider.map(|value| bounded_label(&value)),
+            scope: Some(bounded_label(&record.scope)),
+            outcome: bounded_label(&record.outcome),
+        });
+    }
+
+    /// Record quota exhaustion/recovery without retaining provider response
+    /// bodies or free-form provider error strings.
+    pub fn record_quota(&self, record: QuotaRecord) {
+        self.record_state(StateKey {
+            kind: "quota".to_owned(),
+            route: record.route.map(|value| bounded_label(&value)),
+            provider: Some(bounded_label(&record.provider)),
+            scope: None,
+            outcome: bounded_label(&record.outcome),
+        });
+    }
+
+    /// Record one OAuth refresh result.
+    pub fn record_oauth_refresh(&self, record: OAuthRefreshRecord) {
+        self.record_state(StateKey {
+            kind: "oauth_refresh".to_owned(),
+            route: None,
+            provider: Some(bounded_label(&record.provider)),
+            scope: None,
+            outcome: bounded_label(&record.outcome),
+        });
+    }
+
+    /// Record a selection decision count and its bounded provider outcome.
+    pub fn record_decision(&self, decision: &DecisionRecord) {
+        let key = DecisionKey {
+            route: bounded_label(decision.route.as_deref().unwrap_or("unknown")),
+            provider: decision.selected_provider.as_deref().map(bounded_label),
+            outcome: bounded_label(decision.outcome.as_deref().unwrap_or("selected")),
+        };
+        let mut state = lock_unpoisoned(&self.state);
+        let exists = state.decisions.contains_key(&key);
+        if reserve_series(&mut state, exists, self.config.max_series) {
+            let value = state.decisions.entry(key).or_default();
+            *value = value.saturating_add(1);
+        }
+    }
+
+    /// Record token usage when a caller has provider attribution outside the
+    /// request guard. Values are counters only; prompt and response bodies
+    /// never enter the registry.
+    pub fn record_usage(&self, route: impl AsRef<str>, provider: Option<&str>, usage: Usage) {
+        let mut state = lock_unpoisoned(&self.state);
+        record_usage_locked(
+            &mut state,
+            &bounded_label(route.as_ref()),
+            provider.map(bounded_label),
+            usage,
+            self.config.max_series,
+        );
+    }
+
+    /// Return the current deterministic metrics snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        let state = lock_unpoisoned(&self.state);
+        let routes = state
+            .routes
+            .iter()
+            .map(|(route, value)| RouteMetric {
+                route: route.clone(),
+                requests: value.requests,
+                active: value.active,
+                completed: value.completed,
+            })
+            .collect();
+        let attempts = state
+            .attempts
+            .iter()
+            .map(|(key, count)| AttemptMetric {
+                route: key.route.clone(),
+                provider: key.provider.clone(),
+                result: key.result.clone(),
+                count: *count,
+            })
+            .collect();
+        let latencies = state
+            .latencies
+            .iter()
+            .map(|(key, histogram)| LatencyMetric {
+                route: key.route.clone(),
+                kind: key.kind.clone(),
+                histogram: histogram.snapshot(),
+            })
+            .collect();
+        let completions = state
+            .completions
+            .iter()
+            .map(|(key, count)| CompletionMetric {
+                route: key.route.clone(),
+                class: key.class.clone(),
+                count: *count,
+            })
+            .collect();
+        let retries = state
+            .retries
+            .iter()
+            .map(|(key, count)| RetryMetric {
+                route: key.route.clone(),
+                provider: key.provider.clone(),
+                reason: key.reason.clone(),
+                fallback: key.fallback,
+                count: *count,
+            })
+            .collect();
+        let states = state
+            .states
+            .iter()
+            .map(|(key, count)| StateMetric {
+                kind: key.kind.clone(),
+                route: key.route.clone(),
+                provider: key.provider.clone(),
+                scope: key.scope.clone(),
+                outcome: key.outcome.clone(),
+                count: *count,
+            })
+            .collect();
+        let usage = state
+            .usage
+            .iter()
+            .map(|(key, value)| UsageMetricSnapshot {
+                route: key.route.clone(),
+                provider: key.provider.clone(),
+                requests: value.requests,
+                input_tokens: value.input_tokens,
+                output_tokens: value.output_tokens,
+                total_tokens: value.total_tokens,
+            })
+            .collect();
+        let decisions = state
+            .decisions
+            .iter()
+            .map(|(key, count)| DecisionMetric {
+                route: key.route.clone(),
+                provider: key.provider.clone(),
+                outcome: key.outcome.clone(),
+                count: *count,
+            })
+            .collect();
+        MetricsSnapshot {
+            routes,
+            attempts,
+            latencies,
+            completions,
+            retries,
+            states,
+            usage,
+            decisions,
+            dropped_series: state.dropped_series,
+        }
+    }
+
+    /// Export the snapshot in deterministic Prometheus text format.
+    #[must_use]
+    pub fn export_prometheus(&self) -> String {
+        self.snapshot().to_prometheus()
+    }
+
+    fn record_state(&self, key: StateKey) {
+        let mut state = lock_unpoisoned(&self.state);
+        let exists = state.states.contains_key(&key);
+        if reserve_series(&mut state, exists, self.config.max_series) {
+            let value = state.states.entry(key).or_default();
+            *value = value.saturating_add(1);
+        }
+    }
+
+    fn finish_request(&self, completion: RequestCompletion) {
+        let RequestCompletion {
+            route,
+            tracked,
+            headers_ms,
+            first_event_ms,
+            end_to_end_ms,
+            class,
+            usage,
+        } = completion;
+        let mut state = lock_unpoisoned(&self.state);
+        if tracked {
+            if let Some(route_state) = state.routes.get_mut(&route) {
+                route_state.active = route_state.active.saturating_sub(1);
+                route_state.completed = route_state.completed.saturating_add(1);
+            }
+        }
+        let completion_key = CompletionKey {
+            route: route.clone(),
+            class: class.to_string(),
+        };
+        let exists = state.completions.contains_key(&completion_key);
+        if reserve_series(&mut state, exists, self.config.max_series) {
+            let value = state.completions.entry(completion_key).or_default();
+            *value = value.saturating_add(1);
+        }
+        record_latency_locked(
+            &mut state,
+            &route,
+            "end_to_end",
+            end_to_end_ms,
+            self.config.max_series,
+        );
+        if let Some(value) = headers_ms {
+            record_latency_locked(&mut state, &route, "headers", value, self.config.max_series);
+        }
+        if let Some(value) = first_event_ms {
+            record_latency_locked(
+                &mut state,
+                &route,
+                "first_event",
+                value,
+                self.config.max_series,
+            );
+        }
+        if let Some(usage) = usage {
+            record_usage_locked(&mut state, &route, None, usage, self.config.max_series);
+        }
+    }
+}
+
+/// A request lifecycle guard.  It decrements the active gauge and records a
+/// completion even when a caller drops it during cancellation.
+pub struct RequestObservation {
+    registry: MetricsRegistry,
+    route: String,
+    started: Instant,
+    headers_ms: Option<u64>,
+    first_event_ms: Option<u64>,
+    tracked: bool,
+    completed: bool,
+}
+
+impl fmt::Debug for RequestObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestObservation")
+            .field("route", &self.route)
+            .field("tracked", &self.tracked)
+            .field("completed", &self.completed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RequestObservation {
+    /// Record time to upstream response headers.  Repeated calls are ignored.
+    pub fn mark_headers(&mut self) {
+        if self.headers_ms.is_none() {
+            let elapsed = duration_to_millis(self.started.elapsed());
+            self.headers_ms = Some(elapsed);
+        }
+    }
+
+    /// Record time to the first downstream event.  Repeated calls are ignored.
+    pub fn mark_first_event(&mut self) {
+        if self.first_event_ms.is_none() {
+            let elapsed = duration_to_millis(self.started.elapsed());
+            self.first_event_ms = Some(elapsed);
+        }
+    }
+
+    /// Complete a request with a normalized class and optional token usage.
+    pub fn complete(&mut self, class: CompletionClass, usage: Option<Usage>) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        self.registry.finish_request(RequestCompletion {
+            route: self.route.clone(),
+            tracked: self.tracked,
+            headers_ms: self.headers_ms,
+            first_event_ms: self.first_event_ms,
+            end_to_end_ms: duration_to_millis(self.started.elapsed()),
+            class,
+            usage,
+        });
+    }
+}
+
+impl Drop for RequestObservation {
+    fn drop(&mut self) {
+        self.complete(CompletionClass::Cancelled, None);
+    }
+}
+
+/// A route-level metric snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RouteMetric {
+    pub route: String,
+    pub requests: u64,
+    pub active: u64,
+    pub completed: u64,
+}
+
+/// An attempt counter snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttemptMetric {
+    pub route: String,
+    pub provider: String,
+    pub result: String,
+    pub count: u64,
+}
+
+/// One cumulative latency bucket.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LatencyBucket {
+    pub le_ms: Option<u64>,
+    pub count: u64,
+}
+
+/// A latency histogram snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HistogramSnapshot {
+    pub count: u64,
+    pub sum_ms: u64,
+    pub max_ms: u64,
+    pub buckets: Vec<LatencyBucket>,
+}
+
+/// A named route latency snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LatencyMetric {
+    pub route: String,
+    pub kind: String,
+    pub histogram: HistogramSnapshot,
+}
+
+/// A completion-class counter snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CompletionMetric {
+    pub route: String,
+    pub class: String,
+    pub count: u64,
+}
+
+/// A retry/fallback counter snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RetryMetric {
+    pub route: String,
+    pub provider: String,
+    pub reason: String,
+    pub fallback: bool,
+    pub count: u64,
+}
+
+/// A cooldown, quota, refresh, or other bounded state counter.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StateMetric {
+    pub kind: String,
+    pub route: Option<String>,
+    pub provider: Option<String>,
+    pub scope: Option<String>,
+    pub outcome: String,
+    pub count: u64,
+}
+
+/// Aggregate token usage by route and optional provider.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UsageMetricSnapshot {
+    pub route: String,
+    pub provider: Option<String>,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// A bounded decision counter snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DecisionMetric {
+    pub route: String,
+    pub provider: Option<String>,
+    pub outcome: String,
+    pub count: u64,
+}
+
+/// Deterministic, serializable in-process metrics snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MetricsSnapshot {
+    pub routes: Vec<RouteMetric>,
+    pub attempts: Vec<AttemptMetric>,
+    pub latencies: Vec<LatencyMetric>,
+    pub completions: Vec<CompletionMetric>,
+    pub retries: Vec<RetryMetric>,
+    pub states: Vec<StateMetric>,
+    pub usage: Vec<UsageMetricSnapshot>,
+    pub decisions: Vec<DecisionMetric>,
+    pub dropped_series: u64,
+}
+
+impl MetricsSnapshot {
+    /// Render this snapshot in deterministic Prometheus exposition format.
+    #[must_use]
+    pub fn to_prometheus(&self) -> String {
+        let mut output = String::new();
+        for metric in &self.routes {
+            let labels = labels(&[("route", metric.route.as_str())]);
+            push_metric(
+                &mut output,
+                "pooler_requests_total",
+                &labels,
+                metric.requests,
+            );
+            push_metric(
+                &mut output,
+                "pooler_active_requests",
+                &labels,
+                metric.active,
+            );
+            push_metric(
+                &mut output,
+                "pooler_completed_requests_total",
+                &labels,
+                metric.completed,
+            );
+        }
+        for metric in &self.attempts {
+            let labels = labels(&[
+                ("route", metric.route.as_str()),
+                ("provider", metric.provider.as_str()),
+                ("result", metric.result.as_str()),
+            ]);
+            push_metric(&mut output, "pooler_attempts_total", &labels, metric.count);
+        }
+        for metric in &self.latencies {
+            let base = labels(&[
+                ("route", metric.route.as_str()),
+                ("kind", metric.kind.as_str()),
+            ]);
+            for bucket in &metric.histogram.buckets {
+                let bound = bucket
+                    .le_ms
+                    .map_or_else(|| "+Inf".to_owned(), |value| value.to_string());
+                let bucket_labels = if base.is_empty() {
+                    format!("le=\"{bound}\"")
+                } else {
+                    format!("{base},le=\"{bound}\"")
+                };
+                push_metric(
+                    &mut output,
+                    "pooler_latency_milliseconds_bucket",
+                    &bucket_labels,
+                    bucket.count,
+                );
+            }
+            push_metric(
+                &mut output,
+                "pooler_latency_milliseconds_sum",
+                &base,
+                metric.histogram.sum_ms,
+            );
+            push_metric(
+                &mut output,
+                "pooler_latency_milliseconds_count",
+                &base,
+                metric.histogram.count,
+            );
+        }
+        for metric in &self.completions {
+            let labels = labels(&[
+                ("route", metric.route.as_str()),
+                ("class", metric.class.as_str()),
+            ]);
+            push_metric(
+                &mut output,
+                "pooler_completions_total",
+                &labels,
+                metric.count,
+            );
+        }
+        for metric in &self.retries {
+            let labels = labels(&[
+                ("route", metric.route.as_str()),
+                ("provider", metric.provider.as_str()),
+                ("reason", metric.reason.as_str()),
+                ("fallback", if metric.fallback { "true" } else { "false" }),
+            ]);
+            push_metric(&mut output, "pooler_retries_total", &labels, metric.count);
+        }
+        for metric in &self.states {
+            let mut pairs = vec![
+                ("kind", metric.kind.as_str()),
+                ("outcome", metric.outcome.as_str()),
+            ];
+            if let Some(route) = metric.route.as_deref() {
+                pairs.push(("route", route));
+            }
+            if let Some(provider) = metric.provider.as_deref() {
+                pairs.push(("provider", provider));
+            }
+            if let Some(scope) = metric.scope.as_deref() {
+                pairs.push(("scope", scope));
+            }
+            let labels = labels(&pairs);
+            push_metric(&mut output, "pooler_state_total", &labels, metric.count);
+        }
+        for metric in &self.usage {
+            let route_labels = labels(&[("route", metric.route.as_str())]);
+            push_metric(
+                &mut output,
+                "pooler_usage_requests_total",
+                &route_labels,
+                metric.requests,
+            );
+            let mut pairs = vec![("route", metric.route.as_str())];
+            if let Some(provider) = metric.provider.as_deref() {
+                pairs.push(("provider", provider));
+            }
+            let usage_labels = labels(&pairs);
+            push_metric(
+                &mut output,
+                "pooler_usage_input_tokens_total",
+                &usage_labels,
+                metric.input_tokens,
+            );
+            push_metric(
+                &mut output,
+                "pooler_usage_output_tokens_total",
+                &usage_labels,
+                metric.output_tokens,
+            );
+            push_metric(
+                &mut output,
+                "pooler_usage_total_tokens_total",
+                &usage_labels,
+                metric.total_tokens,
+            );
+        }
+        for metric in &self.decisions {
+            let mut pairs = vec![
+                ("route", metric.route.as_str()),
+                ("outcome", metric.outcome.as_str()),
+            ];
+            if let Some(provider) = metric.provider.as_deref() {
+                pairs.push(("provider", provider));
+            }
+            let labels = labels(&pairs);
+            push_metric(&mut output, "pooler_decisions_total", &labels, metric.count);
+        }
+        push_metric(
+            &mut output,
+            "pooler_metrics_dropped_series_total",
+            "",
+            self.dropped_series,
+        );
+        output
+    }
+}
+
+fn duration_to_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn bounded_text(value: &str) -> String {
+    let mut result = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    if result.chars().count() > MAX_LABEL_LENGTH {
+        result = result.chars().take(MAX_LABEL_LENGTH).collect();
+    }
+    result
+}
+
+fn bounded_label(value: &str) -> String {
+    let value = bounded_text(value);
+    if value.is_empty() {
+        return "unknown".to_owned();
+    }
+    value
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn reserve_series(state: &mut MetricsState, exists: bool, max_series: usize) -> bool {
+    if exists {
+        return true;
+    }
+    if state.series >= max_series.max(1) {
+        state.dropped_series = state.dropped_series.saturating_add(1);
+        return false;
+    }
+    state.series = state.series.saturating_add(1);
+    true
+}
+
+fn record_latency_locked(
+    state: &mut MetricsState,
+    route: &str,
+    kind: &str,
+    value_ms: u64,
+    max_series: usize,
+) {
+    let key = LatencyKey {
+        route: route.to_owned(),
+        kind: kind.to_owned(),
+    };
+    let exists = state.latencies.contains_key(&key);
+    if reserve_series(state, exists, max_series) {
+        state.latencies.entry(key).or_default().record(value_ms);
+    }
+}
+
+fn record_usage_locked(
+    state: &mut MetricsState,
+    route: &str,
+    provider: Option<String>,
+    usage: Usage,
+    max_series: usize,
+) {
+    let key = UsageKey {
+        route: route.to_owned(),
+        provider,
+    };
+    let exists = state.usage.contains_key(&key);
+    if reserve_series(state, exists, max_series) {
+        let value = state.usage.entry(key).or_default();
+        value.requests = value.requests.saturating_add(1);
+        value.input_tokens = value
+            .input_tokens
+            .saturating_add(usage.input_tokens.unwrap_or_default());
+        value.output_tokens = value
+            .output_tokens
+            .saturating_add(usage.output_tokens.unwrap_or_default());
+        value.total_tokens = value
+            .total_tokens
+            .saturating_add(usage.total_tokens.unwrap_or_default());
+    }
+}
+
+fn labels(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{}=\"{}\"", name, escape_prometheus_label(value)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn escape_prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
+fn push_metric(output: &mut String, name: &str, labels: &str, value: u64) {
+    output.push_str(name);
+    if !labels.is_empty() {
+        output.push('{');
+        output.push_str(labels);
+        output.push('}');
+    }
+    output.push(' ');
+    output.push_str(&value.to_string());
+    output.push('\n');
 }
 
 /// Why a candidate was or was not selected.
@@ -1674,5 +2959,107 @@ mod tests {
         fn assert_owned<T: DeserializeOwned>() {}
         assert_owned::<DecisionRecord>();
         assert_owned::<AuditEvent>();
+    }
+
+    #[test]
+    fn metrics_track_active_completion_latency_and_usage() {
+        let registry = MetricsRegistry::new(MetricsConfig::default().with_max_series(64));
+        let mut request = registry.begin_request("route");
+        assert_eq!(registry.snapshot().routes[0].active, 1);
+        request.mark_headers();
+        request.mark_first_event();
+        request.complete(
+            CompletionClass::Success,
+            Some(Usage {
+                input_tokens: Some(3),
+                output_tokens: Some(5),
+                total_tokens: Some(8),
+            }),
+        );
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.routes[0].active, 0);
+        assert_eq!(snapshot.routes[0].requests, 1);
+        assert_eq!(snapshot.routes[0].completed, 1);
+        assert_eq!(snapshot.completions[0].class, "success");
+        assert_eq!(snapshot.usage[0].total_tokens, 8);
+        assert!(snapshot
+            .latencies
+            .iter()
+            .any(|metric| metric.kind == "headers"));
+        assert!(registry
+            .export_prometheus()
+            .contains("pooler_requests_total{route=\"route\"} 1"));
+    }
+
+    #[test]
+    fn metrics_bound_series_and_labels() {
+        let registry = MetricsRegistry::new(MetricsConfig::default().with_max_series(1));
+        let mut request = registry.begin_request("route\nsecret");
+        request.complete(CompletionClass::Success, None);
+        registry.record_attempt(AttemptRecord::new(
+            "new-route",
+            "provider",
+            AttemptResult::Success,
+        ));
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.routes[0].route, "routesecret");
+        assert!(snapshot.dropped_series > 0);
+        let encoded = registry.export_prometheus();
+        assert!(!encoded.contains("\nsecret"));
+    }
+
+    #[test]
+    fn metrics_record_policy_states_and_decisions_without_raw_values() {
+        let registry = MetricsRegistry::new(MetricsConfig::default().with_max_series(64));
+        registry.record_retry(RetryRecord {
+            route: "route".to_owned(),
+            provider: "provider".to_owned(),
+            reason: "quota".to_owned(),
+            fallback: true,
+        });
+        registry.record_cooldown(CooldownRecord {
+            route: Some("route".to_owned()),
+            provider: Some("provider".to_owned()),
+            scope: "credential".to_owned(),
+            outcome: "applied".to_owned(),
+        });
+        registry.record_quota(QuotaRecord {
+            route: Some("route".to_owned()),
+            provider: "provider".to_owned(),
+            outcome: "exhausted".to_owned(),
+        });
+        registry.record_oauth_refresh(OAuthRefreshRecord {
+            provider: "provider".to_owned(),
+            outcome: "success".to_owned(),
+        });
+        let decision = DecisionRecord::builder()
+            .route("route")
+            .provider("provider")
+            .outcome("selected")
+            .build();
+        registry.record_decision(&decision);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.retries[0].count, 1);
+        assert_eq!(snapshot.states.len(), 3);
+        assert_eq!(snapshot.decisions[0].count, 1);
+    }
+
+    #[test]
+    fn trace_recorder_is_bounded_and_redacts_attributes() {
+        let recorder = TraceRecorder::new(1, RedactionPolicy::default());
+        recorder.record(
+            TraceRecord::new(TraceStage::Attempt)
+                .route("route")
+                .provider("provider")
+                .attribute("authorization", "Bearer sk-secret-value"),
+        );
+        recorder.record(TraceRecord::new(TraceStage::Persistence));
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.dropped, 1);
+        let encoded = serde_json::to_string(&snapshot).expect("trace snapshot serializes");
+        assert_not_present(&encoded, &["sk-secret-value"]);
+        assert!(encoded.contains("persistence"));
     }
 }

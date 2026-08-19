@@ -1,0 +1,6 @@
+event: message
+id: seed-1
+data: {"delta":"hello"}
+
+data: [DONE]
+

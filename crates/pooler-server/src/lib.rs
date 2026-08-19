@@ -10,14 +10,19 @@ mod config_store;
 mod http_runtime;
 mod lifecycle;
 mod listener;
+mod management;
 mod server;
 
 pub use config_store::{ConfigSnapshot, ConfigStore, ConfigStoreError};
-pub use http_runtime::{HttpProxyServer, HttpProxyServerError, ListenerAddress};
+pub use http_runtime::{HttpProxyServer, HttpProxyServerError, HttpReloadOutcome, ListenerAddress};
 pub use lifecycle::{Lifecycle, LifecycleError, LifecycleState};
 pub use listener::{ListenerPreparationFuture, ListenerPreparer, PreparedListeners};
+pub use management::{
+    ActiveCounts, ActiveGuard, ManagementApi, ManagementHttpServer, ManagementResponse,
+    ManagementServerError,
+};
 pub use pooler_core::ConfigGeneration;
-pub use server::{ReloadError, Server, ServerError};
+pub use server::{ReloadError, ReloadOutcome, Server, ServerError};
 
 // Re-export the source/config crates used by this crate.  Keeping the server
 // generic over its compiled configuration avoids coupling process lifecycle

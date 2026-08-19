@@ -29,10 +29,14 @@ use url::Url;
 
 mod loader;
 mod route_match;
+mod watch;
 
-pub use loader::{load_path, render_path, ConfigLoader, DEFAULT_MAX_IMPORT_DEPTH};
+pub use loader::{load_path, render_path, ConfigLoader, LoadedConfig, DEFAULT_MAX_IMPORT_DEPTH};
 use route_match::{prefix_matches, template_matches};
 pub use route_match::{RouteMatchError, RouteRequest};
+pub use watch::{
+    ConfigCandidate, ConfigWatcher, DEFAULT_RELOAD_DEBOUNCE, DEFAULT_RELOAD_POLL_INTERVAL,
+};
 
 /// Current configuration schema version.
 pub const CONFIG_VERSION: u32 = 1;
@@ -252,6 +256,8 @@ pub struct Config {
     pub policies: BTreeMap<String, PolicyConfig>,
     /// Routes in declaration order.
     pub routes: Vec<RouteConfig>,
+    /// Optional read-only management listener. It is disabled by default.
+    pub management: ManagementConfig,
     #[serde(skip)]
     source: Option<Source>,
 }
@@ -575,6 +581,27 @@ pub struct NativeProviderConfig {
 /// shape as upstream authentication, but only bearer authentication is
 /// compiled into a route plan.
 pub type DownstreamAuthConfig = AuthConfig;
+
+/// Read-only management HTTP listener declaration.
+///
+/// Management is disabled unless `enabled` is true (or `bind` is supplied).
+/// A loopback listener may run without authentication. Non-loopback listeners
+/// require both `remote: true` and a bearer secret reference.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManagementConfig {
+    /// Whether the management listener is enabled.
+    pub enabled: Option<bool>,
+    /// TCP socket address or Unix socket path.
+    #[serde(alias = "listen")]
+    pub bind: Option<String>,
+    /// Explicitly permit a non-loopback management listener.
+    #[serde(alias = "allow_remote")]
+    pub remote: Option<bool>,
+    /// Bearer authentication for remote management access.
+    #[serde(alias = "authentication")]
+    pub auth: Option<AuthConfig>,
+}
 
 /// Route-level resource and timeout limits.
 ///
@@ -1519,6 +1546,41 @@ impl AuthPlan {
     }
 }
 
+/// Immutable read-only management listener plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagementPlan {
+    bind: Arc<str>,
+    remote: bool,
+    auth: Option<AuthPlan>,
+    source: SourceLabel,
+}
+
+impl ManagementPlan {
+    /// Bound TCP socket address or Unix socket path.
+    #[must_use]
+    pub fn bind(&self) -> &str {
+        &self.bind
+    }
+
+    /// Whether remote management access was explicitly enabled.
+    #[must_use]
+    pub const fn remote(&self) -> bool {
+        self.remote
+    }
+
+    /// Bearer authentication plan, when configured.
+    #[must_use]
+    pub fn auth(&self) -> Option<&AuthPlan> {
+        self.auth.as_ref()
+    }
+
+    /// Source declaration label.
+    #[must_use]
+    pub const fn source(&self) -> &SourceLabel {
+        &self.source
+    }
+}
+
 /// Immutable path matcher.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PathPattern {
@@ -1837,6 +1899,7 @@ pub struct CompiledConfig {
     policies: BTreeMap<Arc<str>, PolicyPlan>,
     models: BTreeMap<Arc<str>, ModelPlan>,
     routes: Vec<RoutePlan>,
+    management: Option<ManagementPlan>,
 }
 
 impl CompiledConfig {
@@ -1844,6 +1907,31 @@ impl CompiledConfig {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Return a copy tagged with a different runtime generation.
+    ///
+    /// The route plans themselves remain immutable. A server uses this when
+    /// publishing a successfully reloaded candidate so selection records and
+    /// diagnostics can identify the generation that admitted a request.
+    #[must_use]
+    pub fn with_generation(&self, generation: u64) -> Self {
+        let mut config = self.clone();
+        config.generation = generation;
+        config
+    }
+
+    /// Compare route plans while deliberately ignoring the generation marker.
+    #[must_use]
+    pub fn equivalent(&self, other: &Self) -> bool {
+        self.listeners == other.listeners
+            && self.upstreams == other.upstreams
+            && self.accounts == other.accounts
+            && self.account_pools == other.account_pools
+            && self.policies == other.policies
+            && self.models == other.models
+            && self.routes == other.routes
+            && self.management == other.management
     }
 
     /// Listener plans keyed by ID.
@@ -1898,6 +1986,12 @@ impl CompiledConfig {
     #[must_use]
     pub fn route(&self, id: &str) -> Option<&RoutePlan> {
         self.routes.iter().find(|route| route.id() == id)
+    }
+
+    /// Optional read-only management listener.
+    #[must_use]
+    pub const fn management(&self) -> Option<&ManagementPlan> {
+        self.management.as_ref()
     }
 }
 
@@ -2045,6 +2139,7 @@ fn compile_config(
     let account_pools = compile_account_pools(config, source, &accounts)?;
     let policies = compile_policies(config, source, &accounts, &account_pools)?;
     let models = compile_models(config, source, &upstreams)?;
+    let management = compile_management(&config.management, source)?;
 
     let mut routes = Vec::with_capacity(config.routes.len());
     let mut route_ids = BTreeMap::new();
@@ -2162,6 +2257,7 @@ fn compile_config(
         policies,
         models,
         routes,
+        management,
     })
 }
 
@@ -3052,6 +3148,59 @@ fn compile_auth(
         kind: Arc::from(kind),
         secret: secret.clone(),
     }))
+}
+
+fn compile_management(
+    declaration: &ManagementConfig,
+    source: &Source,
+) -> Result<Option<ManagementPlan>, ConfigError> {
+    let enabled = declaration.enabled.unwrap_or(declaration.bind.is_some());
+    let label = source_label_with_key(source, "management", "management".to_owned());
+    if !enabled {
+        return Ok(None);
+    }
+
+    let bind = declaration
+        .bind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1:9090");
+    validate_bind(bind, &label)?;
+
+    let remote = declaration.remote.unwrap_or(false);
+    let loopback = management_bind_is_loopback(bind);
+    if !loopback && !remote {
+        return Err(invalid(
+            &label,
+            "non-loopback management bind requires remote: true",
+        ));
+    }
+
+    let auth = compile_auth(declaration.auth.as_ref(), &label)?;
+    if (remote || !loopback) && auth.is_none() {
+        return Err(invalid(
+            &label,
+            "remote management requires bearer authentication",
+        ));
+    }
+
+    Ok(Some(ManagementPlan {
+        bind: Arc::from(bind),
+        remote,
+        auth,
+        source: label,
+    }))
+}
+
+fn management_bind_is_loopback(value: &str) -> bool {
+    if value.starts_with('/') || value.starts_with("unix:") {
+        return true;
+    }
+    value
+        .parse::<SocketAddr>()
+        .map(|address| address.ip().is_loopback())
+        .unwrap_or(false)
 }
 
 fn compile_downstream_auth(
@@ -4038,6 +4187,51 @@ routes:
         assert!(error
             .to_string()
             .contains("require downstream authentication"));
+    }
+
+    #[test]
+    fn management_is_disabled_by_default_and_compiles_loopback_plan() {
+        let disabled = compile_yaml("management-disabled.yaml", "version: 1\n")
+            .expect("minimal config compiles");
+        assert!(disabled.management().is_none());
+
+        let enabled = compile_yaml(
+            "management-loopback.yaml",
+            "version: 1\nmanagement: {bind: 127.0.0.1:0}\n",
+        )
+        .expect("loopback management compiles");
+        let management = enabled.management().expect("management is enabled");
+        assert_eq!(management.bind(), "127.0.0.1:0");
+        assert!(!management.remote());
+        assert!(management.auth().is_none());
+    }
+
+    #[test]
+    fn management_requires_explicit_remote_enablement_and_authentication() {
+        let without_enablement = compile_yaml(
+            "management-remote-disabled.yaml",
+            "version: 1\nmanagement: {bind: 0.0.0.0:9090}\n",
+        )
+        .expect_err("remote bind needs explicit enablement");
+        assert!(without_enablement.to_string().contains("remote: true"));
+
+        let without_auth = compile_yaml(
+            "management-remote-unauthenticated.yaml",
+            "version: 1\nmanagement: {bind: 0.0.0.0:9090, remote: true}\n",
+        )
+        .expect_err("remote management needs auth");
+        assert!(without_auth.to_string().contains("authentication"));
+
+        let authenticated = compile_yaml(
+            "management-remote-authenticated.yaml",
+            "version: 1\nmanagement: {bind: 0.0.0.0:9090, remote: true, auth: {secret: env:POOLER_MANAGEMENT_KEY}}\n",
+        )
+        .expect("authenticated remote management compiles");
+        assert!(authenticated
+            .management()
+            .expect("management plan")
+            .auth()
+            .is_some());
     }
 
     #[test]

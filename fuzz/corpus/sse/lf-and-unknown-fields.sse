@@ -1,0 +1,6 @@
+retry: 1000
+event: message
+data: {"text":"lf"}
+
+data: [DONE]
+

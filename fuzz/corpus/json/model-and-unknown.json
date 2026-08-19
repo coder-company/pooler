@@ -1,0 +1,6 @@
+{
+  "model": "gpt-seed",
+  "messages": [{"role": "user", "content": "hello"}],
+  "unknown": {"nested": true},
+  "temperature": 0.2
+}

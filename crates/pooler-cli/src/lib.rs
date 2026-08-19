@@ -1,16 +1,17 @@
 //! Pooler's command-line interface.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
-use pooler_config::Config;
+use clap::{Parser, Subcommand, ValueEnum};
+use pooler_config::{Config, ConfigCandidate, ConfigWatcher};
 use pooler_http::NativeRuntime;
 use pooler_store::{SqliteOAuthTokenStore, SqliteStore};
 
 mod auth;
+mod fixture_replay;
 pub use auth::AuthCommand;
 
 /// Top-level command-line arguments.
@@ -28,6 +29,10 @@ pub struct Cli {
     /// Literal values are rejected; use env:, file:, or keyring:.
     #[arg(long, global = true)]
     pub credential_key_ref: Option<String>,
+    /// Poll the root configuration and imported files for debounced changes
+    /// while serving. SIGHUP always performs an immediate reload on Unix.
+    #[arg(long, global = true)]
+    pub watch: bool,
     /// Operation to perform.
     #[command(subcommand)]
     pub command: Command,
@@ -52,14 +57,66 @@ pub enum Command {
     Doctor,
     /// List configured public models.
     Models,
-    /// Replay sanitized compatibility fixtures.
-    Fixture,
+    /// Inspect and replay sanitized compatibility fixtures.
+    Fixture {
+        /// Fixture operation.
+        #[command(subcommand)]
+        command: FixtureCommand,
+    },
     /// Manage provider credentials.
     Auth {
         /// Credential-management operation.
         #[command(subcommand)]
         command: AuthCommand,
     },
+}
+
+/// Compatibility-fixture operations.
+#[derive(Debug, Subcommand)]
+pub enum FixtureCommand {
+    /// Replay one fixture or every JSON fixture under a directory.
+    Replay {
+        /// Fixture file or directory to replay.
+        path: PathBuf,
+        /// Optional fixture file or directory containing the expected actual
+        /// records.  Directory entries are paired by relative path.
+        #[arg(long)]
+        actual: Option<PathBuf>,
+    },
+    /// Capture a fixture into an owner-private sanitized record.
+    Capture {
+        /// Structured Pooler fixture to capture.
+        input: PathBuf,
+        /// Explicit output path for the owner-private capture.
+        output: PathBuf,
+        /// Retain bounded, recursively redacted JSON bodies.
+        #[arg(long)]
+        include_bodies: bool,
+        /// Maximum body size retained when `--include-bodies` is set.
+        #[arg(long, default_value_t = pooler_testkit::DEFAULT_MAX_CAPTURE_BODY_BYTES)]
+        max_body_bytes: usize,
+    },
+    /// Render the versioned compatibility manifest as a release report.
+    Report {
+        /// Versioned manifest to render.
+        #[arg(long, default_value = "fixtures/compatibility/manifest.json")]
+        manifest: PathBuf,
+        /// Report format.
+        #[arg(long, value_enum, default_value_t = FixtureReportFormat::Markdown)]
+        format: FixtureReportFormat,
+        /// Write the report to a file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+/// Formats accepted by [`FixtureCommand::Report`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum FixtureReportFormat {
+    /// Human-readable Markdown matrix.
+    Markdown,
+    /// Validated manifest JSON with stable pretty-printing.
+    Json,
 }
 
 /// Configuration inspection operations.
@@ -96,6 +153,7 @@ pub fn run(cli: Cli) -> Result<()> {
             &cli.config,
             cli.credential_store.as_deref(),
             cli.credential_key_ref.as_deref(),
+            cli.watch,
         ),
         Command::Doctor => bail!("doctor is not implemented in the engineering baseline"),
         Command::Models => {
@@ -105,7 +163,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Fixture => bail!("fixture replay is not implemented in the engineering baseline"),
+        Command::Fixture { command } => fixture_replay::run(command),
         Command::Auth { command } => auth::run(
             command,
             &cli.config,
@@ -113,6 +171,26 @@ pub fn run(cli: Cli) -> Result<()> {
             cli.credential_key_ref.as_deref(),
         ),
     }
+}
+
+fn fixture_report(
+    manifest_path: &std::path::Path,
+    format: FixtureReportFormat,
+    output_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let manifest = pooler_testkit::load_compatibility_manifest(manifest_path)?;
+    let report = match format {
+        FixtureReportFormat::Markdown => pooler_testkit::render_compatibility_matrix(&manifest),
+        FixtureReportFormat::Json => serde_json::to_string_pretty(&manifest)
+            .context("could not serialize compatibility manifest")?,
+    };
+    if let Some(path) = output_path {
+        std::fs::write(path, report.as_bytes())
+            .with_context(|| format!("could not write fixture report `{}`", path.display()))?;
+    } else {
+        print!("{report}");
+    }
+    Ok(())
 }
 
 fn load(path: &PathBuf) -> Result<pooler_config::CompiledConfig> {
@@ -123,8 +201,10 @@ fn serve(
     path: &PathBuf,
     explicit_store_path: Option<&std::path::Path>,
     credential_key_ref: Option<&str>,
+    watch: bool,
 ) -> Result<()> {
-    let config = load(path)?;
+    let watcher = ConfigWatcher::new(path)?;
+    let config = watcher.active().compile()?;
     let native = native_runtime(&config, explicit_store_path, credential_key_ref)?;
     pooler_observe::init_tracing().context("failed to initialize structured logging")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -141,14 +221,24 @@ fn serve(
                 "listener bound"
             );
         }
+        if let Some(address) = server.management_address() {
+            tracing::info!(address, "management listener bound");
+        }
 
         let runner = {
             let server = server.clone();
             tokio::spawn(async move { server.run().await })
         };
+        let watcher = Arc::new(Mutex::new(watcher));
+        let reload_runner = {
+            let server = server.clone();
+            let watcher = Arc::clone(&watcher);
+            tokio::spawn(async move { reload_loop(server, watcher, watch).await })
+        };
         tokio::pin!(runner);
         tokio::select! {
             result = &mut runner => {
+                reload_runner.abort();
                 result
                     .context("HTTP proxy task panicked")?
                     .map_err(anyhow::Error::from)
@@ -162,10 +252,111 @@ fn serve(
                 runner
                     .await
                     .context("HTTP proxy task panicked")?
+                    .map_err(anyhow::Error::from)?;
+                reload_runner
+                    .await
+                    .context("configuration reload task panicked")?
                     .map_err(anyhow::Error::from)
             }
         }
     })
+}
+
+async fn reload_loop(
+    server: pooler_server::HttpProxyServer,
+    watcher: Arc<Mutex<ConfigWatcher>>,
+    watch: bool,
+) -> Result<()> {
+    let mut interval = tokio::time::interval(pooler_config::DEFAULT_RELOAD_POLL_INTERVAL);
+    let cancellation = server.cancellation_token();
+    #[cfg(unix)]
+    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("failed to install SIGHUP handler")?;
+
+    loop {
+        #[cfg(unix)]
+        let event = tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = interval.tick(), if watch => ReloadTrigger::Watch,
+            signal = hup.recv() => {
+                signal.context("SIGHUP handler failed")?;
+                ReloadTrigger::Manual
+            }
+        };
+        #[cfg(not(unix))]
+        let event = tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = interval.tick(), if watch => ReloadTrigger::Watch,
+        };
+
+        let candidate = {
+            let watcher = Arc::clone(&watcher);
+            let polled = tokio::task::spawn_blocking(move || {
+                let mut watcher = watcher.lock().expect("configuration watcher lock poisoned");
+                match event {
+                    ReloadTrigger::Watch => watcher.poll().map_err(anyhow::Error::from),
+                    ReloadTrigger::Manual => watcher
+                        .force_candidate()
+                        .map(Some)
+                        .map_err(anyhow::Error::from),
+                }
+            })
+            .await
+            .context("configuration watcher task panicked")?;
+            match polled {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    tracing::warn!(error = %error, "configuration reload source rejected");
+                    continue;
+                }
+            }
+        };
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        apply_reload_candidate(&server, &watcher, candidate).await?;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReloadTrigger {
+    Watch,
+    Manual,
+}
+
+async fn apply_reload_candidate(
+    server: &pooler_server::HttpProxyServer,
+    watcher: &Arc<Mutex<ConfigWatcher>>,
+    candidate: ConfigCandidate,
+) -> Result<()> {
+    let for_compile = candidate.clone();
+    let compiled = tokio::task::spawn_blocking(move || for_compile.compile_with_generation(1))
+        .await
+        .context("configuration compiler task panicked")?;
+    let compiled = match compiled {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(error = %error, "configuration reload rejected");
+            return Ok(());
+        }
+    };
+    match server.reload(compiled).await {
+        Ok(outcome) => {
+            tracing::info!(
+                generation = outcome.generation(),
+                changed = outcome.changed(),
+                "configuration reload applied"
+            );
+            watcher
+                .lock()
+                .expect("configuration watcher lock poisoned")
+                .accept(candidate);
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "configuration reload rejected");
+        }
+    }
+    Ok(())
 }
 
 fn native_runtime(
@@ -276,6 +467,78 @@ mod tests {
             Command::Auth {
                 command: AuthCommand::Revoke { .. }
             }
+        ));
+    }
+
+    #[test]
+    fn fixture_report_command_defaults_to_markdown_manifest() {
+        let cli = Cli::try_parse_from(["pooler", "fixture", "report"])
+            .expect("fixture report should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Fixture {
+                command: FixtureCommand::Report {
+                    format: FixtureReportFormat::Markdown,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn fixture_report_writes_the_generated_matrix() {
+        let directory = tempfile::tempdir().expect("temporary report directory");
+        let output = directory.path().join("matrix.md");
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/compatibility/manifest.json");
+
+        fixture_report(&manifest, FixtureReportFormat::Markdown, Some(&output))
+            .expect("manifest report");
+
+        let expected_path = manifest
+            .parent()
+            .expect("manifest parent")
+            .join("MATRIX.md");
+        let expected = std::fs::read_to_string(expected_path).expect("checked-in matrix");
+        let generated = std::fs::read_to_string(output).expect("report output");
+        assert_eq!(generated, expected);
+    }
+
+    #[test]
+    fn fixture_replay_command_accepts_a_path_without_server_options() {
+        let cli = Cli::try_parse_from(["pooler", "fixture", "replay", "fixtures"])
+            .expect("fixture replay should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Fixture {
+                command: FixtureCommand::Replay { path, actual: None }
+            } if path == PathBuf::from("fixtures")
+        ));
+    }
+
+    #[test]
+    fn fixture_capture_requires_an_explicit_output_path() {
+        let cli = Cli::try_parse_from([
+            "pooler",
+            "fixture",
+            "capture",
+            "input.json",
+            "capture.json",
+            "--include-bodies",
+            "--max-body-bytes",
+            "1024",
+        ])
+        .expect("fixture capture should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Fixture {
+                command: FixtureCommand::Capture {
+                    input,
+                    output,
+                    include_bodies: true,
+                    max_body_bytes: 1024,
+                }
+            } if input == PathBuf::from("input.json") && output == PathBuf::from("capture.json")
         ));
     }
 }

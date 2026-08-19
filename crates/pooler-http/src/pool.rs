@@ -245,6 +245,22 @@ impl PoolingCoordinator {
         Ok(coordinator)
     }
 
+    /// Rebuild the immutable registration view for a new configuration while
+    /// retaining the same mutable store. Credential health, cooldowns,
+    /// session affinity, decisions, and owner-selected enablement therefore
+    /// survive a successful configuration generation swap.
+    pub fn reconfigure(&self, config: &CompiledConfig) -> Result<Self, PoolError> {
+        let mut coordinator = Self::with_store(config, Arc::clone(&self.store))?;
+        coordinator.request_sequence = Arc::clone(&self.request_sequence);
+        Ok(coordinator)
+    }
+
+    /// Return the mutable state store shared by this coordinator.
+    #[must_use]
+    pub fn store(&self) -> Arc<dyn Store> {
+        Arc::clone(&self.store)
+    }
+
     /// Number of persisted decisions, useful for diagnostics and tests.
     pub fn decision_count(&self) -> Result<usize, PoolError> {
         self.store
@@ -260,6 +276,27 @@ impl PoolingCoordinator {
     ) -> Result<Vec<pooler_store::DecisionRecord>, PoolError> {
         self.store
             .recent_decisions(limit)
+            .map_err(|_| PoolError::Store)
+    }
+
+    /// Return persisted credential enablement metadata for diagnostics.
+    pub fn credential_states(&self) -> Result<Vec<pooler_store::CredentialState>, PoolError> {
+        self.store.credential_states().map_err(|_| PoolError::Store)
+    }
+
+    /// Return persisted credential health metadata for diagnostics.
+    pub fn credential_health_states(
+        &self,
+    ) -> Result<Vec<pooler_store::CredentialHealthState>, PoolError> {
+        self.store
+            .credential_health_states()
+            .map_err(|_| PoolError::Store)
+    }
+
+    /// Return active provider/model/route cooldowns for diagnostics.
+    pub fn cooldowns(&self) -> Result<Vec<pooler_store::CooldownState>, PoolError> {
+        self.store
+            .cooldowns(timestamp_now())
             .map_err(|_| PoolError::Store)
     }
 
@@ -1328,9 +1365,11 @@ mod tests {
             .iter()
             .any(|affinity| affinity.key.contains('|') && affinity.expires_at > now));
 
-        let restarted =
-            PoolingCoordinator::with_store(&config, store).expect("restart coordinator");
-        let rebound = restarted
+        let migrated = coordinator
+            .reconfigure(&config)
+            .expect("reconfigure coordinator");
+        assert!(Arc::ptr_eq(&coordinator.store(), &migrated.store()));
+        let rebound = migrated
             .select(&config, route, None, &headers, 2, Instant::now())
             .expect("rehydrated selection");
         assert_ne!(rebound.credential(), Some(&first_credential));

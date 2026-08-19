@@ -9,17 +9,30 @@
 //!   stream injection;
 //! * [`Fixture`] and the normalization helpers for differential compatibility
 //!   tests; and
+//! * opt-in sanitized capture helpers that omit body content by default; and
 //! * [`LeakCounters`] for proving that cancellation returns resources to zero.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]
 
+mod capture;
 mod clock;
+mod compatibility;
 mod counters;
 mod fixture;
 mod upstream;
 
+pub use capture::{
+    capture_body, capture_fixture, capture_request, capture_response, write_captured_fixture,
+    CaptureError, CaptureOptions, CapturedBody, CapturedChunk, CapturedFixture, CapturedRequest,
+    CapturedResponse, CapturedResult, DEFAULT_MAX_CAPTURE_BODY_BYTES,
+};
 pub use clock::{Clock, FakeClock, SystemClock};
+pub use compatibility::{
+    load_compatibility_manifest, render_compatibility_matrix, CompatibilityEntry,
+    CompatibilityError, CompatibilityManifest, CompatibilityStatus,
+    COMPATIBILITY_MANIFEST_SCHEMA_VERSION,
+};
 pub use counters::{
     CancellationSnapshot, CancellationTracker, LeakCounters, LeakError, LeakGuard, LeakKind,
     LeakSnapshot, ResourceCounters, ResourceGuard,

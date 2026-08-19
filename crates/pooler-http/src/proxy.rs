@@ -30,7 +30,11 @@ use pooler_config::{
     CompiledConfig, ModelSource, RequestTransform, RouteMatchError, RoutePlan, RouteRequest,
     SecretRef, UpstreamPlan,
 };
-use pooler_core::{BodyMode, RouteLimits};
+use pooler_core::{BodyMode, ErrorClass, RouteLimits};
+use pooler_observe::{
+    AttemptRecord, AttemptResult, CompletionClass, CooldownRecord, DecisionRecord, MetricsRegistry,
+    QuotaRecord, RequestObservation, RetryRecord, TraceRecord, TraceRecorder, TraceStage,
+};
 use pooler_policy::ReplayCheck;
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
 use thiserror::Error;
@@ -246,6 +250,8 @@ pub struct HttpProxy<A = NoSemanticAdapter> {
     semantic: A,
     pooling: Arc<PoolingCoordinator>,
     native: Arc<NativeRuntime>,
+    observability: MetricsRegistry,
+    traces: TraceRecorder,
 }
 
 impl<A> std::fmt::Debug for HttpProxy<A>
@@ -259,6 +265,8 @@ where
             .field("draining", &self.drain.is_draining())
             .field("active", &self.drain.active())
             .field("semantic", &self.semantic)
+            .field("observability", &self.observability)
+            .field("traces", &self.traces)
             .finish_non_exhaustive()
     }
 }
@@ -339,7 +347,37 @@ where
             semantic,
             pooling,
             native,
+            observability: MetricsRegistry::default(),
+            traces: TraceRecorder::default(),
         })
+    }
+
+    /// Replace the default in-process metrics registry with a shared one.
+    /// Sharing a registry across listeners gives management callers one
+    /// process-wide snapshot without introducing an external metrics backend.
+    #[must_use]
+    pub fn with_observability(mut self, observability: MetricsRegistry) -> Self {
+        self.observability = observability;
+        self
+    }
+
+    /// Replace the default bounded trace recorder.
+    #[must_use]
+    pub fn with_trace_recorder(mut self, traces: TraceRecorder) -> Self {
+        self.traces = traces;
+        self
+    }
+
+    /// Return the process-local metrics registry used by this proxy.
+    #[must_use]
+    pub fn observability(&self) -> MetricsRegistry {
+        self.observability.clone()
+    }
+
+    /// Return the bounded trace recorder used by this proxy.
+    #[must_use]
+    pub fn trace_recorder(&self) -> TraceRecorder {
+        self.traces.clone()
     }
 
     /// Return the listener ID served by this proxy.
@@ -381,23 +419,41 @@ where
             path = request.uri().path(),
             "request routed"
         );
+        let mut observation = Some(self.observability.begin_request(route.id()));
+        let request_span = self.traces.span(TraceStage::Request, Some(route.id()));
+        tracing::debug!(parent: &request_span, listener = %self.listener, route = route.id(), "request span");
+        self.traces.record(
+            TraceRecord::new(TraceStage::Match)
+                .route(route.id())
+                .outcome("matched"),
+        );
 
         if let Err(status) = self.validate_request(route, &request) {
             drop(guard);
-            return status;
+            return observe_response(status, observation.take(), CompletionClass::InvalidRequest);
         }
 
         if let Err(error) = verify_downstream_auth(route, request.headers()) {
             drop(guard);
-            return match error {
+            let response = match error {
                 DownstreamAuthError::MissingOrInvalid => unauthorized_response(),
                 DownstreamAuthError::SecretUnavailable => plain_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "authentication unavailable",
                 ),
             };
+            return observe_response(
+                response,
+                observation.take(),
+                CompletionClass::DownstreamError,
+            );
         }
-        let result = self.forward(route, request, guard).await;
+        self.traces.record(
+            TraceRecord::new(TraceStage::Authentication)
+                .route(route.id())
+                .outcome("accepted"),
+        );
+        let result = self.forward(route, request, guard, &mut observation).await;
         match result {
             Ok(response) => {
                 tracing::info!(
@@ -415,7 +471,8 @@ where
                     error = %error,
                     "request failed"
                 );
-                error_response(error)
+                let class = completion_class_for_error(&error);
+                observe_response(error_response(error), observation.take(), class)
             }
         }
     }
@@ -500,6 +557,7 @@ where
         route: &RoutePlan,
         request: Request<Incoming>,
         guard: DrainGuard,
+        observation: &mut Option<RequestObservation>,
     ) -> Result<Response<ProxyBody>, ProxyError> {
         let started = StdInstant::now();
         let fallback_upstream = self
@@ -699,6 +757,19 @@ where
                     )
                     .map_err(pool_selection_error)?
             };
+            if let Some(explanation) = selection.explanation() {
+                let decision = DecisionRecord::from(explanation);
+                self.observability.record_decision(&decision);
+                self.traces.record_decision(&decision);
+            } else {
+                self.traces.record(
+                    TraceRecord::new(TraceStage::Selection)
+                        .route(route.id())
+                        .provider(selection.provider().as_str())
+                        .attempt(attempt)
+                        .outcome("selected"),
+                );
+            }
             if let Some(credential) = selection.credential() {
                 credentials_used.insert(credential.clone());
             }
@@ -726,6 +797,7 @@ where
                 None
             };
             let attempt_body = prepared.body_for_attempt(selection.upstream_model())?;
+            let attempt_started = StdInstant::now();
             let response = self
                 .send_attempt(
                     AttemptRequest {
@@ -743,6 +815,24 @@ where
                     attempt_body,
                 )
                 .await;
+            let attempt_result = match response.as_ref() {
+                Ok(response) if response.status().is_success() => AttemptResult::Success,
+                Ok(_) => AttemptResult::Error,
+                Err(ProxyError::Timeout) => AttemptResult::Cancelled,
+                Err(_) => AttemptResult::Error,
+            };
+            self.observability.record_attempt(
+                AttemptRecord::new(route.id(), selection.provider().as_str(), attempt_result)
+                    .duration(attempt_started.elapsed()),
+            );
+            self.traces.record(
+                TraceRecord::new(TraceStage::Attempt)
+                    .route(route.id())
+                    .provider(selection.provider().as_str())
+                    .attempt(attempt)
+                    .duration(attempt_started.elapsed())
+                    .outcome(attempt_result.to_string()),
+            );
 
             let mut response = match response {
                 Ok(response) => response,
@@ -767,6 +857,7 @@ where
                             elapsed_recovery_wait,
                             started,
                         });
+                        self.observe_failure(route, &selection, &failure);
                         if failure.decision.is_retry() {
                             let delay = failure.decision.delay();
                             if delay > retry_deadline.saturating_duration_since(Instant::now()) {
@@ -880,6 +971,7 @@ where
                     elapsed_recovery_wait,
                     started,
                 });
+                self.observe_failure(route, &selection, &failure);
                 if failure.decision.is_retry() {
                     self.drain_retry_response(response, limits, &cancellation, retry_deadline)
                         .await?;
@@ -899,8 +991,21 @@ where
                 }
             }
 
+            let observation = observation
+                .take()
+                .expect("request observation remains until response is ready");
             return self
-                .finish_response(route, response, selection, guard, cancellation, started)
+                .finish_response(
+                    route,
+                    response,
+                    selection,
+                    FinishResponseContext {
+                        guard,
+                        cancellation,
+                        started,
+                        observation,
+                    },
+                )
                 .await;
         }
     }
@@ -1041,15 +1146,54 @@ where
         })
     }
 
+    fn observe_failure(
+        &self,
+        route: &RoutePlan,
+        selection: &PoolSelection,
+        failure: &crate::pool::PoolFailure,
+    ) {
+        let class = failure.classification.classification.class;
+        if let Some(cooldown) = &failure.classification.cooldown {
+            self.observability.record_cooldown(CooldownRecord {
+                route: Some(route.id().to_owned()),
+                provider: Some(selection.provider().to_string()),
+                scope: format!("{:?}", cooldown.scope),
+                outcome: "applied".to_owned(),
+            });
+        }
+        if matches!(
+            class,
+            ErrorClass::CredentialQuotaExhausted | ErrorClass::ModelQuotaExhausted
+        ) {
+            self.observability.record_quota(QuotaRecord {
+                route: Some(route.id().to_owned()),
+                provider: selection.provider().to_string(),
+                outcome: "exhausted".to_owned(),
+            });
+        }
+        if failure.decision.is_retry() {
+            self.observability.record_retry(RetryRecord {
+                route: route.id().to_owned(),
+                provider: selection.provider().to_string(),
+                reason: "policy_retry".to_owned(),
+                fallback: true,
+            });
+        }
+    }
+
     async fn finish_response(
         &self,
         route: &RoutePlan,
         response: Response<ProxyBody>,
         mut selection: PoolSelection,
-        guard: DrainGuard,
-        cancellation: CancellationToken,
-        started: StdInstant,
+        context: FinishResponseContext,
     ) -> Result<Response<ProxyBody>, ProxyError> {
+        let FinishResponseContext {
+            guard,
+            cancellation,
+            started,
+            mut observation,
+        } = context;
         let (parts, body) = response.into_parts();
         let mut response_headers = parts.headers;
         strip_hop_by_hop_headers(&mut response_headers);
@@ -1069,11 +1213,15 @@ where
             Instant::from_std(started + request_timeout(route.limits(), upstream)),
         )
         .boxed();
+        observation.mark_headers();
         let body = if route.response().mode() == BodyMode::Semantic && parts.status.is_success() {
             let transformed = self
                 .semantic
                 .decode_response(route, body, cancellation.clone())
-                .map_err(|error| ProxyError::SemanticResponse(error.to_string()))?;
+                .map_err(|error| {
+                    observation.complete(CompletionClass::Unsupported, None);
+                    ProxyError::SemanticResponse(error.to_string())
+                })?;
             response_headers.remove(header::CONTENT_LENGTH);
             response_headers.insert(header::CONTENT_TYPE, transformed.content_type);
             transformed.body
@@ -1082,7 +1230,15 @@ where
         };
         self.pooling
             .persist_affinity(&selection, crate::pool::timestamp_now());
-        let body = SelectionLeaseBody::new(body, selection.take_lease());
+        let body = SelectionLeaseBody::new(body, selection.take_lease()).boxed();
+        self.traces.record(
+            TraceRecord::new(TraceStage::Persistence)
+                .route(route.id())
+                .provider(selection.provider().as_str())
+                .outcome("response_ready"),
+        );
+        let completion = completion_class_for_status(parts.status);
+        let body = ObservedBody::new(body, observation, completion);
         let body = DrainedBody::new(body, guard).boxed();
         let mut response = Response::new(body);
         *response.status_mut() = parts.status;
@@ -1108,6 +1264,13 @@ struct AttemptRequest<'a> {
     native_auth: Option<&'a NativeAuthorization>,
     cancellation: &'a CancellationToken,
     started: StdInstant,
+}
+
+struct FinishResponseContext {
+    guard: DrainGuard,
+    cancellation: CancellationToken,
+    started: StdInstant,
+    observation: RequestObservation,
 }
 
 struct InspectedFailureResponse {
@@ -1182,6 +1345,131 @@ impl Body for SelectionLeaseBody {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+struct ObservedBody {
+    inner: Pin<Box<ProxyBody>>,
+    observation: Option<RequestObservation>,
+    completion: CompletionClass,
+}
+
+impl ObservedBody {
+    fn new(inner: ProxyBody, observation: RequestObservation, completion: CompletionClass) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            observation: Some(observation),
+            completion,
+        }
+    }
+}
+
+impl Body for ObservedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let result = self.inner.as_mut().poll_frame(context);
+        match &result {
+            Poll::Ready(Some(Ok(_))) => {
+                if let Some(observation) = self.observation.as_mut() {
+                    observation.mark_first_event();
+                }
+                if self.inner.is_end_stream() {
+                    if let Some(mut observation) = self.observation.take() {
+                        observation.complete(self.completion.clone(), None);
+                    }
+                }
+            }
+            Poll::Ready(None) => {
+                if let Some(mut observation) = self.observation.take() {
+                    observation.complete(self.completion.clone(), None);
+                }
+            }
+            Poll::Ready(Some(Err(_))) => {
+                if let Some(mut observation) = self.observation.take() {
+                    let completion = if self.completion == CompletionClass::Success {
+                        CompletionClass::IncompleteStream
+                    } else {
+                        self.completion.clone()
+                    };
+                    observation.complete(completion, None);
+                }
+            }
+            Poll::Pending => {}
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for ObservedBody {
+    fn drop(&mut self) {
+        let Some(mut observation) = self.observation.take() else {
+            return;
+        };
+        let completion = if self.inner.is_end_stream() {
+            self.completion.clone()
+        } else {
+            CompletionClass::Cancelled
+        };
+        observation.complete(completion, None);
+    }
+}
+
+fn observe_response(
+    response: Response<ProxyBody>,
+    observation: Option<RequestObservation>,
+    completion: CompletionClass,
+) -> Response<ProxyBody> {
+    let Some(mut observation) = observation else {
+        return response;
+    };
+    observation.mark_headers();
+    response.map(|body| ObservedBody::new(body, observation, completion).boxed())
+}
+
+fn completion_class_for_status(status: StatusCode) -> CompletionClass {
+    if status.is_success() {
+        CompletionClass::Success
+    } else if status.is_client_error() {
+        CompletionClass::DownstreamError
+    } else if status.is_server_error() {
+        CompletionClass::UpstreamError
+    } else {
+        CompletionClass::Unknown
+    }
+}
+
+fn completion_class_for_error(error: &ProxyError) -> CompletionClass {
+    match error {
+        ProxyError::InvalidPatch(_)
+        | ProxyError::RequestBodyTooLarge
+        | ProxyError::SemanticRequest(_) => CompletionClass::InvalidRequest,
+        ProxyError::UnsupportedBodyMode { .. } | ProxyError::SemanticResponse(_) => {
+            CompletionClass::Unsupported
+        }
+        ProxyError::Upstream(_) | ProxyError::Timeout | ProxyError::Native(_) => {
+            CompletionClass::UpstreamError
+        }
+        ProxyError::TlsClient(_)
+        | ProxyError::MissingUpstream { .. }
+        | ProxyError::InvalidUri
+        | ProxyError::SecretUnavailable
+        | ProxyError::InvalidLimits(_)
+        | ProxyError::UnsupportedAuth
+        | ProxyError::RequestBuild(_)
+        | ProxyError::Pool(_) => CompletionClass::InternalError,
     }
 }
 
@@ -1556,6 +1844,30 @@ routes:
         assert_eq!(
             patch_buffer_timeout(&config, route, fallback),
             Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn completion_mapping_preserves_early_error_classes() {
+        assert_eq!(
+            completion_class_for_error(&ProxyError::InvalidPatch("bad".to_owned())),
+            CompletionClass::InvalidRequest
+        );
+        assert_eq!(
+            completion_class_for_error(&ProxyError::RequestBodyTooLarge),
+            CompletionClass::InvalidRequest
+        );
+        assert_eq!(
+            completion_class_for_error(&ProxyError::SemanticResponse("unsupported".to_owned())),
+            CompletionClass::Unsupported
+        );
+        assert_eq!(
+            completion_class_for_error(&ProxyError::Timeout),
+            CompletionClass::UpstreamError
+        );
+        assert_ne!(
+            completion_class_for_error(&ProxyError::Pool("state".to_owned())),
+            CompletionClass::Cancelled
         );
     }
 }

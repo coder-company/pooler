@@ -1,6 +1,6 @@
 //! File imports and deterministic overlay resolution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,6 +12,59 @@ use crate::{validate_version, Config, ConfigError, Source, SourceLabel};
 struct ResolvedDocument {
     value: Value,
     origins: BTreeMap<String, Arc<str>>,
+    dependencies: BTreeSet<PathBuf>,
+}
+
+/// A parsed configuration together with every file that contributed to it.
+///
+/// The dependency list is canonical and deterministic.  Callers that watch a
+/// configuration can therefore include imported files and overlays without
+/// reimplementing the resolver's relative-path or preset rules.
+#[derive(Clone, Debug)]
+pub struct LoadedConfig {
+    config: Config,
+    root: PathBuf,
+    dependencies: Arc<[PathBuf]>,
+    rendered: Arc<str>,
+}
+
+impl LoadedConfig {
+    /// Parsed source configuration.
+    #[must_use]
+    pub const fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Canonical root file used to load this configuration.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Canonical files that contributed to this configuration.
+    #[must_use]
+    pub fn dependencies(&self) -> &[PathBuf] {
+        &self.dependencies
+    }
+
+    /// Deterministic expanded representation used for no-op comparisons.
+    #[must_use]
+    pub fn rendered(&self) -> &str {
+        &self.rendered
+    }
+
+    /// Compile the parsed source with a caller-owned generation.
+    pub fn compile_with_generation(
+        &self,
+        generation: u64,
+    ) -> Result<crate::CompiledConfig, ConfigError> {
+        self.config.compile_with_generation(generation)
+    }
+
+    /// Compile the parsed source with generation one.
+    pub fn compile(&self) -> Result<crate::CompiledConfig, ConfigError> {
+        self.config.compile()
+    }
 }
 
 /// Default maximum nested import depth.
@@ -57,7 +110,29 @@ impl ConfigLoader {
         }
         let resolved = self.resolve(path)?;
         let rendered = render_value(&resolved.value, path)?;
-        parse_resolved(path, &rendered, resolved)
+        parse_resolved(path, &rendered, &resolved)
+    }
+
+    /// Load a configuration and retain its canonical dependency set.
+    ///
+    /// This method deliberately resolves even a file without imports. The
+    /// regular [`Self::load`] fast path retains parser coordinates for the
+    /// common case; reload watchers need the dependency graph as well.
+    pub fn load_tracked(&self, path: impl AsRef<Path>) -> Result<LoadedConfig, ConfigError> {
+        let root = std::fs::canonicalize(path.as_ref()).map_err(|error| ConfigError::Io {
+            path: path.as_ref().display().to_string(),
+            message: error.to_string(),
+        })?;
+        let resolved = self.resolve(&root)?;
+        let rendered = render_value(&resolved.value, &root)?;
+        let config = parse_resolved(&root, &rendered, &resolved)?;
+        let dependencies = resolved.dependencies.into_iter().collect::<Vec<_>>();
+        Ok(LoadedConfig {
+            config,
+            root,
+            dependencies: Arc::from(dependencies),
+            rendered: Arc::from(rendered),
+        })
     }
 
     /// Resolve a configuration file to deterministic expanded YAML.
@@ -129,6 +204,7 @@ impl ConfigLoader {
         let mut resolved = ResolvedDocument {
             value: Value::Mapping(Mapping::new()),
             origins: BTreeMap::new(),
+            dependencies: BTreeSet::from([canonical.clone()]),
         };
         for import in imports.iter().filter(|import| import.overlay.is_none()) {
             let (imported, additive_sequences) = if let Some(file) = &import.file {
@@ -144,7 +220,14 @@ impl ConfigLoader {
                 for origin in origins.values_mut() {
                     *origin = Arc::clone(&preset_source);
                 }
-                (ResolvedDocument { origins, value }, true)
+                (
+                    ResolvedDocument {
+                        origins,
+                        value,
+                        dependencies: BTreeSet::from([canonical.clone()]),
+                    },
+                    true,
+                )
             };
             merge_resolved(&mut resolved, imported, &canonical, additive_sequences)?;
         }
@@ -153,6 +236,7 @@ impl ConfigLoader {
             ResolvedDocument {
                 value: document,
                 origins: document_origins,
+                dependencies: BTreeSet::from([canonical.clone()]),
             },
             &canonical,
             false,
@@ -210,6 +294,7 @@ impl ConfigLoader {
         Ok(ResolvedDocument {
             origins: collect_origins(&document, &canonical),
             value: document,
+            dependencies: BTreeSet::from([canonical]),
         })
     }
 }
@@ -217,7 +302,7 @@ impl ConfigLoader {
 fn parse_resolved(
     root: &Path,
     rendered: &str,
-    resolved: ResolvedDocument,
+    resolved: &ResolvedDocument,
 ) -> Result<Config, ConfigError> {
     let deserializer = serde_yml::Deserializer::from_str(rendered);
     let mut config: Config = serde_path_to_error::deserialize(deserializer).map_err(|error| {
@@ -247,7 +332,7 @@ fn parse_resolved(
     let source = Source::new(root.display().to_string(), rendered);
     validate_version(&config, &source)?;
     config.source = Some(source);
-    config.set_origins(resolved.origins);
+    config.set_origins(resolved.origins.clone());
     Ok(config)
 }
 
@@ -649,6 +734,9 @@ fn collect_origins(document: &Value, path: &Path) -> BTreeMap<String, Arc<str>> 
         return origins;
     };
     let source: Arc<str> = Arc::from(path.display().to_string());
+    if root.contains_key(Value::String("management".to_owned())) {
+        origins.insert("management".to_owned(), Arc::clone(&source));
+    }
     for section in [
         "listeners",
         "upstreams",
@@ -688,6 +776,7 @@ fn merge_resolved(
     path: &Path,
     additive_sequences: bool,
 ) -> Result<(), ConfigError> {
+    base.dependencies.extend(incoming.dependencies);
     apply_origin_changes(
         &mut base.origins,
         &incoming.value,
@@ -708,6 +797,11 @@ fn apply_origin_changes(
     let Some(root) = incoming.as_mapping() else {
         return;
     };
+    if root.contains_key(Value::String("management".to_owned())) {
+        if let Some(origin) = incoming_origins.get("management") {
+            base.insert("management".to_owned(), Arc::clone(origin));
+        }
+    }
     for section in [
         "listeners",
         "upstreams",
@@ -889,7 +983,7 @@ fn merge_named_sequence(
                 ));
             }
             (None, true, false) => {
-                return Err(load_error(path, "cannot merge a missing declaration"))
+                return Err(load_error(path, "cannot merge a missing declaration"));
             }
             (None, false, false) => target.push(value),
         }

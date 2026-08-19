@@ -1,0 +1,5 @@
+version: 1
+upstreams:
+  local:
+    merge: true
+    url: http://127.0.0.1:9001

@@ -8,11 +8,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+pooler-observe = { path = "../pooler-observe" }
+ring.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

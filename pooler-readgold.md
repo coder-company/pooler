@@ -48,7 +48,11 @@ name or advertised without conformance evidence.
   persistence, CLI login/status/revoke, and a status-gated native Codex provider are
   wired through pre-commit refresh and quota failover. Live provider authorization
   and account evidence remain before native compatibility can be advertised.
-- Phases 7–8: pending.
+- Phase 7 — management and compatibility laboratory: implemented and locally
+  verified. Authenticated read-only management, atomic dependency-aware reload,
+  bounded metrics/traces, owner-private sanitized capture, executable fixture replay,
+  a truthful compatibility matrix, and five cargo-fuzz targets are wired and tested.
+- Phase 8 — hardening and release: pending.
 - First useful release acceptance: pending.
 
 ## Verification gates

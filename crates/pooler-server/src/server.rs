@@ -43,6 +43,34 @@ pub enum ReloadError<C, L> {
     GenerationChanged(#[from] ConfigStoreError),
 }
 
+/// Result of a reload attempt that first compares the candidate with the
+/// active immutable configuration.
+#[derive(Debug)]
+pub enum ReloadOutcome<T> {
+    /// The candidate was byte-for-byte/equality-equivalent and no generation
+    /// or listener publication occurred.
+    Unchanged(Arc<ConfigSnapshot<T>>),
+    /// The candidate was prepared and atomically published as a new
+    /// generation.
+    Reloaded(Arc<ConfigSnapshot<T>>),
+}
+
+impl<T> ReloadOutcome<T> {
+    /// Return the snapshot visible after the reload attempt.
+    #[must_use]
+    pub fn snapshot(&self) -> &Arc<ConfigSnapshot<T>> {
+        match self {
+            Self::Unchanged(snapshot) | Self::Reloaded(snapshot) => snapshot,
+        }
+    }
+
+    /// Whether a new configuration generation was published.
+    #[must_use]
+    pub const fn changed(&self) -> bool {
+        matches!(self, Self::Reloaded(_))
+    }
+}
+
 /// A running server with an immutable config store and prepared listeners.
 pub struct Server<C, P>
 where
@@ -130,6 +158,60 @@ where
         config: C,
     ) -> Result<Arc<ConfigSnapshot<C>>, ReloadError<(), P::Error>> {
         self.reload_result(Ok(config)).await
+    }
+
+    /// Reload a candidate only when it differs from the active configuration.
+    ///
+    /// Equality is checked while holding the same writer lock used for
+    /// publication. This keeps repeated file-system notifications and SIGHUP
+    /// requests from consuming generations or rebuilding listeners when the
+    /// expanded source is unchanged.
+    pub async fn reload_if_changed(
+        &self,
+        config: C,
+    ) -> Result<ReloadOutcome<C>, ReloadError<(), P::Error>>
+    where
+        C: PartialEq,
+    {
+        self.reload_result_if_changed(Ok(config)).await
+    }
+
+    /// Fallible form of [`Self::reload_if_changed`] for parser/compiler
+    /// results produced off the request/accepting path.
+    pub async fn reload_result_if_changed<E>(
+        &self,
+        result: Result<C, E>,
+    ) -> Result<ReloadOutcome<C>, ReloadError<E, P::Error>>
+    where
+        C: PartialEq,
+    {
+        let config = result.map_err(ReloadError::Config)?;
+        if self.lifecycle.state() != LifecycleState::Running {
+            return Err(ReloadError::Cancelled);
+        }
+        let _guard = self.reload_lock.lock().await;
+        let old: Arc<ConfigSnapshot<C>> = self.config.snapshot();
+        if old.config() == &config {
+            return Ok(ReloadOutcome::Unchanged(old));
+        }
+        let candidate = Arc::new(ConfigSnapshot::new(old.generation().next(), config));
+        let token = self.lifecycle.cancellation_token();
+        let prepared = self
+            .prepare(Arc::clone(&candidate), token.clone())
+            .await
+            .map_err(|error| match error {
+                ServerError::Lifecycle(_) | ServerError::Cancelled => ReloadError::Cancelled,
+                ServerError::Listener(error) => ReloadError::Listener(error),
+            })?;
+        if token.is_cancelled() {
+            return Err(ReloadError::Cancelled);
+        }
+        let published = self
+            .config
+            .install_arc_if(old.generation(), candidate.config_arc())
+            .map_err(ReloadError::GenerationChanged)?;
+        self.listeners.store(Some(Arc::new(prepared)));
+        Ok(ReloadOutcome::Reloaded(published))
     }
 
     /// Reload from a parser/compiler result, preserving the old generation on
@@ -304,5 +386,30 @@ mod tests {
             "old"
         );
         assert_eq!(old.config(), "old");
+    }
+
+    #[tokio::test]
+    async fn equivalent_reload_keeps_generation_and_listener_identity() {
+        let server = Server::new(
+            String::from("same"),
+            FakePreparer {
+                fail: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        server.start().await.expect("startup succeeds");
+        let before = server.snapshot();
+        let listeners_before = server.listeners().expect("listeners published");
+
+        let outcome = server
+            .reload_if_changed(String::from("same"))
+            .await
+            .expect("equivalent candidate is accepted as a no-op");
+        assert!(!outcome.changed());
+        assert_eq!(outcome.snapshot().generation(), before.generation());
+        assert!(Arc::ptr_eq(outcome.snapshot(), &before));
+        assert!(Arc::ptr_eq(
+            &listeners_before,
+            &server.listeners().expect("listeners remain published")
+        ));
     }
 }

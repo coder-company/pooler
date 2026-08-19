@@ -1,0 +1,8 @@
+{
+  "model": "gpt-seed",
+  "metadata": {
+    "a/b": "slash",
+    "a~b": "tilde"
+  },
+  "items": ["first", "second"]
+}

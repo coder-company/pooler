@@ -1,0 +1,7 @@
+: keep-alive
+data: first line
+data: second line
+
+event: finish
+data: {"ok":true}
+

@@ -1,15 +1,22 @@
 //! Concrete Hyper listener runtime for the opaque HTTP proxy.
 
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     io,
     path::PathBuf,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::Duration,
 };
 
 use adapter_devin::DevinSemanticAdapter;
 use adapter_factory::FactorySemanticAdapter;
+use arc_swap::ArcSwap;
+use bytes::Bytes;
+use http_body::{Body, Frame, SizeHint};
+use http_body_util::BodyExt;
 use hyper::{body::Incoming, http, http::Request, service::service_fn};
 use hyper_util::rt::TokioIo;
 use pooler_config::CompiledConfig;
@@ -17,13 +24,19 @@ use pooler_http::{
     BoxError, DrainError, HttpProxy, NativeRuntime, PoolingCoordinator, ProxyBody, ProxyError,
     SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
 };
+use pooler_observe::MetricsRegistry;
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixListener},
+    sync::Mutex as AsyncMutex,
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+
+use crate::{
+    ActiveCounts, ActiveGuard, ManagementApi, ManagementHttpServer, ManagementServerError,
+};
 
 const FORCE_CANCEL_GRACE: Duration = Duration::from_secs(1);
 
@@ -128,19 +141,50 @@ pub enum HttpProxyServerError {
     /// `run` already consumed the bound sockets.
     #[error("HTTP proxy server is already running")]
     AlreadyRunning,
+    /// Reload tried to change sockets that were already bound.
+    #[error("configuration reload cannot change the bound listener set; restart is required")]
+    ListenerSetChanged,
+    /// The configured management listener could not be started.
+    #[error(transparent)]
+    Management(#[from] ManagementServerError),
+}
+
+/// Result of applying a compiled HTTP runtime candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpReloadOutcome {
+    /// The candidate was equivalent and no generation changed.
+    Unchanged { generation: u64 },
+    /// The candidate was atomically published for new requests.
+    Reloaded { generation: u64 },
+}
+
+impl HttpReloadOutcome {
+    /// Runtime generation visible after the reload attempt.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        match self {
+            Self::Unchanged { generation } | Self::Reloaded { generation } => generation,
+        }
+    }
+
+    /// Whether a new generation was published.
+    #[must_use]
+    pub const fn changed(self) -> bool {
+        matches!(self, Self::Reloaded { .. })
+    }
 }
 
 enum BoundListener {
     Tcp {
         id: Arc<str>,
         listener: TcpListener,
-        proxy: Arc<RuntimeProxy>,
+        dispatch: Arc<ArcSwap<RuntimeGeneration>>,
     },
     Unix {
         id: Arc<str>,
         listener: UnixListener,
         path: UnixSocketPath,
-        proxy: Arc<RuntimeProxy>,
+        dispatch: Arc<ArcSwap<RuntimeGeneration>>,
     },
 }
 
@@ -154,8 +198,27 @@ impl Drop for UnixSocketPath {
 
 struct RuntimeState {
     listeners: Mutex<Option<Vec<BoundListener>>>,
-    proxies: Vec<Arc<RuntimeProxy>>,
+    dispatch: Arc<ArcSwap<RuntimeGeneration>>,
+    reload_lock: AsyncMutex<()>,
+    native: Arc<NativeRuntime>,
+    retired: Mutex<Vec<Vec<Arc<RuntimeProxy>>>>,
+    metrics: MetricsRegistry,
+    active: ActiveCounts,
+    management: Option<ManagementHttpServer>,
+    management_api: Option<Arc<ManagementApi>>,
     cancellation: CancellationToken,
+}
+
+/// Immutable runtime dispatch table for one configuration generation.
+///
+/// Accept loops hold the swap independently from each bound socket. A request
+/// loads one table before dispatch, so every request sees one coherent plan;
+/// an in-flight request retains its selected proxy and therefore its old
+/// generation until the response body ends.
+pub(crate) struct RuntimeGeneration {
+    pub(crate) config: Arc<CompiledConfig>,
+    proxies: BTreeMap<Arc<str>, Arc<RuntimeProxy>>,
+    pub(crate) pooling: Arc<PoolingCoordinator>,
 }
 
 /// A concrete HTTP/1 listener set serving every compiled listener.
@@ -194,21 +257,45 @@ impl HttpProxyServer {
             Arc::new(PoolingCoordinator::new(&config).map_err(|error| {
                 HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string()))
             })?);
+        let dispatch = Arc::new(ArcSwap::from_pointee(RuntimeGeneration {
+            config: Arc::clone(&config),
+            proxies: BTreeMap::new(),
+            pooling: Arc::clone(&pooling),
+        }));
+        let metrics = MetricsRegistry::default();
+        let active = ActiveCounts::new();
+        let management_api = config.management().map(|plan| {
+            Arc::new(ManagementApi::with_runtime_dispatch(
+                plan.clone(),
+                Arc::clone(&config),
+                Arc::clone(&pooling),
+                Arc::clone(&dispatch),
+                active.clone(),
+                metrics.clone(),
+            ))
+        });
+        let management = match management_api.as_ref() {
+            Some(api) => Some(ManagementHttpServer::bind(Arc::clone(api)).await?),
+            None => None,
+        };
         let mut listeners = Vec::with_capacity(config.listeners().len());
-        let mut proxies = Vec::with_capacity(config.listeners().len());
+        let mut proxies = BTreeMap::new();
         let mut addresses = Vec::with_capacity(config.listeners().len());
 
         for plan in config.listeners().values() {
             let id: Arc<str> = Arc::from(plan.id());
-            let proxy = Arc::new(HttpProxy::with_semantic_adapter_and_pooling_and_native(
-                // Native provider handling is selected per upstream at the
-                // attempt boundary; all listeners share this runtime.
-                Arc::clone(&config),
-                Arc::clone(&id),
-                RuntimeSemanticAdapter,
-                Arc::clone(&pooling),
-                Arc::clone(&native),
-            )?);
+            let proxy = Arc::new(
+                HttpProxy::with_semantic_adapter_and_pooling_and_native(
+                    // Native provider handling is selected per upstream at the
+                    // attempt boundary; all listeners share this runtime.
+                    Arc::clone(&config),
+                    Arc::clone(&id),
+                    RuntimeSemanticAdapter,
+                    Arc::clone(&pooling),
+                    Arc::clone(&native),
+                )?
+                .with_observability(metrics.clone()),
+            );
             let bind = plan.bind();
             if bind.starts_with('/') || bind.starts_with("unix:") {
                 let path = bind.strip_prefix("unix:").unwrap_or(bind);
@@ -221,10 +308,10 @@ impl HttpProxyServer {
                     id: Arc::clone(&id),
                     listener,
                     path: UnixSocketPath(PathBuf::from(path)),
-                    proxy: Arc::clone(&proxy),
+                    dispatch: Arc::clone(&dispatch),
                 });
                 addresses.push(ListenerAddress {
-                    id,
+                    id: Arc::clone(&id),
                     address: Arc::from(path),
                 });
             } else {
@@ -245,20 +332,33 @@ impl HttpProxyServer {
                 listeners.push(BoundListener::Tcp {
                     id: Arc::clone(&id),
                     listener,
-                    proxy: Arc::clone(&proxy),
+                    dispatch: Arc::clone(&dispatch),
                 });
                 addresses.push(ListenerAddress {
-                    id,
+                    id: Arc::clone(&id),
                     address: Arc::from(address.to_string()),
                 });
             }
-            proxies.push(proxy);
+            proxies.insert(id, proxy);
         }
+
+        dispatch.store(Arc::new(RuntimeGeneration {
+            config: Arc::clone(&config),
+            proxies,
+            pooling: Arc::clone(&pooling),
+        }));
 
         Ok(Self {
             state: Arc::new(RuntimeState {
                 listeners: Mutex::new(Some(listeners)),
-                proxies,
+                dispatch,
+                reload_lock: AsyncMutex::new(()),
+                native,
+                retired: Mutex::new(Vec::new()),
+                metrics,
+                active,
+                management,
+                management_api,
                 cancellation: CancellationToken::new(),
             }),
             addresses: Arc::new(addresses),
@@ -271,23 +371,120 @@ impl HttpProxyServer {
         self.addresses.as_slice()
     }
 
+    /// Concrete management address assigned while binding, when management
+    /// is enabled in the immutable configuration.
+    #[must_use]
+    pub fn management_address(&self) -> Option<&str> {
+        self.state
+            .management
+            .as_ref()
+            .map(ManagementHttpServer::address)
+    }
+
+    /// Return the live read-only management API, when enabled.
+    #[must_use]
+    pub fn management_api(&self) -> Option<Arc<ManagementApi>> {
+        self.state.management_api.clone()
+    }
+
+    /// Return the process-shared bounded metrics registry.
+    #[must_use]
+    pub fn observability(&self) -> MetricsRegistry {
+        self.state.metrics.clone()
+    }
+
     /// Number of active requests across listeners.
     #[must_use]
     pub fn active(&self) -> usize {
-        self.state
-            .proxies
-            .iter()
-            .map(|proxy| proxy.drain_controller().active())
-            .sum()
+        self.state.active.total()
     }
 
     /// Whether shutdown has begun on any listener.
     #[must_use]
     pub fn is_draining(&self) -> bool {
-        self.state
-            .proxies
+        self.all_proxies()
             .iter()
             .any(|proxy| proxy.drain_controller().is_draining())
+    }
+
+    /// Configuration generation used for newly admitted requests.
+    #[must_use]
+    pub fn config_generation(&self) -> u64 {
+        self.state.dispatch.load().config.generation()
+    }
+
+    /// Current immutable compiled plan for diagnostics and management views.
+    #[must_use]
+    pub fn config(&self) -> Arc<CompiledConfig> {
+        let snapshot = self.state.dispatch.load_full();
+        snapshot.config.clone()
+    }
+
+    /// Return the mutable pooling coordinator for the active generation.
+    #[must_use]
+    pub fn pooling(&self) -> Arc<PoolingCoordinator> {
+        let snapshot = self.state.dispatch.load_full();
+        snapshot.pooling.clone()
+    }
+
+    /// Atomically publish a compiled route plan for new requests.
+    ///
+    /// Candidate proxies are fully constructed before the swap. Existing
+    /// requests retain their old proxy `Arc`, while new requests load the new
+    /// immutable generation from the dispatch table. A changed socket set is
+    /// rejected because replacing bound sockets requires a process-level
+    /// listener handoff; the current service remains untouched.
+    pub async fn reload(
+        &self,
+        candidate: CompiledConfig,
+    ) -> Result<HttpReloadOutcome, HttpProxyServerError> {
+        let _guard = self.state.reload_lock.lock().await;
+        let current = self.state.dispatch.load_full();
+        if current.config.equivalent(&candidate) {
+            return Ok(HttpReloadOutcome::Unchanged {
+                generation: current.config.generation(),
+            });
+        }
+        if !same_listener_bindings(&current.config, &candidate) {
+            return Err(HttpProxyServerError::ListenerSetChanged);
+        }
+        if current.config.management() != candidate.management() {
+            return Err(HttpProxyServerError::ListenerSetChanged);
+        }
+
+        let generation = current.config.generation().saturating_add(1);
+        let config = Arc::new(candidate.with_generation(generation));
+        let pooling =
+            Arc::new(current.pooling.reconfigure(&config).map_err(|error| {
+                HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string()))
+            })?);
+        let mut proxies = BTreeMap::new();
+        for plan in config.listeners().values() {
+            let id: Arc<str> = Arc::from(plan.id());
+            let proxy = Arc::new(
+                HttpProxy::with_semantic_adapter_and_pooling_and_native(
+                    Arc::clone(&config),
+                    Arc::clone(&id),
+                    RuntimeSemanticAdapter,
+                    Arc::clone(&pooling),
+                    Arc::clone(&self.state.native),
+                )?
+                .with_observability(self.state.metrics.clone()),
+            );
+            proxies.insert(id, proxy);
+        }
+
+        self.state
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(current.proxies.values().cloned().collect());
+        self.state.dispatch.store(Arc::new(RuntimeGeneration {
+            config: Arc::clone(&config),
+            proxies,
+            pooling: Arc::clone(&pooling),
+        }));
+        Ok(HttpReloadOutcome::Reloaded { generation })
     }
 
     /// Run all accept loops until graceful drain is requested.
@@ -307,9 +504,22 @@ impl HttpProxyServer {
             .take()
             .ok_or(HttpProxyServerError::AlreadyRunning)?;
         let mut tasks = JoinSet::new();
+        let active = self.state.active.clone();
         for listener in listeners {
             let cancellation = self.state.cancellation.clone();
-            tasks.spawn(async move { accept_loop(listener, cancellation).await });
+            let active = active.clone();
+            tasks.spawn(async move { accept_loop(listener, cancellation, active).await });
+        }
+        if let Some(management) = self.state.management.clone() {
+            tasks.spawn(async move {
+                management
+                    .run()
+                    .await
+                    .map_err(|error| HttpProxyServerError::Listener {
+                        listener: "management".to_owned(),
+                        message: error.to_string(),
+                    })
+            });
         }
 
         loop {
@@ -356,14 +566,14 @@ impl HttpProxyServer {
     pub async fn drain(&self, timeout: Duration) -> Result<(), HttpProxyServerError> {
         self.begin_drain();
         let deadline = tokio::time::Instant::now() + timeout;
-        for proxy in &self.state.proxies {
+        for proxy in self.all_proxies() {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if let Err(error) = proxy.drain(remaining).await {
-                for proxy in &self.state.proxies {
+                for proxy in self.all_proxies() {
                     proxy.cancel_active();
                 }
                 let cleanup_deadline = tokio::time::Instant::now() + FORCE_CANCEL_GRACE;
-                for proxy in &self.state.proxies {
+                for proxy in self.all_proxies() {
                     let remaining =
                         cleanup_deadline.saturating_duration_since(tokio::time::Instant::now());
                     proxy.drain(remaining).await?;
@@ -376,8 +586,11 @@ impl HttpProxyServer {
 
     /// Signal all listeners to stop accepting connections.
     pub fn begin_drain(&self) {
-        for proxy in &self.state.proxies {
+        for proxy in self.all_proxies() {
             proxy.begin_drain();
+        }
+        if let Some(management) = &self.state.management {
+            management.begin_shutdown();
         }
         self.state.cancellation.cancel();
     }
@@ -387,17 +600,101 @@ impl HttpProxyServer {
     pub fn cancellation_token(&self) -> CancellationToken {
         self.state.cancellation.clone()
     }
+
+    fn current_proxies(&self) -> Vec<Arc<RuntimeProxy>> {
+        self.state
+            .dispatch
+            .load_full()
+            .proxies
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn all_proxies(&self) -> Vec<Arc<RuntimeProxy>> {
+        let mut proxies = self.current_proxies();
+        let mut retired = self
+            .state
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retired.retain(|group| {
+            let active = group
+                .iter()
+                .map(|proxy| proxy.drain_controller().active())
+                .sum::<usize>();
+            if active > 0 {
+                proxies.extend(group.iter().cloned());
+                true
+            } else {
+                false
+            }
+        });
+        proxies
+    }
+}
+
+fn same_listener_bindings(current: &CompiledConfig, candidate: &CompiledConfig) -> bool {
+    current.listeners().len() == candidate.listeners().len()
+        && current.listeners().iter().all(|(id, plan)| {
+            candidate
+                .listeners()
+                .get(id)
+                .is_some_and(|other| other.bind() == plan.bind())
+        })
+}
+
+/// Holds a management activity guard until the downstream response stream
+/// ends or is dropped. Counting only until headers would make the read-only
+/// management view miss long-running inference streams.
+struct ActiveBody {
+    inner: Pin<Box<ProxyBody>>,
+    guard: Option<ActiveGuard>,
+}
+
+impl ActiveBody {
+    fn new(inner: ProxyBody, guard: ActiveGuard) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            guard: Some(guard),
+        }
+    }
+}
+
+impl Body for ActiveBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let result = self.inner.as_mut().poll_frame(context);
+        if matches!(result, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            self.guard.take();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 async fn accept_loop(
     listener: BoundListener,
     cancellation: CancellationToken,
+    active: ActiveCounts,
 ) -> Result<(), HttpProxyServerError> {
     match listener {
         BoundListener::Tcp {
             id,
             listener,
-            proxy,
+            dispatch,
         } => {
             let mut connections = JoinSet::new();
             loop {
@@ -408,11 +705,19 @@ async fn accept_loop(
                             listener: id.to_string(),
                             message: source.to_string(),
                         })?;
-                        let proxy = Arc::clone(&proxy);
+                        let dispatch = Arc::clone(&dispatch);
                         let connection_id = Arc::clone(&id);
                         let cancellation = cancellation.clone();
+                        let active = active.clone();
                         connections.spawn(async move {
-                            serve_connection(TokioIo::new(stream), connection_id, proxy, cancellation).await;
+                            serve_connection(
+                                TokioIo::new(stream),
+                                connection_id,
+                                dispatch,
+                                cancellation,
+                                active,
+                            )
+                            .await;
                         });
                         debug!(listener = %id, ?peer, "accepted HTTP connection");
                     }
@@ -433,7 +738,7 @@ async fn accept_loop(
             id,
             listener,
             path: _path,
-            proxy,
+            dispatch,
         } => {
             let mut connections = JoinSet::new();
             loop {
@@ -444,11 +749,19 @@ async fn accept_loop(
                             listener: id.to_string(),
                             message: source.to_string(),
                         })?;
-                        let proxy = Arc::clone(&proxy);
+                        let dispatch = Arc::clone(&dispatch);
                         let id = Arc::clone(&id);
                         let cancellation = cancellation.clone();
+                        let active = active.clone();
                         connections.spawn(async move {
-                            serve_connection(TokioIo::new(stream), id, proxy, cancellation).await;
+                            serve_connection(
+                                TokioIo::new(stream),
+                                id,
+                                dispatch,
+                                cancellation,
+                                active,
+                            )
+                            .await;
                         });
                     }
                     result = connections.join_next(), if !connections.is_empty() => {
@@ -471,14 +784,28 @@ async fn accept_loop(
 async fn serve_connection<I>(
     io: TokioIo<I>,
     listener_id: Arc<str>,
-    proxy: Arc<RuntimeProxy>,
+    dispatch: Arc<ArcSwap<RuntimeGeneration>>,
     cancellation: CancellationToken,
+    active: ActiveCounts,
 ) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let request_listener_id = Arc::clone(&listener_id);
     let service = service_fn(move |request: Request<Incoming>| {
-        let proxy = Arc::clone(&proxy);
-        async move { Ok::<_, Infallible>(proxy.handle(request).await) }
+        let generation = dispatch.load_full();
+        let proxy = generation
+            .proxies
+            .get(request_listener_id.as_ref())
+            .cloned()
+            .expect("bound listener must have a proxy in every generation");
+        let active = active.clone();
+        let listener = Arc::clone(&request_listener_id);
+        async move {
+            let guard = active.enter(listener.as_ref());
+            let response = proxy.handle(request).await;
+            let response = response.map(|body| ActiveBody::new(body, guard).boxed());
+            Ok::<_, Infallible>(response)
+        }
     });
     let connection = hyper::server::conn::http1::Builder::new()
         .keep_alive(true)
@@ -516,6 +843,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
+        sync::Notify,
         time::{sleep, Duration},
     };
 
@@ -1057,6 +1385,15 @@ mod tests {
         )
         .await;
         assert_eq!(status(&expanded), 413);
+        let metrics = server.observability().snapshot();
+        assert!(metrics
+            .completions
+            .iter()
+            .any(|metric| metric.route == "limited" && metric.class == "invalid_request"));
+        assert!(!metrics
+            .completions
+            .iter()
+            .any(|metric| metric.route == "limited" && metric.class == "cancelled"));
         assert!(
             tokio::time::timeout(Duration::from_millis(50), upstream_listener.accept())
                 .await
@@ -1135,6 +1472,93 @@ mod tests {
         })
         .await
         .expect("active request releases");
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn management_active_counts_track_inference_until_stream_end() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener.local_addr().expect("upstream address");
+        let body_started = Arc::new(Notify::new());
+        let release_body = Arc::new(Notify::new());
+        let body_started_upstream = Arc::clone(&body_started);
+        let release_body_upstream = Arc::clone(&release_body);
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+            read_request(&mut stream).await.expect("upstream request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhel")
+                .await
+                .expect("upstream response prefix");
+            body_started_upstream.notify_waiters();
+            release_body_upstream.notified().await;
+            stream
+                .write_all(b"lo")
+                .await
+                .expect("upstream response suffix");
+        });
+        let config = pooler_config::compile_yaml(
+            "management-active.yaml",
+            &format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes: [{{id: active, listen: local, target: local}}]\n"
+            ),
+        )
+        .expect("management active config compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let api = server.management_api().expect("management API");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let mut downstream = TcpStream::connect(address)
+            .await
+            .expect("downstream connects");
+        downstream
+            .write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("downstream request");
+
+        wait_for_active(&server, 1).await;
+        let active = api.handle(&http::Method::GET, "/active", &http::HeaderMap::new());
+        assert_eq!(active.status, http::StatusCode::OK);
+        assert!(String::from_utf8_lossy(&active.body).contains("\"active\":1"));
+
+        tokio::time::timeout(TEST_TIMEOUT, body_started.notified())
+            .await
+            .expect("upstream starts response body");
+        let prefix = tokio::time::timeout(
+            TEST_TIMEOUT,
+            read_response_until(&mut downstream, b"\r\n\r\nhel"),
+        )
+        .await
+        .expect("response prefix arrives")
+        .expect("response prefix reads");
+        assert!(prefix.ends_with(b"hel"));
+        assert_eq!(server.active(), 1);
+        let active_during_stream =
+            api.handle(&http::Method::GET, "/active", &http::HeaderMap::new());
+        assert!(String::from_utf8_lossy(&active_during_stream.body).contains("\"active\":1"));
+
+        release_body.notify_one();
+        let suffix = tokio::time::timeout(TEST_TIMEOUT, read_response(&mut downstream))
+            .await
+            .expect("response suffix arrives")
+            .expect("response suffix reads");
+        assert!(suffix.ends_with(b"lo"));
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while server.active() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("active stream releases");
+        let inactive = api.handle(&http::Method::GET, "/active", &http::HeaderMap::new());
+        assert!(String::from_utf8_lossy(&inactive.body).contains("\"active\":0"));
+
+        upstream.await.expect("upstream task");
         stop_server(&server, runner).await;
     }
 
@@ -2053,6 +2477,196 @@ mod tests {
             "new-access"
         );
         upstream.await.expect("upstream task");
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn reload_swaps_dispatch_atomically_and_keeps_noop_generation_stable() {
+        let (first_address, first_upstream) = spawn_one_shot_upstream(b"first-generation").await;
+        let (second_address, second_upstream) = spawn_one_shot_upstream(b"second-generation").await;
+        let config = pooler_config::compile_yaml(
+            "reload.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: first\n"
+            ),
+        )
+        .expect("initial config");
+        let server = HttpProxyServer::bind(config.clone())
+            .await
+            .expect("proxy binds");
+        let address = listener_address(&server, "local");
+        assert_eq!(server.config_generation(), 1);
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let unchanged = server.reload(config).await.expect("same config is a no-op");
+        assert_eq!(unchanged, HttpReloadOutcome::Unchanged { generation: 1 });
+        assert_eq!(server.config_generation(), 1);
+        let first = send_request(address, b"GET /reload HTTP/1.1\r\nHost: test\r\n\r\n").await;
+        assert_eq!(response_body(&first), b"first-generation");
+
+        let replacement = pooler_config::compile_yaml(
+            "reload.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: second\n"
+            ),
+        )
+        .expect("replacement config");
+        let changed = server.reload(replacement).await.expect("reload succeeds");
+        assert_eq!(changed, HttpReloadOutcome::Reloaded { generation: 2 });
+        let second = send_request(address, b"GET /reload HTTP/1.1\r\nHost: test\r\n\r\n").await;
+        assert_eq!(response_body(&second), b"second-generation");
+
+        first_upstream.await.expect("first upstream");
+        second_upstream.await.expect("second upstream");
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn management_listener_tracks_live_generation_and_decisions_after_reload() {
+        let (first_address, first_upstream) = spawn_one_shot_upstream(b"management-first").await;
+        let (second_address, second_upstream) = spawn_one_shot_upstream(b"management-second").await;
+        let config = pooler_config::compile_yaml(
+            "management-runtime.yaml",
+            &format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /management-runtime}}\n    target: first\n"
+            ),
+        )
+        .expect("management runtime config");
+        let server = HttpProxyServer::bind(config.clone())
+            .await
+            .expect("proxy and management listeners bind");
+        let proxy_address = listener_address(&server, "local");
+        let management_address: SocketAddr = server
+            .management_address()
+            .expect("management address")
+            .parse()
+            .expect("management socket address");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let health_before = send_request(
+            management_address,
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&health_before), 200);
+        assert!(String::from_utf8_lossy(response_body(&health_before))
+            .contains("\"configuration_generation\":1"));
+        let decisions_before = send_request(
+            management_address,
+            b"GET /decisions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&decisions_before), 200);
+        assert!(String::from_utf8_lossy(response_body(&decisions_before))
+            .contains("\"configuration_generation\":1"));
+
+        let first = send_request(
+            proxy_address,
+            b"GET /management-runtime HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_body(&first), b"management-first");
+
+        let replacement = pooler_config::compile_yaml(
+            "management-runtime.yaml",
+            &format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /management-runtime}}\n    target: second\n"
+            ),
+        )
+        .expect("replacement management runtime config");
+        let outcome = server.reload(replacement).await.expect("runtime reload");
+        assert_eq!(outcome, HttpReloadOutcome::Reloaded { generation: 2 });
+
+        let health_after = send_request(
+            management_address,
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&health_after), 200);
+        assert!(String::from_utf8_lossy(response_body(&health_after))
+            .contains("\"configuration_generation\":2"));
+        let decisions_after = send_request(
+            management_address,
+            b"GET /decisions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&decisions_after), 200);
+        assert!(String::from_utf8_lossy(response_body(&decisions_after))
+            .contains("\"configuration_generation\":2"));
+
+        let second = send_request(
+            proxy_address,
+            b"GET /management-runtime HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_body(&second), b"management-second");
+
+        first_upstream.await.expect("first upstream");
+        second_upstream.await.expect("second upstream");
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_an_inflight_request_on_its_old_generation() {
+        let first_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("first upstream binds");
+        let first_address = first_listener.local_addr().expect("first upstream address");
+        let release = Arc::new(Notify::new());
+        let release_first = Arc::clone(&release);
+        let first_upstream = tokio::spawn(async move {
+            let (mut stream, _) = first_listener.accept().await.expect("first accepts");
+            let _request = read_request(&mut stream).await.expect("first request");
+            release_first.notified().await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nold")
+                .await
+                .expect("old response");
+        });
+        let (second_address, second_upstream) = spawn_one_shot_upstream(b"new").await;
+        let config = pooler_config::compile_yaml(
+            "reload-inflight.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: first\n"
+            ),
+        )
+        .expect("initial config");
+        let server = HttpProxyServer::bind(config.clone())
+            .await
+            .expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let old_request = tokio::spawn(async move {
+            send_request(address, b"GET /reload HTTP/1.1\r\nHost: test\r\n\r\n").await
+        });
+        wait_for_active(&server, 1).await;
+
+        let replacement = pooler_config::compile_yaml(
+            "reload-inflight.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: second\n"
+            ),
+        )
+        .expect("replacement config");
+        let outcome = server.reload(replacement).await.expect("reload succeeds");
+        assert_eq!(outcome, HttpReloadOutcome::Reloaded { generation: 2 });
+        let new_request =
+            send_request(address, b"GET /reload HTTP/1.1\r\nHost: test\r\n\r\n").await;
+        assert_eq!(response_body(&new_request), b"new");
+        release.notify_one();
+        let old_response = old_request.await.expect("old request task");
+        assert_eq!(response_body(&old_response), b"old");
+        first_upstream.await.expect("first upstream");
+        second_upstream.await.expect("second upstream");
         stop_server(&server, runner).await;
     }
 }

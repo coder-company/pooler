@@ -21,6 +21,7 @@ pooler-core = { path = "../pooler-core" }
 pooler-protocol = { path = "../pooler-protocol" }
 pooler-policy = { path = "../pooler-policy" }
 pooler-store = { path = "../pooler-store" }
+pooler-observe = { path = "../pooler-observe" }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

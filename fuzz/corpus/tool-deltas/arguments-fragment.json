@@ -1,0 +1,9 @@
+{
+  "id": "chat-seed",
+  "model": "gpt-seed",
+  "choices": [{
+    "index": 0,
+    "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"path\":"}}]},
+    "finish_reason": null
+  }]
+}
