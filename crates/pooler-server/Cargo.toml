@@ -9,11 +9,15 @@ description = "Pooler process lifecycle, immutable configuration generations, an
 
 [dependencies]
 arc-swap.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 pooler-config = { path = "../pooler-config" }
 pooler-core = { path = "../pooler-core" }
+pooler-http = { path = "../pooler-http" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

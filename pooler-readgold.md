@@ -16,7 +16,8 @@ name or advertised without conformance evidence.
 - Phase 0 — engineering baseline: implemented; local formatting, Clippy, tests,
   config-check smoke test, and code review pass. Linux/macOS CI evidence is pending
   the pushed commit.
-- Phase 1 — opaque custom proxy: pending.
+- Phase 1 — opaque custom proxy: implemented and locally verified; cross-platform
+  CI evidence is pending the pushed commit.
 - Phases 2–8: pending.
 - First useful release acceptance: pending.
 

@@ -11,14 +11,16 @@ mod auth;
 mod body;
 mod drain;
 mod headers;
+mod proxy;
 mod stream;
 
 pub use auth::{
     extract_bearer, extract_bearer_secret, extract_bearer_token, BearerError, BearerToken,
 };
 pub use body::{collect_body_limited, read_body_limited, BodyLimitError, LimitedBody};
-pub use drain::{DrainController, DrainError, DrainGuard};
+pub use drain::{DrainController, DrainError, DrainGuard, DrainedBody};
 pub use headers::{
     remove_hop_by_hop_headers, sanitize_headers, strip_hop_by_hop_headers, HOP_BY_HOP_HEADERS,
 };
+pub use proxy::{BoxError, HttpProxy, ProxyBody, ProxyError};
 pub use stream::{CommitmentError, RetryError, StreamCommitment, StreamEvent, StreamState};

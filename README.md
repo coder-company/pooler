@@ -10,5 +10,11 @@ Validate the example configuration with:
 cargo run -p pooler-cli -- check --config config/pooler.example.yaml
 ```
 
+Run the opaque proxy with:
+
+```sh
+POOLER_UPSTREAM_KEY=... cargo run -p pooler-cli -- serve --config config/pooler.example.yaml
+```
+
 See the [delivery index](pooler-readgold.md), [product goal](GOAL.md), and
 [architecture plan](ARCHITECTURE_PLAN.md).

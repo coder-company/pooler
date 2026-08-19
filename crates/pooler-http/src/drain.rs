@@ -1,11 +1,17 @@
 use std::{
+    fmt,
+    future::Future,
+    io,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::Duration,
 };
 
+use http_body::{Body, Frame, SizeHint};
 use thiserror::Error;
 use tokio::{sync::Notify, time};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 #[derive(Debug, Default)]
 struct DrainState {
@@ -50,6 +56,100 @@ pub struct DrainGuard {
     released: bool,
 }
 
+/// A body that keeps a drain permit until its response has finished.
+///
+/// A response body can outlive the service future that produced its headers.
+/// Holding the guard here makes graceful drain account for the complete
+/// downstream stream.  When drain begins, polling stops and the upstream body
+/// is dropped so no additional work is read.
+pub struct DrainedBody<B> {
+    inner: Pin<Box<B>>,
+    cancellation: CancellationToken,
+    cancelled: Pin<Box<WaitForCancellationFutureOwned>>,
+    cancellation_error_emitted: bool,
+    guard: Option<DrainGuard>,
+}
+
+impl<B> DrainedBody<B> {
+    /// Wrap a body and retain `guard` until the body reaches a terminal state.
+    #[must_use]
+    pub fn new(inner: B, guard: DrainGuard) -> Self {
+        let cancellation = guard.cancellation_token();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
+        Self {
+            inner: Box::pin(inner),
+            cancellation,
+            cancelled,
+            cancellation_error_emitted: false,
+            guard: Some(guard),
+        }
+    }
+}
+
+impl<B> fmt::Debug for DrainedBody<B>
+where
+    B: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DrainedBody")
+            .field("inner", &self.inner)
+            .field("cancelled", &self.cancellation.is_cancelled())
+            .field("has_guard", &self.guard.is_some())
+            .finish()
+    }
+}
+
+impl<B> Body for DrainedBody<B>
+where
+    B: Body,
+    B::Data: bytes::Buf,
+    B::Error: From<io::Error>,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.cancelled.as_mut().poll(context).is_ready() {
+            self.guard.take();
+            if self.cancellation_error_emitted {
+                return Poll::Ready(None);
+            }
+            self.cancellation_error_emitted = true;
+            return Poll::Ready(Some(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "response canceled during forced shutdown",
+            )
+            .into())));
+        }
+
+        match self.inner.as_mut().poll_frame(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                self.guard.take();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(error))) => {
+                self.guard.take();
+                Poll::Ready(Some(Err(error)))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        (self.cancellation.is_cancelled() && self.cancellation_error_emitted)
+            || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 impl std::fmt::Debug for DrainGuard {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -90,10 +190,11 @@ impl DrainController {
         })
     }
 
-    /// Begin graceful drain, canceling the shared shutdown token and refusing
-    /// all subsequent acquisitions.
+    /// Begin graceful drain and refuse all subsequent acquisitions.
+    /// Existing requests are not canceled until [`Self::cancel_active`] is
+    /// called, so they can finish within the caller's grace period.
     pub fn begin_drain(&self) {
-        let should_cancel = {
+        let started = {
             let mut state = self
                 .inner
                 .state
@@ -106,10 +207,15 @@ impl DrainController {
                 true
             }
         };
-        if should_cancel {
-            self.inner.cancellation.cancel();
+        if started {
             self.inner.notify.notify_waiters();
         }
+    }
+
+    /// Cancel requests that remain after the graceful drain deadline.
+    pub fn cancel_active(&self) {
+        self.inner.cancellation.cancel();
+        self.inner.notify.notify_waiters();
     }
 
     #[must_use]
@@ -130,8 +236,7 @@ impl DrainController {
             .active
     }
 
-    /// A token canceled when draining starts.  Request tasks should select on
-    /// this token together with their downstream disconnect token.
+    /// A token canceled when active requests are force-canceled after drain.
     #[must_use]
     pub fn cancellation_token(&self) -> CancellationToken {
         self.inner.cancellation.clone()
@@ -208,6 +313,9 @@ impl Drop for DrainGuard {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+
     use super::*;
     use tokio::time::Duration;
 
@@ -224,7 +332,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(controller.is_draining());
         assert!(controller.try_acquire().is_none());
-        assert!(controller.cancellation_token().is_cancelled());
+        assert!(!controller.cancellation_token().is_cancelled());
 
         drop(guard);
         assert!(waiter.await.unwrap().is_ok());
@@ -239,5 +347,41 @@ mod tests {
             controller.drain(Duration::from_millis(1)).await,
             Err(DrainError::Timeout { active: 1 })
         );
+    }
+
+    struct PendingBody;
+
+    impl Body for PendingBody {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_wakes_and_stops_a_pending_response_body() {
+        let controller = DrainController::new();
+        let guard = controller.try_acquire().expect("request admitted");
+        let body = DrainedBody::new(PendingBody, guard);
+        let task = tokio::spawn(async move {
+            let mut body = std::pin::pin!(body);
+            body.frame().await
+        });
+        tokio::task::yield_now().await;
+
+        controller.begin_drain();
+        controller.cancel_active();
+        let error = task
+            .await
+            .expect("body task completes")
+            .expect("cancellation frame")
+            .expect_err("forced cancellation must truncate with an error");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(controller.active(), 0);
     }
 }

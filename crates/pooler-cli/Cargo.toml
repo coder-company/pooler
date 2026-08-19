@@ -11,6 +11,10 @@ description = "Command line interface for the Pooler protocol runtime"
 anyhow.workspace = true
 clap.workspace = true
 pooler-config = { path = "../pooler-config" }
+pooler-observe = { path = "../pooler-observe" }
+pooler-server = { path = "../pooler-server" }
+tokio.workspace = true
+tracing.workspace = true
 
 [lib]
 name = "pooler_cli"

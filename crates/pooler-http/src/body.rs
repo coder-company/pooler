@@ -158,18 +158,16 @@ where
     }
 
     fn size_hint(&self) -> SizeHint {
-        let mut hint = self.inner.size_hint();
+        let inner = self.inner.size_hint();
         let remaining = self.limit.saturating_sub(self.seen) as u64;
-        if let Some(upper) = hint.upper() {
+        let mut hint = SizeHint::new();
+        if let Some(upper) = inner.upper() {
             hint.set_upper(upper.min(remaining));
         } else {
             hint.set_upper(remaining);
         }
-        if let Some(lower) = hint.lower().checked_sub(self.seen as u64) {
-            hint.set_lower(lower.min(remaining));
-        } else {
-            hint.set_lower(0);
-        }
+        // The wrapper may fail before yielding any data when a single frame
+        // crosses the limit, so it cannot safely retain the inner lower bound.
         hint
     }
 }

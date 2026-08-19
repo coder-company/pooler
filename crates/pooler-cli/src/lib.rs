@@ -1,7 +1,7 @@
 //! Pooler's command-line interface.
 
-use std::fs;
 use std::path::PathBuf;
+use std::{fs, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -74,7 +74,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Serve => bail!("serve is not implemented in the engineering baseline"),
+        Command::Serve => serve(&cli.config),
         Command::Doctor => bail!("doctor is not implemented in the engineering baseline"),
         Command::Models => bail!("models are not implemented in the engineering baseline"),
         Command::Fixture => bail!("fixture replay is not implemented in the engineering baseline"),
@@ -93,6 +93,69 @@ fn load(path: &PathBuf) -> Result<pooler_config::CompiledConfig> {
     Config::from_path(path)?.compile().map_err(Into::into)
 }
 
+fn serve(path: &PathBuf) -> Result<()> {
+    let config = load(path)?;
+    pooler_observe::init_tracing().context("failed to initialize structured logging")?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to initialize the async runtime")?;
+    runtime.block_on(async move {
+        let server = pooler_server::HttpProxyServer::bind(config).await?;
+        for listener in server.listener_addresses() {
+            tracing::info!(
+                listener = listener.id(),
+                address = listener.address(),
+                "listener bound"
+            );
+        }
+
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        tokio::pin!(runner);
+        tokio::select! {
+            result = &mut runner => {
+                result
+                    .context("HTTP proxy task panicked")?
+                    .map_err(anyhow::Error::from)
+            }
+            signal = shutdown_signal() => {
+                signal?;
+                server
+                    .drain(Duration::from_secs(30))
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                runner
+                    .await
+                    .context("HTTP proxy task panicked")?
+                    .map_err(anyhow::Error::from)
+            }
+        }
+    })
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install SIGTERM handler")?;
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("failed to wait for Ctrl-C")?;
+        }
+        _ = terminate.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to wait for Ctrl-C")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,9 +169,9 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_command_is_explicit() {
+    fn serve_command_is_available() {
         let cli = Cli::try_parse_from(["pooler", "serve"]).expect("command should parse");
-        let error = run(cli).expect_err("serve should not pretend to be implemented");
-        assert!(error.to_string().contains("not implemented"));
+        let error = run(cli).expect_err("missing default config should be reported");
+        assert!(error.to_string().contains("failed to read configuration"));
     }
 }

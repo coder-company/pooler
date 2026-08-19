@@ -16,10 +16,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::Method;
-pub use pooler_core::{BodyMode, ConfigGeneration, LossPolicy};
+pub use pooler_core::{BodyMode, ConfigGeneration, LossPolicy, RouteLimits};
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
+
+mod route_match;
+
+use route_match::{prefix_matches, template_matches};
+pub use route_match::{RouteMatchError, RouteRequest};
 
 /// Current configuration schema version.
 pub const CONFIG_VERSION: u32 = 1;
@@ -309,6 +314,55 @@ pub struct AuthConfig {
     pub secret: Option<SecretRef>,
 }
 
+/// Downstream authentication declaration.
+///
+/// Downstream authentication currently accepts the same secret-reference
+/// shape as upstream authentication, but only bearer authentication is
+/// compiled into a route plan.
+pub type DownstreamAuthConfig = AuthConfig;
+
+/// Route-level resource and timeout limits.
+///
+/// Numeric limits are expressed in their native units. Durations accept the
+/// same `ms`, `s`, `m`, and `h` suffixes used by transport settings, or an
+/// integer number of milliseconds.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct RouteLimitsConfig {
+    /// Maximum decompressed request body size.
+    pub max_request_body_bytes: Option<u64>,
+    /// Maximum buffered response body size.
+    pub max_response_body_bytes: Option<u64>,
+    /// Maximum number of request headers.
+    pub max_header_count: Option<u32>,
+    /// Maximum total request header bytes.
+    pub max_header_bytes: Option<u64>,
+    /// Maximum one transport frame or message.
+    pub max_frame_bytes: Option<u64>,
+    /// Maximum one SSE/event-semantic event.
+    pub max_event_bytes: Option<u64>,
+    /// Maximum bytes retained while deciding whether a stream is committed.
+    pub max_bootstrap_bytes: Option<u64>,
+    /// Maximum events retained while deciding whether a stream is committed.
+    pub max_bootstrap_events: Option<u32>,
+    /// Maximum bytes waiting in one bounded channel.
+    pub max_queue_bytes: Option<u64>,
+    /// Maximum items waiting in one bounded channel.
+    pub max_queue_items: Option<u32>,
+    /// End-to-end request timeout.
+    #[serde(
+        default = "default_request_timeout",
+        deserialize_with = "deserialize_optional_duration"
+    )]
+    pub request_timeout: Option<Duration>,
+    /// Upstream connection/header timeout.
+    #[serde(
+        default = "default_connect_timeout",
+        deserialize_with = "deserialize_optional_duration"
+    )]
+    pub connect_timeout: Option<Duration>,
+}
+
 /// Route declaration.
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -322,6 +376,11 @@ pub struct RouteConfig {
     /// Match dimensions.
     #[serde(rename = "match")]
     pub route_match: Option<MatchConfig>,
+    /// Optional downstream bearer authentication.
+    #[serde(alias = "auth")]
+    pub downstream_auth: Option<DownstreamAuthConfig>,
+    /// Route-level resource and timeout limits.
+    pub limits: Option<RouteLimitsConfig>,
     /// Ingress body handling.
     pub ingress: Option<BodyConfig>,
     /// Response body handling.
@@ -591,6 +650,15 @@ impl MatchPlan {
     }
 }
 
+fn is_template_segment(segment: &str) -> bool {
+    segment.len() > 2
+        && segment.starts_with('{')
+        && segment.ends_with('}')
+        && segment[1..segment.len() - 1]
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
+}
+
 /// Immutable body plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BodyPlan {
@@ -656,6 +724,8 @@ pub struct RoutePlan {
     ingress: BodyPlan,
     response: BodyPlan,
     target: TargetPlan,
+    downstream_auth: Option<AuthPlan>,
+    limits: RouteLimits,
     loss_policy: LossPolicy,
     priority: i32,
     order: usize,
@@ -697,6 +767,18 @@ impl RoutePlan {
     #[must_use]
     pub const fn target(&self) -> &TargetPlan {
         &self.target
+    }
+
+    /// Optional downstream bearer authentication.
+    #[must_use]
+    pub fn downstream_auth(&self) -> Option<&AuthPlan> {
+        self.downstream_auth.as_ref()
+    }
+
+    /// Route-level resource and timeout limits.
+    #[must_use]
+    pub const fn limits(&self) -> &RouteLimits {
+        &self.limits
     }
 
     /// Loss policy.
@@ -954,6 +1036,15 @@ fn compile_config(
             "response",
         )?;
         let target = compile_target(declaration, &label, &upstreams)?;
+        let downstream_auth =
+            compile_downstream_auth(declaration.downstream_auth.as_ref(), &label)?;
+        if listener_requires_auth(&listeners[listener]) && downstream_auth.is_none() {
+            return Err(invalid(
+                &label,
+                "routes on non-loopback listeners require downstream authentication",
+            ));
+        }
+        let limits = compile_limits(declaration.limits.as_ref(), &label)?;
         if declaration.loss_policy.is_some() && ingress.mode() != BodyMode::Semantic {
             return Err(invalid(&label, "loss_policy requires semantic ingress"));
         }
@@ -964,6 +1055,8 @@ fn compile_config(
             ingress,
             response,
             target,
+            downstream_auth,
+            limits,
             loss_policy: declaration.loss_policy.unwrap_or(LossPolicy::Reject),
             priority: declaration.priority.unwrap_or(0),
             order,
@@ -979,6 +1072,13 @@ fn compile_config(
         upstreams,
         routes,
     })
+}
+
+fn listener_requires_auth(listener: &ListenerPlan) -> bool {
+    listener
+        .bind()
+        .parse::<SocketAddr>()
+        .map_or(true, |address| !address.ip().is_loopback())
 }
 
 type CompiledTransport = (Url, Arc<str>, Option<Duration>, Option<Duration>);
@@ -1044,13 +1144,76 @@ fn compile_auth(
         .as_ref()
         .ok_or_else(|| invalid(label, "auth requires a secret reference"))?;
     let kind = auth.kind.as_deref().unwrap_or("bearer_secret").trim();
-    if kind.is_empty() {
-        return Err(invalid(label, "auth kind must not be empty"));
+    if !matches!(kind, "bearer" | "bearer_secret") {
+        return Err(invalid(label, "auth kind must be bearer or bearer_secret"));
+    }
+    if !matches!(secret, SecretRef::Env(_) | SecretRef::File(_)) {
+        return Err(invalid(
+            label,
+            "auth secrets must use an env: or file: reference",
+        ));
     }
     Ok(Some(AuthPlan {
         kind: Arc::from(kind),
         secret: secret.clone(),
     }))
+}
+
+fn compile_downstream_auth(
+    declaration: Option<&DownstreamAuthConfig>,
+    label: &SourceLabel,
+) -> Result<Option<AuthPlan>, ConfigError> {
+    let Some(declaration) = declaration else {
+        return Ok(None);
+    };
+    let plan = compile_auth(Some(declaration), label)?.expect("auth declaration was present");
+    Ok(Some(plan))
+}
+
+fn compile_limits(
+    declaration: Option<&RouteLimitsConfig>,
+    label: &SourceLabel,
+) -> Result<RouteLimits, ConfigError> {
+    let Some(declaration) = declaration else {
+        return Ok(RouteLimits::default());
+    };
+    let mut limits = RouteLimits::default();
+    if let Some(value) = declaration.max_request_body_bytes {
+        limits.max_request_body_bytes = value;
+    }
+    if let Some(value) = declaration.max_response_body_bytes {
+        limits.max_response_body_bytes = value;
+    }
+    if let Some(value) = declaration.max_header_count {
+        limits.max_header_count = value;
+    }
+    if let Some(value) = declaration.max_header_bytes {
+        limits.max_header_bytes = value;
+    }
+    if let Some(value) = declaration.max_frame_bytes {
+        limits.max_frame_bytes = value;
+    }
+    if let Some(value) = declaration.max_event_bytes {
+        limits.max_event_bytes = value;
+    }
+    if let Some(value) = declaration.max_bootstrap_bytes {
+        limits.max_bootstrap_bytes = value;
+    }
+    if let Some(value) = declaration.max_bootstrap_events {
+        limits.max_bootstrap_events = value;
+    }
+    if let Some(value) = declaration.max_queue_bytes {
+        limits.max_queue_bytes = value;
+    }
+    if let Some(value) = declaration.max_queue_items {
+        limits.max_queue_items = value;
+    }
+    limits.request_timeout = declaration.request_timeout;
+    limits.connect_timeout = declaration.connect_timeout;
+    limits
+        .validate()
+        .map_err(|error| invalid(label, &format!("invalid route limits: {error}")))?;
+    Ok(limits)
 }
 
 fn compile_match(
@@ -1081,7 +1244,7 @@ fn compile_match(
     let path = if let Some(path) = declaration.path {
         PathPattern::Exact(valid_path(path, label)?)
     } else if let Some(path) = declaration.path_template {
-        PathPattern::Template(valid_path(path, label)?)
+        PathPattern::Template(valid_template_path(path, label)?)
     } else if let Some(path) = declaration.path_prefix {
         PathPattern::Prefix(valid_path(path, label)?)
     } else {
@@ -1096,10 +1259,7 @@ fn compile_match(
     let mut content_types = Vec::new();
     let mut content_set = BTreeSet::new();
     for content_type in declaration.content_types {
-        let content_type = content_type.trim().to_ascii_lowercase();
-        if content_type.is_empty() {
-            return Err(invalid(label, "content type must not be empty"));
-        }
+        let content_type = normalize_content_type(&content_type, label)?;
         if content_set.insert(content_type.clone()) {
             content_types.push(Arc::from(content_type));
         }
@@ -1256,22 +1416,46 @@ fn lists_overlap(first: &[Arc<str>], second: &[Arc<str>]) -> bool {
 fn paths_overlap(first: &PathPattern, second: &PathPattern) -> bool {
     match (first, second) {
         (PathPattern::Any, _) | (_, PathPattern::Any) => true,
-        (PathPattern::Exact(a), PathPattern::Exact(b))
-        | (PathPattern::Template(a), PathPattern::Template(b)) => a == b,
+        (PathPattern::Exact(a), PathPattern::Exact(b)) => a == b,
         (PathPattern::Prefix(a), PathPattern::Prefix(b)) => {
-            a.starts_with(b.as_ref()) || b.starts_with(a.as_ref())
+            prefix_matches(a, b) || prefix_matches(b, a)
         }
         (PathPattern::Exact(exact), PathPattern::Prefix(prefix))
-        | (PathPattern::Prefix(prefix), PathPattern::Exact(exact)) => {
-            exact.starts_with(prefix.as_ref())
-        }
+        | (PathPattern::Prefix(prefix), PathPattern::Exact(exact)) => prefix_matches(prefix, exact),
         (PathPattern::Template(template), PathPattern::Prefix(prefix))
         | (PathPattern::Prefix(prefix), PathPattern::Template(template)) => {
-            template.starts_with(prefix.as_ref())
+            template_prefix_overlap(template, prefix)
         }
         (PathPattern::Exact(exact), PathPattern::Template(template))
-        | (PathPattern::Template(template), PathPattern::Exact(exact)) => exact == template,
+        | (PathPattern::Template(template), PathPattern::Exact(exact)) => {
+            template_matches(template, exact)
+        }
+        (PathPattern::Template(first), PathPattern::Template(second)) => {
+            template_templates_overlap(first, second)
+        }
     }
+}
+
+fn template_templates_overlap(first: &str, second: &str) -> bool {
+    let first_segments: Vec<_> = first.split('/').skip(1).collect();
+    let second_segments: Vec<_> = second.split('/').skip(1).collect();
+    first_segments.len() == second_segments.len()
+        && first_segments
+            .iter()
+            .zip(second_segments)
+            .all(|(first, second)| {
+                first == &second || is_template_segment(first) || is_template_segment(second)
+            })
+}
+
+fn template_prefix_overlap(template: &str, prefix: &str) -> bool {
+    let template_segments: Vec<_> = template.split('/').skip(1).collect();
+    let prefix_segments: Vec<_> = prefix.split('/').skip(1).collect();
+    prefix_segments.len() <= template_segments.len()
+        && template_segments
+            .iter()
+            .zip(prefix_segments)
+            .all(|(template, prefix)| is_template_segment(template) || template == &prefix)
 }
 
 fn compare_routes(first: &RoutePlan, second: &RoutePlan) -> Ordering {
@@ -1299,20 +1483,57 @@ fn parse_duration(
     let Some(value) = value else {
         return Ok(None);
     };
+    parse_duration_literal(value)
+        .map(Some)
+        .map_err(|message| invalid(label, &format!("{message} {field}")))
+}
+
+fn parse_duration_literal(value: &str) -> Result<Duration, &'static str> {
     let split = value
         .find(|character: char| !character.is_ascii_digit())
-        .ok_or_else(|| invalid(label, &format!("{field} requires a unit")))?;
+        .ok_or("duration requires a unit")?;
+    if split == 0 {
+        return Err("invalid duration");
+    }
     let number = value[..split]
         .parse::<u64>()
-        .map_err(|_| invalid(label, &format!("invalid {field}")))?;
-    let duration = match value[split..].to_ascii_lowercase().as_str() {
-        "ms" => Duration::from_millis(number),
-        "s" => Duration::from_secs(number),
-        "m" => Duration::from_secs(number.saturating_mul(60)),
-        "h" => Duration::from_secs(number.saturating_mul(3600)),
-        _ => return Err(invalid(label, &format!("invalid {field} unit"))),
-    };
-    Ok(Some(duration))
+        .map_err(|_| "invalid duration")?;
+    match value[split..].to_ascii_lowercase().as_str() {
+        "ms" => Ok(Duration::from_millis(number)),
+        "s" => Ok(Duration::from_secs(number)),
+        "m" => Ok(Duration::from_secs(number.saturating_mul(60))),
+        "h" => Ok(Duration::from_secs(number.saturating_mul(3600))),
+        _ => Err("invalid duration unit"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ConfigDuration {
+    Text(String),
+    Millis(u64),
+}
+
+fn deserialize_optional_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<ConfigDuration>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(ConfigDuration::Text(value)) => parse_duration_literal(&value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(ConfigDuration::Millis(value)) => Ok(Some(Duration::from_millis(value))),
+    }
+}
+
+fn default_request_timeout() -> Option<Duration> {
+    RouteLimits::default().request_timeout
+}
+
+fn default_connect_timeout() -> Option<Duration> {
+    RouteLimits::default().connect_timeout
 }
 
 fn valid_path(value: String, label: &SourceLabel) -> Result<Arc<str>, ConfigError> {
@@ -1321,6 +1542,34 @@ fn valid_path(value: String, label: &SourceLabel) -> Result<Arc<str>, ConfigErro
         return Err(invalid(label, "route path must be absolute and query-free"));
     }
     Ok(Arc::from(value))
+}
+
+fn valid_template_path(value: String, label: &SourceLabel) -> Result<Arc<str>, ConfigError> {
+    let path = valid_path(value, label)?;
+    if path
+        .split('/')
+        .skip(1)
+        .any(|segment| segment.contains(['{', '}']) && !is_template_segment(segment))
+    {
+        return Err(invalid(
+            label,
+            "route path template contains an invalid parameter",
+        ));
+    }
+    Ok(path)
+}
+
+fn normalize_content_type(value: &str, label: &SourceLabel) -> Result<String, ConfigError> {
+    let value = value
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if value.is_empty() || value.chars().any(char::is_control) || value.contains(' ') {
+        return Err(invalid(label, "content type must be a valid media type"));
+    }
+    Ok(value)
 }
 
 fn validate_bind(value: &str, label: &SourceLabel) -> Result<(), ConfigError> {
@@ -1588,6 +1837,35 @@ routes:
         let text = "version: 1\nproviders:\n  alpha:\n    url: http://127.0.0.1:1\n  beta:\n    url: not-a-url\nroutes: []\n";
         let error = compile_yaml("multiple.yaml", text).expect_err("invalid URL");
         assert!(error.to_string().contains("multiple.yaml (upstreams.beta)"));
+    }
+
+    #[test]
+    fn non_loopback_routes_require_downstream_authentication() {
+        let without_auth = "version: 1\nlisteners: {remote: {bind: 0.0.0.0:8400}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes: [{id: r, listen: remote, target: local}]\n";
+        let error = compile_yaml("remote.yaml", without_auth).expect_err("auth required");
+        assert!(error
+            .to_string()
+            .contains("require downstream authentication"));
+
+        let with_auth = "version: 1\nlisteners: {remote: {bind: 0.0.0.0:8400}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes: [{id: r, listen: remote, downstream_auth: {secret: env:POOLER_DOWNSTREAM_KEY}, target: local}]\n";
+        compile_yaml("remote-auth.yaml", with_auth).expect("authenticated remote route");
+
+        let unix_without_auth = "version: 1\nlisteners: {local: {bind: /tmp/pooler.sock}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes: [{id: r, listen: local, target: local}]\n";
+        let error = compile_yaml("unix.yaml", unix_without_auth).expect_err("Unix auth required");
+        assert!(error
+            .to_string()
+            .contains("require downstream authentication"));
+    }
+
+    #[test]
+    fn rejects_auth_that_the_http_runtime_cannot_execute() {
+        let keyring = "version: 1\nupstreams: {local: {url: http://127.0.0.1:1, auth: {secret: keyring:pooler/account}}}\n";
+        let error = compile_yaml("keyring.yaml", keyring).expect_err("unsupported source");
+        assert!(error.to_string().contains("env: or file:"));
+
+        let kind = "version: 1\nupstreams: {local: {url: http://127.0.0.1:1, auth: {kind: basic, secret: env:POOLER_KEY}}}\n";
+        let error = compile_yaml("kind.yaml", kind).expect_err("unsupported kind");
+        assert!(error.to_string().contains("bearer or bearer_secret"));
     }
 
     #[test]

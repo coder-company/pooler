@@ -8,12 +8,19 @@ repository.workspace = true
 
 [dependencies]
 bytes.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
 http.workspace = true
 http-body = "1.0"
 http-body-util.workspace = true
+pooler-config = { path = "../pooler-config" }
+pooler-auth = { path = "../pooler-auth" }
+pooler-core = { path = "../pooler-core" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

@@ -7,11 +7,13 @@
 //! configuration observed by an in-flight request.
 
 mod config_store;
+mod http_runtime;
 mod lifecycle;
 mod listener;
 mod server;
 
 pub use config_store::{ConfigSnapshot, ConfigStore, ConfigStoreError};
+pub use http_runtime::{HttpProxyServer, HttpProxyServerError, ListenerAddress};
 pub use lifecycle::{Lifecycle, LifecycleError, LifecycleState};
 pub use listener::{ListenerPreparationFuture, ListenerPreparer, PreparedListeners};
 pub use pooler_core::ConfigGeneration;
