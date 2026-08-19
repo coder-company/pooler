@@ -6,10 +6,20 @@ version = 4
 name = "adapter-factory"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "pooler-config",
+ "pooler-core",
  "pooler-http",
  "pooler-protocol",
+ "pooler-testkit",
+ "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -818,6 +828,7 @@ dependencies = [
 name = "pooler-server"
 version = "0.1.0"
 dependencies = [
+ "adapter-factory",
  "arc-swap",
  "hyper",
  "hyper-util",

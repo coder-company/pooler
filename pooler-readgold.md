@@ -27,8 +27,11 @@ name or advertised without conformance evidence.
   can be claimed.
 - Phase 3 — semantic events and Factory: in progress. The protocol-neutral model,
   loss-accounted OpenAI Chat codecs, bounded incremental SSE framing, and grounded
-  Factory LanguageModel V3 request/event codecs are implemented and unit tested.
-  Runtime semantic dispatch and current sanitized Factory fixtures remain.
+  Factory LanguageModel V3 request/event codecs are implemented. Runtime semantic
+  dispatch streams fragmented events with bounded backpressure and pre-connect loss
+  enforcement. Sanitized local-reference fixtures cover text, reasoning, tools, and
+  usage. Evidence from a current real Factory client remains before compatibility can
+  be claimed.
 - Phases 4–8: pending.
 - First useful release acceptance: pending.
 

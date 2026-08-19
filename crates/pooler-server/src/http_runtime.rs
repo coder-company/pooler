@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use adapter_factory::FactorySemanticAdapter;
 use hyper::{body::Incoming, http::Request, service::service_fn};
 use hyper_util::rt::TokioIo;
 use pooler_config::CompiledConfig;
@@ -21,6 +22,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 const FORCE_CANCEL_GRACE: Duration = Duration::from_secs(1);
+
+type RuntimeProxy = HttpProxy<FactorySemanticAdapter>;
 
 /// A listener's concrete address after binding.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,13 +74,13 @@ enum BoundListener {
     Tcp {
         id: Arc<str>,
         listener: TcpListener,
-        proxy: Arc<HttpProxy>,
+        proxy: Arc<RuntimeProxy>,
     },
     Unix {
         id: Arc<str>,
         listener: UnixListener,
         path: UnixSocketPath,
-        proxy: Arc<HttpProxy>,
+        proxy: Arc<RuntimeProxy>,
     },
 }
 
@@ -91,7 +94,7 @@ impl Drop for UnixSocketPath {
 
 struct RuntimeState {
     listeners: Mutex<Option<Vec<BoundListener>>>,
-    proxies: Vec<Arc<HttpProxy>>,
+    proxies: Vec<Arc<RuntimeProxy>>,
     cancellation: CancellationToken,
 }
 
@@ -123,7 +126,11 @@ impl HttpProxyServer {
 
         for plan in config.listeners().values() {
             let id: Arc<str> = Arc::from(plan.id());
-            let proxy = Arc::new(HttpProxy::new(Arc::clone(&config), Arc::clone(&id))?);
+            let proxy = Arc::new(HttpProxy::with_semantic_adapter(
+                Arc::clone(&config),
+                Arc::clone(&id),
+                FactorySemanticAdapter,
+            )?);
             let bind = plan.bind();
             if bind.starts_with('/') || bind.starts_with("unix:") {
                 let path = bind.strip_prefix("unix:").unwrap_or(bind);
@@ -386,7 +393,7 @@ async fn accept_loop(
 async fn serve_connection<I>(
     io: TokioIo<I>,
     listener_id: Arc<str>,
-    proxy: Arc<HttpProxy>,
+    proxy: Arc<RuntimeProxy>,
     cancellation: CancellationToken,
 ) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -569,6 +576,35 @@ mod tests {
                 return Ok(bytes);
             }
         }
+    }
+
+    async fn read_response_until(stream: &mut TcpStream, marker: &[u8]) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok(bytes);
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if bytes.windows(marker.len()).any(|window| window == marker) {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    async fn send_request_until(address: SocketAddr, request: &[u8], marker: &[u8]) -> Vec<u8> {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("downstream connects");
+        stream
+            .write_all(request)
+            .await
+            .expect("downstream request bytes");
+        tokio::time::timeout(TEST_TIMEOUT, read_response_until(&mut stream, marker))
+            .await
+            .expect("downstream response arrives before timeout")
+            .expect("downstream response bytes")
     }
 
     fn header_end(bytes: &[u8]) -> Option<usize> {
@@ -1177,6 +1213,327 @@ mod tests {
         assert!(String::from_utf8_lossy(&upstream_request)
             .to_ascii_lowercase()
             .contains("authorization: bearer cursor-token"));
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn streams_factory_semantics_from_fragmented_openai_sse() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let upstream_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_for_task = Arc::clone(&upstream_finished);
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+            let request = read_request(&mut stream).await.expect("upstream request");
+            let request_body = response_body(&request);
+            let request_json: serde_json::Value =
+                serde_json::from_slice(request_body).expect("OpenAI request JSON");
+            assert_eq!(request_json["model"], "gpt-test");
+            assert_eq!(request_json["stream"], true);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("upstream response headers");
+            stream
+                .write_all(
+                    b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n",
+                )
+                .await
+                .expect("first SSE fragment");
+            stream.write_all(b"\n").await.expect("first SSE delimiter");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stream
+                .write_all(
+                    b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+                )
+                .await
+                .expect("text SSE event");
+            stream
+                .write_all(
+                    b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+                )
+                .await
+                .expect("finish SSE event");
+            stream
+                .write_all(b"data: [DONE]\n\n")
+                .await
+                .expect("SSE done event");
+            finished_for_task.store(true, Ordering::Release);
+            request
+        });
+
+        let config = pooler_config::compile_yaml(
+            "factory-runtime.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
+            ),
+        )
+        .expect("Factory semantic route compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let body = br#"{"prompt":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#;
+        let mut downstream = TcpStream::connect(address)
+            .await
+            .expect("downstream connects");
+        let request = format!(
+            "POST /v3/ai/language-model HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Type: application/json\r\nAI-Language-Model-Id: gpt-test\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        downstream
+            .write_all(request.as_bytes())
+            .await
+            .expect("Factory request bytes");
+        let mut response = read_headers(&mut downstream)
+            .await
+            .expect("downstream response headers");
+        assert_eq!(status(&response), 200);
+        assert!(String::from_utf8_lossy(&response)
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"));
+        let body_start = header_end(&response).expect("response header delimiter") + 4;
+        let mut first_event = response.split_off(body_start);
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while !first_event
+                .windows(b"response-metadata".len())
+                .any(|window| window == b"response-metadata")
+            {
+                let mut chunk = [0_u8; 1024];
+                let read = downstream
+                    .read(&mut chunk)
+                    .await
+                    .expect("first event bytes");
+                assert_ne!(read, 0, "semantic stream closed before first event");
+                first_event.extend_from_slice(&chunk[..read]);
+            }
+        })
+        .await
+        .expect("first Factory event arrives");
+        assert!(!upstream_finished.load(Ordering::Acquire));
+
+        let rest = if first_event
+            .windows(b"data: [DONE]\n\n".len())
+            .any(|window| window == b"data: [DONE]\n\n")
+        {
+            Vec::new()
+        } else {
+            read_response_until(&mut downstream, b"data: [DONE]\n\n")
+                .await
+                .expect("remaining semantic stream")
+        };
+        first_event.extend_from_slice(&rest);
+        assert!(first_event
+            .windows(b"text-delta".len())
+            .any(|window| window == b"text-delta"));
+        assert!(first_event
+            .windows(b"\"type\":\"finish\"".len())
+            .any(|window| window == b"\"type\":\"finish\""));
+        drop(downstream);
+        let upstream_request = upstream.await.expect("upstream task");
+        let upstream_request_text = String::from_utf8_lossy(&upstream_request).to_ascii_lowercase();
+        assert!(upstream_request_text.contains("/v1/chat/completions"));
+        for header in [
+            "ai-language-model-id:",
+            "ai-language-model-specification-version:",
+            "ai-language-model-streaming:",
+        ] {
+            assert!(!upstream_request_text.contains(header));
+        }
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn semantic_factory_route_streams_fragmented_openai_sse() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+            let request = read_request(&mut stream).await.expect("upstream request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("upstream headers");
+            for fragment in [
+                b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{" as &[u8],
+                b"\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+                b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+                b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+                b"data: [DONE]\n\n",
+            ] {
+                stream
+                    .write_all(fragment)
+                    .await
+                    .expect("upstream SSE fragment");
+                tokio::task::yield_now().await;
+            }
+            request
+        });
+
+        let config = pooler_config::compile_yaml(
+            "semantic-factory.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
+            ),
+        )
+        .expect("semantic route config");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"prompt":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#;
+        let mut request = format!(
+            "POST /v3/ai/language-model HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nai-language-model-id: gpt-test\r\nai-language-model-specification-version: 3\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        let response = send_request_until(address, &request, b"data: [DONE]\n\n").await;
+        assert_eq!(status(&response), 200);
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.contains("\"type\":\"response-metadata\""));
+        assert!(response_text.contains("\"type\":\"text-delta\""));
+        assert!(response_text.contains("hello"));
+        assert!(response_text.contains("data: [DONE]\n\n"));
+        assert!(!response_text
+            .to_ascii_lowercase()
+            .contains("content-length:"));
+        let upstream_request = upstream.await.expect("upstream task");
+        let upstream_body: serde_json::Value =
+            serde_json::from_slice(response_body(&upstream_request)).expect("OpenAI JSON");
+        assert_eq!(upstream_body["model"], "gpt-test");
+        assert_eq!(upstream_body["stream"], true);
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn semantic_loss_rejection_happens_before_upstream_connect() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let config = pooler_config::compile_yaml(
+            "semantic-reject.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
+            ),
+        )
+        .expect("semantic route config");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"prompt":[{"role":"user","content":[{"type":"file","data":{"type":"url","url":"https://example.test/input.txt"}}]}]}"#;
+        let mut request = format!(
+            "POST /v3/ai/language-model HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nai-language-model-id: gpt-test\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        let response = send_request_until(address, &request, b"invalid request").await;
+        assert_eq!(status(&response), 400);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), upstream_listener.accept())
+                .await
+                .is_err()
+        );
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn semantic_converted_request_respects_request_body_limit() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let config = pooler_config::compile_yaml(
+            "semantic-request-limit.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    limits: {{max_request_body_bytes: 100}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
+            ),
+        )
+        .expect("semantic route config");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"prompt":[{"role":"user","content":[{"type":"text","text":"x"}]}]}"#;
+        let mut request = format!(
+            "POST /v3/ai/language-model HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nai-language-model-id: gpt-test\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        let response = send_request(address, &request).await;
+        assert_eq!(status(&response), 413);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), upstream_listener.accept())
+                .await
+                .is_err()
+        );
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn semantic_raw_request_frame_limit_rejects_before_upstream() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let config = pooler_config::compile_yaml(
+            "semantic-frame-limit.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    limits: {{max_frame_bytes: 8, max_request_body_bytes: 4096}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
+            ),
+        )
+        .expect("semantic route config");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body =
+            br#"{"prompt":[{"role":"user","content":[{"type":"text","text":"raw frame"}]}]}"#;
+        let mut request = format!(
+            "POST /v3/ai/language-model HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nai-language-model-id: gpt-test\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        let response = send_request(address, &request).await;
+        assert_eq!(status(&response), 413);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), upstream_listener.accept())
+                .await
+                .is_err()
+        );
         stop_server(&server, runner).await;
     }
 }

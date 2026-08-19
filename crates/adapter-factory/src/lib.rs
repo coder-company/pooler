@@ -5,15 +5,31 @@ The codec intentionally implements only the documented language-model request
 and stream-part contract. A current Factory request/response fixture is still
 required before the product can claim end-to-end Factory compatibility."]
 
-use pooler_http::{SseEncoder, SseError, SseEvent, SseLimits};
+use bytes::Bytes;
+use http::{HeaderMap, HeaderValue};
+use http_body::{Body, Frame, SizeHint};
+use http_body_util::BodyExt;
+use pooler_config::RoutePlan;
+use pooler_http::{
+    BoxError, ProxyBody, SemanticAdapter, SemanticRequestBody, SemanticResponseBody, SseEncoder,
+    SseError, SseEvent, SseLimits, SseParser,
+};
+use pooler_protocol::OpenAiChatEventDecoder;
 use pooler_protocol::{
     ContentPart, ConversionError, ConversionReport, ExtensionKey, Extensions, FinishReason,
     LossPolicy, MediaSource, Message, OpaqueExtension, PreservedJson, ReasoningBlock,
-    RequestValidationError, ResponseFormat, Role, SemanticRequest, StreamError, StreamEvent,
-    StreamEventKind, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    ReasoningConfig, ReasoningEffort, RequestValidationError, ResponseFormat, Role,
+    SemanticRequest, StreamError, StreamEvent, StreamEventKind, ToolCall, ToolChoice,
+    ToolDefinition, ToolResult, Usage,
 };
 use serde_json::{Map, Value};
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 /// Factory language-model route named by the architecture plan.
 pub const FACTORY_LANGUAGE_MODEL_PATH: &str = "/v3/ai/language-model";
@@ -25,6 +41,10 @@ pub const MODEL_ID_HEADER: &str = "ai-language-model-id";
 pub const STREAMING_HEADER: &str = "ai-language-model-streaming";
 /// LanguageModel V3 specification version.
 pub const SPECIFICATION_VERSION_V3: &str = "3";
+
+/// Semantic adapter mounted by the HTTP runtime for Factory LanguageModel V3.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FactorySemanticAdapter;
 
 /// Bounds applied before a Factory request is converted into semantic values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,6 +186,7 @@ impl FactoryLanguageModelDecoder {
             )?);
         }
         decode_sampling(object, &mut request, &mut report)?;
+        decode_reasoning(object, &mut request)?;
         preserve_provider_options(
             object.get("providerOptions"),
             &mut request.extensions,
@@ -734,6 +755,42 @@ fn decode_sampling(
     Ok(())
 }
 
+fn decode_reasoning(
+    object: &Map<String, Value>,
+    request: &mut SemanticRequest,
+) -> Result<(), FactoryDecodeError> {
+    let Some(value) = object.get("reasoning") else {
+        return Ok(());
+    };
+    let value = value.as_object().ok_or(FactoryDecodeError::InvalidField {
+        field: "reasoning",
+        reason: "must be an object",
+    })?;
+    let effort =
+        value
+            .get("effort")
+            .and_then(Value::as_str)
+            .ok_or(FactoryDecodeError::InvalidField {
+                field: "reasoning.effort",
+                reason: "must be a string",
+            })?;
+    request.reasoning = Some(ReasoningConfig {
+        effort: Some(match effort {
+            "low" => ReasoningEffort::Low,
+            "medium" => ReasoningEffort::Medium,
+            "high" => ReasoningEffort::High,
+            "max" => ReasoningEffort::Max,
+            other => ReasoningEffort::Custom(other.to_owned()),
+        }),
+        include_summary: value
+            .get("includeSummary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        extensions: Extensions::default(),
+    });
+    Ok(())
+}
+
 fn optional_number(
     object: &Map<String, Value>,
     field: &'static str,
@@ -1017,9 +1074,10 @@ impl FactoryEventEncoder {
         let encoded = self.encode_json(event, policy)?;
         let data =
             String::from_utf8(encoded.body).map_err(|_| FactoryEncodeError::InvalidUtf8Json)?;
-        let body = SseEncoder::with_limits(limits)
+        let mut body = SseEncoder::with_limits(limits)
             .encode(&SseEvent::new(data))
             .map_err(FactoryEncodeError::Sse)?;
+        add_factory_data_space(&mut body, limits).map_err(FactoryEncodeError::Sse)?;
         Ok(EncodedFactoryEvent {
             body,
             report: encoded.report,
@@ -1176,6 +1234,32 @@ impl FactoryEventEncoder {
     }
 }
 
+fn add_factory_data_space(body: &mut Vec<u8>, limits: SseLimits) -> Result<(), SseError> {
+    if !body.starts_with(b"data:") || body.starts_with(b"data: ") {
+        return Ok(());
+    }
+    let line_length = body
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(body.len())
+        .saturating_add(1);
+    if line_length > limits.max_line_bytes {
+        return Err(SseError::LineTooLarge {
+            limit: limits.max_line_bytes,
+            observed: line_length,
+        });
+    }
+    let event_length = body.len().saturating_add(1);
+    if event_length > limits.max_event_bytes {
+        return Err(SseError::EventTooLarge {
+            limit: limits.max_event_bytes,
+            observed: event_length,
+        });
+    }
+    body.insert(5, b' ');
+    Ok(())
+}
+
 /// Errors raised while encoding semantic events for LanguageModel V3.
 #[derive(Debug, Error)]
 pub enum FactoryEncodeError {
@@ -1203,6 +1287,369 @@ pub enum FactoryEncodeError {
     /// A provider extension collided with a standard metadata field.
     #[error("Factory provider extension `{0}` collides with standard metadata")]
     ExtensionCollision(String),
+}
+
+impl SemanticAdapter for FactorySemanticAdapter {
+    fn supports(&self, route: &RoutePlan) -> bool {
+        route.ingress().mode() == pooler_core::BodyMode::Semantic
+            && route.ingress().decoder() == Some("decode.factory.language_model")
+            && route.response().mode() == pooler_core::BodyMode::Semantic
+            && route.response().decoder() == Some("decode.openai.chat.events")
+            && route.response().encoder() == Some("encode.factory.events")
+    }
+
+    fn encode_request(
+        &self,
+        route: &RoutePlan,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<SemanticRequestBody, BoxError> {
+        validate_factory_headers(headers)?;
+        let model = headers
+            .get(MODEL_ID_HEADER)
+            .ok_or(FactoryAdapterError::MissingModelHeader)?
+            .to_str()
+            .map_err(|_| FactoryAdapterError::InvalidModelHeader)?
+            .trim();
+        if model.is_empty() {
+            return Err(Box::new(FactoryAdapterError::MissingModelHeader));
+        }
+        let decoder = FactoryLanguageModelDecoder::new(FactoryDecodeOptions {
+            file_policy: if route.loss_policy().allows_degradation() {
+                FactoryFilePolicy::Degrade
+            } else {
+                FactoryFilePolicy::Reject
+            },
+            ..FactoryDecodeOptions::default()
+        });
+        let decoded = decoder
+            .decode(body, model)
+            .map_err(|error| Box::new(error) as BoxError)?;
+        decoded
+            .report
+            .validate(route.loss_policy())
+            .map_err(|error| Box::new(error) as BoxError)?;
+        let encoded =
+            pooler_protocol::OpenAiChatCodec::encode_request(&decoded.request, route.loss_policy())
+                .map_err(|error| Box::new(error) as BoxError)?;
+        let mut value: Value =
+            serde_json::from_slice(&encoded.body).map_err(|error| Box::new(error) as BoxError)?;
+        let object = value
+            .as_object_mut()
+            .ok_or(FactoryAdapterError::EncodedRequestNotObject)?;
+        object.insert("stream".to_owned(), Value::Bool(true));
+        object.insert(
+            "stream_options".to_owned(),
+            serde_json::json!({"include_usage": true}),
+        );
+        Ok(SemanticRequestBody {
+            body: serde_json::to_vec(&value)?,
+            content_type: HeaderValue::from_static("application/json"),
+        })
+    }
+
+    fn sanitize_request_headers(&self, headers: &mut HeaderMap) {
+        headers.remove(SPECIFICATION_VERSION_HEADER);
+        headers.remove(MODEL_ID_HEADER);
+        headers.remove(STREAMING_HEADER);
+    }
+
+    fn decode_response(
+        &self,
+        route: &RoutePlan,
+        body: ProxyBody,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        let line_limit = usize_limit(route.limits().max_frame_bytes);
+        let event_limit = usize_limit(route.limits().max_event_bytes);
+        let limits = SseLimits::new(line_limit, event_limit);
+        let stream = FactoryResponseBody::new(
+            body,
+            route.loss_policy(),
+            limits,
+            usize_limit(u64::from(route.limits().max_queue_items)),
+            usize_limit(route.limits().max_queue_bytes),
+            cancellation,
+        );
+        Ok(SemanticResponseBody {
+            body: stream.boxed(),
+            content_type: HeaderValue::from_static("text/event-stream"),
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+enum FactoryAdapterError {
+    #[error("missing {MODEL_ID_HEADER} header")]
+    MissingModelHeader,
+    #[error("{MODEL_ID_HEADER} header is not valid UTF-8")]
+    InvalidModelHeader,
+    #[error("encoded OpenAI request is not an object")]
+    EncodedRequestNotObject,
+    #[error("Factory specification version must be 3")]
+    InvalidSpecificationVersion,
+    #[error("Factory streaming header is not valid")]
+    InvalidStreamingHeader,
+    #[error("Factory semantic route requires streaming=true")]
+    StreamingDisabled,
+}
+
+fn validate_factory_headers(headers: &HeaderMap) -> Result<(), FactoryAdapterError> {
+    if let Some(value) = headers.get(SPECIFICATION_VERSION_HEADER) {
+        let value = value
+            .to_str()
+            .map_err(|_| FactoryAdapterError::InvalidSpecificationVersion)?;
+        if value.trim() != SPECIFICATION_VERSION_V3 {
+            return Err(FactoryAdapterError::InvalidSpecificationVersion);
+        }
+    }
+    if let Some(value) = headers.get(STREAMING_HEADER) {
+        let value = value
+            .to_str()
+            .map_err(|_| FactoryAdapterError::InvalidStreamingHeader)?;
+        if !value.eq_ignore_ascii_case("true") {
+            if value.eq_ignore_ascii_case("false") {
+                return Err(FactoryAdapterError::StreamingDisabled);
+            }
+            return Err(FactoryAdapterError::InvalidStreamingHeader);
+        }
+    }
+    Ok(())
+}
+
+fn usize_limit(value: u64) -> usize {
+    value.min(usize::MAX as u64) as usize
+}
+
+struct FactoryResponseBody {
+    inner: Pin<Box<ProxyBody>>,
+    parser: SseParser,
+    limits: SseLimits,
+    decoder: OpenAiChatEventDecoder,
+    encoder: FactoryEventEncoder,
+    policy: LossPolicy,
+    queue: VecDeque<Bytes>,
+    queued_bytes: usize,
+    max_queue_items: usize,
+    max_queue_bytes: usize,
+    cancellation: CancellationToken,
+    done_seen: bool,
+    ended: bool,
+    error: Option<BoxError>,
+}
+
+impl FactoryResponseBody {
+    fn new(
+        body: ProxyBody,
+        policy: LossPolicy,
+        limits: SseLimits,
+        max_queue_items: usize,
+        max_queue_bytes: usize,
+        cancellation: CancellationToken,
+    ) -> Self {
+        Self {
+            inner: Box::pin(body),
+            parser: SseParser::with_limits(limits),
+            limits,
+            decoder: OpenAiChatEventDecoder::new(),
+            encoder: FactoryEventEncoder,
+            policy,
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            max_queue_items,
+            max_queue_bytes,
+            cancellation,
+            done_seen: false,
+            ended: false,
+            error: None,
+        }
+    }
+
+    fn set_error(&mut self, error: BoxError) {
+        if self.error.is_some() {
+            return;
+        }
+        if !self.done_seen {
+            let failure = StreamEvent::new(
+                0,
+                StreamEventKind::Failure {
+                    error: StreamError::new(
+                        "invalid_upstream_stream",
+                        "the upstream semantic stream could not be converted",
+                    ),
+                },
+            );
+            if let Ok(encoded) =
+                self.encoder
+                    .encode_sse_with_limits(&failure, self.policy, self.limits)
+            {
+                if self.enqueue(Bytes::from(encoded.body)).is_ok() {
+                    if let Ok(done) = self.done_bytes() {
+                        let _ = self.enqueue(done);
+                    }
+                }
+            }
+        }
+        self.error = Some(error);
+    }
+
+    fn done_bytes(&self) -> Result<Bytes, BoxError> {
+        let mut done = SseEncoder::with_limits(self.limits)
+            .encode(&SseEvent::new("[DONE]"))
+            .map_err(|error| Box::new(error) as BoxError)?;
+        add_factory_data_space(&mut done, self.limits)
+            .map_err(|error| Box::new(error) as BoxError)?;
+        Ok(Bytes::from(done))
+    }
+
+    fn process_chunk(&mut self, chunk: &[u8]) -> Result<(), BoxError> {
+        let events = self
+            .parser
+            .feed(chunk)
+            .map_err(|error| Box::new(error) as BoxError)?;
+        for event in events {
+            self.process_sse_event(&event)?;
+        }
+        Ok(())
+    }
+
+    fn process_sse_event(&mut self, event: &SseEvent) -> Result<(), BoxError> {
+        if event.is_done() {
+            if self.done_seen {
+                return Err(Box::new(FactoryStreamError::DuplicateDone));
+            }
+            self.done_seen = true;
+        }
+        let events = self
+            .decoder
+            .decode_data(event.data.as_bytes())
+            .map_err(|error| Box::new(error) as BoxError)?;
+        for event in events {
+            let encoded = self
+                .encoder
+                .encode_sse_with_limits(&event, self.policy, self.limits)
+                .map_err(|error| Box::new(error) as BoxError)?;
+            self.enqueue(Bytes::from(encoded.body))?;
+        }
+        if event.is_done() {
+            let done = self.done_bytes()?;
+            self.enqueue(done)?;
+        }
+        Ok(())
+    }
+
+    fn enqueue(&mut self, bytes: Bytes) -> Result<(), BoxError> {
+        let next_items = self.queue.len().saturating_add(1);
+        let next_bytes = self.queued_bytes.saturating_add(bytes.len());
+        if next_items > self.max_queue_items || next_bytes > self.max_queue_bytes {
+            return Err(Box::new(FactoryStreamError::QueueLimit {
+                items: next_items,
+                bytes: next_bytes,
+            }));
+        }
+        self.queued_bytes = next_bytes;
+        self.queue.push_back(bytes);
+        Ok(())
+    }
+
+    fn finish_upstream(&mut self) -> Result<(), BoxError> {
+        let events = self
+            .parser
+            .finish()
+            .map_err(|error| Box::new(error) as BoxError)?;
+        for event in events {
+            self.process_sse_event(&event)?;
+        }
+        if !self.done_seen {
+            return Err(Box::new(FactoryStreamError::MissingDone));
+        }
+        self.ended = true;
+        Ok(())
+    }
+}
+
+impl Body for FactoryResponseBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        if this.cancellation.is_cancelled() {
+            this.ended = true;
+            return Poll::Ready(Some(Err(Box::new(FactoryStreamError::Cancelled))));
+        }
+        if let Some(bytes) = this.queue.pop_front() {
+            this.queued_bytes = this.queued_bytes.saturating_sub(bytes.len());
+            return Poll::Ready(Some(Ok(Frame::data(bytes))));
+        }
+        if let Some(error) = this.error.take() {
+            this.ended = true;
+            return Poll::Ready(Some(Err(error)));
+        }
+        if this.ended {
+            return Poll::Ready(None);
+        }
+
+        match this.inner.as_mut().poll_frame(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                if let Err(error) = this.finish_upstream() {
+                    this.set_error(error);
+                    return Pin::new(this).poll_frame(context);
+                }
+                if let Some(bytes) = this.queue.pop_front() {
+                    this.queued_bytes = this.queued_bytes.saturating_sub(bytes.len());
+                    Poll::Ready(Some(Ok(Frame::data(bytes))))
+                } else {
+                    Poll::Ready(None)
+                }
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.set_error(error);
+                Pin::new(this).poll_frame(context)
+            }
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => {
+                    if let Err(error) = this.process_chunk(&data) {
+                        this.set_error(error);
+                    }
+                    Pin::new(this).poll_frame(context)
+                }
+                Err(frame) => match frame.into_trailers() {
+                    Ok(_) => Pin::new(this).poll_frame(context),
+                    Err(_) => {
+                        this.set_error(Box::new(FactoryStreamError::InvalidFrame));
+                        Pin::new(this).poll_frame(context)
+                    }
+                },
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended && self.queue.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::new()
+    }
+}
+
+#[derive(Debug, Error)]
+enum FactoryStreamError {
+    #[error("Factory upstream SSE ended without [DONE]")]
+    MissingDone,
+    #[error("Factory upstream SSE contained duplicate [DONE] markers")]
+    DuplicateDone,
+    #[error("Factory semantic response queue exceeded {items} items or {bytes} bytes")]
+    QueueLimit { items: usize, bytes: usize },
+    #[error("Factory semantic response contained an invalid body frame")]
+    InvalidFrame,
+    #[error("Factory semantic response canceled")]
+    Cancelled,
 }
 
 fn object_with_type(kind: &str) -> Map<String, Value> {
@@ -1909,5 +2356,115 @@ mod tests {
             FactoryEventEncoder.encode_json(&event, LossPolicy::Reject),
             Err(FactoryEncodeError::UnsupportedEvent("refusal"))
         ));
+        assert!(matches!(
+            FactoryEventEncoder.encode_json(&event, LossPolicy::Degrade),
+            Err(FactoryEncodeError::UnsupportedEvent("refusal"))
+        ));
+
+        let completion_without_usage =
+            StreamEvent::new(2, StreamEventKind::completion(FinishReason::Stop, None));
+        assert!(matches!(
+            FactoryEventEncoder.encode_json(&completion_without_usage, LossPolicy::Degrade),
+            Err(FactoryEncodeError::MissingUsage)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_done_markers_after_stream_completion() {
+        let body = http_body_util::Full::new(Bytes::from_static(
+            b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\ndata: [DONE]\n\n",
+        ))
+        .map_err(|never: std::convert::Infallible| match never {})
+        .boxed();
+        let response = FactoryResponseBody::new(
+            body,
+            LossPolicy::Reject,
+            SseLimits::default(),
+            16,
+            4096,
+            CancellationToken::new(),
+        );
+        let error = response
+            .collect()
+            .await
+            .expect_err("duplicate done marker must fail");
+        assert!(error.to_string().contains("duplicate [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn emits_factory_error_event_before_incomplete_stream_closes() {
+        let body = http_body_util::Full::new(Bytes::from_static(
+            b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[]}\n\n",
+        ))
+        .map_err(|never: std::convert::Infallible| match never {})
+        .boxed();
+        let mut response = FactoryResponseBody::new(
+            body,
+            LossPolicy::Reject,
+            SseLimits::default(),
+            16,
+            4096,
+            CancellationToken::new(),
+        );
+        let mut saw_error = false;
+        let error = loop {
+            match response.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        saw_error |= data
+                            .windows(b"\"type\":\"error\"".len())
+                            .any(|window| window == b"\"type\":\"error\"");
+                    }
+                }
+                Some(Err(error)) => break error,
+                None => panic!("incomplete stream must fail"),
+            }
+        };
+        assert!(saw_error);
+        assert!(error.to_string().contains("without [DONE]"));
+    }
+
+    #[test]
+    fn validates_and_strips_factory_only_request_headers() {
+        let route = pooler_config::compile_yaml(
+            "factory-route.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+routes:
+  - id: factory
+    listen: local
+    ingress: {mode: semantic, decoder: decode.factory.language_model}
+    target: local
+    response: {mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}
+    loss_policy: reject
+"#,
+        )
+        .expect("factory route")
+        .routes()[0]
+            .clone();
+        let body = br#"{"prompt":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#;
+        let adapter = FactorySemanticAdapter;
+        let mut headers = HeaderMap::new();
+        headers.insert(MODEL_ID_HEADER, HeaderValue::from_static("gpt-test"));
+        headers.insert(SPECIFICATION_VERSION_HEADER, HeaderValue::from_static("2"));
+        headers.insert(STREAMING_HEADER, HeaderValue::from_static("true"));
+        assert!(matches!(
+            adapter.encode_request(&route, &headers, body),
+            Err(error) if error.to_string().contains("version must be 3")
+        ));
+
+        headers.insert(
+            SPECIFICATION_VERSION_HEADER,
+            HeaderValue::from_static(SPECIFICATION_VERSION_V3),
+        );
+        adapter
+            .encode_request(&route, &headers, body)
+            .expect("valid Factory headers");
+        adapter.sanitize_request_headers(&mut headers);
+        assert!(headers.get(MODEL_ID_HEADER).is_none());
+        assert!(headers.get(SPECIFICATION_VERSION_HEADER).is_none());
+        assert!(headers.get(STREAMING_HEADER).is_none());
     }
 }

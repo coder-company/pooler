@@ -172,6 +172,77 @@ where
     }
 }
 
+/// A streaming body wrapper that rejects any single data frame larger than
+/// `limit`. The aggregate byte count is enforced separately by
+/// [`LimitedBody`]. Trailers pass through unchanged.
+pub struct FrameLimitedBody<B> {
+    inner: Pin<Box<B>>,
+    limit: usize,
+}
+
+impl<B> FrameLimitedBody<B> {
+    /// Wraps `inner` with a per-data-frame bound.
+    #[must_use]
+    pub fn new(inner: B, limit: usize) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            limit,
+        }
+    }
+
+    /// Maximum bytes accepted in one data frame.
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl<B> Body for FrameLimitedBody<B>
+where
+    B: Body,
+    B::Data: Buf,
+{
+    type Data = B::Data;
+    type Error = BodyLimitError<B::Error>;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.inner.as_mut().poll_frame(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(error))) => {
+                Poll::Ready(Some(Err(BodyLimitError::Upstream(error))))
+            }
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => {
+                    let observed = data.remaining();
+                    if observed > self.limit {
+                        return Poll::Ready(Some(Err(BodyLimitError::TooLarge {
+                            limit: self.limit,
+                            observed,
+                        })));
+                    }
+                    Poll::Ready(Some(Ok(Frame::data(data))))
+                }
+                Err(frame) => match frame.into_trailers() {
+                    Ok(trailers) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
+                    Err(_) => Poll::Ready(Some(Err(BodyLimitError::InvalidFrame))),
+                },
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Read a body into memory while enforcing a decoded-byte limit.
 ///
 /// The limit is checked against a body's known lower size bound before
@@ -345,6 +416,22 @@ mod tests {
             BodyLimitError::TooLarge {
                 limit: 3,
                 observed: 4
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_limited_wrapper_rejects_one_large_frame() {
+        let frames = stream::iter([Ok::<_, Infallible>(Frame::data(Bytes::from_static(
+            b"abcd",
+        )))]);
+        let body = StreamBody::new(frames);
+        let mut bounded = FrameLimitedBody::new(body, 3);
+        assert_eq!(
+            bounded.frame().await.unwrap().unwrap_err(),
+            BodyLimitError::TooLarge {
+                limit: 3,
+                observed: 4,
             }
         );
     }

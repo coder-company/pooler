@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Pooler process lifecycle, immutable configuration generations, and listener wiring"
 
 [dependencies]
+adapter-factory = { path = "../adapter-factory" }
 arc-swap.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

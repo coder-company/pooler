@@ -1,0 +1,119 @@
+{
+  "id": "fx-cliproxy-bridge.factory.v3.text",
+  "source": "fx-cliproxy-bridge/server.mjs",
+  "equivalence": "json_structural",
+  "model_header": "gpt-test",
+  "intentional_corrections": [
+    "factory_response_metadata_preserves_response_id",
+    "factory_usage_includes_derived_no_cache_and_text_totals",
+    "factory_finish_reason_uses_unified_only"
+  ],
+  "factory_request": {
+    "prompt": [
+      {
+        "role": "system",
+        "content": "You are a concise coding assistant."
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Summarize the change."
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "name": "read_file",
+        "description": "Read a workspace file.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    ],
+    "toolChoice": {
+      "type": "auto"
+    },
+    "temperature": 0.2,
+    "topP": 0.9,
+    "maxOutputTokens": 123,
+    "reasoning": {
+      "effort": "high"
+    }
+  },
+  "expected_openai_request": {
+    "model": "gpt-test",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a concise coding assistant."
+      },
+      {
+        "role": "user",
+        "content": "Summarize the change."
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a workspace file.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "max_tokens": 123,
+    "reasoning_effort": "high"
+  },
+  "upstream_sse": [
+    "data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The change adds a bounded proxy.\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":6,\"total_tokens\":13}}\n\n",
+    "data: [DONE]\n\n"
+  ],
+  "expected_factory_sse": [
+    "data: {\"type\":\"response-metadata\",\"modelId\":\"gpt-test\"}\n\n",
+    "data: {\"type\":\"text-start\",\"id\":\"text\"}\n\n",
+    "data: {\"type\":\"text-delta\",\"id\":\"text\",\"delta\":\"The change adds a bounded proxy.\"}\n\n",
+    "data: {\"type\":\"text-end\",\"id\":\"text\"}\n\n",
+    "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\",\"raw\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":7},\"outputTokens\":{\"total\":6}}}\n\n",
+    "data: [DONE]\n\n"
+  ],
+  "expected_pooler_factory_sse": [
+    "data: {\"type\":\"response-metadata\",\"id\":\"chat-1\",\"modelId\":\"gpt-test\"}\n\n",
+    "data: {\"type\":\"text-start\",\"id\":\"text\"}\n\n",
+    "data: {\"type\":\"text-delta\",\"id\":\"text\",\"delta\":\"The change adds a bounded proxy.\"}\n\n",
+    "data: {\"type\":\"text-end\",\"id\":\"text\"}\n\n",
+    "data: {\"type\":\"finish\",\"usage\":{\"inputTokens\":{\"total\":7,\"noCache\":7},\"outputTokens\":{\"total\":6,\"text\":6},\"totalTokens\":13},\"finishReason\":{\"unified\":\"stop\"}}\n\n",
+    "data: [DONE]\n\n"
+  ]
+}

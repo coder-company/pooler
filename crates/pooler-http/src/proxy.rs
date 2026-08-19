@@ -33,11 +33,12 @@ use pooler_core::{BodyMode, RouteLimits};
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
 use thiserror::Error;
 use tokio::time::{self, Instant, Sleep};
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::{
     extract_bearer_token, strip_hop_by_hop_headers, DrainController, DrainGuard, DrainedBody,
-    LimitedBody,
+    FrameLimitedBody, LimitedBody,
 };
 
 /// The erased body type used by responses returned from [`HttpProxy`].
@@ -46,6 +47,85 @@ pub type ProxyBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
 /// A boxed body error. Hyper and body-limit errors are both preserved as the
 /// source error behind this boundary.
 pub type BoxError = Box<dyn Error + Send + Sync>;
+
+/// A semantic adapter's encoded upstream request body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticRequestBody {
+    /// Serialized request bytes for the selected upstream protocol.
+    pub body: Vec<u8>,
+    /// Content type to send with `body`.
+    pub content_type: HeaderValue,
+}
+
+/// A semantic adapter's transformed downstream response body.
+#[derive(Debug)]
+pub struct SemanticResponseBody {
+    /// Stream body that emits the downstream protocol.
+    pub body: ProxyBody,
+    /// Content type for the transformed body.
+    pub content_type: HeaderValue,
+}
+
+/// Narrow seam between HTTP transport and one semantic route adapter.
+pub trait SemanticAdapter: Clone + Send + Sync + 'static {
+    /// Whether this adapter owns the configured semantic route.
+    fn supports(&self, route: &RoutePlan) -> bool;
+
+    /// Decode and convert a bounded downstream request before connecting
+    /// upstream. Errors are returned before any upstream request is made.
+    fn encode_request(
+        &self,
+        route: &RoutePlan,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<SemanticRequestBody, BoxError>;
+
+    /// Removes downstream-only headers before the translated request is sent
+    /// to an upstream protocol.
+    fn sanitize_request_headers(&self, _headers: &mut HeaderMap) {}
+
+    /// Transform an upstream response stream into downstream semantic bytes.
+    fn decode_response(
+        &self,
+        route: &RoutePlan,
+        body: ProxyBody,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError>;
+}
+
+/// Adapter used by callers that only need opaque and patch routes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoSemanticAdapter;
+
+impl SemanticAdapter for NoSemanticAdapter {
+    fn supports(&self, _route: &RoutePlan) -> bool {
+        false
+    }
+
+    fn encode_request(
+        &self,
+        _route: &RoutePlan,
+        _headers: &HeaderMap,
+        _body: &[u8],
+    ) -> Result<SemanticRequestBody, BoxError> {
+        Err(box_error(ProxyError::UnsupportedBodyMode {
+            route: "semantic".to_owned(),
+        }))
+    }
+
+    fn sanitize_request_headers(&self, _headers: &mut HeaderMap) {}
+
+    fn decode_response(
+        &self,
+        _route: &RoutePlan,
+        _body: ProxyBody,
+        _cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        Err(box_error(ProxyError::UnsupportedBodyMode {
+            route: "semantic".to_owned(),
+        }))
+    }
+}
 
 type UpstreamClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, ProxyBody>;
 
@@ -133,6 +213,12 @@ pub enum ProxyError {
     /// A buffered or transformed request body exceeded the route limit.
     #[error("request body exceeds configured limit")]
     RequestBodyTooLarge,
+    /// A semantic request could not be decoded or converted before upstream.
+    #[error("invalid semantic request: {0}")]
+    SemanticRequest(String),
+    /// A semantic response could not be initialized after upstream headers.
+    #[error("invalid semantic response: {0}")]
+    SemanticResponse(String),
     /// The upstream request failed before a response was received.
     #[error("upstream request failed: {0}")]
     Upstream(#[source] BoxError),
@@ -143,35 +229,55 @@ pub enum ProxyError {
 
 /// A compiled route table and shared Hyper client for one listener.
 #[derive(Clone)]
-pub struct HttpProxy {
+pub struct HttpProxy<A = NoSemanticAdapter> {
     config: Arc<CompiledConfig>,
     listener: Arc<str>,
     client: UpstreamClient,
     drain: DrainController,
+    semantic: A,
 }
 
-impl std::fmt::Debug for HttpProxy {
+impl<A> std::fmt::Debug for HttpProxy<A>
+where
+    A: std::fmt::Debug,
+{
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("HttpProxy")
             .field("listener", &self.listener)
             .field("draining", &self.drain.is_draining())
             .field("active", &self.drain.active())
+            .field("semantic", &self.semantic)
             .finish_non_exhaustive()
     }
 }
 
-impl HttpProxy {
+impl HttpProxy<NoSemanticAdapter> {
     /// Construct a proxy for one compiled listener.
     pub fn new(
         config: Arc<CompiledConfig>,
         listener: impl Into<Arc<str>>,
     ) -> Result<Self, ProxyError> {
+        Self::with_semantic_adapter(config, listener, NoSemanticAdapter)
+    }
+}
+
+impl<A> HttpProxy<A>
+where
+    A: SemanticAdapter,
+{
+    /// Construct a proxy for one compiled listener and one semantic adapter.
+    pub fn with_semantic_adapter(
+        config: Arc<CompiledConfig>,
+        listener: impl Into<Arc<str>>,
+        semantic: A,
+    ) -> Result<Self, ProxyError> {
         let listener = listener.into();
         if let Some(route) = config.routes().iter().find(|route| {
             route.listener() == listener.as_ref()
-                && (!matches!(route.ingress().mode(), BodyMode::Opaque | BodyMode::Patch)
-                    || route.response().mode() != BodyMode::Opaque)
+                && ((!matches!(route.ingress().mode(), BodyMode::Opaque | BodyMode::Patch)
+                    && !semantic.supports(route))
+                    || (route.response().mode() != BodyMode::Opaque && !semantic.supports(route)))
         }) {
             return Err(ProxyError::UnsupportedBodyMode {
                 route: route.id().to_owned(),
@@ -189,6 +295,7 @@ impl HttpProxy {
             listener,
             client,
             drain: DrainController::new(),
+            semantic,
         })
     }
 
@@ -378,6 +485,8 @@ impl HttpProxy {
                     .boxed()
             }
             BodyMode::Patch => {
+                let incoming =
+                    FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
                 let bytes = tokio::select! {
                     result = time::timeout_at(
                         buffer_deadline,
@@ -391,6 +500,9 @@ impl HttpProxy {
                             crate::BodyLimitError::TooLarge { .. } => {
                                 ProxyError::RequestBodyTooLarge
                             }
+                            crate::BodyLimitError::Upstream(
+                                crate::BodyLimitError::TooLarge { .. },
+                            ) => ProxyError::RequestBodyTooLarge,
                             other => ProxyError::InvalidPatch(other.to_string()),
                         })?,
                     () = cancellation.cancelled() => {
@@ -470,17 +582,65 @@ impl HttpProxy {
                 limits
                     .check_request_body(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
                     .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                limits
+                    .check_frame(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                    .map_err(|_| ProxyError::RequestBodyTooLarge)?;
                 headers.remove(header::CONTENT_LENGTH);
                 Full::new(Bytes::from(bytes))
                     .map_err(|never: Infallible| match never {})
                     .boxed()
             }
-            BodyMode::Inspect | BodyMode::Semantic => {
+            BodyMode::Semantic => {
+                let incoming =
+                    FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
+                let bytes = tokio::select! {
+                    result = time::timeout_at(
+                        buffer_deadline,
+                        crate::collect_body_limited(
+                            incoming,
+                            bounded_usize(limits.max_request_body_bytes),
+                        ),
+                    ) => result
+                        .map_err(|_| ProxyError::Timeout)?
+                        .map_err(|error| match error {
+                            crate::BodyLimitError::TooLarge { .. } => {
+                                ProxyError::RequestBodyTooLarge
+                            }
+                            crate::BodyLimitError::Upstream(
+                                crate::BodyLimitError::TooLarge { .. },
+                            ) => ProxyError::RequestBodyTooLarge,
+                            other => ProxyError::SemanticRequest(other.to_string()),
+                        })?,
+                    () = cancellation.cancelled() => {
+                        return Err(ProxyError::Timeout);
+                    }
+                };
+                let prepared = self
+                    .semantic
+                    .encode_request(route, &headers, &bytes)
+                    .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
+                limits
+                    .check_request_body(u64::try_from(prepared.body.len()).unwrap_or(u64::MAX))
+                    .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                limits
+                    .check_frame(u64::try_from(prepared.body.len()).unwrap_or(u64::MAX))
+                    .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                headers.insert(header::CONTENT_TYPE, prepared.content_type);
+                self.semantic.sanitize_request_headers(&mut headers);
+                headers.remove(header::CONTENT_LENGTH);
+                Full::new(Bytes::from(prepared.body))
+                    .map_err(|never: Infallible| match never {})
+                    .boxed()
+            }
+            BodyMode::Inspect => {
                 return Err(ProxyError::UnsupportedBodyMode {
                     route: route.id().to_owned(),
                 });
             }
         };
+        let body = FrameLimitedBody::new(body, bounded_usize(limits.max_frame_bytes))
+            .map_err(box_error)
+            .boxed();
         let uri = upstream_uri(upstream, route, &downstream_uri)?;
         apply_upstream_auth(&mut headers, upstream)?;
         let header_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
@@ -524,10 +684,24 @@ impl HttpProxy {
         let (parts, body) = response.into_parts();
         let mut response_headers = parts.headers;
         strip_hop_by_hop_headers(&mut response_headers);
+        let body = FrameLimitedBody::new(body, bounded_usize(limits.max_frame_bytes))
+            .map_err(box_error)
+            .boxed();
         let body = LimitedBody::new(body, bounded_usize(limits.max_response_body_bytes))
             .map_err(box_error)
             .boxed();
         let body = DeadlineBody::new(body, request_deadline).boxed();
+        let body = if route.response().mode() == BodyMode::Semantic && parts.status.is_success() {
+            let transformed = self
+                .semantic
+                .decode_response(route, body, cancellation.clone())
+                .map_err(|error| ProxyError::SemanticResponse(error.to_string()))?;
+            response_headers.remove(header::CONTENT_LENGTH);
+            response_headers.insert(header::CONTENT_TYPE, transformed.content_type);
+            transformed.body
+        } else {
+            body
+        };
         let body = DrainedBody::new(body, guard).boxed();
         let mut response = Response::new(body);
         *response.status_mut() = parts.status;
@@ -700,7 +874,12 @@ fn error_response(error: ProxyError) -> Response<ProxyBody> {
             (StatusCode::BAD_GATEWAY, "upstream request failed")
         }
         ProxyError::InvalidPatch(_) => (StatusCode::BAD_REQUEST, "invalid request"),
+        ProxyError::SemanticRequest(_) => (StatusCode::BAD_REQUEST, "invalid request"),
         ProxyError::RequestBodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
+        ProxyError::SemanticResponse(_) => (
+            StatusCode::BAD_GATEWAY,
+            "upstream response could not be converted",
+        ),
         ProxyError::TlsClient(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "proxy initialization failed",

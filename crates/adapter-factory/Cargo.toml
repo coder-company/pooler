@@ -8,10 +8,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+pooler-config = { path = "../pooler-config" }
+pooler-core = { path = "../pooler-core" }
 pooler-http = { path = "../pooler-http" }
 pooler-protocol = { path = "../pooler-protocol" }
 serde_json.workspace = true
 thiserror.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+pooler-testkit = { path = "../pooler-testkit" }
+serde.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
