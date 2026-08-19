@@ -16,9 +16,14 @@ use std::time::SystemTime;
 pub use pooler_core::CredentialId;
 use thiserror::Error;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
+
+mod oauth;
+
+pub use oauth::*;
 
 /// A secret held in memory and zeroized when dropped.
 ///
@@ -695,16 +700,41 @@ impl fmt::Debug for OAuthTokens {
     }
 }
 
-/// Refresh failures are deliberately string-only and should contain a
-/// provider-safe diagnostic, never a token or authorization header.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+/// Refresh failures retain only safe categories and redacted diagnostics;
+/// they never include a token or authorization header.
+#[derive(Error, Clone, PartialEq, Eq)]
 pub enum RefreshError {
     /// The provider rejected or failed the refresh operation.
-    #[error("oauth refresh failed: {0}")]
+    #[error("oauth refresh failed")]
     Failed(String),
     /// The leader task was cancelled before completing the refresh.
     #[error("oauth refresh was cancelled")]
     Cancelled,
+    /// The provider rejected the grant and interactive login is required.
+    #[error("oauth provider requires reauthorization")]
+    NeedsReauth,
+    /// A compare-and-swap token commit lost a generation race.
+    #[error("oauth token generation changed during refresh")]
+    GenerationConflict,
+    /// A structured OAuth operation error, rendered without provider bodies.
+    #[error("oauth refresh operation failed")]
+    OAuth(oauth::OAuthError),
+}
+
+impl fmt::Debug for RefreshError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Failed(_) => "failed",
+            Self::Cancelled => "cancelled",
+            Self::NeedsReauth => "needs_reauth",
+            Self::GenerationConflict => "generation_conflict",
+            Self::OAuth(_) => "oauth",
+        };
+        formatter
+            .debug_struct("RefreshError")
+            .field("kind", &kind)
+            .finish()
+    }
 }
 
 struct RefreshEntry {
@@ -792,6 +822,52 @@ impl RefreshCoordinator {
             completed: false,
         };
         let result = operation().await;
+        guard.complete(result.clone());
+        result
+    }
+
+    /// Run one refresh operation with cancellation-aware leader and waiter
+    /// behavior.  Cancelling a waiter leaves the leader's lease untouched;
+    /// cancelling the leader publishes a terminal cancellation result so no
+    /// refresh lease remains stuck.
+    pub async fn refresh_cancellable<F, Fut>(
+        &self,
+        credential: CredentialId,
+        cancellation: CancellationToken,
+        operation: F,
+    ) -> Result<OAuthTokens, RefreshError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<OAuthTokens, RefreshError>>,
+    {
+        let (entry, leader) = {
+            let mut entries = lock_unpoisoned(&self.state.entries);
+            if let Some(entry) = entries.get(&credential) {
+                (Arc::clone(entry), false)
+            } else {
+                let entry = Arc::new(RefreshEntry::new());
+                entries.insert(credential.clone(), Arc::clone(&entry));
+                (entry, true)
+            }
+        };
+
+        if !leader {
+            return tokio::select! {
+                result = wait_for_refresh(&entry) => result,
+                () = cancellation.cancelled() => Err(RefreshError::Cancelled),
+            };
+        }
+
+        let mut guard = LeaderGuard {
+            coordinator: self.clone(),
+            credential,
+            entry: Arc::clone(&entry),
+            completed: false,
+        };
+        let result = tokio::select! {
+            () = cancellation.cancelled() => Err(RefreshError::Cancelled),
+            result = operation() => result,
+        };
         guard.complete(result.clone());
         result
     }

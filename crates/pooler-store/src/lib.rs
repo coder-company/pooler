@@ -11,8 +11,12 @@ use std::sync::{PoisonError, RwLock};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod encrypted;
+mod oauth;
 mod sqlite;
 
+pub use encrypted::{CredentialPayload, MasterKey, SecretPayload};
+pub use oauth::SqliteOAuthTokenStore;
 pub use sqlite::SqliteStore;
 
 /// Milliseconds since the Unix epoch, supplied by the caller.
@@ -404,6 +408,30 @@ pub enum StoreError {
     Sqlite(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("master key reference is not allowed for persisted credentials")]
+    MasterKeyReferenceRejected,
+    #[error("master key could not be resolved")]
+    MasterKeyUnavailable,
+    #[error("master key must not be empty")]
+    EmptyMasterKey,
+    #[error("credential payload must not be empty")]
+    EmptyCredentialPayload,
+    #[error("credential payload persistence requires an encryption key")]
+    EncryptionRequired,
+    #[error("credential envelope is invalid")]
+    InvalidCredentialEnvelope,
+    #[error("credential envelope version {0} is unsupported")]
+    UnsupportedCredentialEnvelopeVersion(u8),
+    #[error("credential envelope algorithm is unsupported")]
+    UnsupportedCredentialEnvelopeAlgorithm,
+    #[error("credential envelope was created with a different master key")]
+    WrongMasterKey,
+    #[error("credential envelope authentication failed")]
+    CredentialEnvelopeAuthenticationFailed,
+    #[error("credential payload encryption failed")]
+    EncryptionFailed,
+    #[error("credential revision changed during update")]
+    CredentialRevisionConflict,
     #[error("database schema version {0} is newer than this Pooler binary")]
     UnsupportedSchemaVersion(i64),
     #[error("migration {version} failed: {message}")]

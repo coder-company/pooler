@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use adapter_codex::CodexFailureClassifier;
 use http::{header, HeaderMap};
 use pooler_auth::SecretRef as AuthSecretRef;
 use pooler_config::{
@@ -150,6 +151,7 @@ pub(crate) struct FailureInput<'a> {
     pub status: Option<u16>,
     pub provider_code: Option<String>,
     pub message: Option<String>,
+    pub native_codex: bool,
     pub retry_after: Option<Duration>,
     pub replay: ReplayCheck,
     pub idempotency_key_present: bool,
@@ -259,6 +261,18 @@ impl PoolingCoordinator {
         self.store
             .recent_decisions(limit)
             .map_err(|_| PoolError::Store)
+    }
+
+    /// Disable one credential after provider evidence proves it needs
+    /// interactive reauthorization. The state is persisted and removed from
+    /// every model/route registry in this coordinator.
+    pub fn disable_credential(&self, credential: &CredentialId) {
+        let _ = self
+            .store
+            .set_credential_enabled(credential.as_str(), false, timestamp_now());
+        for registry in self.registries.values() {
+            let _ = registry.disable(credential.clone());
+        }
     }
 
     /// Select one target. The returned lease must remain alive until the
@@ -411,6 +425,7 @@ impl PoolingCoordinator {
             status,
             provider_code,
             message,
+            native_codex,
             retry_after,
             replay,
             idempotency_key_present,
@@ -421,8 +436,7 @@ impl PoolingCoordinator {
             elapsed_recovery_wait,
             started,
         } = input;
-        let classifier = HttpFailureClassifier;
-        let mut classification = classifier.classify(&ObservedFailure {
+        let observed = ObservedFailure {
             source: if status.is_some() {
                 pooler_policy::FailureSource::Upstream
             } else {
@@ -432,7 +446,12 @@ impl PoolingCoordinator {
             provider_code,
             message,
             retry_after,
-        });
+        };
+        let mut classification = if native_codex {
+            CodexFailureClassifier::default().classify(&observed)
+        } else {
+            HttpFailureClassifier.classify(&observed)
+        };
         if selection.credential().is_some()
             && classification.classification.class == ErrorClass::CredentialQuotaExhausted
         {
@@ -1071,7 +1090,7 @@ pub(crate) fn apply_account_auth(
     let reference = match secret {
         SecretRef::Env(name) => AuthSecretRef::Env(name.to_string()),
         SecretRef::File(path) => AuthSecretRef::File(path.as_ref().into()),
-        SecretRef::Keyring { .. } | SecretRef::External(_) => return Err(PoolError::Store),
+        SecretRef::Keyring { .. } => return Err(PoolError::Store),
     };
     let value = reference.resolve().map_err(|_| PoolError::Store)?;
     if value.expose_secret().chars().any(char::is_whitespace) {
@@ -1137,6 +1156,7 @@ mod tests {
             status: Some(400),
             provider_code: None,
             message: None,
+            native_codex: false,
             retry_after: None,
             replay: ReplayCheck::for_http_method("POST", false),
             idempotency_key_present: false,
@@ -1179,6 +1199,7 @@ mod tests {
             status: Some(429),
             provider_code: Some("rate_limit".to_owned()),
             message: None,
+            native_codex: false,
             retry_after: Some(Duration::from_secs(30)),
             replay: ReplayCheck::for_http_method("POST", true),
             idempotency_key_present: true,
@@ -1231,6 +1252,7 @@ mod tests {
             status: Some(429),
             provider_code: Some("insufficient_quota".to_owned()),
             message: None,
+            native_codex: false,
             retry_after: Some(Duration::from_secs(30)),
             replay: ReplayCheck::for_http_method("POST", true),
             idempotency_key_present: true,
@@ -1281,6 +1303,7 @@ mod tests {
             status: Some(429),
             provider_code: Some("insufficient_quota".to_owned()),
             message: None,
+            native_codex: false,
             retry_after: Some(Duration::from_secs(30)),
             replay: ReplayCheck::for_http_method("POST", true),
             idempotency_key_present: true,

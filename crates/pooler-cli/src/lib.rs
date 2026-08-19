@@ -1,11 +1,17 @@
 //! Pooler's command-line interface.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use pooler_config::Config;
+use pooler_http::NativeRuntime;
+use pooler_store::{SqliteOAuthTokenStore, SqliteStore};
+
+mod auth;
+pub use auth::AuthCommand;
 
 /// Top-level command-line arguments.
 #[derive(Debug, Parser)]
@@ -14,6 +20,14 @@ pub struct Cli {
     /// Configuration file to load.
     #[arg(short, long, global = true, default_value = "pooler.yaml")]
     pub config: PathBuf,
+    /// Owner-private SQLite credential store. If omitted, use the platform
+    /// state directory or `POOLER_CREDENTIAL_STORE`.
+    #[arg(long, global = true)]
+    pub credential_store: Option<PathBuf>,
+    /// Secret reference used to derive the encrypted credential-store key.
+    /// Literal values are rejected; use env:, file:, or keyring:.
+    #[arg(long, global = true)]
+    pub credential_key_ref: Option<String>,
     /// Operation to perform.
     #[command(subcommand)]
     pub command: Command,
@@ -41,7 +55,11 @@ pub enum Command {
     /// Replay sanitized compatibility fixtures.
     Fixture,
     /// Manage provider credentials.
-    Auth,
+    Auth {
+        /// Credential-management operation.
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
 }
 
 /// Configuration inspection operations.
@@ -74,7 +92,11 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Serve => serve(&cli.config),
+        Command::Serve => serve(
+            &cli.config,
+            cli.credential_store.as_deref(),
+            cli.credential_key_ref.as_deref(),
+        ),
         Command::Doctor => bail!("doctor is not implemented in the engineering baseline"),
         Command::Models => {
             let config = load(&cli.config)?;
@@ -84,9 +106,12 @@ pub fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Fixture => bail!("fixture replay is not implemented in the engineering baseline"),
-        Command::Auth => {
-            bail!("credential management is not implemented in the engineering baseline")
-        }
+        Command::Auth { command } => auth::run(
+            command,
+            &cli.config,
+            cli.credential_store.as_deref(),
+            cli.credential_key_ref.as_deref(),
+        ),
     }
 }
 
@@ -94,15 +119,21 @@ fn load(path: &PathBuf) -> Result<pooler_config::CompiledConfig> {
     Config::from_path(path)?.compile().map_err(Into::into)
 }
 
-fn serve(path: &PathBuf) -> Result<()> {
+fn serve(
+    path: &PathBuf,
+    explicit_store_path: Option<&std::path::Path>,
+    credential_key_ref: Option<&str>,
+) -> Result<()> {
     let config = load(path)?;
+    let native = native_runtime(&config, explicit_store_path, credential_key_ref)?;
     pooler_observe::init_tracing().context("failed to initialize structured logging")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to initialize the async runtime")?;
     runtime.block_on(async move {
-        let server = pooler_server::HttpProxyServer::bind(config).await?;
+        let server =
+            pooler_server::HttpProxyServer::bind_with_native_runtime(config, native).await?;
         for listener in server.listener_addresses() {
             tracing::info!(
                 listener = listener.id(),
@@ -135,6 +166,31 @@ fn serve(path: &PathBuf) -> Result<()> {
             }
         }
     })
+}
+
+fn native_runtime(
+    config: &pooler_config::CompiledConfig,
+    explicit_store_path: Option<&std::path::Path>,
+    credential_key_ref: Option<&str>,
+) -> Result<Arc<NativeRuntime>> {
+    let has_codex = config.upstreams().values().any(|upstream| {
+        upstream
+            .native()
+            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+    });
+    if !has_codex {
+        return Ok(Arc::new(NativeRuntime::disabled()));
+    }
+    let store_path = auth::credential_store_path(explicit_store_path)?;
+    let master_key = auth::load_master_key(credential_key_ref)
+        .context("native providers require an encrypted credential-store key")?;
+    let store = SqliteStore::open_encrypted(store_path, master_key)
+        .context("could not open encrypted credential store")?;
+    let token_store = Arc::new(SqliteOAuthTokenStore::new(store));
+    Ok(Arc::new(NativeRuntime::new_with_sqlite(
+        config,
+        token_store,
+    )?))
 }
 
 #[cfg(unix)]
@@ -174,5 +230,52 @@ mod tests {
         let cli = Cli::try_parse_from(["pooler", "serve"]).expect("command should parse");
         let error = run(cli).expect_err("missing default config should be reported");
         assert!(error.to_string().contains("failed to read configuration"));
+    }
+
+    #[test]
+    fn auth_login_command_requires_explicit_state_and_response_inputs() {
+        let cli = Cli::try_parse_from([
+            "pooler",
+            "--credential-store",
+            "/private/credentials.sqlite3",
+            "auth",
+            "login",
+            "codex",
+            "--state",
+            "state-1",
+            "--response",
+            "http://localhost:1455/auth/callback?code=redacted&state=state-1",
+        ])
+        .expect("auth command should parse");
+        assert_eq!(
+            cli.credential_store,
+            Some(PathBuf::from("/private/credentials.sqlite3"))
+        );
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Login { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_status_and_revoke_commands_are_available() {
+        let status = Cli::try_parse_from(["pooler", "auth", "status", "codex"])
+            .expect("status command should parse");
+        assert!(matches!(
+            status.command,
+            Command::Auth {
+                command: AuthCommand::Status { provider: Some(_) }
+            }
+        ));
+        let revoke = Cli::try_parse_from(["pooler", "auth", "revoke", "codex"])
+            .expect("revoke command should parse");
+        assert!(matches!(
+            revoke.command,
+            Command::Auth {
+                command: AuthCommand::Revoke { .. }
+            }
+        ));
     }
 }

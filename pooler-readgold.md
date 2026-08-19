@@ -43,7 +43,12 @@ name or advertised without conformance evidence.
   scoped cooldown and quota recovery, affinity with safe rebind policy, redacted
   decisions, and owner-private transactional SQLite persistence. Local restart and
   live quota-failover tests cover the phase exit invariants.
-- Phases 6–8: pending.
+- Phase 6 — OAuth and native providers: implemented and locally verified. PKCE and
+  device OAuth flows, cancellation-safe refresh leases, atomic encrypted token
+  persistence, CLI login/status/revoke, and a status-gated native Codex provider are
+  wired through pre-commit refresh and quota failover. Live provider authorization
+  and account evidence remain before native compatibility can be advertised.
+- Phases 7–8: pending.
 - First useful release acceptance: pending.
 
 ## Verification gates

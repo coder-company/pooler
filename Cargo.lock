@@ -3,6 +3,27 @@
 version = 4
 
 [[package]]
+name = "adapter-codex"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "http",
+ "libc",
+ "pooler-auth",
+ "pooler-core",
+ "pooler-policy",
+ "ring",
+ "rustix 0.38.44",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "adapter-devin"
 version = "0.1.0"
 dependencies = [
@@ -932,11 +953,21 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "pooler-auth"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "libc",
  "pooler-core",
+ "ring",
  "rustix 0.38.44",
+ "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
+ "url",
  "uuid",
  "zeroize",
 ]
@@ -947,11 +978,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "pooler-auth",
  "pooler-config",
+ "pooler-http",
  "pooler-observe",
  "pooler-server",
+ "pooler-store",
+ "serde",
+ "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -985,6 +1024,7 @@ dependencies = [
 name = "pooler-http"
 version = "0.1.0"
 dependencies = [
+ "adapter-codex",
  "bytes",
  "futures-util",
  "http",
@@ -1052,6 +1092,7 @@ dependencies = [
  "arc-swap",
  "hyper",
  "hyper-util",
+ "pooler-auth",
  "pooler-config",
  "pooler-core",
  "pooler-http",
@@ -1067,12 +1108,16 @@ dependencies = [
 name = "pooler-store"
 version = "0.1.0"
 dependencies = [
+ "pooler-auth",
  "pooler-policy",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

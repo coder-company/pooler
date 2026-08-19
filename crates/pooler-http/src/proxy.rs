@@ -40,7 +40,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     extract_bearer_token, retry_after_delay, strip_hop_by_hop_headers, DrainController, DrainGuard,
-    DrainedBody, FrameLimitedBody, LimitedBody, PoolError, PoolSelection, PoolingCoordinator,
+    DrainedBody, FrameLimitedBody, LimitedBody, NativeAuthorization, NativeRuntime,
+    NativeRuntimeError, PoolError, PoolSelection, PoolingCoordinator,
 };
 
 /// The erased body type used by responses returned from [`HttpProxy`].
@@ -224,6 +225,9 @@ pub enum ProxyError {
     /// Account selection or mutable pooling state failed.
     #[error("account selection failed: {0}")]
     Pool(String),
+    /// Native provider credential materialization or refresh failed.
+    #[error("native provider request failed: {0}")]
+    Native(String),
     /// The upstream request failed before a response was received.
     #[error("upstream request failed: {0}")]
     Upstream(#[source] BoxError),
@@ -241,6 +245,7 @@ pub struct HttpProxy<A = NoSemanticAdapter> {
     drain: DrainController,
     semantic: A,
     pooling: Arc<PoolingCoordinator>,
+    native: Arc<NativeRuntime>,
 }
 
 impl<A> std::fmt::Debug for HttpProxy<A>
@@ -289,6 +294,25 @@ where
         semantic: A,
         pooling: Arc<PoolingCoordinator>,
     ) -> Result<Self, ProxyError> {
+        Self::with_semantic_adapter_and_pooling_and_native(
+            config,
+            listener,
+            semantic,
+            pooling,
+            Arc::new(NativeRuntime::disabled()),
+        )
+    }
+
+    /// Construct a proxy with a shared account pool and native provider
+    /// runtime. Native authorization is loaded for each attempt and is never
+    /// retained in the immutable route plan.
+    pub fn with_semantic_adapter_and_pooling_and_native(
+        config: Arc<CompiledConfig>,
+        listener: impl Into<Arc<str>>,
+        semantic: A,
+        pooling: Arc<PoolingCoordinator>,
+        native: Arc<NativeRuntime>,
+    ) -> Result<Self, ProxyError> {
         let listener = listener.into();
         if let Some(route) = config.routes().iter().find(|route| {
             route.listener() == listener.as_ref()
@@ -314,6 +338,7 @@ where
             drain: DrainController::new(),
             semantic,
             pooling,
+            native,
         })
     }
 
@@ -656,19 +681,24 @@ where
         let mut elapsed_recovery_wait = Duration::ZERO;
         let mut credentials_used = BTreeSet::new();
         let mut providers_used = BTreeSet::new();
+        let mut forced_selection = None;
+        let mut native_refresh_attempted = false;
 
         loop {
-            let selection = self
-                .pooling
-                .select(
-                    &self.config,
-                    route,
-                    selected_model.as_deref(),
-                    &headers,
-                    attempt,
-                    started,
-                )
-                .map_err(pool_selection_error)?;
+            let selection = if let Some(selection) = forced_selection.take() {
+                selection
+            } else {
+                self.pooling
+                    .select(
+                        &self.config,
+                        route,
+                        selected_model.as_deref(),
+                        &headers,
+                        attempt,
+                        started,
+                    )
+                    .map_err(pool_selection_error)?
+            };
             if let Some(credential) = selection.credential() {
                 credentials_used.insert(credential.clone());
             }
@@ -682,6 +712,19 @@ where
                     upstream: selection.upstream_id().to_owned(),
                 })?;
             let retry_deadline = retry_deadline(started, limits, upstream, selection.policy());
+            let native_auth = if self.native.supports(upstream) {
+                let credential = selection
+                    .credential()
+                    .ok_or_else(|| ProxyError::Native("credential is not configured".to_owned()))?;
+                Some(
+                    self.native
+                        .authorize(upstream, credential, &headers, cancellation.clone())
+                        .await
+                        .map_err(native_error)?,
+                )
+            } else {
+                None
+            };
             let attempt_body = prepared.body_for_attempt(selection.upstream_model())?;
             let response = self
                 .send_attempt(
@@ -693,6 +736,7 @@ where
                         headers: &headers,
                         upstream,
                         selection: &selection,
+                        native_auth: native_auth.as_ref(),
                         cancellation: &cancellation,
                         started,
                     },
@@ -700,32 +744,132 @@ where
                 )
                 .await;
 
-            let (status, provider_code, retry_after, response) = match response {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let retry_after = retry_after_delay(response.headers());
-                    let provider_code = response
-                        .headers()
-                        .get("x-error-code")
-                        .or_else(|| response.headers().get("x-provider-code"))
-                        .and_then(|value| value.to_str().ok())
-                        .map(|value| value.chars().take(128).collect());
-                    (Some(status), provider_code, retry_after, Ok(response))
+            let mut response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    if is_buffered && selection.has_policy() {
+                        let failure = self.pooling.classify_failure(crate::pool::FailureInput {
+                            config: &self.config,
+                            route,
+                            selection: &selection,
+                            status: None,
+                            provider_code: None,
+                            message: None,
+                            native_codex: false,
+                            retry_after: None,
+                            replay,
+                            idempotency_key_present,
+                            attempt,
+                            credentials_used: u32::try_from(credentials_used.len())
+                                .unwrap_or(u32::MAX),
+                            providers_used: u32::try_from(providers_used.len()).unwrap_or(u32::MAX),
+                            elapsed_retry_delay,
+                            elapsed_recovery_wait,
+                            started,
+                        });
+                        if failure.decision.is_retry() {
+                            let delay = failure.decision.delay();
+                            if delay > retry_deadline.saturating_duration_since(Instant::now()) {
+                                return Err(ProxyError::Timeout);
+                            }
+                            crate::wait_for_retry(delay, &cancellation)
+                                .await
+                                .map_err(|_| ProxyError::Timeout)?;
+                            elapsed_retry_delay = elapsed_retry_delay.saturating_add(delay);
+                            if let Some(recovery) =
+                                failure.classification.classification.recovery_after
+                            {
+                                elapsed_recovery_wait =
+                                    elapsed_recovery_wait.saturating_add(recovery);
+                            }
+                            attempt = attempt.saturating_add(1);
+                            continue;
+                        }
+                    }
+                    return Err(error);
                 }
-                Err(error) => (None, None, None, Err(error)),
             };
+            let status = response.status().as_u16();
+            let mut retry_after = retry_after_delay(response.headers());
+            let mut provider_code = response
+                .headers()
+                .get("x-error-code")
+                .or_else(|| response.headers().get("x-provider-code"))
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.chars().take(128).collect());
+            if self.native.supports(upstream) && !matches!(status, 402 | 429) {
+                provider_code = None;
+            }
 
-            if is_buffered
-                && (should_classify(status) || response.is_err())
-                && selection.has_policy()
+            if self.native.supports(upstream) && is_buffered && should_classify(Some(status)) {
+                let inspected = self
+                    .inspect_failure_response(
+                        response,
+                        upstream,
+                        status,
+                        limits,
+                        &cancellation,
+                        retry_deadline,
+                    )
+                    .await?;
+                response = inspected.response;
+                if provider_code.is_none() {
+                    provider_code = inspected.provider_code;
+                }
+                retry_after = retry_after.or(inspected.retry_after);
+            }
+
+            // A native 401 is eligible for exactly one pre-commit refresh. The
+            // response is still buffered and no downstream headers have been
+            // sent, so retrying remains safe. A failed refresh is returned as
+            // the provider response unless invalid_grant disables this account
+            // and the configured pool has another eligible target.
+            if status == 401
+                && is_buffered
+                && self.native.supports(upstream)
+                && !native_refresh_attempted
             {
+                native_refresh_attempted = true;
+                let credential = selection
+                    .credential()
+                    .ok_or_else(|| ProxyError::Native("credential is not configured".to_owned()))?;
+                let generation = native_auth
+                    .as_ref()
+                    .map(NativeAuthorization::generation)
+                    .ok_or_else(|| ProxyError::Native("authorization is unavailable".to_owned()))?;
+                match self
+                    .native
+                    .refresh(upstream, credential, generation, cancellation.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        forced_selection = Some(selection);
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    Err(NativeRuntimeError::NeedsReauth) => {
+                        self.pooling.disable_credential(credential);
+                        let can_fail_over = selection
+                            .policy()
+                            .is_some_and(|policy| attempt < policy.retry().maximum_attempts());
+                        if can_fail_over {
+                            attempt = attempt.saturating_add(1);
+                            continue;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            if is_buffered && should_classify(Some(status)) && selection.has_policy() {
                 let failure = self.pooling.classify_failure(crate::pool::FailureInput {
                     config: &self.config,
                     route,
                     selection: &selection,
-                    status,
+                    status: Some(status),
                     provider_code: provider_code.clone(),
                     message: None,
+                    native_codex: self.native.supports(upstream),
                     retry_after,
                     replay,
                     idempotency_key_present,
@@ -737,10 +881,8 @@ where
                     started,
                 });
                 if failure.decision.is_retry() {
-                    if let Ok(response) = response {
-                        self.drain_retry_response(response, limits, &cancellation, retry_deadline)
-                            .await?;
-                    }
+                    self.drain_retry_response(response, limits, &cancellation, retry_deadline)
+                        .await?;
                     let delay = failure.decision.delay();
                     if delay > retry_deadline.saturating_duration_since(Instant::now()) {
                         return Err(ProxyError::Timeout);
@@ -757,7 +899,6 @@ where
                 }
             }
 
-            let response = response?;
             return self
                 .finish_response(route, response, selection, guard, cancellation, started)
                 .await;
@@ -768,7 +909,7 @@ where
         &self,
         request: AttemptRequest<'_>,
         body: ProxyBody,
-    ) -> Result<Response<Incoming>, ProxyError> {
+    ) -> Result<Response<ProxyBody>, ProxyError> {
         let AttemptRequest {
             route,
             method,
@@ -777,13 +918,17 @@ where
             headers: request_headers,
             upstream,
             selection,
+            native_auth,
             cancellation,
             started,
         } = request;
         let mut headers = request_headers.clone();
-        let _ = crate::pool::apply_account_auth(&mut headers, selection.account_secret())
-            .map_err(pool_error)?;
-        if selection.account_secret().is_none() {
+        if let Some(native_auth) = native_auth {
+            native_auth.apply_to(&mut headers).map_err(native_error)?;
+        } else if selection.account_secret().is_some() {
+            let _ = crate::pool::apply_account_auth(&mut headers, selection.account_secret())
+                .map_err(pool_error)?;
+        } else {
             apply_upstream_auth(&mut headers, upstream)?;
         }
         let body = FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
@@ -831,12 +976,16 @@ where
                 "upstream response body exceeds limits".to_owned(),
             ));
         }
-        Ok(response)
+        let (parts, body) = response.into_parts();
+        let body = FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
+            .map_err(box_error)
+            .boxed();
+        Ok(Response::from_parts(parts, body))
     }
 
     async fn drain_retry_response(
         &self,
-        response: Response<Incoming>,
+        response: Response<ProxyBody>,
         limits: &RouteLimits,
         cancellation: &CancellationToken,
         deadline: Instant,
@@ -856,10 +1005,46 @@ where
         }
     }
 
+    async fn inspect_failure_response(
+        &self,
+        response: Response<ProxyBody>,
+        upstream: &UpstreamPlan,
+        status: u16,
+        limits: &RouteLimits,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<InspectedFailureResponse, ProxyError> {
+        let (parts, body) = response.into_parts();
+        let body = LimitedBody::new(body, bounded_usize(limits.max_response_body_bytes));
+        let body = tokio::select! {
+            result = time::timeout_at(
+                deadline,
+                crate::collect_body_limited(body, bounded_usize(limits.max_response_body_bytes)),
+            ) => result
+                .map_err(|_| ProxyError::Timeout)?
+                .map_err(|error| ProxyError::Upstream(Box::new(error)))?,
+            () = cancellation.cancelled() => return Err(ProxyError::Timeout),
+        };
+        let (provider_code, retry_after) =
+            self.native
+                .quota_evidence(upstream, status, &parts.headers, &body);
+        let response = Response::from_parts(
+            parts,
+            Full::new(body)
+                .map_err(|never: Infallible| match never {})
+                .boxed(),
+        );
+        Ok(InspectedFailureResponse {
+            response,
+            provider_code,
+            retry_after,
+        })
+    }
+
     async fn finish_response(
         &self,
         route: &RoutePlan,
-        response: Response<Incoming>,
+        response: Response<ProxyBody>,
         mut selection: PoolSelection,
         guard: DrainGuard,
         cancellation: CancellationToken,
@@ -876,9 +1061,6 @@ where
                 route: route.id().to_owned(),
                 upstream: selection.upstream_id().to_owned(),
             })?;
-        let body = FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
-            .map_err(box_error)
-            .boxed();
         let body = LimitedBody::new(body, bounded_usize(route.limits().max_response_body_bytes))
             .map_err(box_error)
             .boxed();
@@ -923,8 +1105,15 @@ struct AttemptRequest<'a> {
     headers: &'a HeaderMap,
     upstream: &'a UpstreamPlan,
     selection: &'a PoolSelection,
+    native_auth: Option<&'a NativeAuthorization>,
     cancellation: &'a CancellationToken,
     started: StdInstant,
+}
+
+struct InspectedFailureResponse {
+    response: Response<ProxyBody>,
+    provider_code: Option<String>,
+    retry_after: Option<Duration>,
 }
 
 impl PreparedBody {
@@ -1019,7 +1208,17 @@ fn upstream_uri(
     downstream: &Uri,
 ) -> Result<Uri, ProxyError> {
     let mut url = upstream.url().clone();
-    let path = route.target().path().unwrap_or_else(|| downstream.path());
+    let path = route.target().path().unwrap_or_else(|| {
+        if upstream.native().is_some_and(|native| {
+            native
+                .kind()
+                .eq_ignore_ascii_case(adapter_codex::CODEX_PROVIDER_ID)
+        }) {
+            adapter_codex::CODEX_RESPONSES_PATH
+        } else {
+            downstream.path()
+        }
+    });
     url.set_path(path);
     url.set_query(downstream.query());
     url.as_str().parse().map_err(|_| ProxyError::InvalidUri)
@@ -1047,9 +1246,7 @@ fn resolve_secret(secret: &SecretRef) -> Result<SecretValue, ProxyError> {
     let reference = match secret {
         SecretRef::Env(name) => AuthSecretRef::Env(name.to_string()),
         SecretRef::File(path) => AuthSecretRef::File(path.as_ref().into()),
-        SecretRef::Keyring { .. } | SecretRef::External(_) => {
-            return Err(ProxyError::SecretUnavailable)
-        }
+        SecretRef::Keyring { .. } => return Err(ProxyError::SecretUnavailable),
     };
     let secret = reference
         .resolve()
@@ -1187,6 +1384,7 @@ fn error_response(error: ProxyError) -> Response<ProxyBody> {
         | ProxyError::InvalidLimits(_)
         | ProxyError::RequestBuild(_)
         | ProxyError::Upstream(_)
+        | ProxyError::Native(_)
         | ProxyError::Pool(_)
         | ProxyError::UnsupportedBodyMode { .. } => {
             (StatusCode::BAD_GATEWAY, "upstream request failed")
@@ -1218,6 +1416,10 @@ fn pool_selection_error(error: PoolError) -> ProxyError {
         PoolError::InvalidModel => ProxyError::InvalidPatch("request model is invalid".to_owned()),
         other => pool_error(other),
     }
+}
+
+fn native_error(error: NativeRuntimeError) -> ProxyError {
+    ProxyError::Native(error.to_string())
 }
 
 #[cfg(test)]

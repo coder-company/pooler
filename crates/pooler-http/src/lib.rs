@@ -11,6 +11,7 @@ mod auth;
 mod body;
 mod drain;
 mod headers;
+mod native;
 mod pool;
 mod proxy;
 mod sse;
@@ -27,6 +28,7 @@ pub use headers::{
     remove_hop_by_hop_headers, retry_after_delay, sanitize_headers, strip_hop_by_hop_headers,
     HOP_BY_HOP_HEADERS,
 };
+pub use native::{NativeAuthorization, NativeRuntime, NativeRuntimeError};
 pub use pool::{PoolError, PoolFailure, PoolSelection, PoolingCoordinator};
 pub use proxy::{
     BoxError, HttpProxy, NoSemanticAdapter, ProxyBody, ProxyError, SemanticAdapter,

@@ -14,8 +14,8 @@ use hyper::{body::Incoming, http, http::Request, service::service_fn};
 use hyper_util::rt::TokioIo;
 use pooler_config::CompiledConfig;
 use pooler_http::{
-    BoxError, DrainError, HttpProxy, PoolingCoordinator, ProxyBody, ProxyError, SemanticAdapter,
-    SemanticRequestBody, SemanticResponseBody,
+    BoxError, DrainError, HttpProxy, NativeRuntime, PoolingCoordinator, ProxyBody, ProxyError,
+    SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
 };
 use thiserror::Error;
 use tokio::{
@@ -179,6 +179,16 @@ impl std::fmt::Debug for HttpProxyServer {
 impl HttpProxyServer {
     /// Bind all listeners before accepting any downstream connection.
     pub async fn bind(config: CompiledConfig) -> Result<Self, HttpProxyServerError> {
+        Self::bind_with_native_runtime(config, Arc::new(NativeRuntime::disabled())).await
+    }
+
+    /// Bind listeners with an injected native provider runtime. This keeps
+    /// credential stores and refresh policy outside immutable configuration
+    /// while allowing native routes to share one refresh coordinator.
+    pub async fn bind_with_native_runtime(
+        config: CompiledConfig,
+        native: Arc<NativeRuntime>,
+    ) -> Result<Self, HttpProxyServerError> {
         let config = Arc::new(config);
         let pooling =
             Arc::new(PoolingCoordinator::new(&config).map_err(|error| {
@@ -190,11 +200,14 @@ impl HttpProxyServer {
 
         for plan in config.listeners().values() {
             let id: Arc<str> = Arc::from(plan.id());
-            let proxy = Arc::new(HttpProxy::with_semantic_adapter_and_pooling(
+            let proxy = Arc::new(HttpProxy::with_semantic_adapter_and_pooling_and_native(
+                // Native provider handling is selected per upstream at the
+                // attempt boundary; all listeners share this runtime.
                 Arc::clone(&config),
                 Arc::clone(&id),
                 RuntimeSemanticAdapter,
                 Arc::clone(&pooling),
+                Arc::clone(&native),
             )?);
             let bind = plan.bind();
             if bind.starts_with('/') || bind.starts_with("unix:") {
@@ -493,9 +506,13 @@ mod tests {
         io,
         net::SocketAddr,
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc,
+        },
     };
 
+    use pooler_auth::{OAuthFuture, OAuthRefresher, OAuthTokenStore, OAuthTokens, SecretValue};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
@@ -1926,6 +1943,116 @@ mod tests {
                 .await
                 .is_err()
         );
+        stop_server(&server, runner).await;
+    }
+
+    struct MockCodexRefresher {
+        calls: AtomicUsize,
+    }
+
+    impl OAuthRefresher for MockCodexRefresher {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a SecretValue,
+            _cancellation: CancellationToken,
+        ) -> OAuthFuture<'a, OAuthTokens> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(OAuthTokens::bearer("new-access", Some("new-refresh"), None)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn native_codex_materializes_headers_refreshes_once_and_replays_before_commit() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let upstream = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+                let request = read_request(&mut stream).await.expect("request bytes");
+                let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                if index == 0 {
+                    assert!(request_text.contains("authorization: bearer old-access"));
+                    assert!(request_text.contains("chatgpt-account-id: chatgpt-account-a"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .expect("401 response");
+                } else {
+                    assert!(request_text.contains("authorization: bearer new-access"));
+                    assert!(request_text.contains("chatgpt-account-id: chatgpt-account-a"));
+                    let body = b"ok";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("200 headers");
+                    stream.write_all(body).await.expect("200 body");
+                }
+                requests.push(request);
+            }
+            requests
+        });
+
+        let config = pooler_config::compile_yaml(
+            "native-codex-e2e.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{upstream_address}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  account-a:\n    provider: codex\n    secret: env:CODEX_TEST_SECRET\npolicies:\n  codex:\n    selection: {{strategy: fill_first, accounts: [account-a]}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 1, statuses: [429], before_commit_only: true}}\nroutes:\n  - id: codex\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: codex, policy: codex}}\n    response: {{mode: opaque}}\n"
+            ),
+        )
+        .expect("native route config");
+        let token_store = Arc::new(pooler_auth::MemoryOAuthTokenStore::new());
+        let credential = pooler_auth::CredentialId::new("account-a").expect("credential");
+        token_store.insert(
+            credential,
+            OAuthTokens::bearer("old-access", Some("old-refresh"), None),
+        );
+        let refresher = Arc::new(MockCodexRefresher {
+            calls: AtomicUsize::new(0),
+        });
+        let native = Arc::new(
+            NativeRuntime::with_codex_provider(token_store.clone(), "codex", refresher.clone())
+                .with_account_id("account-a", "chatgpt-account-a"),
+        );
+        let server = HttpProxyServer::bind_with_native_runtime(config, native)
+            .await
+            .expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"gpt-test","input":"hello"}"#;
+        let mut request = format!(
+            "POST /responses HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        let response = send_request(address, &request).await;
+        assert_eq!(status(&response), 200);
+        assert_eq!(response_body(&response), b"ok");
+        assert_eq!(refresher.calls.load(Ordering::Relaxed), 1);
+        let rotated = token_store
+            .load(&pooler_auth::CredentialId::new("account-a").expect("credential"))
+            .await
+            .expect("token store load")
+            .expect("rotated snapshot");
+        assert_eq!(rotated.generation(), 1);
+        assert_eq!(
+            rotated.tokens().access_token().expose_secret(),
+            "new-access"
+        );
+        upstream.await.expect("upstream task");
         stop_server(&server, runner).await;
     }
 }

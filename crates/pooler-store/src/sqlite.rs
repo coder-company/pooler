@@ -7,22 +7,24 @@
 
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::{
+    encrypted::{CredentialCipher, CredentialPayload},
     non_empty, CooldownState, CredentialHealthState, CredentialHealthStatus, CredentialState,
-    DecisionRecord, PruneReport, RetentionPolicy, SessionAffinity, Store, StoreError, StoreLengths,
-    StoreResult, Timestamp,
+    DecisionRecord, MasterKey, PruneReport, RetentionPolicy, SessionAffinity, Store, StoreError,
+    StoreLengths, StoreResult, Timestamp,
 };
 
 const MAX_COOLDOWNS: usize = 4_096;
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const LATEST_SCHEMA_VERSION: i64 = 3;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/001_initial.sql")),
     (2, include_str!("migrations/002_health_and_cooldowns.sql")),
+    (3, include_str!("migrations/003_credential_payloads.sql")),
 ];
 
 /// A transactional, WAL-backed SQLite [`Store`].
@@ -31,6 +33,7 @@ pub struct SqliteStore {
     retention: RetentionPolicy,
     connection: Arc<Mutex<Connection>>,
     path: Option<PathBuf>,
+    encryption: Arc<RwLock<Option<Arc<CredentialCipher>>>>,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -55,8 +58,27 @@ impl SqliteStore {
         retention: RetentionPolicy,
     ) -> StoreResult<Self> {
         let path = prepare_database_path(path.as_ref())?;
+        ensure_private_sidecars(&path)?;
         let connection = Connection::open(&path).map_err(sqlite_error)?;
-        initialize_connection(connection, false, retention, Some(path))
+        initialize_connection(connection, false, retention, Some(path), None)
+    }
+
+    /// Open or create a private database whose credential payloads are
+    /// encrypted with `master_key`.
+    pub fn open_encrypted(path: impl AsRef<Path>, master_key: MasterKey) -> StoreResult<Self> {
+        Self::open_encrypted_with_retention(path, RetentionPolicy::default(), master_key)
+    }
+
+    /// Open or create an encrypted database with explicit retention limits.
+    pub fn open_encrypted_with_retention(
+        path: impl AsRef<Path>,
+        retention: RetentionPolicy,
+        master_key: MasterKey,
+    ) -> StoreResult<Self> {
+        let path = prepare_database_path(path.as_ref())?;
+        ensure_private_sidecars(&path)?;
+        let connection = Connection::open(&path).map_err(sqlite_error)?;
+        initialize_connection(connection, false, retention, Some(path), Some(master_key))
     }
 
     /// Open an in-memory database.  This is intended for tests and ephemeral
@@ -68,7 +90,21 @@ impl SqliteStore {
     /// Open an in-memory database with explicit retention.
     pub fn open_in_memory_with_retention(retention: RetentionPolicy) -> StoreResult<Self> {
         let connection = Connection::open_in_memory().map_err(sqlite_error)?;
-        initialize_connection(connection, true, retention, None)
+        initialize_connection(connection, true, retention, None, None)
+    }
+
+    /// Open an encrypted in-memory database for ephemeral use and tests.
+    pub fn open_in_memory_encrypted(master_key: MasterKey) -> StoreResult<Self> {
+        Self::open_in_memory_encrypted_with_retention(RetentionPolicy::default(), master_key)
+    }
+
+    /// Open an encrypted in-memory database with explicit retention limits.
+    pub fn open_in_memory_encrypted_with_retention(
+        retention: RetentionPolicy,
+        master_key: MasterKey,
+    ) -> StoreResult<Self> {
+        let connection = Connection::open_in_memory().map_err(sqlite_error)?;
+        initialize_connection(connection, true, retention, None, Some(master_key))
     }
 
     /// Return the on-disk path, if this store is file-backed.
@@ -105,8 +141,297 @@ impl SqliteStore {
             .map_err(sqlite_error)
     }
 
+    /// Persist one encrypted credential payload.
+    ///
+    /// The credential metadata row must already exist.  This ordering keeps a
+    /// payload from becoming an unowned secret blob and lets the metadata
+    /// retention path remove its payload through the foreign key.
+    pub fn upsert_credential_payload(
+        &self,
+        credential_id: &str,
+        payload: &CredentialPayload,
+        updated_at: Timestamp,
+    ) -> StoreResult<()> {
+        non_empty("credential_id", credential_id)?;
+        let encryption = self.encryption_read()?;
+        let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
+        let envelope = cipher.seal_for(payload, credential_id.as_bytes())?;
+        self.with_transaction(|transaction| {
+            let exists = transaction
+                .query_row(
+                    "SELECT 1 FROM credentials WHERE credential_id = ?1",
+                    [credential_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            if exists.is_none() {
+                return Err(StoreError::CredentialNotFound(credential_id.to_owned()));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(credential_id) DO UPDATE SET
+                       envelope = excluded.envelope,
+                       updated_at = excluded.updated_at",
+                    params![credential_id, envelope, updated_at],
+                )
+                .map_err(sqlite_error)?;
+            Ok(())
+        })
+    }
+
+    /// Atomically replace an encrypted credential payload and advance its
+    /// metadata revision when the caller still owns `expected_revision`.
+    ///
+    /// The compare-and-swap and payload write share one transaction. This is
+    /// important for OAuth rotation: a process crash cannot leave a new
+    /// revision pointing at an old payload, and concurrent refreshers cannot
+    /// overwrite one another after the initial revision check.
+    pub fn compare_and_swap_credential_payload(
+        &self,
+        credential_id: &str,
+        expected_revision: u64,
+        payload: &CredentialPayload,
+        updated_at: Timestamp,
+    ) -> StoreResult<CredentialState> {
+        non_empty("credential_id", credential_id)?;
+        let encryption = self.encryption_read()?;
+        let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
+        self.with_immediate_transaction(|transaction| {
+            let current: CredentialState = transaction
+                .query_row(
+                    "SELECT credential_id, provider_id, enabled, updated_at, revision
+                     FROM credentials WHERE credential_id = ?1",
+                    [credential_id],
+                    credential_from_row,
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
+            if current.revision != expected_revision {
+                return Err(StoreError::CredentialRevisionConflict);
+            }
+            if let Some(existing_envelope) = transaction
+                .query_row(
+                    "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
+                    [credential_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?
+            {
+                // Authenticate the old value before changing either the
+                // metadata revision or the encrypted payload. A wrong key
+                // must fail closed rather than overwrite an unreadable token.
+                cipher.open_for(&existing_envelope, credential_id.as_bytes())?;
+            }
+            let envelope = cipher.seal_for(payload, credential_id.as_bytes())?;
+            let revision = current.revision.saturating_add(1);
+            let changed = transaction
+                .execute(
+                    "UPDATE credentials SET updated_at = ?1, revision = ?2
+                     WHERE credential_id = ?3 AND revision = ?4",
+                    params![
+                        updated_at,
+                        i64::try_from(revision).unwrap_or(i64::MAX),
+                        credential_id,
+                        i64::try_from(expected_revision).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            if changed != 1 {
+                return Err(StoreError::CredentialRevisionConflict);
+            }
+            transaction
+                .execute(
+                    "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(credential_id) DO UPDATE SET
+                       envelope = excluded.envelope,
+                       updated_at = excluded.updated_at",
+                    params![credential_id, envelope, updated_at],
+                )
+                .map_err(sqlite_error)?;
+            Ok(CredentialState {
+                updated_at,
+                revision,
+                ..current
+            })
+        })
+    }
+
+    /// Alias for [`Self::upsert_credential_payload`].
+    pub fn put_credential_payload(
+        &self,
+        credential_id: &str,
+        payload: &CredentialPayload,
+        updated_at: Timestamp,
+    ) -> StoreResult<()> {
+        self.upsert_credential_payload(credential_id, payload, updated_at)
+    }
+
+    /// Load and authenticate one encrypted credential payload.
+    pub fn credential_payload(
+        &self,
+        credential_id: &str,
+    ) -> StoreResult<Option<CredentialPayload>> {
+        non_empty("credential_id", credential_id)?;
+        let encryption = self.encryption_read()?;
+        let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
+        let connection = self.connection()?;
+        let envelope = connection
+            .query_row(
+                "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
+                [credential_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        envelope
+            .map(|value| cipher.open_for(&value, credential_id.as_bytes()))
+            .transpose()
+    }
+
+    /// Load credential metadata and its encrypted payload under one SQLite
+    /// connection lock. This prevents an OAuth reader from pairing a newer
+    /// revision with an older payload while a refresh transaction commits.
+    pub fn credential_payload_with_state(
+        &self,
+        credential_id: &str,
+    ) -> StoreResult<Option<(CredentialState, Option<CredentialPayload>)>> {
+        non_empty("credential_id", credential_id)?;
+        let encryption = self.encryption_read()?;
+        let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT c.credential_id, c.provider_id, c.enabled, c.updated_at,
+                        c.revision, p.envelope
+                 FROM credentials AS c
+                 LEFT JOIN credential_payloads AS p
+                   ON p.credential_id = c.credential_id
+                 WHERE c.credential_id = ?1",
+                [credential_id],
+                |row| {
+                    let state = CredentialState {
+                        credential_id: row.get(0)?,
+                        provider_id: row.get(1)?,
+                        enabled: row.get::<_, i64>(2)? != 0,
+                        updated_at: row.get(3)?,
+                        revision: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(u64::MAX),
+                    };
+                    let envelope = row.get::<_, Option<Vec<u8>>>(5)?;
+                    Ok((state, envelope))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        row.map(|(state, envelope)| {
+            envelope
+                .map(|value| cipher.open_for(&value, credential_id.as_bytes()))
+                .transpose()
+                .map(|payload| (state, payload))
+        })
+        .transpose()
+    }
+
+    /// Alias for [`Self::credential_payload`].
+    pub fn load_credential_payload(
+        &self,
+        credential_id: &str,
+    ) -> StoreResult<Option<CredentialPayload>> {
+        self.credential_payload(credential_id)
+    }
+
+    /// Remove one encrypted credential payload.
+    pub fn remove_credential_payload(&self, credential_id: &str) -> StoreResult<bool> {
+        non_empty("credential_id", credential_id)?;
+        let encryption = self.encryption_read()?;
+        if encryption.is_none() {
+            return Err(StoreError::EncryptionRequired);
+        }
+        self.with_transaction(|transaction| {
+            let removed = transaction
+                .execute(
+                    "DELETE FROM credential_payloads WHERE credential_id = ?1",
+                    [credential_id],
+                )
+                .map_err(sqlite_error)?;
+            Ok(removed != 0)
+        })
+    }
+
+    /// Re-encrypt every payload in one transaction with a new master key.
+    ///
+    /// Any authentication or encryption failure aborts the transaction and
+    /// leaves both the database and the active key unchanged.
+    pub fn rotate_master_key(&self, master_key: MasterKey) -> StoreResult<usize> {
+        let mut encryption = self.encryption_write()?;
+        let current = encryption
+            .as_ref()
+            .cloned()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let next = Arc::new(CredentialCipher::new(master_key));
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(sqlite_error)?;
+        let rows = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT credential_id, envelope
+                     FROM credential_payloads ORDER BY credential_id ASC",
+                )
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(sqlite_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+        };
+        let mut rotated = 0_usize;
+        for (credential_id, envelope) in rows {
+            let payload = current.open_for(&envelope, credential_id.as_bytes())?;
+            let replacement = next.seal_for(&payload, credential_id.as_bytes())?;
+            transaction
+                .execute(
+                    "UPDATE credential_payloads SET envelope = ?1 WHERE credential_id = ?2",
+                    params![replacement, credential_id],
+                )
+                .map_err(sqlite_error)?;
+            rotated += 1;
+        }
+        transaction.commit().map_err(sqlite_error)?;
+        *encryption = Some(Arc::clone(&next));
+        self.ensure_private_sidecars()?;
+        Ok(rotated)
+    }
+
+    /// Alias for [`Self::rotate_master_key`].
+    pub fn rotate_credential_payloads(&self, master_key: MasterKey) -> StoreResult<usize> {
+        self.rotate_master_key(master_key)
+    }
+
     fn connection(&self) -> StoreResult<MutexGuard<'_, Connection>> {
         self.connection.lock().map_err(|_| StoreError::LockPoisoned)
+    }
+
+    fn encryption_read(&self) -> StoreResult<RwLockReadGuard<'_, Option<Arc<CredentialCipher>>>> {
+        self.encryption.read().map_err(|_| StoreError::LockPoisoned)
+    }
+
+    fn encryption_write(&self) -> StoreResult<RwLockWriteGuard<'_, Option<Arc<CredentialCipher>>>> {
+        self.encryption
+            .write()
+            .map_err(|_| StoreError::LockPoisoned)
+    }
+
+    fn ensure_private_sidecars(&self) -> StoreResult<()> {
+        if let Some(path) = &self.path {
+            ensure_private_sidecars(path)?;
+        }
+        Ok(())
     }
 
     fn with_transaction<T>(
@@ -117,6 +442,21 @@ impl SqliteStore {
         let transaction = connection.transaction().map_err(sqlite_error)?;
         let value = operation(&transaction)?;
         transaction.commit().map_err(sqlite_error)?;
+        self.ensure_private_sidecars()?;
+        Ok(value)
+    }
+
+    fn with_immediate_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>) -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error)?;
+        let value = operation(&transaction)?;
+        transaction.commit().map_err(sqlite_error)?;
+        self.ensure_private_sidecars()?;
         Ok(value)
     }
 }
@@ -126,9 +466,13 @@ fn initialize_connection(
     in_memory: bool,
     retention: RetentionPolicy,
     path: Option<PathBuf>,
+    master_key: Option<MasterKey>,
 ) -> StoreResult<SqliteStore> {
     connection
         .busy_timeout(Duration::from_secs(5))
+        .map_err(sqlite_error)?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
         .map_err(sqlite_error)?;
     if !in_memory {
         let mode: String = connection
@@ -149,10 +493,16 @@ fn initialize_connection(
             .map_err(sqlite_error)?;
     }
     migrate(&mut connection)?;
+    if let Some(path) = &path {
+        ensure_private_sidecars(path)?;
+    }
     Ok(SqliteStore {
         retention,
         connection: Arc::new(Mutex::new(connection)),
         path,
+        encryption: Arc::new(RwLock::new(
+            master_key.map(|key| Arc::new(CredentialCipher::new(key))),
+        )),
     })
 }
 
@@ -230,6 +580,33 @@ fn prepare_database_path(path: &Path) -> StoreResult<PathBuf> {
         ensure_private_directory(parent)?;
     }
     Ok(path.to_path_buf())
+}
+
+fn ensure_private_sidecars(path: &Path) -> StoreResult<()> {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_name = path.as_os_str().to_owned();
+        sidecar_name.push(suffix);
+        let sidecar = PathBuf::from(sidecar_name);
+        let metadata = match fs::symlink_metadata(&sidecar) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error(error)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(StoreError::UnsafePath(format!(
+                "SQLite sidecar `{}` must not be a symbolic link",
+                sidecar.display()
+            )));
+        }
+        if !metadata.is_file() {
+            return Err(StoreError::InvalidPath(format!(
+                "SQLite sidecar `{}` is not a regular file",
+                sidecar.display()
+            )));
+        }
+        ensure_private_file(&sidecar)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1095,6 +1472,329 @@ mod tests {
             .session_affinity("session", 10)
             .expect("lookup")
             .is_none());
+    }
+
+    #[test]
+    fn encrypted_payload_is_opaque_and_survives_restart() {
+        let directory = private_tempdir();
+        let path = directory.path().join("pooler.sqlite");
+        let key = MasterKey::from_bytes(b"persisted master key").expect("master key");
+        let payload = CredentialPayload::new(b"refresh-token-value").expect("payload");
+        {
+            let store = SqliteStore::open_encrypted(&path, key.clone()).expect("open store");
+            store
+                .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+                .expect("credential");
+            store
+                .upsert_credential_payload("credential", &payload, 2)
+                .expect("payload");
+        }
+
+        let raw = Connection::open(&path).expect("raw database");
+        let envelope: Vec<u8> = raw
+            .query_row(
+                "SELECT envelope FROM credential_payloads WHERE credential_id = 'credential'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("envelope");
+        assert!(!envelope
+            .windows(b"refresh-token-value".len())
+            .any(|window| window == b"refresh-token-value"));
+        drop(raw);
+
+        let store = SqliteStore::open_encrypted(&path, key).expect("restart");
+        assert_eq!(
+            store
+                .credential_payload("credential")
+                .expect("load")
+                .expect("payload"),
+            payload
+        );
+    }
+
+    #[test]
+    fn encrypted_payload_rotation_is_atomic_and_rejects_old_key() {
+        let directory = private_tempdir();
+        let path = directory.path().join("pooler.sqlite");
+        let old_key = MasterKey::from_bytes(b"old persisted key").expect("old key");
+        let new_key = MasterKey::from_bytes(b"new persisted key").expect("new key");
+        let store = SqliteStore::open_encrypted(&path, old_key.clone()).expect("open store");
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
+        store
+            .upsert_credential_payload(
+                "credential",
+                &CredentialPayload::new(b"refresh-token-value").expect("payload"),
+                2,
+            )
+            .expect("payload");
+        assert_eq!(store.rotate_master_key(new_key.clone()).expect("rotate"), 1);
+        assert_eq!(
+            store
+                .credential_payload("credential")
+                .expect("load after rotate")
+                .expect("payload")
+                .as_bytes(),
+            b"refresh-token-value"
+        );
+        drop(store);
+
+        let old_store = SqliteStore::open_encrypted(&path, old_key).expect("old open");
+        assert_eq!(
+            old_store.credential_payload("credential"),
+            Err(StoreError::WrongMasterKey)
+        );
+        drop(old_store);
+        let new_store = SqliteStore::open_encrypted(&path, new_key).expect("new open");
+        assert!(new_store
+            .credential_payload("credential")
+            .expect("new load")
+            .is_some());
+    }
+
+    #[test]
+    fn stale_multi_instance_cas_is_rejected_without_overwriting_new_tokens() {
+        let directory = private_tempdir();
+        let path = directory.path().join("pooler.sqlite");
+        let key = MasterKey::from_bytes(b"multi-instance cas key").expect("key");
+        {
+            let store = SqliteStore::open_encrypted(&path, key.clone()).expect("open");
+            store
+                .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+                .expect("metadata");
+            store
+                .upsert_credential_payload(
+                    "credential",
+                    &CredentialPayload::new(b"original-token").expect("payload"),
+                    1,
+                )
+                .expect("payload");
+        }
+
+        let first = SqliteStore::open_encrypted(&path, key.clone()).expect("first instance");
+        let second = SqliteStore::open_encrypted(&path, key).expect("second instance");
+        let first_revision = first
+            .credential_state("credential")
+            .expect("first state")
+            .expect("state")
+            .revision;
+        let second_revision = second
+            .credential_state("credential")
+            .expect("second state")
+            .expect("state")
+            .revision;
+        assert_eq!(first_revision, second_revision);
+        first
+            .compare_and_swap_credential_payload(
+                "credential",
+                first_revision,
+                &CredentialPayload::new(b"first-token").expect("payload"),
+                2,
+            )
+            .expect("first CAS");
+        assert_eq!(
+            second.compare_and_swap_credential_payload(
+                "credential",
+                second_revision,
+                &CredentialPayload::new(b"stale-token").expect("payload"),
+                3,
+            ),
+            Err(StoreError::CredentialRevisionConflict)
+        );
+        assert_eq!(
+            second
+                .credential_payload("credential")
+                .expect("payload lookup")
+                .expect("payload")
+                .as_bytes(),
+            b"first-token"
+        );
+    }
+
+    #[test]
+    fn cas_payload_failure_rolls_back_metadata_revision() {
+        let directory = private_tempdir();
+        let path = directory.path().join("pooler.sqlite");
+        let key = MasterKey::from_bytes(b"cas rollback key").expect("key");
+        {
+            let store = SqliteStore::open_encrypted(&path, key.clone()).expect("open");
+            store
+                .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+                .expect("metadata");
+            store
+                .upsert_credential_payload(
+                    "credential",
+                    &CredentialPayload::new(b"original-token").expect("payload"),
+                    1,
+                )
+                .expect("payload");
+        }
+        let raw = Connection::open(&path).expect("raw database");
+        raw.execute_batch(
+            "CREATE TRIGGER reject_payload_update
+             BEFORE UPDATE ON credential_payloads
+             BEGIN SELECT RAISE(ABORT, 'payload write rejected'); END;",
+        )
+        .expect("trigger");
+        drop(raw);
+
+        let store = SqliteStore::open_encrypted(&path, key).expect("reopen");
+        assert!(matches!(
+            store.compare_and_swap_credential_payload(
+                "credential",
+                1,
+                &CredentialPayload::new(b"replacement-token").expect("payload"),
+                2,
+            ),
+            Err(StoreError::Sqlite(_))
+        ));
+        assert_eq!(
+            store
+                .credential_state("credential")
+                .expect("state lookup")
+                .expect("state")
+                .revision,
+            1
+        );
+        assert_eq!(
+            store
+                .credential_payload("credential")
+                .expect("payload lookup")
+                .expect("payload")
+                .as_bytes(),
+            b"original-token"
+        );
+    }
+
+    #[test]
+    fn wrong_master_key_cas_does_not_mutate_existing_token_or_revision() {
+        let directory = private_tempdir();
+        let path = directory.path().join("pooler.sqlite");
+        let correct_key = MasterKey::from_bytes(b"correct cas key").expect("key");
+        {
+            let store = SqliteStore::open_encrypted(&path, correct_key.clone()).expect("open");
+            store
+                .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+                .expect("metadata");
+            store
+                .upsert_credential_payload(
+                    "credential",
+                    &CredentialPayload::new(b"original-token").expect("payload"),
+                    1,
+                )
+                .expect("payload");
+        }
+        let wrong_store = SqliteStore::open_encrypted(
+            &path,
+            MasterKey::from_bytes(b"wrong cas key").expect("wrong key"),
+        )
+        .expect("wrong-key open");
+        assert_eq!(
+            wrong_store.compare_and_swap_credential_payload(
+                "credential",
+                1,
+                &CredentialPayload::new(b"replacement-token").expect("payload"),
+                2,
+            ),
+            Err(StoreError::WrongMasterKey)
+        );
+        drop(wrong_store);
+
+        let store = SqliteStore::open_encrypted(&path, correct_key).expect("correct reopen");
+        assert_eq!(
+            store
+                .credential_state("credential")
+                .expect("state lookup")
+                .expect("state")
+                .revision,
+            1
+        );
+        assert_eq!(
+            store
+                .credential_payload("credential")
+                .expect("payload lookup")
+                .expect("payload")
+                .as_bytes(),
+            b"original-token"
+        );
+    }
+
+    #[test]
+    fn encrypted_payload_tampering_fails_closed() {
+        let directory = private_tempdir();
+        let path = directory.path().join("pooler.sqlite");
+        let key = MasterKey::from_bytes(b"tamper test key").expect("key");
+        let store = SqliteStore::open_encrypted(&path, key.clone()).expect("open store");
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
+        store
+            .upsert_credential_payload(
+                "credential",
+                &CredentialPayload::new(b"secret-value").expect("payload"),
+                2,
+            )
+            .expect("payload");
+        drop(store);
+
+        let raw = Connection::open(&path).expect("raw database");
+        let mut envelope: Vec<u8> = raw
+            .query_row(
+                "SELECT envelope FROM credential_payloads WHERE credential_id = 'credential'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("envelope");
+        let last = envelope.len() - 1;
+        envelope[last] ^= 1;
+        raw.execute(
+            "UPDATE credential_payloads SET envelope = ?1 WHERE credential_id = 'credential'",
+            params![envelope],
+        )
+        .expect("tamper");
+        drop(raw);
+
+        let store = SqliteStore::open_encrypted(&path, key).expect("reopen");
+        assert_eq!(
+            store.credential_payload("credential"),
+            Err(StoreError::CredentialEnvelopeAuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn unencrypted_store_rejects_credential_payloads() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
+        let payload = CredentialPayload::new(b"secret-value").expect("payload");
+        assert_eq!(
+            store.upsert_credential_payload("credential", &payload, 2),
+            Err(StoreError::EncryptionRequired)
+        );
+        assert_eq!(
+            store.credential_payload("credential"),
+            Err(StoreError::EncryptionRequired)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_rejects_non_private_wal_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = private_tempdir();
+        let path = directory.path().join("pooler.sqlite");
+        let sidecar = PathBuf::from(format!("{}-wal", path.display()));
+        std::fs::write(&sidecar, []).expect("sidecar");
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644))
+            .expect("sidecar permissions");
+        assert!(matches!(
+            SqliteStore::open(&path),
+            Err(StoreError::UnsafePath(_))
+        ));
     }
 
     #[cfg(unix)]

@@ -1,6 +1,6 @@
 [package]
-name = "pooler-store"
-description = "Bounded state storage contracts and the in-memory Pooler store"
+name = "adapter-codex"
+description = "Evidence-grounded Codex OAuth credentials and native subscription provider contracts"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,14 +8,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22"
+http.workspace = true
 pooler-auth = { path = "../pooler-auth" }
+pooler-core = { path = "../pooler-core" }
 pooler-policy = { path = "../pooler-policy" }
 ring.workspace = true
-rusqlite.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-zeroize.workspace = true
+url.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -23,3 +27,6 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

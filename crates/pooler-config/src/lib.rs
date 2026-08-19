@@ -40,6 +40,9 @@ pub const CONFIG_VERSION: u32 = 1;
 pub const MAX_REQUEST_STEPS: usize = 32;
 /// Maximum aggregate serialized replacement bytes accepted for one route.
 pub const MAX_REQUEST_STEP_TOTAL_VALUE_BYTES: usize = 1024 * 1024;
+/// Default callback used by the local OAuth login flow when a provider does
+/// not override it.
+pub const DEFAULT_OAUTH_CALLBACK: &str = "http://localhost:1455/auth/callback";
 
 /// Location of a declaration in its source document.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -122,8 +125,6 @@ pub enum SecretRef {
         service: Arc<str>,
         account: Arc<str>,
     },
-    /// External secret-manager key.
-    External(Arc<str>),
 }
 
 impl SecretRef {
@@ -149,7 +150,7 @@ impl SecretRef {
                     account: Arc::from(account),
                 })
             }
-            "external" => Ok(Self::External(Arc::from(payload))),
+            "external" => Err(SecretRefError::UnknownScheme),
             "literal" | "raw" | "value" => Err(SecretRefError::LiteralNotAllowed),
             _ => Err(SecretRefError::UnknownScheme),
         }
@@ -162,7 +163,6 @@ impl SecretRef {
             Self::Env(name) => format!("env:{name}"),
             Self::File(path) => format!("file:{path}"),
             Self::Keyring { service, account } => format!("keyring:{service}/{account}"),
-            Self::External(key) => format!("external:{key}"),
         }
     }
 
@@ -173,7 +173,6 @@ impl SecretRef {
             Self::Env(_) => "env",
             Self::File(_) => "file",
             Self::Keyring { .. } => "keyring",
-            Self::External(_) => "external",
         }
     }
 }
@@ -221,7 +220,7 @@ pub enum SecretRefError {
     #[error("invalid environment secret name")]
     InvalidEnvironmentName,
     /// Literal secret values are forbidden.
-    #[error("literal secret values are not allowed; use env:, file:, keyring:, or external:")]
+    #[error("literal secret values are not allowed; use env:, file:, or keyring:")]
     LiteralNotAllowed,
     /// Unsupported scheme.
     #[error("unknown secret reference scheme")]
@@ -317,6 +316,10 @@ pub struct UpstreamConfig {
     pub transport: Option<TransportConfig>,
     /// Authentication reference.
     pub auth: Option<AuthConfig>,
+    /// OAuth provider declaration.
+    pub oauth: Option<OAuthConfig>,
+    /// Native provider declaration.
+    pub native: Option<NativeProviderConfig>,
 }
 
 /// Public model declaration.
@@ -525,6 +528,45 @@ pub struct AuthConfig {
     pub kind: Option<String>,
     /// Secret reference.
     pub secret: Option<SecretRef>,
+}
+
+/// OAuth provider endpoints and public client configuration.
+///
+/// Token material is never part of configuration. The CLI and provider
+/// implementation obtain it through the authentication boundary and retain
+/// only protected handles.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuthConfig {
+    /// Authorization endpoint used to start an authorization-code flow.
+    pub authorization_endpoint: Option<String>,
+    /// Token endpoint used to exchange an authorization code.
+    pub token_endpoint: Option<String>,
+    /// Optional endpoint used to revoke a provider token.
+    #[serde(alias = "revoke_endpoint")]
+    pub revocation_endpoint: Option<String>,
+    /// Optional identity endpoint used to discover the native account ID.
+    pub identity_endpoint: Option<String>,
+    /// Public OAuth client identifier.
+    pub client_id: Option<String>,
+    /// Requested OAuth scopes.
+    pub scopes: Vec<String>,
+    /// Loopback callback URI used by the local login flow.
+    pub callback: Option<String>,
+}
+
+/// Native provider declaration.
+///
+/// `kind` identifies a compiled-in provider adapter. Provider-specific
+/// behavior stays in the adapter; configuration contains only endpoints and
+/// stable identifiers.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct NativeProviderConfig {
+    /// Compiled-in provider adapter identifier.
+    pub kind: Option<String>,
+    /// Optional provider quota endpoint.
+    pub quota_endpoint: Option<String>,
 }
 
 /// Downstream authentication declaration.
@@ -749,6 +791,8 @@ pub struct UpstreamPlan {
     connect_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
     auth: Option<AuthPlan>,
+    oauth: Option<OAuthPlan>,
+    native: Option<NativeProviderPlan>,
     source: SourceLabel,
 }
 
@@ -789,10 +833,100 @@ impl UpstreamPlan {
         self.auth.as_ref()
     }
 
+    /// OAuth provider configuration, when this upstream is OAuth-backed.
+    #[must_use]
+    pub fn oauth(&self) -> Option<&OAuthPlan> {
+        self.oauth.as_ref()
+    }
+
+    /// Native provider configuration, when this upstream uses a compiled-in
+    /// provider adapter.
+    #[must_use]
+    pub fn native(&self) -> Option<&NativeProviderPlan> {
+        self.native.as_ref()
+    }
+
     /// Source declaration label.
     #[must_use]
     pub const fn source(&self) -> &SourceLabel {
         &self.source
+    }
+}
+
+/// Immutable OAuth provider configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OAuthPlan {
+    authorization_endpoint: Url,
+    token_endpoint: Url,
+    revocation_endpoint: Option<Url>,
+    identity_endpoint: Option<Url>,
+    client_id: Arc<str>,
+    scopes: Vec<Arc<str>>,
+    callback: Url,
+}
+
+impl OAuthPlan {
+    /// Authorization endpoint.
+    #[must_use]
+    pub const fn authorization_endpoint(&self) -> &Url {
+        &self.authorization_endpoint
+    }
+
+    /// Token exchange endpoint.
+    #[must_use]
+    pub const fn token_endpoint(&self) -> &Url {
+        &self.token_endpoint
+    }
+
+    /// Optional token revocation endpoint.
+    #[must_use]
+    pub fn revocation_endpoint(&self) -> Option<&Url> {
+        self.revocation_endpoint.as_ref()
+    }
+
+    /// Optional identity endpoint used to associate a native account.
+    #[must_use]
+    pub fn identity_endpoint(&self) -> Option<&Url> {
+        self.identity_endpoint.as_ref()
+    }
+
+    /// Public OAuth client identifier.
+    #[must_use]
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Requested OAuth scopes.
+    #[must_use]
+    pub fn scopes(&self) -> &[Arc<str>] {
+        &self.scopes
+    }
+
+    /// Loopback callback URI.
+    #[must_use]
+    pub const fn callback(&self) -> &Url {
+        &self.callback
+    }
+}
+
+/// Immutable native provider configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeProviderPlan {
+    kind: Arc<str>,
+    quota_endpoint: Option<Url>,
+}
+
+impl NativeProviderPlan {
+    /// Compiled-in provider adapter identifier.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Optional quota endpoint.
+    #[must_use]
+    pub fn quota_endpoint(&self) -> Option<&Url> {
+        self.quota_endpoint.as_ref()
     }
 }
 
@@ -1889,6 +2023,7 @@ fn compile_config(
         validate_id("upstream", id, &label)?;
         let (url, transport, connect_timeout, request_timeout) =
             compile_upstream(declaration, &label)?;
+        let (oauth, native) = compile_provider_auth(declaration, &label)?;
         let auth = compile_auth(declaration.auth.as_ref(), &label)?;
         upstreams.insert(
             Arc::from(id.as_str()),
@@ -1899,6 +2034,8 @@ fn compile_config(
                 connect_timeout,
                 request_timeout,
                 auth,
+                oauth,
+                native,
                 source: label,
             },
         );
@@ -2079,10 +2216,7 @@ fn compile_accounts(
                 .ok_or_else(|| invalid(&label, "account requires a secret reference"))?;
             if !matches!(
                 secret,
-                SecretRef::Env(_)
-                    | SecretRef::File(_)
-                    | SecretRef::Keyring { .. }
-                    | SecretRef::External(_)
+                SecretRef::Env(_) | SecretRef::File(_) | SecretRef::Keyring { .. }
             ) {
                 return Err(invalid(&label, "account secret reference is unsupported"));
             }
@@ -2554,6 +2688,194 @@ fn compile_upstream(
         connect_timeout,
         request_timeout,
     ))
+}
+
+fn compile_provider_auth(
+    declaration: &UpstreamConfig,
+    label: &SourceLabel,
+) -> Result<(Option<OAuthPlan>, Option<NativeProviderPlan>), ConfigError> {
+    if declaration.oauth.is_none() && declaration.native.is_none() {
+        return Ok((None, None));
+    }
+    if declaration.oauth.is_some() && declaration.auth.is_some() {
+        return Err(invalid(
+            label,
+            "upstream auth cannot be combined with oauth provider authentication",
+        ));
+    }
+
+    let oauth = declaration
+        .oauth
+        .as_ref()
+        .map(|value| compile_oauth(value, label))
+        .transpose()?;
+    let native = declaration
+        .native
+        .as_ref()
+        .map(|native| {
+            let kind = required_nonempty(native.kind.as_deref(), label, "native.kind")?;
+            validate_component_id(kind, label, "native.kind")?;
+            let quota_endpoint = native
+                .quota_endpoint
+                .as_deref()
+                .map(|value| compile_secure_endpoint(value, label, "native.quota_endpoint"))
+                .transpose()?;
+            Ok(NativeProviderPlan {
+                kind: Arc::from(kind),
+                quota_endpoint,
+            })
+        })
+        .transpose()?;
+    if native
+        .as_ref()
+        .is_some_and(|provider| provider.kind.as_ref() == "codex")
+        && oauth
+            .as_ref()
+            .is_some_and(|provider| provider.identity_endpoint.is_none())
+    {
+        return Err(invalid(
+            label,
+            "native codex OAuth providers require oauth.identity_endpoint",
+        ));
+    }
+    Ok((oauth, native))
+}
+
+fn compile_oauth(declaration: &OAuthConfig, label: &SourceLabel) -> Result<OAuthPlan, ConfigError> {
+    let authorization_endpoint = compile_secure_endpoint(
+        required_nonempty(
+            declaration.authorization_endpoint.as_deref(),
+            label,
+            "oauth.authorization_endpoint",
+        )?,
+        label,
+        "oauth.authorization_endpoint",
+    )?;
+    let token_endpoint = compile_secure_endpoint(
+        required_nonempty(
+            declaration.token_endpoint.as_deref(),
+            label,
+            "oauth.token_endpoint",
+        )?,
+        label,
+        "oauth.token_endpoint",
+    )?;
+    let revocation_endpoint = declaration
+        .revocation_endpoint
+        .as_deref()
+        .map(|value| compile_secure_endpoint(value, label, "oauth.revocation_endpoint"))
+        .transpose()?;
+    let identity_endpoint = declaration
+        .identity_endpoint
+        .as_deref()
+        .map(|value| compile_secure_endpoint(value, label, "oauth.identity_endpoint"))
+        .transpose()?;
+    let client_id = required_nonempty(declaration.client_id.as_deref(), label, "oauth.client_id")?;
+    let callback = compile_loopback_callback(
+        declaration
+            .callback
+            .as_deref()
+            .unwrap_or(DEFAULT_OAUTH_CALLBACK),
+        label,
+    )?;
+
+    if declaration.scopes.is_empty() {
+        return Err(invalid(
+            label,
+            "oauth.scopes must contain at least one scope",
+        ));
+    }
+    let mut scopes = Vec::with_capacity(declaration.scopes.len());
+    let mut seen = BTreeSet::new();
+    for scope in &declaration.scopes {
+        let scope = scope.trim();
+        if scope.is_empty() || !seen.insert(scope.to_owned()) {
+            return Err(invalid(label, "oauth.scopes must be non-empty and unique"));
+        }
+        scopes.push(Arc::from(scope));
+    }
+
+    Ok(OAuthPlan {
+        authorization_endpoint,
+        token_endpoint,
+        revocation_endpoint,
+        identity_endpoint,
+        client_id: Arc::from(client_id),
+        scopes,
+        callback,
+    })
+}
+
+fn required_nonempty<'a>(
+    value: Option<&'a str>,
+    label: &SourceLabel,
+    field: &str,
+) -> Result<&'a str, ConfigError> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid(label, &format!("{field} is required")))
+}
+
+fn compile_secure_endpoint(
+    value: &str,
+    label: &SourceLabel,
+    field: &str,
+) -> Result<Url, ConfigError> {
+    let url =
+        Url::parse(value.trim()).map_err(|_| invalid(label, &format!("{field} is invalid")))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid(
+            label,
+            &format!("{field} must be an HTTPS URL without userinfo or fragment"),
+        ));
+    }
+    Ok(url)
+}
+
+fn compile_loopback_callback(value: &str, label: &SourceLabel) -> Result<Url, ConfigError> {
+    let url = Url::parse(value.trim())
+        .map_err(|_| invalid(label, "oauth.callback must be a valid URL"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| invalid(label, "oauth.callback must include a loopback host"))?;
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false);
+    if url.scheme() != "http"
+        || !is_loopback
+        || url.port().is_none()
+        || url.port() == Some(0)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid(
+            label,
+            "oauth.callback must be an HTTP loopback URL with an explicit port and no query, fragment, or userinfo",
+        ));
+    }
+    Ok(url)
+}
+
+fn validate_component_id(value: &str, label: &SourceLabel, field: &str) -> Result<(), ConfigError> {
+    if value.chars().any(|character| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    }) {
+        return Err(invalid(
+            label,
+            &format!("{field} contains unsupported characters"),
+        ));
+    }
+    Ok(())
 }
 
 fn compile_models(
@@ -3735,6 +4057,10 @@ routes:
         assert_eq!(reference.to_string(), "env:POOLER_KEY");
         assert!(!format!("{reference:?}").contains("secret-value"));
         assert!(SecretRef::parse("literal:secret-value").is_err());
+        assert!(matches!(
+            SecretRef::parse("external:pooler/master"),
+            Err(SecretRefError::UnknownScheme)
+        ));
     }
 
     #[test]
@@ -3992,5 +4318,147 @@ account_pools: {default: {accounts: [absent]}}
         let unknown = "version: 1\npolicies: {default: {rety: {maximum_attempts: 2}}}\n";
         let error = parse_yaml("policy-field.yaml", unknown).expect_err("unknown policy field");
         assert!(error.to_string().contains("rety"));
+    }
+
+    #[test]
+    fn compiles_strict_oauth_provider_and_retains_no_token_material() {
+        let text = r#"
+version: 1
+upstreams:
+  codex:
+    url: https://api.example.test
+    oauth:
+      authorization_endpoint: https://auth.example.test/authorize
+      token_endpoint: https://auth.example.test/token
+      revocation_endpoint: https://auth.example.test/revoke
+      client_id: pooler-cli
+      scopes: [openid, profile]
+      callback: http://127.0.0.1:8765/oauth/callback
+"#;
+        let config = compile_yaml("oauth.yaml", text).expect("oauth config");
+        let oauth = config.upstreams()["codex"].oauth().expect("oauth plan");
+        assert_eq!(oauth.client_id(), "pooler-cli");
+        assert_eq!(oauth.scopes().len(), 2);
+        assert_eq!(oauth.callback().host_str(), Some("127.0.0.1"));
+        assert!(format!("{oauth:?}").contains("pooler-cli"));
+        assert!(!format!("{oauth:?}").contains("access_token"));
+    }
+
+    #[test]
+    fn rejects_unsafe_oauth_callback_and_duplicate_scopes() {
+        let public_callback = r#"
+version: 1
+upstreams:
+  codex:
+    url: https://api.example.test
+    oauth:
+      authorization_endpoint: https://auth.example.test/authorize
+      token_endpoint: https://auth.example.test/token
+      client_id: pooler-cli
+      scopes: [openid]
+      callback: https://example.test/callback
+"#;
+        let error = compile_yaml("oauth-public.yaml", public_callback)
+            .expect_err("public callback must fail");
+        assert!(error.to_string().contains("loopback"));
+
+        let duplicate_scope = public_callback
+            .replace("scopes: [openid]", "scopes: [openid, openid]")
+            .replace(
+                "callback: https://example.test/callback",
+                "callback: http://127.0.0.1:8765/callback",
+            );
+        let error = compile_yaml("oauth-duplicate-scope.yaml", &duplicate_scope)
+            .expect_err("duplicate scopes must fail");
+        assert!(error.to_string().contains("non-empty and unique"));
+
+        let fallback = r#"
+version: 1
+upstreams:
+  codex:
+    url: https://api.example.test
+    oauth:
+      authorization_endpoint: https://auth.example.test/authorize
+      token_endpoint: https://auth.example.test/token
+      client_id: pooler-cli
+      scopes: [openid]
+"#;
+        let config = compile_yaml("oauth-fallback.yaml", fallback).expect("default callback");
+        assert_eq!(
+            config.upstreams()["codex"]
+                .oauth()
+                .expect("oauth plan")
+                .callback()
+                .as_str(),
+            DEFAULT_OAUTH_CALLBACK
+        );
+    }
+
+    #[test]
+    fn compiles_native_provider_with_oauth_authentication() {
+        let text = r#"
+version: 1
+upstreams:
+  provider:
+    url: https://api.example.test
+    oauth:
+      authorization_endpoint: https://auth.example.test/authorize
+      token_endpoint: https://auth.example.test/token
+      client_id: pooler-cli
+      scopes: [openid]
+      callback: http://127.0.0.1:8765/callback
+      identity_endpoint: https://auth.example.test/me
+    native: {kind: codex}
+"#;
+        let config = compile_yaml("oauth-native.yaml", text).expect("native OAuth provider");
+        let provider = &config.upstreams()["provider"];
+        assert!(provider.oauth().is_some());
+        assert_eq!(
+            provider
+                .oauth()
+                .expect("oauth plan")
+                .identity_endpoint()
+                .expect("identity endpoint")
+                .path(),
+            "/me"
+        );
+        assert_eq!(provider.native().expect("native plan").kind(), "codex");
+    }
+
+    #[test]
+    fn native_codex_oauth_requires_identity_endpoint() {
+        let text = r#"
+version: 1
+upstreams:
+  provider:
+    url: https://api.example.test
+    oauth:
+      authorization_endpoint: https://auth.example.test/authorize
+      token_endpoint: https://auth.example.test/token
+      client_id: pooler-cli
+      scopes: [openid]
+      callback: http://127.0.0.1:8765/callback
+    native: {kind: codex}
+"#;
+        let error = compile_yaml("oauth-native-missing-identity.yaml", text)
+            .expect_err("native Codex identity is required");
+        assert!(error.to_string().contains("identity_endpoint"));
+    }
+
+    #[test]
+    fn compiles_native_provider_quota_endpoint() {
+        let text = r#"
+version: 1
+upstreams:
+  codex:
+    url: https://api.example.test
+    native:
+      kind: codex
+      quota_endpoint: https://api.example.test/quota
+"#;
+        let config = compile_yaml("native.yaml", text).expect("native config");
+        let native = config.upstreams()["codex"].native().expect("native plan");
+        assert_eq!(native.kind(), "codex");
+        assert_eq!(native.quota_endpoint().expect("quota").path(), "/quota");
     }
 }

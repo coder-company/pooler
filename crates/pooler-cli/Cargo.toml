@@ -10,11 +10,19 @@ description = "Command line interface for the Pooler protocol runtime"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+pooler-auth = { path = "../pooler-auth" }
 pooler-config = { path = "../pooler-config" }
+pooler-http = { path = "../pooler-http" }
 pooler-observe = { path = "../pooler-observe" }
+pooler-store = { path = "../pooler-store" }
 pooler-server = { path = "../pooler-server" }
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
+url.workspace = true
+zeroize.workspace = true
 
 [lib]
 name = "pooler_cli"
