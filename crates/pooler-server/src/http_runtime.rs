@@ -476,7 +476,7 @@ mod tests {
         let address = listener.local_addr().expect("upstream address available");
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("upstream accepts");
-            let request = read_headers(&mut stream)
+            let request = read_request(&mut stream)
                 .await
                 .expect("upstream request bytes");
             let headers = format!(
@@ -526,6 +526,26 @@ mod tests {
                 return Ok(bytes);
             }
         }
+    }
+
+    async fn read_request(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+        let mut bytes = read_headers(stream).await?;
+        let header_length = header_end(&bytes).map_or(bytes.len(), |index| index + 4);
+        let body_length = content_length(&bytes[..header_length]).unwrap_or_default();
+        let request_length = header_length + body_length;
+        while bytes.len() < request_length {
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before request body",
+                ));
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        bytes.truncate(request_length);
+        Ok(bytes)
     }
 
     async fn read_response(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
@@ -831,7 +851,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "limit.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: limited\n    listen: local\n    match: {{method: POST, path: /limited}}\n    limits: {{max_request_body_bytes: 3}}\n    target: local\n"
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: limited\n    listen: local\n    match: {{method: POST, path: /limited}}\n    limits: {{max_request_body_bytes: 3}}\n    target: local\n  - id: expanded\n    listen: local\n    match: {{method: POST, path: /expanded}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /x, value: \"1234567890123456789012345678901234567890\"}}\n    limits: {{max_request_body_bytes: 16}}\n    target: local\n    response: {{mode: opaque}}\n"
             ),
         )
         .expect("limit config compiles");
@@ -860,6 +880,12 @@ mod tests {
         )
         .await;
         assert_eq!(status(&repeated_encoding), 415);
+        let expanded = send_request(
+            address,
+            b"POST /expanded HTTP/1.1\r\nHost: test\r\nContent-Length: 7\r\n\r\n{\"x\":0}",
+        )
+        .await;
+        assert_eq!(status(&expanded), 413);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), upstream_listener.accept())
                 .await
@@ -987,5 +1013,38 @@ mod tests {
         assert_eq!(server.active(), 0);
         client.await.expect("client task");
         assert_eq!(upstream.await.expect("upstream task"), 0);
+    }
+
+    #[tokio::test]
+    async fn patch_route_changes_reasoning_and_preserves_unknown_json() {
+        let (upstream_address, upstream) = spawn_one_shot_upstream(b"patched").await;
+        let config = pooler_config::compile_yaml(
+            "patch.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: patch\n    listen: local\n    match: {{method: POST, path: /patch}}\n    ingress: {{mode: patch, inspectors: [inspect.openai.model]}}\n    request:\n      steps:\n        - use: transform.json.set_when_model_prefix\n          with: {{prefix: gpt-, pointer: /reasoning/effort, value: high}}\n    target: local\n    response: {{mode: opaque}}\n"
+            ),
+        )
+        .expect("patch route compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body =
+            br#"{"model":"gpt-5.6-sol","reasoning":{"effort":"low"},"unknown":{"keep":[1,2]}}"#;
+        let request = format!(
+            "POST /patch HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response = send_request(address, request.as_bytes()).await;
+        assert_eq!(status(&response), 200);
+        let upstream_request = upstream.await.expect("upstream task");
+        let patched: serde_json::Value =
+            serde_json::from_slice(response_body(&upstream_request)).expect("patched JSON body");
+        assert_eq!(patched["reasoning"]["effort"], "high");
+        assert_eq!(patched["unknown"]["keep"], serde_json::json!([1, 2]));
+        stop_server(&server, runner).await;
     }
 }

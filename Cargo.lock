@@ -727,6 +727,7 @@ version = "0.1.0"
 dependencies = [
  "http",
  "pooler-core",
+ "pooler-protocol",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -761,6 +762,7 @@ dependencies = [
  "pooler-auth",
  "pooler-config",
  "pooler-core",
+ "pooler-protocol",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -810,6 +812,7 @@ dependencies = [
  "pooler-config",
  "pooler-core",
  "pooler-http",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-util",

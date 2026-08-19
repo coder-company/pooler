@@ -76,7 +76,13 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Serve => serve(&cli.config),
         Command::Doctor => bail!("doctor is not implemented in the engineering baseline"),
-        Command::Models => bail!("models are not implemented in the engineering baseline"),
+        Command::Models => {
+            let config = load(&cli.config)?;
+            for model in config.models().values() {
+                println!("{}", model.id());
+            }
+            Ok(())
+        }
         Command::Fixture => bail!("fixture replay is not implemented in the engineering baseline"),
         Command::Auth => {
             bail!("credential management is not implemented in the engineering baseline")

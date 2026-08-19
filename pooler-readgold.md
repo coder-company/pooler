@@ -18,7 +18,11 @@ name or advertised without conformance evidence.
   the pushed commit.
 - Phase 1 — opaque custom proxy: implemented and locally verified; cross-platform
   CI evidence is pending the pushed commit.
-- Phases 2–8: pending.
+- Phase 2 — patch and overlay engine: in progress. Bounded JSON inspection,
+  transforms, model declarations, runtime patching, and local E2E coverage are
+  implemented; overlays, preset rendering, model-based target selection, and
+  Cursor compatibility evidence remain.
+- Phases 3–8: pending.
 - First useful release acceptance: pending.
 
 ## Verification gates

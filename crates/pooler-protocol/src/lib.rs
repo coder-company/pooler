@@ -20,7 +20,11 @@ pub use extensions::{
     ExtensionError, ExtensionKey, ExtensionName, ExtensionNamespace, Extensions, OpaqueExtension,
     OpaqueExtensions, ReplayPolicy,
 };
-pub use json::{PreservedJson, PreservedJsonError};
+pub use json::{
+    JsonInspectionError, JsonPatchError, JsonPatchLimits, PreservedJson, PreservedJsonError,
+    DEFAULT_JSON_PATCH_MAX_POINTER_BYTES, DEFAULT_JSON_PATCH_MAX_POINTER_DEPTH,
+    DEFAULT_JSON_PATCH_MAX_VALUE_BYTES,
+};
 pub use model::{
     CacheHints, ContentPart, InputItem, MediaSource, Message, ReasoningBlock, ReasoningConfig,
     ReasoningEffort, Request, RequestValidationError, ResponseFormat, Role, SamplingParameters,

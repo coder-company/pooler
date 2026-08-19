@@ -1,8 +1,7 @@
-//! Opaque HTTP forwarding for compiled custom routes.
+//! HTTP forwarding for opaque and bounded JSON-patch routes.
 //!
-//! The proxy deliberately keeps the request and response bodies as Hyper
-//! streams.  It only inspects the dimensions required to select a route and
-//! never parses or rewrites an opaque payload.
+//! Opaque bodies remain Hyper streams. Patch routes buffer within their route
+//! limit, apply the compiled transforms, and keep responses opaque.
 
 use std::{
     convert::Infallible,
@@ -27,9 +26,11 @@ use hyper_util::{
 };
 use pooler_auth::{constant_time_eq, SecretRef as AuthSecretRef, SecretValue};
 use pooler_config::{
-    CompiledConfig, RouteMatchError, RoutePlan, RouteRequest, SecretRef, UpstreamPlan,
+    CompiledConfig, RequestTransform, RouteMatchError, RoutePlan, RouteRequest, SecretRef,
+    UpstreamPlan,
 };
 use pooler_core::{BodyMode, RouteLimits};
+use pooler_protocol::{JsonPatchLimits, PreservedJson};
 use thiserror::Error;
 use tokio::time::{self, Instant, Sleep};
 use zeroize::Zeroizing;
@@ -126,6 +127,12 @@ pub enum ProxyError {
     /// An HTTP request could not be constructed.
     #[error("failed to build upstream request: {0}")]
     RequestBuild(#[from] http::Error),
+    /// A patch request body was not valid for its compiled transform plan.
+    #[error("invalid patch request: {0}")]
+    InvalidPatch(String),
+    /// A buffered or transformed request body exceeded the route limit.
+    #[error("request body exceeds configured limit")]
+    RequestBodyTooLarge,
     /// The upstream request failed before a response was received.
     #[error("upstream request failed: {0}")]
     Upstream(#[source] BoxError),
@@ -163,7 +170,7 @@ impl HttpProxy {
         let listener = listener.into();
         if let Some(route) = config.routes().iter().find(|route| {
             route.listener() == listener.as_ref()
-                && (route.ingress().mode() != BodyMode::Opaque
+                && (!matches!(route.ingress().mode(), BodyMode::Opaque | BodyMode::Patch)
                     || route.response().mode() != BodyMode::Opaque)
         }) {
             return Err(ProxyError::UnsupportedBodyMode {
@@ -256,7 +263,7 @@ impl HttpProxy {
                     listener = %self.listener,
                     route = route.id(),
                     error = %error,
-                    "upstream request failed"
+                    "request failed"
                 );
                 error_response(error)
             }
@@ -352,6 +359,9 @@ impl HttpProxy {
                 route: route.id().to_owned(),
                 upstream: route.target().upstream().to_owned(),
             })?;
+        let started = Instant::now();
+        let request_deadline = started + request_timeout(route.limits(), upstream);
+        let cancellation = guard.cancellation_token();
         let uri = upstream_uri(upstream, route, request.uri())?;
         let method = request.method().clone();
         let version = request.version();
@@ -366,20 +376,83 @@ impl HttpProxy {
             .check_headers(header_count, header_bytes(&headers))
             .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
 
-        let body = LimitedBody::new(
-            request.into_body(),
-            bounded_usize(limits.max_request_body_bytes),
-        )
-        .map_err(box_error)
-        .boxed();
+        let incoming = request.into_body();
+        let body = match route.ingress().mode() {
+            BodyMode::Opaque => {
+                LimitedBody::new(incoming, bounded_usize(limits.max_request_body_bytes))
+                    .map_err(box_error)
+                    .boxed()
+            }
+            BodyMode::Patch => {
+                let bytes = tokio::select! {
+                    result = time::timeout_at(
+                        request_deadline,
+                        crate::collect_body_limited(
+                            incoming,
+                            bounded_usize(limits.max_request_body_bytes),
+                        ),
+                    ) => result
+                        .map_err(|_| ProxyError::Timeout)?
+                        .map_err(|error| match error {
+                            crate::BodyLimitError::TooLarge { .. } => {
+                                ProxyError::RequestBodyTooLarge
+                            }
+                            other => ProxyError::InvalidPatch(other.to_string()),
+                        })?,
+                    () = cancellation.cancelled() => {
+                        return Err(ProxyError::Timeout);
+                    }
+                };
+                let mut document = PreservedJson::from_bytes(bytes.to_vec())
+                    .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+                for transform in route.request_steps() {
+                    match transform {
+                        RequestTransform::JsonSet { pointer, value } => {
+                            document
+                                .set_pointer_bounded(
+                                    pointer,
+                                    value.clone(),
+                                    JsonPatchLimits::default(),
+                                )
+                                .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+                        }
+                        RequestTransform::JsonSetWhenModelPrefix {
+                            prefix,
+                            pointer,
+                            value,
+                        } => {
+                            document
+                                .set_pointer_when_model_prefix(
+                                    prefix,
+                                    pointer,
+                                    value.clone(),
+                                    JsonPatchLimits::default(),
+                                )
+                                .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+                        }
+                    }
+                }
+                let bytes = document.bytes().into_owned();
+                limits
+                    .check_request_body(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                    .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                headers.remove(header::CONTENT_LENGTH);
+                Full::new(Bytes::from(bytes))
+                    .map_err(|never: Infallible| match never {})
+                    .boxed()
+            }
+            BodyMode::Inspect | BodyMode::Semantic => {
+                return Err(ProxyError::UnsupportedBodyMode {
+                    route: route.id().to_owned(),
+                });
+            }
+        };
         let mut builder = Request::builder().method(method).uri(uri).version(version);
         *builder.headers_mut().expect("request builder headers") = headers;
         let upstream_request = builder.body(body)?;
 
-        let started = Instant::now();
-        let request_deadline = started + request_timeout(limits, upstream);
-        let header_deadline = (started + connect_timeout(limits, upstream)).min(request_deadline);
-        let cancellation = guard.cancellation_token();
+        let header_deadline =
+            (Instant::now() + connect_timeout(limits, upstream)).min(request_deadline);
         let response = tokio::select! {
             result = time::timeout_at(header_deadline, self.client.request(upstream_request)) => {
                 result.map_err(|_| ProxyError::Timeout)?.map_err(|error| ProxyError::Upstream(Box::new(error)))?
@@ -556,18 +629,27 @@ fn unauthorized_response() -> Response<ProxyBody> {
 }
 
 fn error_response(error: ProxyError) -> Response<ProxyBody> {
-    let status = match error {
-        ProxyError::Timeout => StatusCode::GATEWAY_TIMEOUT,
-        ProxyError::UnsupportedAuth | ProxyError::SecretUnavailable => StatusCode::BAD_GATEWAY,
+    let (status, message) = match error {
+        ProxyError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "upstream request failed"),
+        ProxyError::UnsupportedAuth | ProxyError::SecretUnavailable => {
+            (StatusCode::BAD_GATEWAY, "upstream request failed")
+        }
         ProxyError::MissingUpstream { .. }
         | ProxyError::InvalidUri
         | ProxyError::InvalidLimits(_)
         | ProxyError::RequestBuild(_)
         | ProxyError::Upstream(_)
-        | ProxyError::UnsupportedBodyMode { .. } => StatusCode::BAD_GATEWAY,
-        ProxyError::TlsClient(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        | ProxyError::UnsupportedBodyMode { .. } => {
+            (StatusCode::BAD_GATEWAY, "upstream request failed")
+        }
+        ProxyError::InvalidPatch(_) => (StatusCode::BAD_REQUEST, "invalid request"),
+        ProxyError::RequestBodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
+        ProxyError::TlsClient(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "proxy initialization failed",
+        ),
     };
-    plain_response(status, "upstream request failed")
+    plain_response(status, message)
 }
 
 #[cfg(test)]

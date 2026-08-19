@@ -16,7 +16,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::Method;
-pub use pooler_core::{BodyMode, ConfigGeneration, LossPolicy, RouteLimits};
+pub use pooler_core::{
+    BodyMode, Capability, CapabilitySet, ConfigGeneration, LossPolicy, RouteLimits,
+};
+use pooler_protocol::{
+    DEFAULT_JSON_PATCH_MAX_POINTER_BYTES, DEFAULT_JSON_PATCH_MAX_POINTER_DEPTH,
+    DEFAULT_JSON_PATCH_MAX_VALUE_BYTES,
+};
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
@@ -28,6 +34,10 @@ pub use route_match::{RouteMatchError, RouteRequest};
 
 /// Current configuration schema version.
 pub const CONFIG_VERSION: u32 = 1;
+/// Maximum number of transforms accepted for one route.
+pub const MAX_REQUEST_STEPS: usize = 32;
+/// Maximum aggregate serialized replacement bytes accepted for one route.
+pub const MAX_REQUEST_STEP_TOTAL_VALUE_BYTES: usize = 1024 * 1024;
 
 /// Location of a declaration in its source document.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -223,6 +233,8 @@ pub struct Config {
     /// Upstream declarations keyed by ID. `providers` is accepted as an alias.
     #[serde(alias = "providers")]
     pub upstreams: BTreeMap<String, UpstreamConfig>,
+    /// Public model declarations and their static upstream targets.
+    pub models: Vec<ModelConfig>,
     /// Routes in declaration order.
     pub routes: Vec<RouteConfig>,
     #[serde(skip)]
@@ -288,6 +300,33 @@ pub struct UpstreamConfig {
     pub transport: Option<TransportConfig>,
     /// Authentication reference.
     pub auth: Option<AuthConfig>,
+}
+
+/// Public model declaration.
+///
+/// Models are deliberately represented as a list in the source schema.  This
+/// keeps the stable public model ID next to its targets and leaves room for
+/// source-aware duplicate diagnostics during compilation.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelConfig {
+    /// Stable public model ID.
+    pub id: String,
+    /// Static upstream targets tried in declaration order.
+    pub targets: Vec<ModelTargetConfig>,
+}
+
+/// Static target for a public model.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelTargetConfig {
+    /// Upstream/provider ID.
+    #[serde(alias = "upstream")]
+    pub provider: Option<String>,
+    /// Model name sent to the upstream.
+    pub upstream_model: Option<String>,
+    /// Capabilities advertised by this target.
+    pub capabilities: Vec<String>,
 }
 
 /// Upstream transport declaration.
@@ -383,6 +422,8 @@ pub struct RouteConfig {
     pub limits: Option<RouteLimitsConfig>,
     /// Ingress body handling.
     pub ingress: Option<BodyConfig>,
+    /// Ordered request transforms.
+    pub request: Option<RequestConfig>,
     /// Response body handling.
     pub response: Option<BodyConfig>,
     /// Target declaration.
@@ -431,6 +472,39 @@ pub struct BodyConfig {
     pub encoder: Option<String>,
     /// Inspector components.
     pub inspectors: Vec<String>,
+}
+
+/// Request-side transforms applied in declaration order.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestConfig {
+    /// Ordered transform steps.
+    pub steps: Vec<RequestStepConfig>,
+}
+
+/// One request transform declaration.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestStepConfig {
+    /// Built-in transform identifier.
+    #[serde(rename = "use")]
+    pub transform: String,
+    /// Transform parameters from the `with` mapping.
+    #[serde(rename = "with")]
+    pub parameters: TransformParameters,
+}
+
+/// Parameters accepted by the built-in JSON request transforms.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransformParameters {
+    /// RFC 6901 JSON pointer to replace.
+    pub pointer: Option<String>,
+    /// Replacement JSON value.
+    pub value: serde_json::Value,
+    /// Required model prefix for conditional transforms.
+    #[serde(alias = "model_prefix")]
+    pub prefix: Option<String>,
 }
 
 /// Target may be an upstream ID or an object.
@@ -536,6 +610,110 @@ impl UpstreamPlan {
     #[must_use]
     pub const fn source(&self) -> &SourceLabel {
         &self.source
+    }
+}
+
+/// Immutable static target for a public model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelTargetPlan {
+    provider: Arc<str>,
+    upstream_model: Arc<str>,
+    capabilities: CapabilitySet,
+}
+
+impl ModelTargetPlan {
+    /// Upstream/provider ID.
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// Model name sent to the upstream.
+    #[must_use]
+    pub fn upstream_model(&self) -> &str {
+        &self.upstream_model
+    }
+
+    /// Capabilities advertised by the target.
+    #[must_use]
+    pub const fn capabilities(&self) -> CapabilitySet {
+        self.capabilities
+    }
+}
+
+/// Immutable public model registry entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelPlan {
+    id: Arc<str>,
+    targets: Vec<ModelTargetPlan>,
+    source: SourceLabel,
+}
+
+impl ModelPlan {
+    /// Public model ID.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Static targets in declaration order.
+    #[must_use]
+    pub fn targets(&self) -> &[ModelTargetPlan] {
+        &self.targets
+    }
+
+    /// Source declaration label.
+    #[must_use]
+    pub const fn source(&self) -> &SourceLabel {
+        &self.source
+    }
+}
+
+/// A compiled request transform.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestTransform {
+    /// Replace a value at a JSON pointer.
+    JsonSet {
+        /// RFC 6901 pointer.
+        pointer: Arc<str>,
+        /// Replacement value.
+        value: serde_json::Value,
+    },
+    /// Replace a value when the request model starts with a prefix.
+    JsonSetWhenModelPrefix {
+        /// Required model prefix.
+        prefix: Arc<str>,
+        /// RFC 6901 pointer.
+        pointer: Arc<str>,
+        /// Replacement value.
+        value: serde_json::Value,
+    },
+}
+
+impl RequestTransform {
+    /// JSON pointer targeted by this transform.
+    #[must_use]
+    pub fn pointer(&self) -> &str {
+        match self {
+            Self::JsonSet { pointer, .. } | Self::JsonSetWhenModelPrefix { pointer, .. } => pointer,
+        }
+    }
+
+    /// Replacement value.
+    #[must_use]
+    pub fn value(&self) -> &serde_json::Value {
+        match self {
+            Self::JsonSet { value, .. } | Self::JsonSetWhenModelPrefix { value, .. } => value,
+        }
+    }
+
+    /// Conditional model prefix, when this transform has one.
+    #[must_use]
+    pub fn model_prefix(&self) -> Option<&str> {
+        match self {
+            Self::JsonSet { .. } => None,
+            Self::JsonSetWhenModelPrefix { prefix, .. } => Some(prefix),
+        }
     }
 }
 
@@ -722,6 +900,7 @@ pub struct RoutePlan {
     listener: Arc<str>,
     matcher: MatchPlan,
     ingress: BodyPlan,
+    request_steps: Vec<RequestTransform>,
     response: BodyPlan,
     target: TargetPlan,
     downstream_auth: Option<AuthPlan>,
@@ -755,6 +934,12 @@ impl RoutePlan {
     #[must_use]
     pub const fn ingress(&self) -> &BodyPlan {
         &self.ingress
+    }
+
+    /// Ordered request transforms.
+    #[must_use]
+    pub fn request_steps(&self) -> &[RequestTransform] {
+        &self.request_steps
     }
 
     /// Response plan.
@@ -836,6 +1021,7 @@ pub struct CompiledConfig {
     generation: u64,
     listeners: BTreeMap<Arc<str>, ListenerPlan>,
     upstreams: BTreeMap<Arc<str>, UpstreamPlan>,
+    models: BTreeMap<Arc<str>, ModelPlan>,
     routes: Vec<RoutePlan>,
 }
 
@@ -856,6 +1042,12 @@ impl CompiledConfig {
     #[must_use]
     pub const fn upstreams(&self) -> &BTreeMap<Arc<str>, UpstreamPlan> {
         &self.upstreams
+    }
+
+    /// Public model plans keyed by ID.
+    #[must_use]
+    pub const fn models(&self) -> &BTreeMap<Arc<str>, ModelPlan> {
+        &self.models
     }
 
     /// Routes sorted by deterministic precedence.
@@ -932,6 +1124,16 @@ pub enum ConfigError {
         /// Second declaration.
         second: Box<SourceLabel>,
     },
+    /// Duplicate public model ID.
+    #[error("duplicate model `{id}` at {second}; first declaration is at {first}")]
+    DuplicateModel {
+        /// Model ID.
+        id: String,
+        /// First declaration.
+        first: Box<SourceLabel>,
+        /// Second declaration.
+        second: Box<SourceLabel>,
+    },
     /// Indistinguishable routes at equal precedence.
     #[error("route conflict between `{first_route}` at {first} and `{second_route}` at {second}")]
     RouteConflict {
@@ -998,6 +1200,8 @@ fn compile_config(
         );
     }
 
+    let models = compile_models(config, source, &upstreams)?;
+
     let mut routes = Vec::with_capacity(config.routes.len());
     let mut route_ids = BTreeMap::new();
     for (order, declaration) in config.routes.iter().enumerate() {
@@ -1029,6 +1233,27 @@ fn compile_config(
             &label,
             "ingress",
         )?;
+        let request_steps = compile_request(declaration.request.as_ref(), &label)?;
+        if !request_steps.is_empty() && ingress.mode() != BodyMode::Patch {
+            return Err(invalid(
+                &label,
+                "JSON request transforms require patch ingress mode",
+            ));
+        }
+        let needs_model_inspector = request_steps
+            .iter()
+            .any(|step| matches!(step, RequestTransform::JsonSetWhenModelPrefix { .. }));
+        if needs_model_inspector
+            && !ingress
+                .inspectors()
+                .iter()
+                .any(|inspector| inspector.as_ref() == "inspect.openai.model")
+        {
+            return Err(invalid(
+                &label,
+                "model-prefix transforms require inspect.openai.model",
+            ));
+        }
         let response = compile_body(
             declaration.response.as_ref(),
             ingress.mode(),
@@ -1053,6 +1278,7 @@ fn compile_config(
             listener: Arc::from(listener),
             matcher,
             ingress,
+            request_steps,
             response,
             target,
             downstream_auth,
@@ -1070,6 +1296,7 @@ fn compile_config(
         generation,
         listeners,
         upstreams,
+        models,
         routes,
     })
 }
@@ -1130,6 +1357,155 @@ fn compile_upstream(
         connect_timeout,
         request_timeout,
     ))
+}
+
+fn compile_models(
+    config: &Config,
+    source: &Source,
+    upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
+) -> Result<BTreeMap<Arc<str>, ModelPlan>, ConfigError> {
+    let mut models = BTreeMap::new();
+    let mut model_labels = BTreeMap::new();
+    for (ordinal, declaration) in config.models.iter().enumerate() {
+        let label = model_label(source, ordinal, &declaration.id);
+        validate_id("model", &declaration.id, &label)?;
+        if let Some(first) = model_labels.insert(declaration.id.clone(), label.clone()) {
+            return Err(ConfigError::DuplicateModel {
+                id: declaration.id.clone(),
+                first: Box::new(first),
+                second: Box::new(label),
+            });
+        }
+        if declaration.targets.is_empty() {
+            return Err(invalid(&label, "model requires at least one static target"));
+        }
+        let mut targets = Vec::with_capacity(declaration.targets.len());
+        for (target_ordinal, target) in declaration.targets.iter().enumerate() {
+            let target_label = model_target_label(source, ordinal, target_ordinal);
+            let provider = target
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid(&target_label, "model target requires provider"))?;
+            if !upstreams.contains_key(provider) {
+                return Err(ConfigError::MissingReference {
+                    kind: "upstream",
+                    name: provider.to_owned(),
+                    label: target_label,
+                });
+            }
+            let upstream_model = target
+                .upstream_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid(&target_label, "model target requires upstream_model"))?;
+            let capabilities = compile_capabilities(&target.capabilities, &target_label)?;
+            targets.push(ModelTargetPlan {
+                provider: Arc::from(provider),
+                upstream_model: Arc::from(upstream_model),
+                capabilities,
+            });
+        }
+        models.insert(
+            Arc::from(declaration.id.as_str()),
+            ModelPlan {
+                id: Arc::from(declaration.id.as_str()),
+                targets,
+                source: label,
+            },
+        );
+    }
+    Ok(models)
+}
+
+fn compile_capabilities(
+    values: &[String],
+    label: &SourceLabel,
+) -> Result<CapabilitySet, ConfigError> {
+    let mut capabilities = CapabilitySet::new();
+    for value in values {
+        let value = value.trim().to_ascii_lowercase();
+        let capability = Capability::ALL
+            .into_iter()
+            .find(|capability| capability.as_str() == value)
+            .ok_or_else(|| invalid(label, &format!("unknown model capability `{value}`")))?;
+        capabilities.insert(capability);
+    }
+    Ok(capabilities)
+}
+
+fn compile_request(
+    declaration: Option<&RequestConfig>,
+    label: &SourceLabel,
+) -> Result<Vec<RequestTransform>, ConfigError> {
+    let Some(declaration) = declaration else {
+        return Ok(Vec::new());
+    };
+    if declaration.steps.len() > MAX_REQUEST_STEPS {
+        return Err(invalid(label, "route has too many request transforms"));
+    }
+    let mut steps = Vec::with_capacity(declaration.steps.len());
+    let mut total_value_bytes = 0usize;
+    for step in &declaration.steps {
+        let kind = step.transform.trim().to_ascii_lowercase();
+        let pointer = step
+            .parameters
+            .pointer
+            .as_deref()
+            .ok_or_else(|| invalid(label, "request transform requires pointer"))?;
+        validate_json_pointer(pointer, label)?;
+        let value = step.parameters.value.clone();
+        let value_size = serde_json::to_vec(&value)
+            .map_err(|_| invalid(label, "request transform value cannot be serialized"))?
+            .len();
+        if value_size > DEFAULT_JSON_PATCH_MAX_VALUE_BYTES {
+            return Err(invalid(label, "request transform value exceeds size limit"));
+        }
+        total_value_bytes = total_value_bytes.saturating_add(value_size);
+        if total_value_bytes > MAX_REQUEST_STEP_TOTAL_VALUE_BYTES {
+            return Err(invalid(
+                label,
+                "aggregate request transform values exceed size limit",
+            ));
+        }
+        let transform = match kind.as_str() {
+            "transform.json.set" => {
+                if step.parameters.prefix.is_some() {
+                    return Err(invalid(
+                        label,
+                        "transform.json.set does not accept a prefix",
+                    ));
+                }
+                RequestTransform::JsonSet {
+                    pointer: Arc::from(pointer),
+                    value,
+                }
+            }
+            "transform.json.set_when_model_prefix" => {
+                let prefix = step
+                    .parameters
+                    .prefix
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid(label, "model-prefix transform requires prefix"))?;
+                RequestTransform::JsonSetWhenModelPrefix {
+                    prefix: Arc::from(prefix),
+                    pointer: Arc::from(pointer),
+                    value,
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    label,
+                    "unsupported request transform; expected transform.json.set or transform.json.set_when_model_prefix",
+                ));
+            }
+        };
+        steps.push(transform);
+    }
+    Ok(steps)
 }
 
 fn compile_auth(
@@ -1305,6 +1681,24 @@ fn compile_body(
             label,
             &format!("{field} opaque mode cannot use inspectors or decoder"),
         ));
+    }
+    if mode == BodyMode::Patch {
+        if declaration.decoder.is_some() || declaration.encoder.is_some() {
+            return Err(invalid(
+                label,
+                &format!("{field} patch mode cannot use decoder or encoder"),
+            ));
+        }
+        if declaration
+            .inspectors
+            .iter()
+            .any(|inspector| inspector.trim() != "inspect.openai.model")
+        {
+            return Err(invalid(
+                label,
+                &format!("{field} patch mode only supports inspect.openai.model"),
+            ));
+        }
     }
     Ok(BodyPlan {
         mode,
@@ -1559,6 +1953,42 @@ fn valid_template_path(value: String, label: &SourceLabel) -> Result<Arc<str>, C
     Ok(path)
 }
 
+fn validate_json_pointer(pointer: &str, label: &SourceLabel) -> Result<(), ConfigError> {
+    if pointer.len() > DEFAULT_JSON_PATCH_MAX_POINTER_BYTES
+        || (!pointer.is_empty() && !pointer.starts_with('/'))
+    {
+        return Err(invalid(
+            label,
+            "request transform pointer is invalid or too long",
+        ));
+    }
+    let depth = pointer.split('/').skip(1).count();
+    if depth > DEFAULT_JSON_PATCH_MAX_POINTER_DEPTH {
+        return Err(invalid(label, "request transform pointer is too deep"));
+    }
+    let mut escaped = false;
+    for character in pointer.chars().skip(1) {
+        if escaped {
+            if character != '0' && character != '1' {
+                return Err(invalid(
+                    label,
+                    "request transform pointer has an invalid escape",
+                ));
+            }
+            escaped = false;
+        } else if character == '~' {
+            escaped = true;
+        }
+    }
+    if escaped {
+        return Err(invalid(
+            label,
+            "request transform pointer has an invalid escape",
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_content_type(value: &str, label: &SourceLabel) -> Result<String, ConfigError> {
     let value = value
         .split(';')
@@ -1650,6 +2080,19 @@ fn declaration_label(source: &Source, section: &str, id: &str, _ordinal: usize) 
 
 fn upstream_label(source: &Source, id: &str, ordinal: usize) -> SourceLabel {
     declaration_label(source, "upstreams", id, ordinal)
+}
+
+fn model_label(source: &Source, ordinal: usize, _id: &str) -> SourceLabel {
+    SourceLabel::new(source, None, None, format!("models[{ordinal}]"))
+}
+
+fn model_target_label(source: &Source, model_ordinal: usize, target_ordinal: usize) -> SourceLabel {
+    SourceLabel::new(
+        source,
+        None,
+        None,
+        format!("models[{model_ordinal}].targets[{target_ordinal}]"),
+    )
 }
 
 fn route_label(source: &Source, ordinal: usize, id: &str) -> SourceLabel {
@@ -1874,5 +2317,113 @@ routes:
         assert_eq!(reference.to_string(), "env:POOLER_KEY");
         assert!(!format!("{reference:?}").contains("secret-value"));
         assert!(SecretRef::parse("literal:secret-value").is_err());
+    }
+
+    #[test]
+    fn compiles_model_registry_and_bounded_patch_steps() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+models:
+  - id: gpt-public
+    targets:
+      - provider: local
+        upstream_model: gpt-upstream
+        capabilities: [text, tools, text]
+routes:
+  - id: patched
+    listen: local
+    ingress: {mode: patch, inspectors: [inspect.openai.model]}
+    request:
+      steps:
+        - use: transform.json.set_when_model_prefix
+          with: {prefix: gpt-, pointer: /reasoning/effort, value: high}
+    target: local
+    response: {mode: opaque}
+"#;
+        let config = compile_yaml("patch.yaml", text).expect("patch config");
+        let model = &config.models()["gpt-public"];
+        assert_eq!(model.targets()[0].provider(), "local");
+        assert_eq!(model.targets()[0].upstream_model(), "gpt-upstream");
+        assert!(model.targets()[0].capabilities().contains(Capability::Text));
+        assert!(model.targets()[0]
+            .capabilities()
+            .contains(Capability::Tools));
+        assert!(matches!(
+            config.routes()[0].request_steps(),
+            [RequestTransform::JsonSetWhenModelPrefix { .. }]
+        ));
+    }
+
+    #[test]
+    fn rejects_patch_steps_on_non_patch_routes() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: invalid
+    listen: local
+    request:
+      steps:
+        - use: transform.json.set
+          with: {pointer: /value, value: true}
+    target: local
+"#;
+        let error = compile_yaml("invalid-patch.yaml", text).expect_err("patch mode required");
+        assert!(error.to_string().contains("require patch ingress mode"));
+    }
+
+    #[test]
+    fn preserves_pointer_and_prefix_semantics_and_accepts_null_root_value() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: exact-text
+    listen: local
+    ingress: {mode: patch, inspectors: [inspect.openai.model]}
+    request:
+      steps:
+        - use: transform.json.set_when_model_prefix
+          with: {prefix: "gpt- ", pointer: "/field ", value: null}
+        - use: transform.json.set
+          with: {pointer: "", value: null}
+    target: local
+    response: {mode: opaque}
+"#;
+        let config = compile_yaml("exact-text.yaml", text).expect("exact transform text");
+        let steps = config.routes()[0].request_steps();
+        assert_eq!(steps[0].pointer(), "/field ");
+        assert_eq!(steps[0].model_prefix(), Some("gpt- "));
+        assert_eq!(steps[1].pointer(), "");
+        assert!(steps[1].value().is_null());
+    }
+
+    #[test]
+    fn rejects_unknown_capability_and_unused_transform_prefix() {
+        let capability = "version: 1\nupstreams: {local: {url: http://127.0.0.1:1}}\nmodels: [{id: m, targets: [{provider: local, upstream_model: m, capabilities: [tolos]}]}]\n";
+        let error = compile_yaml("capability.yaml", capability).expect_err("unknown capability");
+        assert!(error.to_string().contains("unknown model capability"));
+
+        let prefix = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+routes:
+  - id: r
+    listen: local
+    ingress: {mode: patch}
+    request:
+      steps:
+        - use: transform.json.set
+          with: {pointer: /value, value: true, prefix: gpt-}
+    target: local
+    response: {mode: opaque}
+"#;
+        let error = compile_yaml("prefix.yaml", prefix).expect_err("unused prefix");
+        assert!(error.to_string().contains("does not accept a prefix"));
     }
 }

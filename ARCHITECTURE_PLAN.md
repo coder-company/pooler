@@ -326,7 +326,7 @@ routes:
       path: /my/private/inference
       content_types: [application/json]
     ingress:
-      mode: inspect
+      mode: patch
       inspectors: [inspect.openai.model]
     request:
       steps:
