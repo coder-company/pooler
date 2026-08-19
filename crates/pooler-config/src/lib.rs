@@ -241,6 +241,16 @@ pub struct Config {
     pub upstreams: BTreeMap<String, UpstreamConfig>,
     /// Public model declarations and their static upstream targets.
     pub models: Vec<ModelConfig>,
+    /// Credential-bearing account declarations keyed by stable ID.
+    pub accounts: BTreeMap<String, AccountConfig>,
+    /// Compatibility alias for account declarations.
+    #[serde(alias = "credentials")]
+    pub credentials: BTreeMap<String, AccountConfig>,
+    /// Named account pools used by selection policies.
+    #[serde(alias = "pools")]
+    pub account_pools: BTreeMap<String, AccountPoolConfig>,
+    /// Named target-selection and retry policies.
+    pub policies: BTreeMap<String, PolicyConfig>,
     /// Routes in declaration order.
     pub routes: Vec<RouteConfig>,
     #[serde(skip)]
@@ -334,6 +344,163 @@ pub struct ModelTargetConfig {
     pub upstream_model: Option<String>,
     /// Capabilities advertised by this target.
     pub capabilities: Vec<String>,
+}
+
+/// One credential-bearing account.
+///
+/// The secret remains a [`SecretRef`].  Configuration compilation never reads
+/// or materializes the referenced value.  `provider` is required so account
+/// selection cannot accidentally cross provider boundaries.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountConfig {
+    /// Provider/upstream ID that owns this account.
+    #[serde(alias = "upstream")]
+    pub provider: Option<String>,
+    /// Reference to the account's credential material.
+    pub secret: Option<SecretRef>,
+    /// Whether selection may use this account. Omitted means enabled.
+    pub enabled: Option<bool>,
+    /// Relative selection weight. Omitted means one.
+    pub weight: Option<u32>,
+    /// Optional per-account in-flight bound.
+    pub max_concurrency: Option<u32>,
+}
+
+/// A named, explicit account pool.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountPoolConfig {
+    /// Account IDs in selection order.
+    #[serde(alias = "members")]
+    pub accounts: Vec<String>,
+}
+
+/// Named target-selection and retry policy declaration.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// Selection strategy and affinity settings.
+    pub selection: Option<SelectionConfig>,
+    /// Retry and replay budget.
+    pub retry: Option<RetryConfig>,
+    /// Stream bootstrap budget used before commitment.
+    pub stream: Option<StreamConfig>,
+    /// Optional health cooldown applied by policy consumers.
+    pub cooldown: Option<CooldownConfig>,
+    /// Optional named account pool. A policy without this field may still be
+    /// used for static provider targets.
+    #[serde(alias = "pool")]
+    pub account_pool: Option<String>,
+}
+
+/// Target-selection declaration.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SelectionConfig {
+    /// One of the documented deterministic strategies.
+    pub strategy: Option<String>,
+    /// Named account pool to use for this selection policy.
+    #[serde(alias = "pool")]
+    pub account_pool: Option<String>,
+    /// Inline account IDs. Prefer a named account pool for reusable policy.
+    pub accounts: Vec<String>,
+    /// Compatibility shorthand for an affinity lifetime.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub session_affinity: Option<Duration>,
+    /// Full affinity declaration.
+    pub affinity: Option<AffinityConfig>,
+}
+
+/// Session-affinity declaration.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AffinityConfig {
+    /// Deterministic key source, for example `header:x-session-id`.
+    pub key: Option<String>,
+    /// Lifetime of an affinity binding.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub ttl: Option<Duration>,
+    /// Whether an unavailable target may be safely rebound.
+    pub rebind: Option<bool>,
+}
+
+/// Retry and replay budget declaration.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetryConfig {
+    /// Total attempts, including the initial attempt.
+    #[serde(alias = "max_attempts")]
+    pub maximum_attempts: Option<u32>,
+    /// Maximum distinct accounts used by one request.
+    #[serde(alias = "max_credentials")]
+    pub maximum_credentials: Option<u32>,
+    /// Maximum distinct providers used by one request.
+    #[serde(alias = "max_providers")]
+    pub maximum_providers: Option<u32>,
+    /// Maximum wall time spent waiting between attempts.
+    #[serde(
+        default,
+        alias = "max_elapsed",
+        deserialize_with = "deserialize_optional_duration"
+    )]
+    pub maximum_elapsed: Option<Duration>,
+    /// Maximum provider recovery delay honored by one request.
+    #[serde(
+        default,
+        alias = "max_recovery_wait",
+        deserialize_with = "deserialize_optional_duration"
+    )]
+    pub maximum_recovery_wait: Option<Duration>,
+    /// Lower bound for exponential retry delay.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub base_delay: Option<Duration>,
+    /// Upper bound for one retry delay.
+    #[serde(
+        default,
+        alias = "max_delay",
+        deserialize_with = "deserialize_optional_duration"
+    )]
+    pub maximum_delay: Option<Duration>,
+    /// Upper bound for the sum of retry delays.
+    #[serde(
+        default,
+        alias = "max_total_delay",
+        deserialize_with = "deserialize_optional_duration"
+    )]
+    pub maximum_total_delay: Option<Duration>,
+    /// Retries are legal only before downstream commitment. Must be true when
+    /// more than one attempt is configured.
+    pub before_commit_only: Option<bool>,
+    /// Explicit upstream statuses eligible for a retry classification.
+    #[serde(alias = "retryable_statuses")]
+    pub statuses: Vec<u16>,
+}
+
+/// Stream bootstrap budget declaration.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct StreamConfig {
+    /// Number of events retained before commitment.
+    pub bootstrap_events: Option<u32>,
+    /// Number of bytes retained before commitment.
+    #[serde(default, deserialize_with = "deserialize_optional_byte_size")]
+    pub bootstrap_bytes: Option<u64>,
+    /// Maximum time spent waiting for the initial response/events.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub bootstrap_timeout: Option<Duration>,
+}
+
+/// A policy-directed health cooldown declaration.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct CooldownConfig {
+    /// One of credential, credential_model, model, provider, provider_model,
+    /// or route.
+    pub scope: Option<String>,
+    /// Positive cooldown lifetime.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub duration: Option<Duration>,
 }
 
 /// Upstream transport declaration.
@@ -435,6 +602,8 @@ pub struct RouteConfig {
     pub response: Option<BodyConfig>,
     /// Target declaration.
     pub target: Option<TargetValue>,
+    /// Optional named selection/retry policy.
+    pub policy: Option<String>,
     /// Upstream ID shorthand.
     pub upstream: Option<String>,
     /// Loss policy.
@@ -539,6 +708,8 @@ pub struct TargetConfig {
     /// Extract a public model ID from the JSON request and select its first
     /// static registry target.
     pub model_from: Option<String>,
+    /// Named selection/retry policy.
+    pub policy: Option<String>,
 }
 
 /// Immutable listener plan.
@@ -616,6 +787,470 @@ impl UpstreamPlan {
     #[must_use]
     pub fn auth(&self) -> Option<&AuthPlan> {
         self.auth.as_ref()
+    }
+
+    /// Source declaration label.
+    #[must_use]
+    pub const fn source(&self) -> &SourceLabel {
+        &self.source
+    }
+}
+
+/// Immutable account plan containing only a secret reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountPlan {
+    id: Arc<str>,
+    provider: Arc<str>,
+    secret: SecretRef,
+    enabled: bool,
+    weight: u32,
+    max_concurrency: Option<u32>,
+    source: SourceLabel,
+}
+
+impl AccountPlan {
+    /// Stable account ID.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Owning provider/upstream ID.
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// Secret reference. The referenced value is never held in this plan.
+    #[must_use]
+    pub const fn secret(&self) -> &SecretRef {
+        &self.secret
+    }
+
+    /// Whether selection may use this account.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Relative selection weight.
+    #[must_use]
+    pub const fn weight(&self) -> u32 {
+        self.weight
+    }
+
+    /// Optional in-flight bound.
+    #[must_use]
+    pub const fn max_concurrency(&self) -> Option<u32> {
+        self.max_concurrency
+    }
+
+    /// Source declaration label.
+    #[must_use]
+    pub const fn source(&self) -> &SourceLabel {
+        &self.source
+    }
+}
+
+/// Compatibility name for credential-oriented callers.
+pub type CredentialPlan = AccountPlan;
+
+/// Immutable account pool plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountPoolPlan {
+    id: Arc<str>,
+    accounts: Vec<Arc<str>>,
+    source: SourceLabel,
+}
+
+impl AccountPoolPlan {
+    /// Stable pool ID.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Account IDs in deterministic selection order.
+    #[must_use]
+    pub fn accounts(&self) -> &[Arc<str>] {
+        &self.accounts
+    }
+
+    /// Source declaration label.
+    #[must_use]
+    pub const fn source(&self) -> &SourceLabel {
+        &self.source
+    }
+}
+
+/// Supported deterministic account-selection strategies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionStrategy {
+    /// Rotate through eligible accounts in declaration order.
+    RoundRobin,
+    /// Smoothly distribute weighted traffic.
+    SmoothWeightedRoundRobin,
+    /// Keep using the first eligible account.
+    FillFirst,
+    /// Choose the account with the fewest in-flight requests.
+    LeastInFlight,
+    /// Score health, weight, and current eligibility.
+    HealthWeighted,
+    /// Try accounts in explicit declaration order.
+    OrderedFallback,
+}
+
+impl SelectionStrategy {
+    /// Parse the documented configuration spelling.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "round_robin" => Some(Self::RoundRobin),
+            "smooth_weighted_round_robin" => Some(Self::SmoothWeightedRoundRobin),
+            "fill_first" => Some(Self::FillFirst),
+            "least_in_flight" => Some(Self::LeastInFlight),
+            "health_weighted" => Some(Self::HealthWeighted),
+            "ordered_fallback" => Some(Self::OrderedFallback),
+            _ => None,
+        }
+    }
+
+    /// Stable configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round_robin",
+            Self::SmoothWeightedRoundRobin => "smooth_weighted_round_robin",
+            Self::FillFirst => "fill_first",
+            Self::LeastInFlight => "least_in_flight",
+            Self::HealthWeighted => "health_weighted",
+            Self::OrderedFallback => "ordered_fallback",
+        }
+    }
+}
+
+/// Immutable session-affinity plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AffinityPlan {
+    key: Arc<str>,
+    ttl: Duration,
+    rebind: bool,
+}
+
+impl AffinityPlan {
+    /// Deterministic key source.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Affinity lifetime.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// Whether unavailable targets may be safely rebound.
+    #[must_use]
+    pub const fn rebind(&self) -> bool {
+        self.rebind
+    }
+}
+
+/// Immutable target-selection plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectionPlan {
+    strategy: SelectionStrategy,
+    account_pool: Option<Arc<str>>,
+    accounts: Vec<Arc<str>>,
+    affinity: Option<AffinityPlan>,
+}
+
+impl SelectionPlan {
+    /// Selection strategy.
+    #[must_use]
+    pub const fn strategy(&self) -> SelectionStrategy {
+        self.strategy
+    }
+
+    /// Referenced named account pool, if any.
+    #[must_use]
+    pub fn account_pool(&self) -> Option<&str> {
+        self.account_pool.as_deref()
+    }
+
+    /// Inline account IDs in declaration order.
+    #[must_use]
+    pub fn accounts(&self) -> &[Arc<str>] {
+        &self.accounts
+    }
+
+    /// Session-affinity plan, if enabled.
+    #[must_use]
+    pub const fn affinity(&self) -> Option<&AffinityPlan> {
+        self.affinity.as_ref()
+    }
+}
+
+/// Immutable retry and replay budget.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetryPlan {
+    maximum_attempts: u32,
+    maximum_credentials: u32,
+    maximum_providers: u32,
+    maximum_elapsed: Option<Duration>,
+    maximum_recovery_wait: Option<Duration>,
+    base_delay: Duration,
+    maximum_delay: Duration,
+    maximum_total_delay: Duration,
+    before_commit_only: bool,
+    statuses: Vec<u16>,
+}
+
+impl RetryPlan {
+    /// Total attempts, including the initial attempt.
+    #[must_use]
+    pub const fn maximum_attempts(&self) -> u32 {
+        self.maximum_attempts
+    }
+
+    /// Alias for callers using the shorter policy vocabulary.
+    #[must_use]
+    pub const fn max_attempts(&self) -> u32 {
+        self.maximum_attempts
+    }
+
+    /// Maximum distinct accounts used by a request.
+    #[must_use]
+    pub const fn maximum_credentials(&self) -> u32 {
+        self.maximum_credentials
+    }
+
+    /// Alias for callers using the shorter policy vocabulary.
+    #[must_use]
+    pub const fn max_credentials(&self) -> u32 {
+        self.maximum_credentials
+    }
+
+    /// Maximum distinct providers used by a request.
+    #[must_use]
+    pub const fn maximum_providers(&self) -> u32 {
+        self.maximum_providers
+    }
+
+    /// Alias for callers using the shorter policy vocabulary.
+    #[must_use]
+    pub const fn max_providers(&self) -> u32 {
+        self.maximum_providers
+    }
+
+    /// Maximum elapsed retry wait.
+    #[must_use]
+    pub const fn maximum_elapsed(&self) -> Option<Duration> {
+        self.maximum_elapsed
+    }
+
+    /// Alias for callers using the shorter policy vocabulary.
+    #[must_use]
+    pub const fn max_elapsed(&self) -> Option<Duration> {
+        self.maximum_elapsed
+    }
+
+    /// Maximum provider recovery delay honored.
+    #[must_use]
+    pub const fn maximum_recovery_wait(&self) -> Option<Duration> {
+        self.maximum_recovery_wait
+    }
+
+    /// Alias for callers using the shorter policy vocabulary.
+    #[must_use]
+    pub const fn max_recovery_wait(&self) -> Option<Duration> {
+        self.maximum_recovery_wait
+    }
+
+    /// Base retry delay.
+    #[must_use]
+    pub const fn base_delay(&self) -> Duration {
+        self.base_delay
+    }
+
+    /// Maximum delay for one retry.
+    #[must_use]
+    pub const fn maximum_delay(&self) -> Duration {
+        self.maximum_delay
+    }
+
+    /// Alias for callers using the shorter policy vocabulary.
+    #[must_use]
+    pub const fn max_delay(&self) -> Duration {
+        self.maximum_delay
+    }
+
+    /// Maximum sum of retry delays.
+    #[must_use]
+    pub const fn maximum_total_delay(&self) -> Duration {
+        self.maximum_total_delay
+    }
+
+    /// Alias for callers using the shorter policy vocabulary.
+    #[must_use]
+    pub const fn max_total_delay(&self) -> Duration {
+        self.maximum_total_delay
+    }
+
+    /// Whether retry is restricted to the pre-commit stage.
+    #[must_use]
+    pub const fn before_commit_only(&self) -> bool {
+        self.before_commit_only
+    }
+
+    /// Explicit retryable status set.
+    #[must_use]
+    pub fn statuses(&self) -> &[u16] {
+        &self.statuses
+    }
+
+    /// Whether the status is explicitly eligible for retry classification.
+    #[must_use]
+    pub fn allows_status(&self, status: u16) -> bool {
+        self.statuses.binary_search(&status).is_ok()
+    }
+}
+
+/// Immutable stream bootstrap budget.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamPlan {
+    bootstrap_events: u32,
+    bootstrap_bytes: u64,
+    bootstrap_timeout: Duration,
+}
+
+impl StreamPlan {
+    /// Event bound before downstream commitment.
+    #[must_use]
+    pub const fn bootstrap_events(&self) -> u32 {
+        self.bootstrap_events
+    }
+
+    /// Byte bound before downstream commitment.
+    #[must_use]
+    pub const fn bootstrap_bytes(&self) -> u64 {
+        self.bootstrap_bytes
+    }
+
+    /// Time bound before downstream commitment.
+    #[must_use]
+    pub const fn bootstrap_timeout(&self) -> Duration {
+        self.bootstrap_timeout
+    }
+}
+
+/// Supported health-cooldown scopes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CooldownScopePlan {
+    Credential,
+    CredentialModel,
+    Model,
+    Provider,
+    ProviderModel,
+    Route,
+}
+
+impl CooldownScopePlan {
+    /// Parse a documented cooldown scope.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "credential" => Some(Self::Credential),
+            "credential_model" => Some(Self::CredentialModel),
+            "model" => Some(Self::Model),
+            "provider" => Some(Self::Provider),
+            "provider_model" => Some(Self::ProviderModel),
+            "route" => Some(Self::Route),
+            _ => None,
+        }
+    }
+
+    /// Stable configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Credential => "credential",
+            Self::CredentialModel => "credential_model",
+            Self::Model => "model",
+            Self::Provider => "provider",
+            Self::ProviderModel => "provider_model",
+            Self::Route => "route",
+        }
+    }
+}
+
+/// Immutable cooldown declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CooldownPlan {
+    scope: CooldownScopePlan,
+    duration: Duration,
+}
+
+impl CooldownPlan {
+    /// Cooldown scope.
+    #[must_use]
+    pub const fn scope(&self) -> CooldownScopePlan {
+        self.scope
+    }
+
+    /// Cooldown duration.
+    #[must_use]
+    pub const fn duration(&self) -> Duration {
+        self.duration
+    }
+}
+
+/// Immutable named policy plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyPlan {
+    id: Arc<str>,
+    selection: SelectionPlan,
+    retry: RetryPlan,
+    stream: StreamPlan,
+    cooldown: Option<CooldownPlan>,
+    account_pool: Option<Arc<str>>,
+    source: SourceLabel,
+}
+
+impl PolicyPlan {
+    /// Stable policy ID.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Selection plan.
+    #[must_use]
+    pub const fn selection(&self) -> &SelectionPlan {
+        &self.selection
+    }
+
+    /// Retry plan.
+    #[must_use]
+    pub const fn retry(&self) -> &RetryPlan {
+        &self.retry
+    }
+
+    /// Stream bootstrap plan.
+    #[must_use]
+    pub const fn stream(&self) -> &StreamPlan {
+        &self.stream
+    }
+
+    /// Optional cooldown plan.
+    #[must_use]
+    pub const fn cooldown(&self) -> Option<&CooldownPlan> {
+        self.cooldown.as_ref()
+    }
+
+    /// Named account pool, if configured.
+    #[must_use]
+    pub fn account_pool(&self) -> Option<&str> {
+        self.account_pool.as_deref()
     }
 
     /// Source declaration label.
@@ -897,6 +1532,7 @@ pub struct TargetPlan {
     upstream: Arc<str>,
     path: Option<Arc<str>>,
     model_source: Option<ModelSource>,
+    policy: Option<Arc<str>>,
 }
 
 /// JSON model value used for static model-registry selection.
@@ -925,6 +1561,12 @@ impl TargetPlan {
     #[must_use]
     pub const fn model_source(&self) -> Option<ModelSource> {
         self.model_source
+    }
+
+    /// Named selection/retry policy.
+    #[must_use]
+    pub fn policy(&self) -> Option<&str> {
+        self.policy.as_deref()
     }
 }
 
@@ -1056,6 +1698,9 @@ pub struct CompiledConfig {
     generation: u64,
     listeners: BTreeMap<Arc<str>, ListenerPlan>,
     upstreams: BTreeMap<Arc<str>, UpstreamPlan>,
+    accounts: BTreeMap<Arc<str>, AccountPlan>,
+    account_pools: BTreeMap<Arc<str>, AccountPoolPlan>,
+    policies: BTreeMap<Arc<str>, PolicyPlan>,
     models: BTreeMap<Arc<str>, ModelPlan>,
     routes: Vec<RoutePlan>,
 }
@@ -1077,6 +1722,30 @@ impl CompiledConfig {
     #[must_use]
     pub const fn upstreams(&self) -> &BTreeMap<Arc<str>, UpstreamPlan> {
         &self.upstreams
+    }
+
+    /// Account plans keyed by stable ID.
+    #[must_use]
+    pub const fn accounts(&self) -> &BTreeMap<Arc<str>, AccountPlan> {
+        &self.accounts
+    }
+
+    /// Compatibility alias for credential-oriented callers.
+    #[must_use]
+    pub const fn credentials(&self) -> &BTreeMap<Arc<str>, AccountPlan> {
+        &self.accounts
+    }
+
+    /// Named account pool plans keyed by stable ID.
+    #[must_use]
+    pub const fn account_pools(&self) -> &BTreeMap<Arc<str>, AccountPoolPlan> {
+        &self.account_pools
+    }
+
+    /// Named selection/retry policies keyed by stable ID.
+    #[must_use]
+    pub const fn policies(&self) -> &BTreeMap<Arc<str>, PolicyPlan> {
+        &self.policies
     }
 
     /// Public model plans keyed by ID.
@@ -1235,6 +1904,9 @@ fn compile_config(
         );
     }
 
+    let accounts = compile_accounts(config, source, &upstreams)?;
+    let account_pools = compile_account_pools(config, source, &accounts)?;
+    let policies = compile_policies(config, source, &accounts, &account_pools)?;
     let models = compile_models(config, source, &upstreams)?;
 
     let mut routes = Vec::with_capacity(config.routes.len());
@@ -1295,7 +1967,7 @@ fn compile_config(
             &label,
             "response",
         )?;
-        let target = compile_target(declaration, &label, &upstreams)?;
+        let target = compile_target(declaration, &label, &upstreams, &policies)?;
         if target.model_source().is_some() && ingress.mode() != BodyMode::Patch {
             return Err(invalid(
                 &label,
@@ -1348,6 +2020,9 @@ fn compile_config(
         generation,
         listeners,
         upstreams,
+        accounts,
+        account_pools,
+        policies,
         models,
         routes,
     })
@@ -1361,6 +2036,476 @@ fn listener_requires_auth(listener: &ListenerPlan) -> bool {
 }
 
 type CompiledTransport = (Url, Arc<str>, Option<Duration>, Option<Duration>);
+
+const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const DEFAULT_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+const DEFAULT_RETRY_TOTAL_DELAY: Duration = Duration::from_secs(60);
+const DEFAULT_STREAM_BOOTSTRAP_EVENTS: u32 = 1;
+const DEFAULT_STREAM_BOOTSTRAP_BYTES: u64 = 64 * 1024;
+const DEFAULT_STREAM_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn compile_accounts(
+    config: &Config,
+    source: &Source,
+    upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
+) -> Result<BTreeMap<Arc<str>, AccountPlan>, ConfigError> {
+    let mut accounts = BTreeMap::new();
+    for (declarations, collection) in [
+        (&config.accounts, "accounts"),
+        (&config.credentials, "credentials"),
+    ] {
+        for (id, declaration) in declarations {
+            let label = account_label(source, collection, id);
+            validate_id("account", id, &label)?;
+            if accounts.contains_key(id.as_str()) {
+                return Err(invalid(&label, "duplicate account declaration"));
+            }
+            let provider = declaration
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid(&label, "account requires provider"))?;
+            if !upstreams.contains_key(provider) {
+                return Err(ConfigError::MissingReference {
+                    kind: "upstream",
+                    name: provider.to_owned(),
+                    label,
+                });
+            }
+            let secret = declaration
+                .secret
+                .as_ref()
+                .ok_or_else(|| invalid(&label, "account requires a secret reference"))?;
+            if !matches!(
+                secret,
+                SecretRef::Env(_)
+                    | SecretRef::File(_)
+                    | SecretRef::Keyring { .. }
+                    | SecretRef::External(_)
+            ) {
+                return Err(invalid(&label, "account secret reference is unsupported"));
+            }
+            let weight = declaration.weight.unwrap_or(1);
+            if weight == 0 {
+                return Err(invalid(&label, "account weight must be greater than zero"));
+            }
+            if declaration.max_concurrency == Some(0) {
+                return Err(invalid(
+                    &label,
+                    "account max_concurrency must be greater than zero",
+                ));
+            }
+            accounts.insert(
+                Arc::from(id.as_str()),
+                AccountPlan {
+                    id: Arc::from(id.as_str()),
+                    provider: Arc::from(provider),
+                    secret: secret.clone(),
+                    enabled: declaration.enabled.unwrap_or(true),
+                    weight,
+                    max_concurrency: declaration.max_concurrency,
+                    source: label,
+                },
+            );
+        }
+    }
+    Ok(accounts)
+}
+
+fn compile_account_pools(
+    config: &Config,
+    source: &Source,
+    accounts: &BTreeMap<Arc<str>, AccountPlan>,
+) -> Result<BTreeMap<Arc<str>, AccountPoolPlan>, ConfigError> {
+    let mut pools = BTreeMap::new();
+    for (id, declaration) in &config.account_pools {
+        let label = pool_label(source, id);
+        validate_id("account pool", id, &label)?;
+        if declaration.accounts.is_empty() {
+            return Err(invalid(
+                &label,
+                "account pool requires at least one account",
+            ));
+        }
+        let mut members = Vec::with_capacity(declaration.accounts.len());
+        let mut seen = BTreeSet::new();
+        for account in &declaration.accounts {
+            let account = account.trim();
+            if account.is_empty() || !seen.insert(account.to_owned()) {
+                return Err(invalid(
+                    &label,
+                    "account pool contains an empty or duplicate account ID",
+                ));
+            }
+            if !accounts.contains_key(account) {
+                return Err(ConfigError::MissingReference {
+                    kind: "account",
+                    name: account.to_owned(),
+                    label: label.clone(),
+                });
+            }
+            members.push(Arc::from(account.to_owned()));
+        }
+        pools.insert(
+            Arc::from(id.as_str()),
+            AccountPoolPlan {
+                id: Arc::from(id.as_str()),
+                accounts: members,
+                source: label,
+            },
+        );
+    }
+    Ok(pools)
+}
+
+fn compile_policies(
+    config: &Config,
+    source: &Source,
+    accounts: &BTreeMap<Arc<str>, AccountPlan>,
+    pools: &BTreeMap<Arc<str>, AccountPoolPlan>,
+) -> Result<BTreeMap<Arc<str>, PolicyPlan>, ConfigError> {
+    let mut policies = BTreeMap::new();
+    for (id, declaration) in &config.policies {
+        let label = policy_label(source, id);
+        validate_id("policy", id, &label)?;
+        let (selection, selection_pool) = compile_selection(
+            declaration.selection.as_ref(),
+            declaration.account_pool.as_deref(),
+            accounts,
+            pools,
+            &label,
+        )?;
+        let retry = compile_retry(declaration.retry.as_ref(), &label)?;
+        let stream = compile_stream(declaration.stream.as_ref(), &label)?;
+        let cooldown = compile_cooldown(declaration.cooldown.as_ref(), &label)?;
+        policies.insert(
+            Arc::from(id.as_str()),
+            PolicyPlan {
+                id: Arc::from(id.as_str()),
+                selection,
+                retry,
+                stream,
+                cooldown,
+                account_pool: selection_pool,
+                source: label,
+            },
+        );
+    }
+    Ok(policies)
+}
+
+fn compile_selection(
+    declaration: Option<&SelectionConfig>,
+    policy_pool: Option<&str>,
+    accounts: &BTreeMap<Arc<str>, AccountPlan>,
+    pools: &BTreeMap<Arc<str>, AccountPoolPlan>,
+    label: &SourceLabel,
+) -> Result<(SelectionPlan, Option<Arc<str>>), ConfigError> {
+    let selection_is_explicit = declaration.is_some();
+    let declaration = declaration.cloned().unwrap_or_default();
+    let strategy = match declaration.strategy.as_deref().map(str::trim) {
+        Some(value) if !value.is_empty() => SelectionStrategy::parse(value).ok_or_else(|| {
+            invalid(
+                label,
+                "unknown selection strategy; expected round_robin, smooth_weighted_round_robin, fill_first, least_in_flight, health_weighted, or ordered_fallback",
+            )
+        })?,
+        Some(_) => return Err(invalid(label, "selection strategy must not be empty")),
+        None if selection_is_explicit => {
+            return Err(invalid(label, "selection requires strategy"));
+        }
+        None => SelectionStrategy::OrderedFallback,
+    };
+    let nested_pool = declaration
+        .account_pool
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let policy_pool = policy_pool.map(str::trim).filter(|v| !v.is_empty());
+    if nested_pool.is_some() && policy_pool.is_some() {
+        return Err(invalid(
+            label,
+            "selection.account_pool and policy.account_pool cannot both be set",
+        ));
+    }
+    let pool = nested_pool.or(policy_pool);
+    if let Some(pool) = pool {
+        if !pools.contains_key(pool) {
+            return Err(ConfigError::MissingReference {
+                kind: "account pool",
+                name: pool.to_owned(),
+                label: label.clone(),
+            });
+        }
+    }
+    let mut inline_accounts = Vec::with_capacity(declaration.accounts.len());
+    let mut seen = BTreeSet::new();
+    for account in &declaration.accounts {
+        let account = account.trim();
+        if account.is_empty() || !seen.insert(account.to_owned()) {
+            return Err(invalid(
+                label,
+                "selection accounts must be non-empty and unique",
+            ));
+        }
+        if !accounts.contains_key(account) {
+            return Err(ConfigError::MissingReference {
+                kind: "account",
+                name: account.to_owned(),
+                label: label.clone(),
+            });
+        }
+        inline_accounts.push(Arc::from(account.to_owned()));
+    }
+    if pool.is_some() && !inline_accounts.is_empty() {
+        return Err(invalid(
+            label,
+            "selection cannot combine account_pool with inline accounts",
+        ));
+    }
+    let affinity = compile_affinity(&declaration, label)?;
+    let pool = pool.map(Arc::from);
+    Ok((
+        SelectionPlan {
+            strategy,
+            account_pool: pool.clone(),
+            accounts: inline_accounts,
+            affinity,
+        },
+        pool,
+    ))
+}
+
+fn compile_affinity(
+    declaration: &SelectionConfig,
+    label: &SourceLabel,
+) -> Result<Option<AffinityPlan>, ConfigError> {
+    if declaration.session_affinity.is_some() && declaration.affinity.is_some() {
+        return Err(invalid(
+            label,
+            "selection.session_affinity and selection.affinity cannot both be set",
+        ));
+    }
+    if let Some(duration) = declaration.session_affinity {
+        if duration.is_zero() {
+            return Err(invalid(label, "session_affinity must be greater than zero"));
+        }
+        return Ok(Some(AffinityPlan {
+            key: Arc::from("request.session_id"),
+            ttl: duration,
+            rebind: true,
+        }));
+    }
+    let Some(affinity) = declaration.affinity.as_ref() else {
+        return Ok(None);
+    };
+    let key = affinity
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid(label, "affinity requires key"))?;
+    validate_affinity_key(key, label)?;
+    let ttl = affinity
+        .ttl
+        .ok_or_else(|| invalid(label, "affinity requires ttl"))?;
+    if ttl.is_zero() {
+        return Err(invalid(label, "affinity ttl must be greater than zero"));
+    }
+    Ok(Some(AffinityPlan {
+        key: Arc::from(key),
+        ttl,
+        rebind: affinity.rebind.unwrap_or(true),
+    }))
+}
+
+fn validate_affinity_key(value: &str, label: &SourceLabel) -> Result<(), ConfigError> {
+    if value.chars().any(char::is_control) || value.chars().any(char::is_whitespace) {
+        return Err(invalid(
+            label,
+            "affinity key contains whitespace or control characters",
+        ));
+    }
+    if let Some(header) = value.strip_prefix("header:") {
+        if header.is_empty() || http::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
+            return Err(invalid(label, "affinity header key is invalid"));
+        }
+        return Ok(());
+    }
+    let known = [
+        "request.session_id",
+        "semantic.session_id",
+        "devin.conversation_id",
+        "devin.cascade_id",
+        "devin.execution_id",
+        "openai.previous_response_id",
+        "anthropic.metadata",
+        "hash:selected_fields",
+    ];
+    if known.contains(&value) {
+        Ok(())
+    } else {
+        Err(invalid(
+            label,
+            "unsupported affinity key; use header:<name> or a documented semantic key",
+        ))
+    }
+}
+
+fn compile_retry(
+    declaration: Option<&RetryConfig>,
+    label: &SourceLabel,
+) -> Result<RetryPlan, ConfigError> {
+    let declaration = declaration.cloned().unwrap_or_default();
+    let maximum_attempts = declaration.maximum_attempts.unwrap_or(1);
+    if maximum_attempts == 0 {
+        return Err(invalid(
+            label,
+            "retry maximum_attempts must be greater than zero",
+        ));
+    }
+    if maximum_attempts > 1 {
+        if declaration.before_commit_only != Some(true) {
+            return Err(invalid(
+                label,
+                "retry before_commit_only: true is required when maximum_attempts exceeds one",
+            ));
+        }
+        if declaration.maximum_credentials.is_none() {
+            return Err(invalid(
+                label,
+                "retry maximum_credentials is required when retries are enabled",
+            ));
+        }
+        if declaration.statuses.is_empty() {
+            return Err(invalid(
+                label,
+                "retry statuses are required when retries are enabled",
+            ));
+        }
+    } else if declaration.before_commit_only == Some(false) {
+        return Err(invalid(label, "retry before_commit_only must be true"));
+    }
+    let maximum_credentials = declaration.maximum_credentials.unwrap_or(1);
+    let maximum_providers = declaration.maximum_providers.unwrap_or(maximum_attempts);
+    if maximum_credentials == 0 || maximum_credentials > maximum_attempts {
+        return Err(invalid(
+            label,
+            "retry maximum_credentials must be between one and maximum_attempts",
+        ));
+    }
+    if maximum_providers == 0 || maximum_providers > maximum_attempts {
+        return Err(invalid(
+            label,
+            "retry maximum_providers must be between one and maximum_attempts",
+        ));
+    }
+    let base_delay = declaration.base_delay.unwrap_or(DEFAULT_RETRY_BASE_DELAY);
+    let maximum_delay = declaration.maximum_delay.unwrap_or(DEFAULT_RETRY_MAX_DELAY);
+    let maximum_total_delay = declaration
+        .maximum_total_delay
+        .unwrap_or(DEFAULT_RETRY_TOTAL_DELAY);
+    if base_delay > maximum_delay || maximum_delay > maximum_total_delay {
+        return Err(invalid(
+            label,
+            "retry delays must satisfy base_delay <= maximum_delay <= maximum_total_delay",
+        ));
+    }
+    if declaration
+        .maximum_elapsed
+        .is_some_and(|value| value.is_zero())
+        || declaration
+            .maximum_recovery_wait
+            .is_some_and(|value| value.is_zero())
+    {
+        return Err(invalid(
+            label,
+            "retry elapsed and recovery budgets must be greater than zero",
+        ));
+    }
+    let mut statuses = declaration.statuses;
+    for status in &statuses {
+        if !matches!(*status, 408 | 425 | 429 | 500..=599) {
+            return Err(invalid(
+                label,
+                "retry statuses must be 408, 425, 429, or a 5xx status",
+            ));
+        }
+    }
+    statuses.sort_unstable();
+    statuses.dedup();
+    Ok(RetryPlan {
+        maximum_attempts,
+        maximum_credentials,
+        maximum_providers,
+        maximum_elapsed: declaration
+            .maximum_elapsed
+            .or(Some(DEFAULT_RETRY_TOTAL_DELAY)),
+        maximum_recovery_wait: declaration
+            .maximum_recovery_wait
+            .or(Some(DEFAULT_RETRY_TOTAL_DELAY)),
+        base_delay,
+        maximum_delay,
+        maximum_total_delay,
+        before_commit_only: true,
+        statuses,
+    })
+}
+
+fn compile_stream(
+    declaration: Option<&StreamConfig>,
+    label: &SourceLabel,
+) -> Result<StreamPlan, ConfigError> {
+    let declaration = declaration.cloned().unwrap_or_default();
+    let bootstrap_events = declaration
+        .bootstrap_events
+        .unwrap_or(DEFAULT_STREAM_BOOTSTRAP_EVENTS);
+    let bootstrap_bytes = declaration
+        .bootstrap_bytes
+        .unwrap_or(DEFAULT_STREAM_BOOTSTRAP_BYTES);
+    let bootstrap_timeout = declaration
+        .bootstrap_timeout
+        .unwrap_or(DEFAULT_STREAM_BOOTSTRAP_TIMEOUT);
+    if bootstrap_events == 0 || bootstrap_bytes == 0 || bootstrap_timeout.is_zero() {
+        return Err(invalid(
+            label,
+            "stream bootstrap events, bytes, and timeout must be greater than zero",
+        ));
+    }
+    Ok(StreamPlan {
+        bootstrap_events,
+        bootstrap_bytes,
+        bootstrap_timeout,
+    })
+}
+
+fn compile_cooldown(
+    declaration: Option<&CooldownConfig>,
+    label: &SourceLabel,
+) -> Result<Option<CooldownPlan>, ConfigError> {
+    let Some(declaration) = declaration else {
+        return Ok(None);
+    };
+    let scope = declaration
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid(label, "cooldown requires scope"))?;
+    let scope =
+        CooldownScopePlan::parse(scope).ok_or_else(|| invalid(label, "unknown cooldown scope"))?;
+    let duration = declaration
+        .duration
+        .ok_or_else(|| invalid(label, "cooldown requires duration"))?;
+    if duration.is_zero() {
+        return Err(invalid(
+            label,
+            "cooldown duration must be greater than zero",
+        ));
+    }
+    Ok(Some(CooldownPlan { scope, duration }))
+}
 
 fn compile_upstream(
     declaration: &UpstreamConfig,
@@ -1783,16 +2928,18 @@ fn compile_target(
     declaration: &RouteConfig,
     label: &SourceLabel,
     upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
+    policies: &BTreeMap<Arc<str>, PolicyPlan>,
 ) -> Result<TargetPlan, ConfigError> {
     let target = declaration.target.as_ref();
-    let (upstream, path, model_from) = match target {
-        Some(TargetValue::Name(name)) => (Some(name.as_str()), None, None),
+    let (upstream, path, model_from, target_policy) = match target {
+        Some(TargetValue::Name(name)) => (Some(name.as_str()), None, None, None),
         Some(TargetValue::Config(config)) => (
             config.upstream.as_deref(),
             config.path.as_deref(),
             config.model_from.as_deref(),
+            config.policy.as_deref(),
         ),
-        None => (declaration.upstream.as_deref(), None, None),
+        None => (declaration.upstream.as_deref(), None, None, None),
     };
     let upstream = upstream
         .filter(|name| !name.trim().is_empty())
@@ -1818,10 +2965,37 @@ fn compile_target(
             ));
         }
     };
+    if target_policy.is_some() && declaration.policy.is_some() {
+        return Err(invalid(
+            label,
+            "route policy and target policy cannot both be set",
+        ));
+    }
+    let policy = target_policy.or(declaration.policy.as_deref());
+    if let Some(policy) = policy {
+        let policy = policy.trim();
+        if policy.is_empty() {
+            return Err(invalid(label, "route policy must not be empty"));
+        }
+        if !policies.contains_key(policy) {
+            return Err(ConfigError::MissingReference {
+                kind: "policy",
+                name: policy.to_owned(),
+                label: label.clone(),
+            });
+        }
+        return Ok(TargetPlan {
+            upstream: Arc::from(upstream),
+            path,
+            model_source,
+            policy: Some(Arc::from(policy)),
+        });
+    }
     Ok(TargetPlan {
         upstream: Arc::from(upstream),
         path,
         model_source,
+        policy: None,
     })
 }
 
@@ -2003,6 +3177,54 @@ where
     }
 }
 
+fn deserialize_optional_byte_size<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<ByteSize>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(ByteSize::Number(value)) => Ok(Some(value)),
+        Some(ByteSize::Text(value)) => parse_byte_size_literal(&value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ByteSize {
+    Number(u64),
+    Text(String),
+}
+
+fn parse_byte_size_literal(value: &str) -> Result<u64, &'static str> {
+    let value = value.trim();
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or("byte size requires a unit")?;
+    if split == 0 {
+        return Err("invalid byte size");
+    }
+    let number = value[..split]
+        .parse::<u64>()
+        .map_err(|_| "invalid byte size")?;
+    let unit = value[split..].to_ascii_lowercase();
+    let multiplier = match unit.as_str() {
+        "b" => 1,
+        "kb" => 1_000,
+        "kib" => 1 << 10,
+        "mb" => 1_000_000,
+        "mib" => 1 << 20,
+        "gb" => 1_000_000_000,
+        "gib" => 1 << 30,
+        _ => return Err("invalid byte size unit"),
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or("byte size is too large")
+}
+
 fn default_request_timeout() -> Option<Duration> {
     RouteLimits::default().request_timeout
 }
@@ -2162,6 +3384,25 @@ fn declaration_label(source: &Source, section: &str, id: &str, _ordinal: usize) 
 
 fn upstream_label(source: &Source, id: &str, ordinal: usize) -> SourceLabel {
     declaration_label(source, "upstreams", id, ordinal)
+}
+
+fn account_label(source: &Source, section: &str, id: &str) -> SourceLabel {
+    declaration_label(source, section, id, 0)
+}
+
+fn pool_label(source: &Source, id: &str) -> SourceLabel {
+    let canonical = format!("account_pools.{id}");
+    let alias = format!("pools.{id}");
+    let key = if source.origins.contains_key(&canonical) {
+        canonical
+    } else {
+        alias
+    };
+    source_label_with_key(source, &key, format!("account_pools.{id}"))
+}
+
+fn policy_label(source: &Source, id: &str) -> SourceLabel {
+    declaration_label(source, "policies", id, 0)
 }
 
 fn model_label(source: &Source, ordinal: usize, id: &str) -> SourceLabel {
@@ -2606,5 +3847,150 @@ routes:
 "#;
         let error = compile_yaml("prefix.yaml", prefix).expect_err("unused prefix");
         assert!(error.to_string().contains("does not accept a prefix"));
+    }
+
+    #[test]
+    fn compiles_account_pool_policy_and_immutable_budgets() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+accounts:
+  primary:
+    provider: local
+    secret: env:POOLER_PRIMARY
+    weight: 2
+    max_concurrency: 4
+  backup:
+    provider: local
+    secret: file:/run/pooler/backup.token
+account_pools:
+  default: {accounts: [primary, backup]}
+policies:
+  default:
+    account_pool: default
+    selection:
+      strategy: health_weighted
+      session_affinity: 30m
+    retry:
+      maximum_attempts: 3
+      maximum_credentials: 2
+      before_commit_only: true
+      statuses: [408, 429, 500, 503]
+      base_delay: 100ms
+      maximum_delay: 5s
+      maximum_total_delay: 20s
+    stream:
+      bootstrap_events: 1
+      bootstrap_bytes: 64KiB
+      bootstrap_timeout: 20s
+routes:
+  - id: pooled
+    listen: local
+    target: {provider: local, policy: default}
+"#;
+        let config = compile_yaml("pooling.yaml", text).expect("pooling config");
+        assert_eq!(config.accounts().len(), 2);
+        assert_eq!(config.accounts()["primary"].weight(), 2);
+        assert_eq!(config.account_pools()["default"].accounts().len(), 2);
+        let policy = &config.policies()["default"];
+        assert_eq!(
+            policy.selection().strategy(),
+            SelectionStrategy::HealthWeighted
+        );
+        assert_eq!(policy.selection().account_pool(), Some("default"));
+        assert_eq!(
+            policy.selection().affinity().expect("affinity").ttl(),
+            Duration::from_secs(30 * 60)
+        );
+        assert!(policy.retry().before_commit_only());
+        assert_eq!(policy.retry().maximum_attempts(), 3);
+        assert_eq!(policy.retry().maximum_credentials(), 2);
+        assert!(policy.retry().allows_status(503));
+        assert!(!policy.retry().allows_status(400));
+        assert_eq!(policy.stream().bootstrap_bytes(), 64 * 1024);
+        assert_eq!(config.routes()[0].target().policy(), Some("default"));
+    }
+
+    #[test]
+    fn rejects_unbounded_or_ambiguous_retry_configuration() {
+        let missing_commit = r#"
+version: 1
+policies:
+  default:
+    retry: {maximum_attempts: 2, maximum_credentials: 2, statuses: [503]}
+"#;
+        let error = compile_yaml("missing-commit.yaml", missing_commit)
+            .expect_err("pre-commit guard is required");
+        assert!(error.to_string().contains("before_commit_only"));
+
+        let missing_credentials = r#"
+version: 1
+policies:
+  default:
+    retry: {maximum_attempts: 2, before_commit_only: true, statuses: [503]}
+"#;
+        let error = compile_yaml("missing-credentials.yaml", missing_credentials)
+            .expect_err("credential budget is required");
+        assert!(error.to_string().contains("maximum_credentials"));
+
+        let invalid_status = r#"
+version: 1
+policies:
+  default:
+    retry: {maximum_attempts: 2, maximum_credentials: 2, before_commit_only: true, statuses: [400]}
+"#;
+        let error = compile_yaml("invalid-status.yaml", invalid_status)
+            .expect_err("invalid status must not retry");
+        assert!(error.to_string().contains("retry statuses"));
+    }
+
+    #[test]
+    fn rejects_invalid_strategy_affinity_and_budget_literals() {
+        let strategy = "version: 1\npolicies: {default: {selection: {strategy: random}}}\n";
+        let error = compile_yaml("strategy.yaml", strategy).expect_err("unknown strategy");
+        assert!(error.to_string().contains("unknown selection strategy"));
+
+        let affinity = r#"
+version: 1
+policies:
+  default:
+    selection:
+      strategy: round_robin
+      affinity: {key: "header:bad header", ttl: 0s}
+"#;
+        let error = compile_yaml("affinity.yaml", affinity).expect_err("invalid affinity");
+        assert!(error.to_string().contains("affinity"));
+
+        let bytes = r#"
+version: 1
+policies:
+  default:
+    stream: {bootstrap_bytes: 2XB}
+"#;
+        let error = parse_yaml("bytes.yaml", bytes).expect_err("invalid byte size");
+        assert!(error.to_string().contains("byte size"));
+    }
+
+    #[test]
+    fn account_and_policy_references_are_strict() {
+        let missing_provider = r#"
+version: 1
+accounts: {primary: {provider: absent, secret: env:POOLER_PRIMARY}}
+"#;
+        let error =
+            compile_yaml("provider-ref.yaml", missing_provider).expect_err("missing provider");
+        assert!(error.to_string().contains("missing upstream `absent`"));
+
+        let missing_account = r#"
+version: 1
+account_pools: {default: {accounts: [absent]}}
+"#;
+        let error = compile_yaml("account-ref.yaml", missing_account).expect_err("missing account");
+        assert!(error.to_string().contains("missing account `absent`"));
+
+        let unknown = "version: 1\npolicies: {default: {rety: {maximum_attempts: 2}}}\n";
+        let error = parse_yaml("policy-field.yaml", unknown).expect_err("unknown policy field");
+        assert!(error.to_string().contains("rety"));
     }
 }

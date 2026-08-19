@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 http.workspace = true
+pooler-policy = { path = "../pooler-policy" }
+pooler-store = { path = "../pooler-store" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

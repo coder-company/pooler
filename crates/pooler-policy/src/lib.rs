@@ -20,6 +20,13 @@ pub use pooler_core::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod selection;
+
+pub use selection::{
+    AffinityKey, CredentialRegistration, CredentialRegistry, QuotaSnapshot, SelectionError,
+    SelectionLease, SelectionRequest, SelectionReservation, SelectionStrategy,
+};
+
 // -----------------------------------------------------------------------------
 // Classification
 // -----------------------------------------------------------------------------
@@ -312,38 +319,202 @@ pub trait FailureClassifier: Send + Sync {
     fn classify(&self, failure: &ObservedFailure) -> FailureClassification;
 }
 
-/// Conservative HTTP/status classifier for adapters that have no provider
-/// reason-code rules of their own.
+/// Classifies common provider HTTP failures and bounded provider reason codes.
+///
+/// The classifier only returns data.  It never mutates a credential or model,
+/// so callers can safely classify a malformed request before selecting a
+/// target or applying health changes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProviderFailureClassifier;
+
+impl FailureClassifier for ProviderFailureClassifier {
+    fn classify(&self, failure: &ObservedFailure) -> FailureClassification {
+        classify_provider_failure(failure)
+    }
+}
+
+/// OpenAI-compatible provider reason-code classifier.
+///
+/// OpenAI-compatible gateways commonly use the same status and reason-code
+/// vocabulary.  Keeping this as a named classifier makes the route contract
+/// explicit while sharing the conservative rules with other HTTP providers.
+pub type OpenAiCompatibleFailureClassifier = ProviderFailureClassifier;
+
+/// Short compatibility name for OpenAI-style classifiers.
+pub type OpenAiFailureClassifier = ProviderFailureClassifier;
+
+/// Anthropic-compatible provider reason-code classifier.
+pub type AnthropicCompatibleFailureClassifier = ProviderFailureClassifier;
+
+/// Short compatibility name for Anthropic-style classifiers.
+pub type AnthropicFailureClassifier = ProviderFailureClassifier;
+
+/// HTTP/status classifier using the shared conservative provider rules.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HttpFailureClassifier;
 
 impl FailureClassifier for HttpFailureClassifier {
     fn classify(&self, failure: &ObservedFailure) -> FailureClassification {
-        let class = match failure.source {
-            FailureSource::Downstream => match failure.status {
-                Some(401 | 403) => ErrorClass::DownstreamAuthentication,
-                _ => ErrorClass::InvalidRequest,
-            },
-            FailureSource::Transport => ErrorClass::Network,
-            FailureSource::Internal => ErrorClass::InternalInvariant,
-            FailureSource::Upstream => match failure.status {
-                Some(401 | 403) => ErrorClass::ProviderAuthentication,
-                Some(429) => ErrorClass::ProviderRateLimited,
-                Some(408 | 500..=599) => ErrorClass::ProviderUnavailable,
-                Some(400..=499) => ErrorClass::InvalidRequest,
-                _ => ErrorClass::InvalidUpstreamResponse,
-            },
-        };
-        let mut result = FailureClassification::for_class(class);
-        result.evidence = RedactedEvidence {
-            status: failure.status,
-            provider_code: failure.provider_code.clone(),
-            summary: failure.message.clone(),
-        };
-        if let Some(delay) = failure.retry_after {
-            result = result.with_recovery_after(delay);
+        classify_provider_failure(failure)
+    }
+}
+
+const DEFAULT_PROVIDER_AUTH_RECOVERY: Duration = Duration::from_secs(30);
+const DEFAULT_QUOTA_RECOVERY: Duration = Duration::from_secs(60);
+const DEFAULT_RATE_LIMIT_RECOVERY: Duration = Duration::from_secs(1);
+const DEFAULT_PROVIDER_UNAVAILABLE_RECOVERY: Duration = Duration::from_secs(1);
+
+fn classify_provider_failure(failure: &ObservedFailure) -> FailureClassification {
+    let class = match failure.source {
+        FailureSource::Downstream => match failure.status {
+            Some(401 | 403) => ErrorClass::DownstreamAuthentication,
+            _ => ErrorClass::InvalidRequest,
+        },
+        FailureSource::Transport => ErrorClass::Network,
+        FailureSource::Internal => ErrorClass::InternalInvariant,
+        FailureSource::Upstream => classify_upstream_class(failure),
+    };
+
+    let mut result = FailureClassification::for_class(class);
+    result.evidence = RedactedEvidence {
+        status: failure.status,
+        provider_code: failure.provider_code.clone(),
+        summary: failure.message.clone(),
+    };
+
+    let recovery = failure
+        .retry_after
+        .unwrap_or_else(|| default_recovery_for(class));
+    if recovery > Duration::ZERO && allows_recovery_hint(class) {
+        result = result.with_recovery_after(recovery);
+        if let Some(scope) = cooldown_scope_for(class) {
+            result = result.with_cooldown(CooldownSpec {
+                scope,
+                duration: recovery,
+            });
         }
-        result
+    }
+    result
+}
+
+fn classify_upstream_class(failure: &ObservedFailure) -> ErrorClass {
+    let hint = provider_hint(failure);
+    if has_any(
+        &hint,
+        &[
+            "invalid_request",
+            "invalid_argument",
+            "bad_request",
+            "malformed",
+            "validation_error",
+        ],
+    ) {
+        return ErrorClass::InvalidRequest;
+    }
+    if has_any(
+        &hint,
+        &[
+            "insufficient_quota",
+            "quota_exceeded",
+            "billing_hard_limit",
+            "resource_exhausted",
+            "quota",
+            "daily_limit",
+            "monthly_limit",
+            "credit_exhausted",
+        ],
+    ) {
+        return if has_any(&hint, &["model_quota", "model_limit", "model_capacity"]) {
+            ErrorClass::ModelQuotaExhausted
+        } else {
+            ErrorClass::CredentialQuotaExhausted
+        };
+    }
+    if has_any(
+        &hint,
+        &[
+            "invalid_api_key",
+            "invalid_auth",
+            "authentication",
+            "unauthorized",
+        ],
+    ) || (matches!(failure.status, Some(401 | 403))
+        && !has_any(&hint, &["invalid_request", "invalid_argument"]))
+    {
+        return ErrorClass::ProviderAuthentication;
+    }
+    if matches!(failure.status, Some(429))
+        || has_any(
+            &hint,
+            &[
+                "rate_limit",
+                "too_many_requests",
+                "throttl",
+                "overload",
+                "temporarily_unavailable",
+            ],
+        )
+    {
+        return ErrorClass::ProviderRateLimited;
+    }
+    match failure.status {
+        Some(408 | 500..=599) => ErrorClass::ProviderUnavailable,
+        Some(400..=499) => ErrorClass::InvalidRequest,
+        _ => ErrorClass::InvalidUpstreamResponse,
+    }
+}
+
+fn provider_hint(failure: &ObservedFailure) -> String {
+    let mut hint = String::new();
+    if let Some(code) = &failure.provider_code {
+        hint.push_str(&code.to_ascii_lowercase());
+    }
+    if let Some(message) = &failure.message {
+        if !hint.is_empty() {
+            hint.push(' ');
+        }
+        hint.push_str(&message.to_ascii_lowercase());
+    }
+    hint
+}
+
+fn has_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn default_recovery_for(class: ErrorClass) -> Duration {
+    match class {
+        ErrorClass::ProviderAuthentication => DEFAULT_PROVIDER_AUTH_RECOVERY,
+        ErrorClass::CredentialQuotaExhausted | ErrorClass::ModelQuotaExhausted => {
+            DEFAULT_QUOTA_RECOVERY
+        }
+        ErrorClass::ProviderRateLimited => DEFAULT_RATE_LIMIT_RECOVERY,
+        ErrorClass::ProviderUnavailable => DEFAULT_PROVIDER_UNAVAILABLE_RECOVERY,
+        _ => Duration::ZERO,
+    }
+}
+
+fn allows_recovery_hint(class: ErrorClass) -> bool {
+    matches!(
+        class,
+        ErrorClass::ProviderAuthentication
+            | ErrorClass::CredentialQuotaExhausted
+            | ErrorClass::ModelQuotaExhausted
+            | ErrorClass::ProviderRateLimited
+            | ErrorClass::ProviderUnavailable
+    )
+}
+
+fn cooldown_scope_for(class: ErrorClass) -> Option<CooldownScopeKind> {
+    match class {
+        ErrorClass::ProviderAuthentication | ErrorClass::CredentialQuotaExhausted => {
+            Some(CooldownScopeKind::Credential)
+        }
+        ErrorClass::ModelQuotaExhausted => Some(CooldownScopeKind::Model),
+        ErrorClass::ProviderRateLimited | ErrorClass::ProviderUnavailable => {
+            Some(CooldownScopeKind::Provider)
+        }
+        _ => None,
     }
 }
 
@@ -420,6 +591,25 @@ impl ReplayCheck {
         }
     }
 
+    /// Build the replay proof for an HTTP operation whose body is retained.
+    ///
+    /// HTTP methods with idempotent semantics may be replayed directly. A
+    /// non-idempotent method, such as POST, requires an explicit
+    /// `Idempotency-Key` header before the operation is considered repeatable.
+    #[must_use]
+    pub fn for_http_method(method: &str, idempotency_key_present: bool) -> Self {
+        let idempotent = matches!(
+            method,
+            "GET" | "HEAD" | "OPTIONS" | "PUT" | "DELETE" | "TRACE"
+        );
+        Self {
+            body_replayable: true,
+            operation_replayable: idempotent || idempotency_key_present,
+            no_nonrepeatable_side_effect: true,
+            session_allows_replay: true,
+        }
+    }
+
     /// Whether all request-level replay checks pass.
     #[must_use]
     pub const fn is_safe(self) -> bool {
@@ -437,6 +627,17 @@ pub struct RetryContext {
     pub commitment: CommitmentState,
     pub replay: ReplayCheck,
     pub elapsed_retry_delay: Duration,
+    /// Total request time observed before making another attempt.
+    pub elapsed: Duration,
+    /// Number of credentials already tried by this request.
+    pub credentials_used: u32,
+    /// Number of providers already tried by this request.
+    pub providers_used: u32,
+    /// Time spent waiting on provider-advertised recovery windows.
+    pub elapsed_recovery_wait: Duration,
+    /// Whether the request carries the idempotency key required by the
+    /// provider before replaying a non-idempotent operation.
+    pub idempotency_key_present: bool,
 }
 
 impl RetryContext {
@@ -448,6 +649,11 @@ impl RetryContext {
             commitment,
             replay,
             elapsed_retry_delay: Duration::ZERO,
+            elapsed: Duration::ZERO,
+            credentials_used: 1,
+            providers_used: 1,
+            elapsed_recovery_wait: Duration::ZERO,
+            idempotency_key_present: false,
         }
     }
 
@@ -455,6 +661,35 @@ impl RetryContext {
     #[must_use]
     pub const fn with_elapsed_retry_delay(mut self, delay: Duration) -> Self {
         self.elapsed_retry_delay = delay;
+        self
+    }
+
+    /// Include total request time already consumed by this attempt.
+    #[must_use]
+    pub const fn with_elapsed(mut self, elapsed: Duration) -> Self {
+        self.elapsed = elapsed;
+        self
+    }
+
+    /// Include the number of credentials and providers already attempted.
+    #[must_use]
+    pub const fn with_used_targets(mut self, credentials: u32, providers: u32) -> Self {
+        self.credentials_used = credentials;
+        self.providers_used = providers;
+        self
+    }
+
+    /// Include time already spent waiting for provider recovery.
+    #[must_use]
+    pub const fn with_elapsed_recovery_wait(mut self, delay: Duration) -> Self {
+        self.elapsed_recovery_wait = delay;
+        self
+    }
+
+    /// Mark whether a request-scoped idempotency key is available for replay.
+    #[must_use]
+    pub const fn with_idempotency_key(mut self, present: bool) -> Self {
+        self.idempotency_key_present = present;
         self
     }
 }
@@ -465,7 +700,11 @@ pub enum RetryStopReason {
     DownstreamCommitted,
     NotReplaySafe,
     ClassificationNotRetryable,
+    RequiresIdempotencyKey,
     AttemptsExhausted,
+    CredentialsExhausted,
+    ProvidersExhausted,
+    RecoveryWaitExhausted,
     RetryBudgetExhausted,
 }
 
@@ -508,18 +747,30 @@ impl RetryDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
+    /// Maximum distinct credential attempts for one request.
+    pub max_credentials: u32,
+    /// Maximum distinct provider attempts for one request.
+    pub max_providers: u32,
     pub base_delay: Duration,
     pub max_delay: Duration,
     pub max_total_delay: Duration,
+    /// Optional wall-clock bound for the complete request retry window.
+    pub max_elapsed: Option<Duration>,
+    /// Maximum time spent honoring provider recovery hints.
+    pub max_recovery_wait: Duration,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 2,
+            max_credentials: 2,
+            max_providers: 2,
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(30),
             max_total_delay: Duration::from_secs(60),
+            max_elapsed: Some(Duration::from_secs(60)),
+            max_recovery_wait: Duration::from_secs(60),
         }
     }
 }
@@ -537,10 +788,51 @@ impl RetryPolicy {
         }
         Ok(Self {
             max_attempts,
+            max_credentials: max_attempts,
+            max_providers: max_attempts,
             base_delay,
             max_delay,
             max_total_delay,
+            max_recovery_wait: max_total_delay,
+            max_elapsed: Some(max_total_delay),
         })
+    }
+
+    /// Construct a policy with explicit attempt, target, and wait bounds.
+    pub fn with_bounds(
+        max_attempts: u32,
+        max_credentials: u32,
+        max_providers: u32,
+        base_delay: Duration,
+        max_delay: Duration,
+        max_total_delay: Duration,
+        max_recovery_wait: Duration,
+    ) -> Result<Self, PolicyError> {
+        if max_attempts == 0
+            || max_credentials == 0
+            || max_providers == 0
+            || base_delay > max_delay
+            || max_recovery_wait > max_total_delay
+        {
+            return Err(PolicyError::InvalidRetryBudget);
+        }
+        Ok(Self {
+            max_attempts,
+            max_credentials,
+            max_providers,
+            base_delay,
+            max_delay,
+            max_total_delay,
+            max_recovery_wait,
+            max_elapsed: Some(max_total_delay),
+        })
+    }
+
+    /// Set an optional wall-clock retry bound.
+    #[must_use]
+    pub const fn with_max_elapsed(mut self, max_elapsed: Option<Duration>) -> Self {
+        self.max_elapsed = max_elapsed;
+        self
     }
 
     /// Decide whether this failed attempt can be replayed.
@@ -549,6 +841,14 @@ impl RetryPolicy {
         if context.commitment.is_committed() {
             return RetryDecision::DoNotRetry {
                 reason: RetryStopReason::DownstreamCommitted,
+            };
+        }
+        if self
+            .max_elapsed
+            .is_some_and(|limit| context.elapsed > limit)
+        {
+            return RetryDecision::DoNotRetry {
+                reason: RetryStopReason::RetryBudgetExhausted,
             };
         }
         if failure.classification.retryability != Retryability::BeforeCommit
@@ -563,12 +863,48 @@ impl RetryPolicy {
                 reason: RetryStopReason::NotReplaySafe,
             };
         }
+        if failure.classification.replay_safety == ReplaySafety::RequiresIdempotencyKey
+            && !context.idempotency_key_present
+        {
+            return RetryDecision::DoNotRetry {
+                reason: RetryStopReason::RequiresIdempotencyKey,
+            };
+        }
         if context.attempt == 0 || context.attempt >= self.max_attempts {
             return RetryDecision::DoNotRetry {
                 reason: RetryStopReason::AttemptsExhausted,
             };
         }
+        if matches!(failure.classification.scope, ErrorScope::Credential)
+            && context.credentials_used >= self.max_credentials
+        {
+            return RetryDecision::DoNotRetry {
+                reason: RetryStopReason::CredentialsExhausted,
+            };
+        }
+        if matches!(failure.classification.scope, ErrorScope::Provider)
+            && context.providers_used >= self.max_providers
+        {
+            return RetryDecision::DoNotRetry {
+                reason: RetryStopReason::ProvidersExhausted,
+            };
+        }
         let delay = self.delay_for(failure, context.attempt);
+        if self
+            .max_elapsed
+            .is_some_and(|limit| context.elapsed.saturating_add(delay) > limit)
+        {
+            return RetryDecision::DoNotRetry {
+                reason: RetryStopReason::RetryBudgetExhausted,
+            };
+        }
+        if let Some(recovery) = failure.classification.recovery_after {
+            if context.elapsed_recovery_wait.saturating_add(recovery) > self.max_recovery_wait {
+                return RetryDecision::DoNotRetry {
+                    reason: RetryStopReason::RecoveryWaitExhausted,
+                };
+            }
+        }
         if context.elapsed_retry_delay.saturating_add(delay) > self.max_total_delay {
             return RetryDecision::DoNotRetry {
                 reason: RetryStopReason::RetryBudgetExhausted,
@@ -826,6 +1162,22 @@ impl HealthRegistry {
         Self::default()
     }
 
+    /// Rehydrate one persisted cooldown without reconstructing a synthetic
+    /// failure classification.
+    pub fn restore_cooldown(&mut self, scope: CooldownScope, until: Instant) {
+        self.cooldowns
+            .entry(scope.clone())
+            .and_modify(|old| *old = (*old).max(until))
+            .or_insert(until);
+        if let CooldownScope::Credential(id) = scope {
+            let health = self.credentials.entry(id).or_default();
+            if health.status != CredentialStatus::Disabled {
+                health.status = CredentialStatus::CoolingDown;
+                health.cooldown_until = Some(until);
+            }
+        }
+    }
+
     /// Apply a classification. Classifiers never call this method.
     pub fn apply_failure(
         &mut self,
@@ -903,6 +1255,19 @@ impl HealthRegistry {
     /// Return whether any scope applicable to a target is active.
     #[must_use]
     pub fn target_is_cooling_down(&self, subject: &HealthSubject, now: Instant) -> bool {
+        self.target_cooldown_scopes(subject, now)
+            .into_iter()
+            .next()
+            .is_some()
+    }
+
+    /// Return every active cooldown scope that applies to a target.
+    #[must_use]
+    pub fn target_cooldown_scopes(
+        &self,
+        subject: &HealthSubject,
+        now: Instant,
+    ) -> Vec<CooldownScopeKind> {
         [
             CooldownScopeKind::Credential,
             CooldownScopeKind::CredentialModel,
@@ -913,7 +1278,38 @@ impl HealthRegistry {
         ]
         .into_iter()
         .filter_map(|kind| subject.resolve(kind))
-        .any(|scope| self.is_cooling_down(&scope, now))
+        .filter(|scope| self.is_cooling_down(scope, now))
+        .map(|scope| scope.kind())
+        .collect()
+    }
+
+    /// Return the earliest active recovery deadline that applies to a target.
+    ///
+    /// The caller can use this value to wait or to record why a target was
+    /// skipped.  Expired entries are ignored and are left for the next
+    /// mutable cleanup pass.
+    #[must_use]
+    pub fn target_recovery_until(&self, subject: &HealthSubject, now: Instant) -> Option<Instant> {
+        [
+            CooldownScopeKind::Credential,
+            CooldownScopeKind::CredentialModel,
+            CooldownScopeKind::Model,
+            CooldownScopeKind::Provider,
+            CooldownScopeKind::ProviderModel,
+            CooldownScopeKind::Route,
+        ]
+        .into_iter()
+        .filter_map(|kind| subject.resolve(kind))
+        .filter_map(|scope| self.cooldown_until(&scope, now))
+        .min()
+    }
+
+    /// Return the remaining recovery delay for a target, if any cooldown is
+    /// active.
+    #[must_use]
+    pub fn target_recovery_after(&self, subject: &HealthSubject, now: Instant) -> Option<Duration> {
+        self.target_recovery_until(subject, now)
+            .map(|until| until.saturating_duration_since(now))
     }
 
     /// Return credential health without creating a new entry.
@@ -931,6 +1327,17 @@ impl HealthRegistry {
                 cooldown_until: None,
             },
         );
+    }
+
+    /// Re-enable a credential after an operator or control plane clears its
+    /// disabled state. Active scoped cooldowns remain authoritative until
+    /// they expire.
+    pub fn enable_credential(&mut self, id: CredentialId) {
+        let health = self.credentials.entry(id).or_default();
+        if health.status == CredentialStatus::Disabled {
+            health.status = CredentialStatus::Healthy;
+            health.cooldown_until = None;
+        }
     }
 
     /// Remove expired entries and restore expired credential status.
@@ -1013,8 +1420,11 @@ pub enum FilterReason {
     CodecUnavailable(String),
     CredentialUnavailable,
     CredentialCooldown,
+    CredentialModelCooldown,
     ModelCooldown,
     ProviderCooldown,
+    ProviderModelCooldown,
+    RouteCooldown,
     ConcurrencyLimit,
     RoutePolicy,
     SessionAffinity,
@@ -1073,6 +1483,11 @@ pub enum AffinityDecision {
     Rebound {
         key_pseudonym: String,
         previous_provider: ProviderId,
+        target: SelectionTarget,
+    },
+    /// The bound target was unavailable and policy forbade rebinding.
+    Unavailable {
+        key_pseudonym: String,
         target: SelectionTarget,
     },
 }
@@ -1231,6 +1646,76 @@ mod tests {
     }
 
     #[test]
+    fn malformed_provider_request_does_not_cool_a_credential() {
+        let classifier = ProviderFailureClassifier;
+        let failure = classifier.classify(
+            &ObservedFailure::new(FailureSource::Upstream, Some(400))
+                .with_provider_code("invalid_request")
+                .with_message("request body is malformed"),
+        );
+        assert_eq!(failure.classification.class, ErrorClass::InvalidRequest);
+        assert!(failure.cooldown.is_none());
+        let mut health = HealthRegistry::new();
+        assert_eq!(
+            health.apply_failure(&failure, &subject(), Instant::now()),
+            HealthMutation::NoChange {
+                reason: HealthMutationReason::NoCooldownRequested,
+            }
+        );
+    }
+
+    #[test]
+    fn retry_after_is_preserved_for_rate_limit_recovery() {
+        let failure = ProviderFailureClassifier.classify(
+            &ObservedFailure::new(FailureSource::Upstream, Some(429))
+                .with_provider_code("rate_limit_exceeded")
+                .with_retry_after(Duration::from_secs(7)),
+        );
+        assert_eq!(
+            failure.classification.class,
+            ErrorClass::ProviderRateLimited
+        );
+        assert_eq!(
+            failure.classification.recovery_after,
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            failure.cooldown,
+            Some(CooldownSpec::provider(Duration::from_secs(7)))
+        );
+    }
+
+    #[test]
+    fn quota_failure_cools_one_credential_and_allows_failover() {
+        let failure = ProviderFailureClassifier.classify(
+            &ObservedFailure::new(FailureSource::Upstream, Some(429))
+                .with_provider_code("insufficient_quota")
+                .with_retry_after(Duration::from_secs(45)),
+        );
+        assert_eq!(
+            failure.classification.class,
+            ErrorClass::CredentialQuotaExhausted
+        );
+        assert_eq!(failure.classification.scope, ErrorScope::Credential);
+        let now = Instant::now();
+        let mut health = HealthRegistry::new();
+        let mutation = health.apply_failure(&failure, &subject(), now);
+        assert!(mutation.applied());
+        assert!(health.target_is_cooling_down(&subject(), now));
+        assert_eq!(
+            health.target_recovery_after(&subject(), now),
+            Some(Duration::from_secs(45))
+        );
+
+        let retry = RetryPolicy::default().decide(
+            &failure,
+            RetryContext::new(1, CommitmentState::Uncommitted, ReplayCheck::safe())
+                .with_used_targets(1, 1),
+        );
+        assert!(retry.is_retry());
+    }
+
+    #[test]
     fn retry_stops_after_commit_even_for_replayable_failures() {
         let policy = RetryPolicy::default();
         let failure = FailureClassification::for_class(ErrorClass::ProviderUnavailable);
@@ -1262,6 +1747,123 @@ mod tests {
             RetryPolicy::default().decide(&failure, context),
             RetryDecision::DoNotRetry {
                 reason: RetryStopReason::NotReplaySafe,
+            }
+        );
+    }
+
+    #[test]
+    fn replay_proof_requires_idempotent_method_or_key() {
+        let failure = ProviderFailureClassifier
+            .classify(&ObservedFailure::new(FailureSource::Upstream, Some(503)));
+        let policy = RetryPolicy::default();
+        let post_without_key = RetryContext::new(
+            1,
+            CommitmentState::Uncommitted,
+            ReplayCheck::for_http_method("POST", false),
+        );
+        assert_eq!(
+            policy.decide(&failure, post_without_key),
+            RetryDecision::DoNotRetry {
+                reason: RetryStopReason::NotReplaySafe
+            }
+        );
+        let post_with_key = RetryContext::new(
+            1,
+            CommitmentState::Uncommitted,
+            ReplayCheck::for_http_method("POST", true),
+        );
+        assert!(policy.decide(&failure, post_with_key).is_retry());
+        let get = RetryContext::new(
+            1,
+            CommitmentState::Uncommitted,
+            ReplayCheck::for_http_method("GET", false),
+        );
+        assert!(policy.decide(&failure, get).is_retry());
+    }
+
+    #[test]
+    fn retry_requires_an_idempotency_key_when_classification_requires_one() {
+        let classification = ErrorClassification::new(
+            ErrorClass::ProviderUnavailable,
+            ErrorScope::Provider,
+            Retryability::BeforeCommit,
+            ReplaySafety::RequiresIdempotencyKey,
+        );
+        let failure = FailureClassification::new(
+            classification,
+            PublicResponse::new(503, "provider_unavailable", "provider unavailable"),
+            RedactedEvidence::default(),
+        );
+        let context = RetryContext::new(1, CommitmentState::Uncommitted, ReplayCheck::safe());
+        assert_eq!(
+            RetryPolicy::default().decide(&failure, context),
+            RetryDecision::DoNotRetry {
+                reason: RetryStopReason::RequiresIdempotencyKey,
+            }
+        );
+        assert!(RetryPolicy::default()
+            .decide(&failure, context.with_idempotency_key(true))
+            .is_retry());
+    }
+
+    #[test]
+    fn retry_budget_limits_credentials_and_recovery_wait() {
+        let failure = ProviderFailureClassifier.classify(
+            &ObservedFailure::new(FailureSource::Upstream, Some(429))
+                .with_provider_code("insufficient_quota")
+                .with_retry_after(Duration::from_secs(10)),
+        );
+        let policy = RetryPolicy::with_bounds(
+            3,
+            1,
+            3,
+            Duration::from_millis(1),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .expect("valid retry bounds");
+        assert_eq!(
+            policy.decide(
+                &failure,
+                RetryContext::new(1, CommitmentState::Uncommitted, ReplayCheck::safe())
+                    .with_used_targets(1, 1),
+            ),
+            RetryDecision::DoNotRetry {
+                reason: RetryStopReason::CredentialsExhausted,
+            }
+        );
+
+        let policy = RetryPolicy::with_bounds(
+            3,
+            3,
+            3,
+            Duration::from_millis(1),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .expect("valid retry bounds");
+        assert_eq!(
+            policy.decide(
+                &failure,
+                RetryContext::new(1, CommitmentState::Uncommitted, ReplayCheck::safe())
+                    .with_used_targets(1, 1),
+            ),
+            RetryDecision::DoNotRetry {
+                reason: RetryStopReason::RecoveryWaitExhausted,
+            }
+        );
+
+        let policy = RetryPolicy::default().with_max_elapsed(Some(Duration::from_secs(2)));
+        assert_eq!(
+            policy.decide(
+                &failure,
+                RetryContext::new(1, CommitmentState::Uncommitted, ReplayCheck::safe())
+                    .with_elapsed(Duration::from_secs(3)),
+            ),
+            RetryDecision::DoNotRetry {
+                reason: RetryStopReason::RetryBudgetExhausted,
             }
         );
     }

@@ -18,6 +18,8 @@ pooler-config = { path = "../pooler-config" }
 pooler-auth = { path = "../pooler-auth" }
 pooler-core = { path = "../pooler-core" }
 pooler-protocol = { path = "../pooler-protocol" }
+pooler-policy = { path = "../pooler-policy" }
+pooler-store = { path = "../pooler-store" }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

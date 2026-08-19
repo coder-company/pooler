@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
+pub use pooler_core::CredentialId;
 use thiserror::Error;
 use tokio::sync::Notify;
+#[cfg(test)]
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -509,59 +511,6 @@ pub fn validate_owner_only_permissions(path: impl AsRef<Path>) -> Result<(), Sec
     validate_owner_only_file(path)
 }
 
-/// A stable opaque credential identifier.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CredentialId(Uuid);
-
-impl CredentialId {
-    /// Generate a random identifier.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    /// Construct from a UUID.
-    #[must_use]
-    pub const fn from_uuid(value: Uuid) -> Self {
-        Self(value)
-    }
-
-    /// Return the underlying UUID.  This is an identifier, never a secret.
-    #[must_use]
-    pub const fn as_uuid(self) -> Uuid {
-        self.0
-    }
-}
-
-impl Default for CredentialId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Debug for CredentialId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("CredentialId")
-            .field(&self.0)
-            .finish()
-    }
-}
-
-impl fmt::Display for CredentialId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl std::str::FromStr for CredentialId {
-    type Err = uuid::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::parse_str(value)?))
-    }
-}
-
 /// A credential handle carrying one secret for a bounded operation.
 ///
 /// The handle's `Debug` output includes only its opaque identifier.  It does
@@ -589,8 +538,8 @@ impl CredentialHandle {
 
     /// Opaque identifier associated with this credential.
     #[must_use]
-    pub const fn id(&self) -> CredentialId {
-        self.id
+    pub fn id(&self) -> CredentialId {
+        self.id.clone()
     }
 
     /// Borrow secret material at an explicit outbound boundary.
@@ -616,7 +565,7 @@ impl CredentialHandle {
 impl Clone for CredentialHandle {
     fn clone(&self) -> Self {
         Self {
-            id: self.id,
+            id: self.id.clone(),
             secret: self.secret.clone(),
         }
     }
@@ -827,7 +776,7 @@ impl RefreshCoordinator {
                 (Arc::clone(entry), false)
             } else {
                 let entry = Arc::new(RefreshEntry::new());
-                entries.insert(credential, Arc::clone(&entry));
+                entries.insert(credential.clone(), Arc::clone(&entry));
                 (entry, true)
             }
         };
@@ -884,7 +833,7 @@ impl LeaderGuard {
         *lock_unpoisoned(&self.entry.result) = Some(result);
         remove_entry(
             &self.coordinator.state.entries,
-            self.credential,
+            &self.credential,
             &self.entry,
         );
         self.entry.complete.notify_waiters();
@@ -900,7 +849,7 @@ impl Drop for LeaderGuard {
         *lock_unpoisoned(&self.entry.result) = Some(Err(RefreshError::Cancelled));
         remove_entry(
             &self.coordinator.state.entries,
-            self.credential,
+            &self.credential,
             &self.entry,
         );
         self.entry.complete.notify_waiters();
@@ -909,15 +858,15 @@ impl Drop for LeaderGuard {
 
 fn remove_entry(
     entries: &Mutex<HashMap<CredentialId, Arc<RefreshEntry>>>,
-    credential: CredentialId,
+    credential: &CredentialId,
     expected: &Arc<RefreshEntry>,
 ) {
     let mut entries = lock_unpoisoned(entries);
     let should_remove = entries
-        .get(&credential)
+        .get(credential)
         .is_some_and(|current| Arc::ptr_eq(current, expected));
     if should_remove {
-        entries.remove(&credential);
+        entries.remove(credential);
     }
 }
 
@@ -998,7 +947,10 @@ mod tests {
         let value = SecretValue::new("super-secret");
         assert_eq!(format!("{value:?}"), "[REDACTED]");
         assert_eq!(value.to_string(), "[REDACTED]");
-        let handle = CredentialHandle::new(CredentialId::new(), "super-secret");
+        let handle = CredentialHandle::new(
+            CredentialId::new("credential-test").expect("valid credential ID"),
+            "super-secret",
+        );
         let rendered = format!("{handle:?}");
         assert!(!rendered.contains("super-secret"));
         assert!(!format!("{handle:?}").contains("len"));
@@ -1051,15 +1003,16 @@ mod tests {
     #[tokio::test]
     async fn concurrent_refreshes_share_one_result() {
         let coordinator = RefreshCoordinator::new();
-        let id = CredentialId::new();
+        let id = CredentialId::new("credential-refresh").expect("valid credential ID");
         let calls = Arc::new(AtomicUsize::new(0));
         let (ready_tx, ready_rx) = oneshot::channel();
         let first_calls = Arc::clone(&calls);
+        let first_id = id.clone();
         let first = {
             let coordinator = coordinator.clone();
             tokio::spawn(async move {
                 coordinator
-                    .refresh(id, || async move {
+                    .refresh(first_id, || async move {
                         first_calls.fetch_add(1, Ordering::SeqCst);
                         let _ = ready_rx.await;
                         Ok(OAuthTokens::bearer("access", Some("refresh"), None))
@@ -1069,11 +1022,12 @@ mod tests {
         };
         tokio::task::yield_now().await;
         let second_calls = Arc::clone(&calls);
+        let second_id = id;
         let second = {
             let coordinator = coordinator.clone();
             tokio::spawn(async move {
                 coordinator
-                    .refresh(id, || async move {
+                    .refresh(second_id, || async move {
                         second_calls.fetch_add(1, Ordering::SeqCst);
                         Ok(OAuthTokens::bearer("wrong", None::<String>, None))
                     })
@@ -1094,14 +1048,15 @@ mod tests {
     #[tokio::test]
     async fn cancelling_leader_releases_lease_and_wakes_waiter() {
         let coordinator = RefreshCoordinator::new();
-        let id = CredentialId::new();
+        let id = CredentialId::new("credential-cancel").expect("valid credential ID");
         let (started_tx, started_rx) = oneshot::channel();
         let (_never_tx, never_rx) = oneshot::channel::<()>();
+        let leader_id = id.clone();
         let leader = {
             let coordinator = coordinator.clone();
             tokio::spawn(async move {
                 coordinator
-                    .refresh(id, || async move {
+                    .refresh(leader_id, || async move {
                         let _ = started_tx.send(());
                         let _ = never_rx.await;
                         Ok(OAuthTokens::bearer("never", None::<String>, None))
@@ -1110,11 +1065,12 @@ mod tests {
             })
         };
         started_rx.await.unwrap();
+        let waiter_id = id;
         let waiter = {
             let coordinator = coordinator.clone();
             tokio::spawn(async move {
                 coordinator
-                    .refresh(id, || async {
+                    .refresh(waiter_id, || async {
                         panic!("waiter must not become a refresh leader");
                     })
                     .await
@@ -1130,7 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn failed_refresh_result_is_shared_and_lease_is_released() {
         let coordinator = RefreshCoordinator::new();
-        let id = CredentialId::new();
+        let id = CredentialId::new("credential-failure").expect("valid credential ID");
         let first = coordinator
             .refresh(id, || async { Err(RefreshError::Failed("denied".into())) })
             .await;

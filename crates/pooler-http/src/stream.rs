@@ -1,4 +1,8 @@
+use std::time::Duration;
+
 use thiserror::Error;
+use tokio::time;
+use tokio_util::sync::CancellationToken;
 
 /// Transport milestones for one upstream attempt.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -8,7 +12,7 @@ pub enum StreamState {
     AwaitingHeaders,
     ValidatingHeaders,
     BootstrapBuffering,
-    /// At least one downstream-visible response byte/event has been emitted.
+    /// Downstream response headers or body output has become visible.
     Committed,
     Completed,
     Disconnected,
@@ -26,6 +30,8 @@ pub enum StreamEvent {
     HeadersReceived,
     HeadersValidated,
     Bootstrap,
+    /// Downstream response headers became visible.
+    HeadersSent,
     Commit,
     Complete,
     Disconnect,
@@ -51,6 +57,33 @@ pub enum RetryError {
     NotRetryable,
     #[error("stream has reached a terminal state")]
     Terminal,
+}
+
+/// Why a retry wait did not complete.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
+pub enum RetryWaitError {
+    #[error("retry wait canceled")]
+    Canceled,
+}
+
+/// Wait for a bounded retry delay while honoring request cancellation.
+///
+/// Cancellation is checked before the timer so a caller never starts a new
+/// attempt after the request has already been canceled.
+pub async fn wait_for_retry(
+    delay: Duration,
+    cancellation: &CancellationToken,
+) -> Result<(), RetryWaitError> {
+    if cancellation.is_cancelled() {
+        return Err(RetryWaitError::Canceled);
+    }
+    if delay.is_zero() {
+        return Ok(());
+    }
+    tokio::select! {
+        () = time::sleep(delay) => Ok(()),
+        () = cancellation.cancelled() => Err(RetryWaitError::Canceled),
+    }
 }
 
 /// Tracks whether a downstream response has been committed and gates retries
@@ -109,6 +142,14 @@ impl StreamCommitment {
             (StreamState::ValidatingHeaders, StreamEvent::Bootstrap) => {
                 StreamState::BootstrapBuffering
             }
+            (
+                StreamState::Created
+                | StreamState::Connecting
+                | StreamState::AwaitingHeaders
+                | StreamState::ValidatingHeaders
+                | StreamState::BootstrapBuffering,
+                StreamEvent::HeadersSent,
+            ) => StreamState::Committed,
             (StreamState::BootstrapBuffering, StreamEvent::Commit) => StreamState::Committed,
             (StreamState::Committed, StreamEvent::Complete) => StreamState::Completed,
             (StreamState::Committed, StreamEvent::Disconnect) => StreamState::Disconnected,
@@ -169,6 +210,12 @@ impl StreamCommitment {
 
     pub fn begin_bootstrap(&mut self) -> Result<(), CommitmentError> {
         self.transition(StreamEvent::Bootstrap)
+    }
+
+    /// Mark downstream response headers as visible.  Headers are a commitment
+    /// boundary even when the body has not emitted its first byte.
+    pub fn mark_headers_sent(&mut self) -> Result<(), CommitmentError> {
+        self.transition(StreamEvent::HeadersSent)
     }
 
     /// Mark the first downstream-visible byte/event.  This is the point after
@@ -244,6 +291,41 @@ mod tests {
         stream.fail().unwrap();
         assert!(!stream.can_retry());
         assert_eq!(stream.retry(), Err(RetryError::Committed));
+    }
+
+    #[test]
+    fn headers_are_a_commitment_boundary() {
+        let mut stream = StreamCommitment::new();
+        stream.connect().unwrap();
+        stream.headers_received().unwrap();
+        stream.validate_headers().unwrap();
+        stream.mark_headers_sent().unwrap();
+        assert!(stream.is_committed());
+        assert!(!stream.can_retry());
+        assert_eq!(
+            stream.fail_retryable(),
+            Err(CommitmentError {
+                state: StreamState::Committed,
+                event: StreamEvent::RetryableFailure,
+            })
+        );
+        assert_eq!(stream.retry(), Err(RetryError::Committed));
+    }
+
+    #[tokio::test]
+    async fn retry_wait_honors_cancellation() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert_eq!(
+            wait_for_retry(Duration::from_secs(60), &cancellation).await,
+            Err(RetryWaitError::Canceled)
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_retry_wait_returns_without_sleeping() {
+        let cancellation = CancellationToken::new();
+        assert_eq!(wait_for_retry(Duration::ZERO, &cancellation).await, Ok(()));
     }
 
     #[test]

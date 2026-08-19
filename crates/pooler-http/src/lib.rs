@@ -11,6 +11,7 @@ mod auth;
 mod body;
 mod drain;
 mod headers;
+mod pool;
 mod proxy;
 mod sse;
 mod stream;
@@ -23,8 +24,10 @@ pub use body::{
 };
 pub use drain::{DrainController, DrainError, DrainGuard, DrainedBody};
 pub use headers::{
-    remove_hop_by_hop_headers, sanitize_headers, strip_hop_by_hop_headers, HOP_BY_HOP_HEADERS,
+    remove_hop_by_hop_headers, retry_after_delay, sanitize_headers, strip_hop_by_hop_headers,
+    HOP_BY_HOP_HEADERS,
 };
+pub use pool::{PoolError, PoolFailure, PoolSelection, PoolingCoordinator};
 pub use proxy::{
     BoxError, HttpProxy, NoSemanticAdapter, ProxyBody, ProxyError, SemanticAdapter,
     SemanticRequestBody, SemanticResponseBody,
@@ -33,4 +36,7 @@ pub use sse::{
     SseEncoder, SseError, SseEvent, SseLimits, SseParser, DEFAULT_SSE_MAX_EVENT_BYTES,
     DEFAULT_SSE_MAX_LINE_BYTES,
 };
-pub use stream::{CommitmentError, RetryError, StreamCommitment, StreamEvent, StreamState};
+pub use stream::{
+    wait_for_retry, CommitmentError, RetryError, RetryWaitError, StreamCommitment, StreamEvent,
+    StreamState,
+};

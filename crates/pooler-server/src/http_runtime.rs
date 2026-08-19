@@ -14,8 +14,8 @@ use hyper::{body::Incoming, http, http::Request, service::service_fn};
 use hyper_util::rt::TokioIo;
 use pooler_config::CompiledConfig;
 use pooler_http::{
-    BoxError, DrainError, HttpProxy, ProxyBody, ProxyError, SemanticAdapter, SemanticRequestBody,
-    SemanticResponseBody,
+    BoxError, DrainError, HttpProxy, PoolingCoordinator, ProxyBody, ProxyError, SemanticAdapter,
+    SemanticRequestBody, SemanticResponseBody,
 };
 use thiserror::Error;
 use tokio::{
@@ -180,16 +180,21 @@ impl HttpProxyServer {
     /// Bind all listeners before accepting any downstream connection.
     pub async fn bind(config: CompiledConfig) -> Result<Self, HttpProxyServerError> {
         let config = Arc::new(config);
+        let pooling =
+            Arc::new(PoolingCoordinator::new(&config).map_err(|error| {
+                HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string()))
+            })?);
         let mut listeners = Vec::with_capacity(config.listeners().len());
         let mut proxies = Vec::with_capacity(config.listeners().len());
         let mut addresses = Vec::with_capacity(config.listeners().len());
 
         for plan in config.listeners().values() {
             let id: Arc<str> = Arc::from(plan.id());
-            let proxy = Arc::new(HttpProxy::with_semantic_adapter(
+            let proxy = Arc::new(HttpProxy::with_semantic_adapter_and_pooling(
                 Arc::clone(&config),
                 Arc::clone(&id),
                 RuntimeSemanticAdapter,
+                Arc::clone(&pooling),
             )?);
             let bind = plan.bind();
             if bind.starts_with('/') || bind.starts_with("unix:") {
@@ -1248,6 +1253,85 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(50), fallback_listener.accept())
                 .await
                 .is_err()
+        );
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn pooled_patch_request_fails_over_after_credential_quota() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("pooling upstream binds");
+        let upstream_address = listener.local_addr().expect("pooling upstream address");
+        let upstream = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("pooling upstream accepts");
+                let request = read_request(&mut stream)
+                    .await
+                    .expect("pooling request bytes");
+                let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let quota = request_text.contains("bearer first-token");
+                let (status, body) = if quota {
+                    (429, b"quota".as_slice())
+                } else {
+                    (200, b"ok".as_slice())
+                };
+                let reason = if quota { "Too Many Requests" } else { "OK" };
+                let code = if quota {
+                    "x-error-code: insufficient_quota\r\nRetry-After: 1\r\n"
+                } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n{code}Connection: close\r\n\r\n",
+                    body.len(),
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("pooling response headers");
+                stream.write_all(body).await.expect("pooling response body");
+                requests.push(request);
+            }
+            requests
+        });
+        let first_secret = TestSecret::new("first-token");
+        let second_secret = TestSecret::new("second-token");
+        let config = pooler_config::compile_yaml(
+            "pooling.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{accounts: [first, second]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, account_pool: pool}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
+                first_secret.reference(),
+                second_secret.reference()
+            ),
+        )
+        .expect("pooling config compiles");
+        let server = HttpProxyServer::bind(config)
+            .await
+            .expect("pooling proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"public","value":true}"#;
+        let request = format!(
+            "POST /pooled HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nIdempotency-Key: pooling-test-1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response = send_request(address, request.as_bytes()).await;
+        assert_eq!(status(&response), 200);
+        assert_eq!(response_body(&response), b"ok");
+        let requests = tokio::time::timeout(TEST_TIMEOUT, upstream)
+            .await
+            .expect("pooling upstream completes")
+            .expect("pooling upstream task");
+        assert_eq!(requests.len(), 2);
+        assert!(String::from_utf8_lossy(&requests[0]).contains("authorization: Bearer first-token"));
+        assert!(
+            String::from_utf8_lossy(&requests[1]).contains("authorization: Bearer second-token")
         );
         stop_server(&server, runner).await;
     }

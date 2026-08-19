@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 pooler-core = { path = "../pooler-core" }
+ring.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

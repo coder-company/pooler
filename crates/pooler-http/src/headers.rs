@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use http::header::{HeaderMap, HeaderName};
 
@@ -66,6 +66,20 @@ pub fn sanitize_headers(headers: &mut HeaderMap) -> usize {
     strip_hop_by_hop_headers(headers)
 }
 
+/// Parse the delta-seconds form of an HTTP `Retry-After` header.
+///
+/// HTTP-date values require a wall-clock reference and are intentionally left
+/// for a caller that owns that clock. Invalid values are ignored rather than
+/// turning a provider response into a transport error.
+#[must_use]
+pub fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +111,14 @@ mod tests {
 
         assert_eq!(remove_hop_by_hop_headers(&mut headers), 4);
         assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn parses_bounded_retry_after_seconds() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(retry_after_delay(&headers), Some(Duration::from_secs(7)));
+        headers.insert("retry-after", HeaderValue::from_static("tomorrow"));
+        assert_eq!(retry_after_delay(&headers), None);
     }
 }

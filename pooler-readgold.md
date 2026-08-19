@@ -38,7 +38,12 @@ name or advertised without conformance evidence.
   implemented. The installed Devin client model-list path is evidenced locally; a
   current real-client tool conversation through Pooler remains before compatibility
   can be claimed.
-- Phases 5–8: pending.
+- Phase 5 — account pooling: implemented and locally verified. Strict immutable
+  account/pool/policy plans drive deterministic selection, bounded pre-commit retry,
+  scoped cooldown and quota recovery, affinity with safe rebind policy, redacted
+  decisions, and owner-private transactional SQLite persistence. Local restart and
+  live quota-failover tests cover the phase exit invariants.
+- Phases 6–8: pending.
 - First useful release acceptance: pending.
 
 ## Verification gates

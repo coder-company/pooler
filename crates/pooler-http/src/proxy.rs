@@ -4,6 +4,7 @@
 //! limit, apply the compiled transforms, and keep responses opaque.
 
 use std::{
+    collections::BTreeSet,
     convert::Infallible,
     error::Error,
     future::Future,
@@ -11,7 +12,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 
 use bytes::Bytes;
@@ -30,6 +31,7 @@ use pooler_config::{
     SecretRef, UpstreamPlan,
 };
 use pooler_core::{BodyMode, RouteLimits};
+use pooler_policy::ReplayCheck;
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
 use thiserror::Error;
 use tokio::time::{self, Instant, Sleep};
@@ -37,8 +39,8 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::{
-    extract_bearer_token, strip_hop_by_hop_headers, DrainController, DrainGuard, DrainedBody,
-    FrameLimitedBody, LimitedBody,
+    extract_bearer_token, retry_after_delay, strip_hop_by_hop_headers, DrainController, DrainGuard,
+    DrainedBody, FrameLimitedBody, LimitedBody, PoolError, PoolSelection, PoolingCoordinator,
 };
 
 /// The erased body type used by responses returned from [`HttpProxy`].
@@ -219,6 +221,9 @@ pub enum ProxyError {
     /// A semantic response could not be initialized after upstream headers.
     #[error("invalid semantic response: {0}")]
     SemanticResponse(String),
+    /// Account selection or mutable pooling state failed.
+    #[error("account selection failed: {0}")]
+    Pool(String),
     /// The upstream request failed before a response was received.
     #[error("upstream request failed: {0}")]
     Upstream(#[source] BoxError),
@@ -235,6 +240,7 @@ pub struct HttpProxy<A = NoSemanticAdapter> {
     client: UpstreamClient,
     drain: DrainController,
     semantic: A,
+    pooling: Arc<PoolingCoordinator>,
 }
 
 impl<A> std::fmt::Debug for HttpProxy<A>
@@ -272,6 +278,17 @@ where
         listener: impl Into<Arc<str>>,
         semantic: A,
     ) -> Result<Self, ProxyError> {
+        let pooling = Arc::new(PoolingCoordinator::new(&config).map_err(pool_error)?);
+        Self::with_semantic_adapter_and_pooling(config, listener, semantic, pooling)
+    }
+
+    /// Construct a proxy using a coordinator shared with sibling listeners.
+    pub fn with_semantic_adapter_and_pooling(
+        config: Arc<CompiledConfig>,
+        listener: impl Into<Arc<str>>,
+        semantic: A,
+        pooling: Arc<PoolingCoordinator>,
+    ) -> Result<Self, ProxyError> {
         let listener = listener.into();
         if let Some(route) = config.routes().iter().find(|route| {
             route.listener() == listener.as_ref()
@@ -296,6 +313,7 @@ where
             client,
             drain: DrainController::new(),
             semantic,
+            pooling,
         })
     }
 
@@ -458,7 +476,8 @@ where
         request: Request<Incoming>,
         guard: DrainGuard,
     ) -> Result<Response<ProxyBody>, ProxyError> {
-        let mut upstream = self
+        let started = StdInstant::now();
+        let fallback_upstream = self
             .config
             .upstreams()
             .get(route.target().upstream())
@@ -466,8 +485,9 @@ where
                 route: route.id().to_owned(),
                 upstream: route.target().upstream().to_owned(),
             })?;
-        let started = Instant::now();
-        let buffer_deadline = started + patch_buffer_timeout(&self.config, route, upstream);
+        let buffer_deadline = Instant::from_std(
+            started + patch_buffer_timeout(&self.config, route, fallback_upstream),
+        );
         let cancellation = guard.cancellation_token();
         let method = request.method().clone();
         let downstream_uri = request.uri().clone();
@@ -478,11 +498,14 @@ where
         headers.remove(header::HOST);
         headers.remove(header::AUTHORIZATION);
         let incoming = request.into_body();
-        let body = match route.ingress().mode() {
+        let idempotency_key_present = headers.contains_key("idempotency-key");
+        let replay = ReplayCheck::for_http_method(method.as_str(), idempotency_key_present);
+        let (mut prepared, selected_model) = match route.ingress().mode() {
             BodyMode::Opaque => {
-                LimitedBody::new(incoming, bounded_usize(limits.max_request_body_bytes))
+                let body = LimitedBody::new(incoming, bounded_usize(limits.max_request_body_bytes))
                     .map_err(box_error)
-                    .boxed()
+                    .boxed();
+                (PreparedBody::Streaming(Some(body)), None)
             }
             BodyMode::Patch => {
                 let incoming =
@@ -547,37 +570,6 @@ where
                         }
                     }
                 }
-                if let Some(source) = route.target().model_source() {
-                    let public_model = match source {
-                        ModelSource::Request => document
-                            .require_model()
-                            .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?,
-                        ModelSource::Inspected => inspected_model.as_deref().ok_or_else(|| {
-                            ProxyError::InvalidPatch("request model is missing".to_owned())
-                        })?,
-                    };
-                    let model = self.config.models().get(public_model).ok_or_else(|| {
-                        ProxyError::InvalidPatch(format!("unknown public model `{public_model}`"))
-                    })?;
-                    let target = model.targets().first().ok_or_else(|| {
-                        ProxyError::InvalidPatch("model has no target".to_owned())
-                    })?;
-                    upstream = self
-                        .config
-                        .upstreams()
-                        .get(target.provider())
-                        .ok_or_else(|| ProxyError::MissingUpstream {
-                            route: route.id().to_owned(),
-                            upstream: target.provider().to_owned(),
-                        })?;
-                    document
-                        .set_pointer_bounded(
-                            "/model",
-                            serde_json::Value::String(target.upstream_model().to_owned()),
-                            JsonPatchLimits::default(),
-                        )
-                        .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
-                }
                 let bytes = document.bytes().into_owned();
                 limits
                     .check_request_body(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
@@ -586,9 +578,25 @@ where
                     .check_frame(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
                     .map_err(|_| ProxyError::RequestBodyTooLarge)?;
                 headers.remove(header::CONTENT_LENGTH);
-                Full::new(Bytes::from(bytes))
-                    .map_err(|never: Infallible| match never {})
-                    .boxed()
+                let selected_model = match route.target().model_source() {
+                    Some(ModelSource::Request) => Some(
+                        document
+                            .require_model()
+                            .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?
+                            .to_owned(),
+                    ),
+                    Some(ModelSource::Inspected) => Some(inspected_model.ok_or_else(|| {
+                        ProxyError::InvalidPatch("request model is missing".to_owned())
+                    })?),
+                    None => None,
+                };
+                (
+                    PreparedBody::Buffered {
+                        bytes: Bytes::from(bytes),
+                        patch_model: selected_model.is_some(),
+                    },
+                    selected_model,
+                )
             }
             BodyMode::Semantic => {
                 let incoming =
@@ -628,9 +636,13 @@ where
                 headers.insert(header::CONTENT_TYPE, prepared.content_type);
                 self.semantic.sanitize_request_headers(&mut headers);
                 headers.remove(header::CONTENT_LENGTH);
-                Full::new(Bytes::from(prepared.body))
-                    .map_err(|never: Infallible| match never {})
-                    .boxed()
+                (
+                    PreparedBody::Buffered {
+                        bytes: Bytes::from(prepared.body),
+                        patch_model: false,
+                    },
+                    None,
+                )
             }
             BodyMode::Inspect => {
                 return Err(ProxyError::UnsupportedBodyMode {
@@ -638,22 +650,161 @@ where
                 });
             }
         };
-        let body = FrameLimitedBody::new(body, bounded_usize(limits.max_frame_bytes))
+        let is_buffered = matches!(prepared, PreparedBody::Buffered { .. });
+        let mut attempt = 1_u32;
+        let mut elapsed_retry_delay = Duration::ZERO;
+        let mut elapsed_recovery_wait = Duration::ZERO;
+        let mut credentials_used = BTreeSet::new();
+        let mut providers_used = BTreeSet::new();
+
+        loop {
+            let selection = self
+                .pooling
+                .select(
+                    &self.config,
+                    route,
+                    selected_model.as_deref(),
+                    &headers,
+                    attempt,
+                    started,
+                )
+                .map_err(pool_selection_error)?;
+            if let Some(credential) = selection.credential() {
+                credentials_used.insert(credential.clone());
+            }
+            providers_used.insert(selection.provider().clone());
+            let upstream = self
+                .config
+                .upstreams()
+                .get(selection.upstream_id())
+                .ok_or_else(|| ProxyError::MissingUpstream {
+                    route: route.id().to_owned(),
+                    upstream: selection.upstream_id().to_owned(),
+                })?;
+            let retry_deadline = retry_deadline(started, limits, upstream, selection.policy());
+            let attempt_body = prepared.body_for_attempt(selection.upstream_model())?;
+            let response = self
+                .send_attempt(
+                    AttemptRequest {
+                        route,
+                        method: &method,
+                        downstream_uri: &downstream_uri,
+                        version,
+                        headers: &headers,
+                        upstream,
+                        selection: &selection,
+                        cancellation: &cancellation,
+                        started,
+                    },
+                    attempt_body,
+                )
+                .await;
+
+            let (status, provider_code, retry_after, response) = match response {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let retry_after = retry_after_delay(response.headers());
+                    let provider_code = response
+                        .headers()
+                        .get("x-error-code")
+                        .or_else(|| response.headers().get("x-provider-code"))
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| value.chars().take(128).collect());
+                    (Some(status), provider_code, retry_after, Ok(response))
+                }
+                Err(error) => (None, None, None, Err(error)),
+            };
+
+            if is_buffered
+                && (should_classify(status) || response.is_err())
+                && selection.has_policy()
+            {
+                let failure = self.pooling.classify_failure(crate::pool::FailureInput {
+                    config: &self.config,
+                    route,
+                    selection: &selection,
+                    status,
+                    provider_code: provider_code.clone(),
+                    message: None,
+                    retry_after,
+                    replay,
+                    idempotency_key_present,
+                    attempt,
+                    credentials_used: u32::try_from(credentials_used.len()).unwrap_or(u32::MAX),
+                    providers_used: u32::try_from(providers_used.len()).unwrap_or(u32::MAX),
+                    elapsed_retry_delay,
+                    elapsed_recovery_wait,
+                    started,
+                });
+                if failure.decision.is_retry() {
+                    if let Ok(response) = response {
+                        self.drain_retry_response(response, limits, &cancellation, retry_deadline)
+                            .await?;
+                    }
+                    let delay = failure.decision.delay();
+                    if delay > retry_deadline.saturating_duration_since(Instant::now()) {
+                        return Err(ProxyError::Timeout);
+                    }
+                    crate::wait_for_retry(delay, &cancellation)
+                        .await
+                        .map_err(|_| ProxyError::Timeout)?;
+                    elapsed_retry_delay = elapsed_retry_delay.saturating_add(delay);
+                    if let Some(recovery) = failure.classification.classification.recovery_after {
+                        elapsed_recovery_wait = elapsed_recovery_wait.saturating_add(recovery);
+                    }
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            }
+
+            let response = response?;
+            return self
+                .finish_response(route, response, selection, guard, cancellation, started)
+                .await;
+        }
+    }
+
+    async fn send_attempt(
+        &self,
+        request: AttemptRequest<'_>,
+        body: ProxyBody,
+    ) -> Result<Response<Incoming>, ProxyError> {
+        let AttemptRequest {
+            route,
+            method,
+            downstream_uri,
+            version,
+            headers: request_headers,
+            upstream,
+            selection,
+            cancellation,
+            started,
+        } = request;
+        let mut headers = request_headers.clone();
+        let _ = crate::pool::apply_account_auth(&mut headers, selection.account_secret())
+            .map_err(pool_error)?;
+        if selection.account_secret().is_none() {
+            apply_upstream_auth(&mut headers, upstream)?;
+        }
+        let body = FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
             .map_err(box_error)
             .boxed();
-        let uri = upstream_uri(upstream, route, &downstream_uri)?;
-        apply_upstream_auth(&mut headers, upstream)?;
+        let uri = upstream_uri(upstream, route, downstream_uri)?;
         let header_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
-        limits
+        route
+            .limits()
             .check_headers(header_count, header_bytes(&headers))
             .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
-        let mut builder = Request::builder().method(method).uri(uri).version(version);
+        let mut builder = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .version(version);
         *builder.headers_mut().expect("request builder headers") = headers;
         let upstream_request = builder.body(body)?;
-
-        let request_deadline = started + request_timeout(limits, upstream);
-        let header_deadline =
-            (Instant::now() + connect_timeout(limits, upstream)).min(request_deadline);
+        let request_deadline = started + request_timeout(route.limits(), upstream);
+        let header_deadline = Instant::from_std(
+            (StdInstant::now() + connect_timeout(route.limits(), upstream)).min(request_deadline),
+        );
         let response = tokio::select! {
             result = time::timeout_at(header_deadline, self.client.request(upstream_request)) => {
                 result.map_err(|_| ProxyError::Timeout)?.map_err(|error| ProxyError::Upstream(Box::new(error)))?
@@ -662,8 +813,8 @@ where
                 return Err(ProxyError::Timeout);
             }
         };
-
-        limits
+        route
+            .limits()
             .check_headers(
                 u32::try_from(response.headers().len()).unwrap_or(u32::MAX),
                 header_bytes(response.headers()),
@@ -674,23 +825,68 @@ where
             .get(header::CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|length| limits.check_response_body(length).is_err())
+            .is_some_and(|length| route.limits().check_response_body(length).is_err())
         {
             return Err(ProxyError::InvalidLimits(
                 "upstream response body exceeds limits".to_owned(),
             ));
         }
+        Ok(response)
+    }
 
+    async fn drain_retry_response(
+        &self,
+        response: Response<Incoming>,
+        limits: &RouteLimits,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), ProxyError> {
+        let body =
+            FrameLimitedBody::new(response.into_body(), bounded_usize(limits.max_frame_bytes));
+        let body = LimitedBody::new(body, bounded_usize(limits.max_response_body_bytes));
+        tokio::select! {
+            result = time::timeout_at(
+                deadline,
+                crate::collect_body_limited(body, bounded_usize(limits.max_response_body_bytes)),
+            ) => {
+                let result = result.map_err(|_| ProxyError::Timeout)?;
+                result.map(|_| ()).map_err(|error| ProxyError::Upstream(Box::new(error)))
+            }
+            () = cancellation.cancelled() => Err(ProxyError::Timeout),
+        }
+    }
+
+    async fn finish_response(
+        &self,
+        route: &RoutePlan,
+        response: Response<Incoming>,
+        mut selection: PoolSelection,
+        guard: DrainGuard,
+        cancellation: CancellationToken,
+        started: StdInstant,
+    ) -> Result<Response<ProxyBody>, ProxyError> {
         let (parts, body) = response.into_parts();
         let mut response_headers = parts.headers;
         strip_hop_by_hop_headers(&mut response_headers);
-        let body = FrameLimitedBody::new(body, bounded_usize(limits.max_frame_bytes))
+        let upstream = self
+            .config
+            .upstreams()
+            .get(selection.upstream_id())
+            .ok_or_else(|| ProxyError::MissingUpstream {
+                route: route.id().to_owned(),
+                upstream: selection.upstream_id().to_owned(),
+            })?;
+        let body = FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
             .map_err(box_error)
             .boxed();
-        let body = LimitedBody::new(body, bounded_usize(limits.max_response_body_bytes))
+        let body = LimitedBody::new(body, bounded_usize(route.limits().max_response_body_bytes))
             .map_err(box_error)
             .boxed();
-        let body = DeadlineBody::new(body, request_deadline).boxed();
+        let body = DeadlineBody::new(
+            body,
+            Instant::from_std(started + request_timeout(route.limits(), upstream)),
+        )
+        .boxed();
         let body = if route.response().mode() == BodyMode::Semantic && parts.status.is_success() {
             let transformed = self
                 .semantic
@@ -702,6 +898,9 @@ where
         } else {
             body
         };
+        self.pooling
+            .persist_affinity(&selection, crate::pool::timestamp_now());
+        let body = SelectionLeaseBody::new(body, selection.take_lease());
         let body = DrainedBody::new(body, guard).boxed();
         let mut response = Response::new(body);
         *response.status_mut() = parts.status;
@@ -709,6 +908,109 @@ where
         *response.headers_mut() = response_headers;
         Ok(response)
     }
+}
+
+enum PreparedBody {
+    Streaming(Option<ProxyBody>),
+    Buffered { bytes: Bytes, patch_model: bool },
+}
+
+struct AttemptRequest<'a> {
+    route: &'a RoutePlan,
+    method: &'a http::Method,
+    downstream_uri: &'a Uri,
+    version: http::Version,
+    headers: &'a HeaderMap,
+    upstream: &'a UpstreamPlan,
+    selection: &'a PoolSelection,
+    cancellation: &'a CancellationToken,
+    started: StdInstant,
+}
+
+impl PreparedBody {
+    fn body_for_attempt(&mut self, upstream_model: Option<&str>) -> Result<ProxyBody, ProxyError> {
+        match self {
+            Self::Streaming(body) => {
+                body.take()
+                    .ok_or(ProxyError::Upstream(Box::new(io::Error::new(
+                        io::ErrorKind::Other,
+                        "streaming request body was already used",
+                    ))))
+            }
+            Self::Buffered { bytes, patch_model } => {
+                let bytes = if *patch_model {
+                    if let Some(model) = upstream_model {
+                        patch_model_bytes(bytes, model)?
+                    } else {
+                        bytes.clone()
+                    }
+                } else {
+                    bytes.clone()
+                };
+                Ok(Full::new(bytes)
+                    .map_err(|never: Infallible| match never {})
+                    .boxed())
+            }
+        }
+    }
+}
+
+struct SelectionLeaseBody {
+    inner: Pin<Box<ProxyBody>>,
+    lease: Option<pooler_policy::SelectionLease>,
+}
+
+impl SelectionLeaseBody {
+    fn new(inner: ProxyBody, lease: Option<pooler_policy::SelectionLease>) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            lease,
+        }
+    }
+}
+
+impl Body for SelectionLeaseBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let result = self.inner.as_mut().poll_frame(context);
+        match &result {
+            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
+                self.lease.take();
+            }
+            _ => {}
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn patch_model_bytes(bytes: &Bytes, model: &str) -> Result<Bytes, ProxyError> {
+    let mut document = PreservedJson::from_bytes(bytes.to_vec())
+        .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+    document
+        .set_pointer_bounded(
+            "/model",
+            serde_json::Value::String(model.to_owned()),
+            JsonPatchLimits::default(),
+        )
+        .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+    Ok(Bytes::from(document.bytes().into_owned()))
+}
+
+fn should_classify(status: Option<u16>) -> bool {
+    status.is_some_and(|status| status >= 400)
 }
 
 fn upstream_uri(
@@ -775,6 +1077,21 @@ fn request_timeout(limits: &RouteLimits, upstream: &UpstreamPlan) -> Duration {
         .flatten()
         .min()
         .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+}
+
+fn retry_deadline(
+    started: StdInstant,
+    limits: &RouteLimits,
+    upstream: &UpstreamPlan,
+    policy: Option<&pooler_config::PolicyPlan>,
+) -> Instant {
+    let request_deadline = started + request_timeout(limits, upstream);
+    let retry_deadline = policy
+        .and_then(|policy| policy.retry().maximum_elapsed())
+        .map_or(request_deadline, |elapsed| {
+            request_deadline.min(started + elapsed)
+        });
+    Instant::from_std(retry_deadline)
 }
 
 fn patch_buffer_timeout(
@@ -870,6 +1187,7 @@ fn error_response(error: ProxyError) -> Response<ProxyBody> {
         | ProxyError::InvalidLimits(_)
         | ProxyError::RequestBuild(_)
         | ProxyError::Upstream(_)
+        | ProxyError::Pool(_)
         | ProxyError::UnsupportedBodyMode { .. } => {
             (StatusCode::BAD_GATEWAY, "upstream request failed")
         }
@@ -886,6 +1204,20 @@ fn error_response(error: ProxyError) -> Response<ProxyBody> {
         ),
     };
     plain_response(status, message)
+}
+
+fn pool_error(error: PoolError) -> ProxyError {
+    ProxyError::Pool(error.to_string())
+}
+
+fn pool_selection_error(error: PoolError) -> ProxyError {
+    match error {
+        PoolError::UnknownModel { model } => {
+            ProxyError::InvalidPatch(format!("unknown public model `{model}`"))
+        }
+        PoolError::InvalidModel => ProxyError::InvalidPatch("request model is invalid".to_owned()),
+        other => pool_error(other),
+    }
 }
 
 #[cfg(test)]

@@ -649,7 +649,15 @@ fn collect_origins(document: &Value, path: &Path) -> BTreeMap<String, Arc<str>> 
         return origins;
     };
     let source: Arc<str> = Arc::from(path.display().to_string());
-    for section in ["listeners", "upstreams"] {
+    for section in [
+        "listeners",
+        "upstreams",
+        "accounts",
+        "credentials",
+        "account_pools",
+        "pools",
+        "policies",
+    ] {
         if let Some(mapping) = root
             .get(Value::String(section.to_owned()))
             .and_then(Value::as_mapping)
@@ -700,7 +708,15 @@ fn apply_origin_changes(
     let Some(root) = incoming.as_mapping() else {
         return;
     };
-    for section in ["listeners", "upstreams"] {
+    for section in [
+        "listeners",
+        "upstreams",
+        "accounts",
+        "credentials",
+        "account_pools",
+        "pools",
+        "policies",
+    ] {
         if let Some(mapping) = root
             .get(Value::String(section.to_owned()))
             .and_then(Value::as_mapping)
@@ -764,7 +780,8 @@ fn merge_document(
     for (key, value) in incoming {
         let name = key.as_str().unwrap_or_default();
         match name {
-            "listeners" | "upstreams" => merge_named_map(base, key, value, path)?,
+            "listeners" | "upstreams" | "accounts" | "credentials" | "account_pools" | "pools"
+            | "policies" => merge_named_map(base, key, value, path)?,
             "routes" | "models" => {
                 merge_named_sequence(base, key, value, path, additive_sequences)?;
             }

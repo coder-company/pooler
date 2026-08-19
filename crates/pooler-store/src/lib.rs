@@ -1,15 +1,19 @@
 //! Bounded storage contracts for Pooler's mutable state.
 //!
-//! The first implementation is in-memory.  Callers provide timestamps rather
-//! than making the store read a process clock; expiry and retention are therefore
-//! deterministic and easy to test.  Secret values are deliberately absent from
-//! every type in this crate.
+//! The crate contains both a deterministic in-memory store and a transactional
+//! SQLite store. Callers provide timestamps rather than making the store read a
+//! process clock; expiry and retention are therefore deterministic and easy to
+//! test. Secret values are deliberately absent from every type in this crate.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod sqlite;
+
+pub use sqlite::SqliteStore;
 
 /// Milliseconds since the Unix epoch, supplied by the caller.
 pub type Timestamp = u64;
@@ -172,6 +176,177 @@ impl DecisionRecord {
             recorded_at,
         }
     }
+
+    /// Convert a policy explanation into the persistence shape with the
+    /// request context that policy intentionally does not own.
+    #[must_use]
+    pub fn from_selection(
+        selection: &pooler_policy::SelectionExplanation,
+        request_id: impl Into<String>,
+        route_id: impl Into<String>,
+        recorded_at: Timestamp,
+    ) -> Self {
+        let requested_model = selection.model_alias_resolution.requested.to_string();
+        let mut record = Self::new(request_id, route_id, requested_model, recorded_at);
+        record.attempt = selection.attempt;
+        record.configuration_generation = selection.configuration_generation.value();
+        record.candidates = selection
+            .candidates
+            .iter()
+            .map(|candidate| DecisionCandidate {
+                provider_id: candidate.target.provider.to_string(),
+                credential_id: Some(candidate.target.credential_pseudonym.as_str().to_owned()),
+                score: candidate.score.map_or(0, score_as_integer),
+                eligible: candidate.is_eligible(),
+                reason: decision_reason(&candidate.filter_reasons),
+            })
+            .collect();
+        if let Some(selected) = &selection.selected {
+            record.selected_provider = Some(selected.provider.to_string());
+            record.selected_credential = Some(selected.credential_pseudonym.as_str().to_owned());
+            record.upstream_model = Some(selected.model.to_string());
+        }
+        record.reason = selection_reason(selection);
+        record
+    }
+}
+
+fn score_as_integer(score: f64) -> i64 {
+    if score.is_finite() {
+        score.round() as i64
+    } else {
+        0
+    }
+}
+
+fn decision_reason(reasons: &[pooler_policy::FilterReason]) -> Option<String> {
+    (!reasons.is_empty()).then(|| {
+        reasons
+            .iter()
+            .map(filter_reason)
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
+fn filter_reason(reason: &pooler_policy::FilterReason) -> String {
+    match reason {
+        pooler_policy::FilterReason::ModelMismatch => "model_mismatch".to_owned(),
+        pooler_policy::FilterReason::MissingCapability(value) => {
+            format!("missing_capability:{value}")
+        }
+        pooler_policy::FilterReason::CodecUnavailable(value) => {
+            format!("codec_unavailable:{value}")
+        }
+        pooler_policy::FilterReason::CredentialUnavailable => "credential_unavailable".to_owned(),
+        pooler_policy::FilterReason::CredentialCooldown => "credential_cooldown".to_owned(),
+        pooler_policy::FilterReason::CredentialModelCooldown => {
+            "credential_model_cooldown".to_owned()
+        }
+        pooler_policy::FilterReason::ModelCooldown => "model_cooldown".to_owned(),
+        pooler_policy::FilterReason::ProviderCooldown => "provider_cooldown".to_owned(),
+        pooler_policy::FilterReason::ProviderModelCooldown => "provider_model_cooldown".to_owned(),
+        pooler_policy::FilterReason::RouteCooldown => "route_cooldown".to_owned(),
+        pooler_policy::FilterReason::ConcurrencyLimit => "concurrency_limit".to_owned(),
+        pooler_policy::FilterReason::RoutePolicy => "route_policy".to_owned(),
+        pooler_policy::FilterReason::SessionAffinity => "session_affinity".to_owned(),
+        pooler_policy::FilterReason::LossPolicy => "loss_policy".to_owned(),
+        pooler_policy::FilterReason::QuotaExhausted => "quota_exhausted".to_owned(),
+        pooler_policy::FilterReason::Disabled => "disabled".to_owned(),
+    }
+}
+
+fn selection_reason(selection: &pooler_policy::SelectionExplanation) -> Option<String> {
+    match &selection.affinity {
+        pooler_policy::AffinityDecision::NotRequested => None,
+        pooler_policy::AffinityDecision::NoMatch { .. } => Some("affinity_no_match".to_owned()),
+        pooler_policy::AffinityDecision::Matched { .. } => Some("affinity_matched".to_owned()),
+        pooler_policy::AffinityDecision::Rebound { .. } => Some("affinity_rebound".to_owned()),
+        pooler_policy::AffinityDecision::Unavailable { .. } => {
+            Some("affinity_unavailable".to_owned())
+        }
+    }
+}
+
+/// Coarse persisted health for one credential.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CredentialHealthStatus {
+    Healthy,
+    CoolingDown,
+    Disabled,
+}
+
+impl CredentialHealthStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::CoolingDown => "cooling_down",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, ()> {
+        match value {
+            "healthy" => Ok(Self::Healthy),
+            "cooling_down" => Ok(Self::CoolingDown),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Persisted health metadata. This contains no authorization material.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CredentialHealthState {
+    pub credential_id: String,
+    pub status: CredentialHealthStatus,
+    pub failure_count: u64,
+    pub cooldown_until: Option<Timestamp>,
+    pub updated_at: Timestamp,
+}
+
+impl CredentialHealthState {
+    pub fn new(
+        credential_id: impl Into<String>,
+        status: CredentialHealthStatus,
+        updated_at: Timestamp,
+    ) -> Self {
+        Self {
+            credential_id: credential_id.into(),
+            status,
+            failure_count: 0,
+            cooldown_until: None,
+            updated_at,
+        }
+    }
+}
+
+/// A persisted cooldown keyed by a policy-defined scope and opaque key.
+/// Typical scopes are `credential`, `provider`, `model`, and `route`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CooldownState {
+    pub scope: String,
+    pub key: String,
+    pub until: Timestamp,
+    pub reason: Option<String>,
+    pub updated_at: Timestamp,
+}
+
+impl CooldownState {
+    pub fn new(
+        scope: impl Into<String>,
+        key: impl Into<String>,
+        until: Timestamp,
+        updated_at: Timestamp,
+    ) -> Self {
+        Self {
+            scope: scope.into(),
+            key: key.into(),
+            until,
+            reason: None,
+            updated_at,
+        }
+    }
 }
 
 /// Counts returned by [`MemoryStore::len`].
@@ -219,6 +394,20 @@ pub enum StoreError {
     CredentialNotFound(String),
     #[error("decision identifier exhausted")]
     DecisionIdExhausted,
+    #[error("database path is invalid: {0}")]
+    InvalidPath(String),
+    #[error("database path is not private: {0}")]
+    UnsafePath(String),
+    #[error("I/O error: {0}")]
+    Io(String),
+    #[error("SQLite error: {0}")]
+    Sqlite(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
+    #[error("database schema version {0} is newer than this Pooler binary")]
+    UnsupportedSchemaVersion(i64),
+    #[error("migration {version} failed: {message}")]
+    Migration { version: i64, message: String },
     #[error("store lock poisoned")]
     LockPoisoned,
 }
@@ -240,6 +429,23 @@ pub trait Store: Send + Sync {
     ) -> StoreResult<CredentialState>;
     fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool>;
 
+    fn upsert_credential_health(
+        &self,
+        state: CredentialHealthState,
+    ) -> StoreResult<CredentialHealthState>;
+    fn credential_health(&self, credential_id: &str) -> StoreResult<Option<CredentialHealthState>>;
+    fn credential_health_states(&self) -> StoreResult<Vec<CredentialHealthState>>;
+
+    fn upsert_cooldown(&self, state: CooldownState) -> StoreResult<CooldownState>;
+    fn cooldown(
+        &self,
+        scope: &str,
+        key: &str,
+        now: Timestamp,
+    ) -> StoreResult<Option<CooldownState>>;
+    fn cooldowns(&self, now: Timestamp) -> StoreResult<Vec<CooldownState>>;
+    fn remove_cooldown(&self, scope: &str, key: &str) -> StoreResult<bool>;
+
     fn upsert_session_affinity(&self, affinity: SessionAffinity) -> StoreResult<SessionAffinity>;
     fn session_affinity(&self, key: &str, now: Timestamp) -> StoreResult<Option<SessionAffinity>>;
     fn session_affinities(&self, now: Timestamp) -> StoreResult<Vec<SessionAffinity>>;
@@ -255,6 +461,8 @@ pub trait Store: Send + Sync {
 #[derive(Debug, Default)]
 struct Inner {
     credentials: BTreeMap<String, CredentialState>,
+    health: BTreeMap<String, CredentialHealthState>,
+    cooldowns: BTreeMap<(String, String), CooldownState>,
     affinities: BTreeMap<String, SessionAffinity>,
     decisions: VecDeque<DecisionRecord>,
     next_decision_id: u64,
@@ -324,6 +532,7 @@ impl MemoryStore {
                 .map(|state| state.credential_id.clone());
             if let Some(key) = key {
                 inner.credentials.remove(&key);
+                inner.health.remove(&key);
                 count += 1;
             }
         }
@@ -375,6 +584,31 @@ impl MemoryStore {
         }
         count
     }
+
+    fn purge_expired_cooldowns(inner: &mut Inner, now: Timestamp) {
+        inner.cooldowns.retain(|_, cooldown| cooldown.until > now);
+    }
+
+    fn evict_cooldowns(inner: &mut Inner) {
+        while inner.cooldowns.len() > 4_096 {
+            let key = inner
+                .cooldowns
+                .iter()
+                .min_by(|(_, left), (_, right)| {
+                    (left.updated_at, &left.scope, &left.key).cmp(&(
+                        right.updated_at,
+                        &right.scope,
+                        &right.key,
+                    ))
+                })
+                .map(|(key, _)| key.clone());
+            if let Some(key) = key {
+                inner.cooldowns.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 impl Default for MemoryStore {
@@ -398,6 +632,18 @@ impl Store for MemoryStore {
         inner
             .credentials
             .insert(state.credential_id.clone(), state.clone());
+        if !state.enabled {
+            inner.health.insert(
+                state.credential_id.clone(),
+                CredentialHealthState {
+                    credential_id: state.credential_id.clone(),
+                    status: CredentialHealthStatus::Disabled,
+                    failure_count: 0,
+                    cooldown_until: None,
+                    updated_at: state.updated_at,
+                },
+            );
+        }
         Self::evict_credentials(&mut inner, self.retention.max_credentials);
         Ok(state)
     }
@@ -421,20 +667,111 @@ impl Store for MemoryStore {
     ) -> StoreResult<CredentialState> {
         non_empty("credential_id", credential_id)?;
         let mut inner = self.inner.write().map_err(lock_error)?;
-        let state = inner
-            .credentials
-            .get_mut(credential_id)
-            .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
-        state.enabled = enabled;
-        state.updated_at = updated_at;
-        state.revision = state.revision.saturating_add(1);
-        Ok(state.clone())
+        let state = {
+            let state = inner
+                .credentials
+                .get_mut(credential_id)
+                .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
+            state.enabled = enabled;
+            state.updated_at = updated_at;
+            state.revision = state.revision.saturating_add(1);
+            state.clone()
+        };
+        if !enabled {
+            inner.health.insert(
+                credential_id.to_owned(),
+                CredentialHealthState {
+                    credential_id: credential_id.to_owned(),
+                    status: CredentialHealthStatus::Disabled,
+                    failure_count: 0,
+                    cooldown_until: None,
+                    updated_at,
+                },
+            );
+        } else if let Some(health) = inner.health.get_mut(credential_id) {
+            if health.status == CredentialHealthStatus::Disabled {
+                health.status = CredentialHealthStatus::Healthy;
+                health.cooldown_until = None;
+                health.updated_at = updated_at;
+            }
+        }
+        Ok(state)
     }
 
     fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool> {
         non_empty("credential_id", credential_id)?;
         let mut inner = self.inner.write().map_err(lock_error)?;
         Ok(inner.credentials.remove(credential_id).is_some())
+    }
+
+    fn upsert_credential_health(
+        &self,
+        state: CredentialHealthState,
+    ) -> StoreResult<CredentialHealthState> {
+        non_empty("credential_id", &state.credential_id)?;
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        inner
+            .health
+            .insert(state.credential_id.clone(), state.clone());
+        Ok(state)
+    }
+
+    fn credential_health(&self, credential_id: &str) -> StoreResult<Option<CredentialHealthState>> {
+        non_empty("credential_id", credential_id)?;
+        let inner = self.inner.read().map_err(lock_error)?;
+        Ok(inner.health.get(credential_id).cloned())
+    }
+
+    fn credential_health_states(&self) -> StoreResult<Vec<CredentialHealthState>> {
+        let inner = self.inner.read().map_err(lock_error)?;
+        Ok(inner.health.values().cloned().collect())
+    }
+
+    fn upsert_cooldown(&self, state: CooldownState) -> StoreResult<CooldownState> {
+        non_empty("scope", &state.scope)?;
+        non_empty("key", &state.key)?;
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        let key = (state.scope.clone(), state.key.clone());
+        if let Some(previous) = inner.cooldowns.get(&key) {
+            if previous.until > state.until {
+                return Ok(previous.clone());
+            }
+        }
+        inner.cooldowns.insert(key, state.clone());
+        Self::evict_cooldowns(&mut inner);
+        Ok(state)
+    }
+
+    fn cooldown(
+        &self,
+        scope: &str,
+        key: &str,
+        now: Timestamp,
+    ) -> StoreResult<Option<CooldownState>> {
+        non_empty("scope", scope)?;
+        non_empty("key", key)?;
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        Self::purge_expired_cooldowns(&mut inner, now);
+        Ok(inner
+            .cooldowns
+            .get(&(scope.to_owned(), key.to_owned()))
+            .cloned())
+    }
+
+    fn cooldowns(&self, now: Timestamp) -> StoreResult<Vec<CooldownState>> {
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        Self::purge_expired_cooldowns(&mut inner, now);
+        Ok(inner.cooldowns.values().cloned().collect())
+    }
+
+    fn remove_cooldown(&self, scope: &str, key: &str) -> StoreResult<bool> {
+        non_empty("scope", scope)?;
+        non_empty("key", key)?;
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        Ok(inner
+            .cooldowns
+            .remove(&(scope.to_owned(), key.to_owned()))
+            .is_some())
     }
 
     fn upsert_session_affinity(&self, affinity: SessionAffinity) -> StoreResult<SessionAffinity> {
@@ -500,6 +837,7 @@ impl Store for MemoryStore {
 
     fn prune(&self, now: Timestamp) -> StoreResult<PruneReport> {
         let mut inner = self.inner.write().map_err(lock_error)?;
+        Self::purge_expired_cooldowns(&mut inner, now);
         Ok(PruneReport {
             expired_affinities: Self::purge_expired(&mut inner, now),
             evicted_credentials: Self::evict_credentials(
@@ -644,6 +982,44 @@ mod tests {
             store.recent_decisions(1).expect("recent succeeds")[0].request_id,
             "three"
         );
+    }
+
+    #[test]
+    fn policy_selection_conversion_preserves_redacted_decision_fields() {
+        let provider = pooler_policy::ProviderId::new("provider").expect("provider");
+        let model = pooler_policy::ModelId::new("model").expect("model");
+        let selection = {
+            let mut selection = pooler_policy::SelectionExplanation::new(
+                pooler_policy::ModelAliasResolution::exact(model.clone()),
+                2,
+                pooler_policy::ConfigGeneration::new(7),
+            );
+            selection.push_candidate(pooler_policy::CandidateExplanation::eligible(
+                pooler_policy::SelectionTarget::new(
+                    provider.clone(),
+                    model.clone(),
+                    pooler_policy::CredentialPseudonym::new("cred-redacted"),
+                ),
+                1.5,
+            ));
+            selection.set_selected(
+                pooler_policy::SelectionTarget::new(
+                    provider,
+                    model.clone(),
+                    pooler_policy::CredentialPseudonym::new("cred-redacted"),
+                ),
+                Some(1.5),
+            );
+            selection
+        };
+
+        let record = DecisionRecord::from_selection(&selection, "request", "route", 42);
+        assert_eq!(record.request_id, "request");
+        assert_eq!(record.route_id, "route");
+        assert_eq!(record.model, "model");
+        assert_eq!(record.configuration_generation, 7);
+        assert_eq!(record.selected_credential.as_deref(), Some("cred-redacted"));
+        assert_eq!(record.candidates[0].score, 2);
     }
 
     #[test]

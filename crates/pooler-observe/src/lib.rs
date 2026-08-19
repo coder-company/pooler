@@ -851,6 +851,150 @@ impl DecisionRecord {
     }
 }
 
+impl From<&pooler_policy::SelectionExplanation> for DecisionRecord {
+    fn from(selection: &pooler_policy::SelectionExplanation) -> Self {
+        let mut record = DecisionRecord::builder()
+            .model(selection.model_alias_resolution.requested.to_string())
+            .attempt(selection.attempt)
+            .config_generation(selection.configuration_generation.value());
+        if let Some(selected) = &selection.selected {
+            record = record
+                .provider(selected.provider.to_string())
+                .selected_provider(selected.provider.to_string())
+                .selected_model(selected.model.to_string())
+                .credential_pseudonym(selected.credential_pseudonym.as_str().to_owned());
+        }
+        if selection.model_alias_resolution.alias_used {
+            record = record.model_alias(selection.model_alias_resolution.resolved.to_string());
+        }
+        for candidate in &selection.candidates {
+            record = record.candidate(CandidateRecord {
+                provider: candidate.target.provider.to_string(),
+                credential_pseudonym: Some(
+                    candidate.target.credential_pseudonym.as_str().to_owned(),
+                ),
+                score: candidate.score,
+                eligible: candidate.is_eligible(),
+                filter_reasons: candidate
+                    .filter_reasons
+                    .iter()
+                    .map(observe_filter_reason)
+                    .collect(),
+            });
+        }
+        if let Some(affinity) = observe_affinity(&selection.affinity) {
+            record = record.affinity(affinity);
+        }
+        record.build()
+    }
+}
+
+impl From<&pooler_store::DecisionRecord> for DecisionRecord {
+    fn from(stored: &pooler_store::DecisionRecord) -> Self {
+        let mut record = DecisionRecord::builder()
+            .request_id(stored.request_id.clone())
+            .route(stored.route_id.clone())
+            .model(stored.model.clone())
+            .attempt(stored.attempt)
+            .config_generation(stored.configuration_generation)
+            .outcome(
+                stored
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "selected".to_owned()),
+            );
+        record.record.timestamp_ms = stored.recorded_at;
+        if let Some(provider) = &stored.selected_provider {
+            record = record
+                .provider(provider.clone())
+                .selected_provider(provider.clone());
+        }
+        if let Some(credential) = &stored.selected_credential {
+            record = record.credential_pseudonym(credential.clone());
+        }
+        if let Some(model) = &stored.upstream_model {
+            record = record.selected_model(model.clone());
+        }
+        for candidate in &stored.candidates {
+            record = record.candidate(CandidateRecord {
+                provider: candidate.provider_id.clone(),
+                credential_pseudonym: candidate.credential_id.clone(),
+                score: Some(f64::from(candidate.score as i32)),
+                eligible: candidate.eligible,
+                filter_reasons: candidate.reason.clone().into_iter().collect(),
+            });
+        }
+        record.build()
+    }
+}
+
+fn observe_filter_reason(reason: &pooler_policy::FilterReason) -> String {
+    match reason {
+        pooler_policy::FilterReason::ModelMismatch => "model_mismatch".to_owned(),
+        pooler_policy::FilterReason::MissingCapability(value) => {
+            format!("missing_capability:{value}")
+        }
+        pooler_policy::FilterReason::CodecUnavailable(value) => {
+            format!("codec_unavailable:{value}")
+        }
+        pooler_policy::FilterReason::CredentialUnavailable => "credential_unavailable".to_owned(),
+        pooler_policy::FilterReason::CredentialCooldown => "credential_cooldown".to_owned(),
+        pooler_policy::FilterReason::CredentialModelCooldown => {
+            "credential_model_cooldown".to_owned()
+        }
+        pooler_policy::FilterReason::ModelCooldown => "model_cooldown".to_owned(),
+        pooler_policy::FilterReason::ProviderCooldown => "provider_cooldown".to_owned(),
+        pooler_policy::FilterReason::ProviderModelCooldown => "provider_model_cooldown".to_owned(),
+        pooler_policy::FilterReason::RouteCooldown => "route_cooldown".to_owned(),
+        pooler_policy::FilterReason::ConcurrencyLimit => "concurrency_limit".to_owned(),
+        pooler_policy::FilterReason::RoutePolicy => "route_policy".to_owned(),
+        pooler_policy::FilterReason::SessionAffinity => "session_affinity".to_owned(),
+        pooler_policy::FilterReason::LossPolicy => "loss_policy".to_owned(),
+        pooler_policy::FilterReason::QuotaExhausted => "quota_exhausted".to_owned(),
+        pooler_policy::FilterReason::Disabled => "disabled".to_owned(),
+    }
+}
+
+fn observe_affinity(affinity: &pooler_policy::AffinityDecision) -> Option<AffinityDecision> {
+    match affinity {
+        pooler_policy::AffinityDecision::NotRequested => None,
+        pooler_policy::AffinityDecision::NoMatch { key_pseudonym } => Some(AffinityDecision {
+            key_pseudonym: Some(key_pseudonym.clone()),
+            reason: Some("no_match".to_owned()),
+            ..AffinityDecision::default()
+        }),
+        pooler_policy::AffinityDecision::Matched {
+            key_pseudonym,
+            target,
+        } => Some(AffinityDecision {
+            key_pseudonym: Some(key_pseudonym.clone()),
+            selected_provider: Some(target.provider.to_string()),
+            reason: Some("matched".to_owned()),
+            ..AffinityDecision::default()
+        }),
+        pooler_policy::AffinityDecision::Rebound {
+            key_pseudonym,
+            previous_provider,
+            target,
+        } => Some(AffinityDecision {
+            key_pseudonym: Some(key_pseudonym.clone()),
+            previous_provider: Some(previous_provider.to_string()),
+            selected_provider: Some(target.provider.to_string()),
+            rebound: true,
+            reason: Some("rebound".to_owned()),
+        }),
+        pooler_policy::AffinityDecision::Unavailable {
+            key_pseudonym,
+            target,
+        } => Some(AffinityDecision {
+            key_pseudonym: Some(key_pseudonym.clone()),
+            selected_provider: Some(target.provider.to_string()),
+            reason: Some("unavailable".to_owned()),
+            ..AffinityDecision::default()
+        }),
+    }
+}
+
 impl Serialize for DecisionRecord {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1427,6 +1571,41 @@ mod tests {
         );
         assert!(encoded.contains(REDACTED));
         assert!(encoded.contains("credential-pseudonym-1"));
+    }
+
+    #[test]
+    fn policy_and_store_decisions_convert_to_one_observe_shape() {
+        let provider = pooler_policy::ProviderId::new("provider").expect("provider");
+        let model = pooler_policy::ModelId::new("model").expect("model");
+        let mut selection = pooler_policy::SelectionExplanation::new(
+            pooler_policy::ModelAliasResolution::exact(model.clone()),
+            2,
+            pooler_policy::ConfigGeneration::new(7),
+        );
+        selection.set_selected(
+            pooler_policy::SelectionTarget::new(
+                provider,
+                model,
+                pooler_policy::CredentialPseudonym::new("cred-redacted"),
+            ),
+            Some(1.0),
+        );
+
+        let from_policy = DecisionRecord::from(&selection);
+        assert_eq!(from_policy.selected_provider.as_deref(), Some("provider"));
+        assert_eq!(
+            from_policy.credential_pseudonym.as_deref(),
+            Some("cred-redacted")
+        );
+        assert_eq!(from_policy.attempt, 2);
+
+        let stored =
+            pooler_store::DecisionRecord::from_selection(&selection, "request", "route", 42);
+        let from_store = DecisionRecord::from(&stored);
+        assert_eq!(from_store.request_id.as_deref(), Some("request"));
+        assert_eq!(from_store.route.as_deref(), Some("route"));
+        assert_eq!(from_store.selected_model.as_deref(), Some("model"));
+        assert_eq!(from_store.timestamp_ms, 42);
     }
 
     #[test]
