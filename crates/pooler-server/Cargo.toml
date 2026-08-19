@@ -13,6 +13,7 @@ adapter-factory = { path = "../adapter-factory" }
 arc-swap.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+pooler-auth = { path = "../pooler-auth" }
 pooler-config = { path = "../pooler-config" }
 pooler-core = { path = "../pooler-core" }
 pooler-http = { path = "../pooler-http" }
