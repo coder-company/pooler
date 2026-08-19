@@ -1,0 +1,95 @@
+#![forbid(unsafe_code)]
+#![doc = "Protocol-neutral semantic values and explicit conversion accounting for Pooler."]
+
+mod conversion;
+mod events;
+mod extensions;
+mod json;
+mod model;
+
+use serde::{Deserialize, Serialize};
+
+pub use conversion::{
+    ConversionError, ConversionReport, ConversionResult, ConversionWarning, WarningSeverity,
+};
+pub use events::{
+    FinishReason, SemanticEvent, StreamError, StreamEvent, StreamEventKind, StreamValidationError,
+    StreamValidator, Usage,
+};
+pub use extensions::{
+    ExtensionError, ExtensionKey, ExtensionName, ExtensionNamespace, Extensions, OpaqueExtension,
+    OpaqueExtensions, ReplayPolicy,
+};
+pub use json::{PreservedJson, PreservedJsonError};
+pub use model::{
+    CacheHints, ContentPart, InputItem, MediaSource, Message, ReasoningBlock, ReasoningConfig,
+    ReasoningEffort, Request, RequestValidationError, ResponseFormat, Role, SamplingParameters,
+    SemanticRequest, TargetMetadata, ToolCall, ToolChoice, ToolDefinition, ToolResult,
+};
+pub use pooler_core::LossPolicy;
+
+/// Request body representations used by route plans.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RequestBody {
+    /// Bytes or frames that do not require semantic decoding.
+    Opaque(Vec<u8>),
+    /// A JSON body whose original bytes can still be forwarded.
+    Json(PreservedJson),
+    /// A decoded protocol-neutral request.
+    Semantic(SemanticRequest),
+}
+
+impl RequestBody {
+    /// Returns the body as preserved JSON, if this is the JSON representation.
+    #[must_use]
+    pub const fn as_json(&self) -> Option<&PreservedJson> {
+        match self {
+            Self::Json(value) => Some(value),
+            Self::Opaque(_) | Self::Semantic(_) => None,
+        }
+    }
+
+    /// Returns the body as a semantic request, if this is the semantic
+    /// representation.
+    #[must_use]
+    pub const fn as_semantic(&self) -> Option<&SemanticRequest> {
+        match self {
+            Self::Semantic(value) => Some(value),
+            Self::Opaque(_) | Self::Json(_) => None,
+        }
+    }
+}
+
+/// Response body representations used by route plans.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ResponseBody {
+    /// Opaque response bytes.
+    Opaque(Vec<u8>),
+    /// A preserved JSON response.
+    Json(PreservedJson),
+    /// One semantic stream event.
+    Event(StreamEvent),
+}
+
+impl Default for Role {
+    fn default() -> Self {
+        Self::User
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PreservedJson, RequestBody, SemanticRequest};
+
+    #[test]
+    fn request_body_keeps_json_and_semantic_paths_distinct() {
+        let json = PreservedJson::from_str("{\"model\":\"x\"}").expect("JSON");
+        let body = RequestBody::Json(json);
+        assert!(body.as_json().is_some());
+        assert!(body.as_semantic().is_none());
+
+        let semantic = RequestBody::Semantic(SemanticRequest::new("x"));
+        assert!(semantic.as_semantic().is_some());
+        assert!(semantic.as_json().is_none());
+    }
+}

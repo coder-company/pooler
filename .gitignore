@@ -1,0 +1,6 @@
+/target/
+/.structurely/
+/.omo/
+*.db-shm
+*.db-wal
+.env

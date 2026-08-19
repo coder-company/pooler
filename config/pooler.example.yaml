@@ -1,0 +1,30 @@
+version: 1
+
+listeners:
+  local:
+    bind: 127.0.0.1:8400
+
+providers:
+  local-upstream:
+    transport:
+      kind: http
+      base_url: http://127.0.0.1:8319
+    auth:
+      kind: bearer_secret
+      secret: env:POOLER_UPSTREAM_KEY
+
+routes:
+  - id: private-inference
+    listen: local
+    match:
+      methods: [POST]
+      path: /inference
+      content_types: [application/json]
+    ingress:
+      mode: opaque
+    target:
+      provider: local-upstream
+      upstream_path: /v1/responses
+    response:
+      mode: opaque
+

@@ -1,0 +1,19 @@
+[package]
+name = "pooler-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pooler process lifecycle, immutable configuration generations, and listener wiring"
+
+[dependencies]
+arc-swap.workspace = true
+pooler-config = { path = "../pooler-config" }
+pooler-core = { path = "../pooler-core" }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true
