@@ -36,7 +36,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
         with:
           toolchain: 1.86.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: scripts/deep-test.sh --no-fuzz
 
   fuzz:
@@ -51,10 +51,10 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@a27ef18d36cfa66b0af3a360104621793b41c036 # v2.54.3
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: >-
           RUSTUP_TOOLCHAIN=nightly POOLER_FUZZ_TOOLCHAIN=nightly
           POOLER_REQUIRE_FUZZ=1
@@ -72,7 +72,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
         with:
           toolchain: 1.86.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run bounded smoke workload
         shell: bash
         run: >-
@@ -97,7 +97,7 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: >-
           POOLER_REQUIRE_SANITIZER=1 POOLER_SANITIZER=address
           scripts/deep-test.sh --sanitize --no-fuzz
