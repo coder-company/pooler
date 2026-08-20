@@ -681,6 +681,7 @@ fn discovered_model_value(model: &pooler_model_catalog::CatalogModel) -> Value {
         "display_name": model.display_name(),
         "selection_origin": "discovered",
         "targets": targets,
+        "request_overlay": model.request_overlay(),
     })
 }
 

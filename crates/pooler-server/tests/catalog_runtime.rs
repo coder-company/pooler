@@ -516,6 +516,13 @@ async fn serve_discovery_then_optional_inference(
 async fn proxy_a_request_rejecting_temperature(
     loss_policy: Option<&str>,
 ) -> (String, Option<String>) {
+    proxy_a_request_with_catalog_overrides(loss_policy, "").await
+}
+
+async fn proxy_a_request_with_catalog_overrides(
+    loss_policy: Option<&str>,
+    overrides: &str,
+) -> (String, Option<String>) {
     let upstream = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fake provider bind");
@@ -536,7 +543,7 @@ listeners: {{local: {{bind: 127.0.0.1:0}}}}
 upstreams: {{openai: {{url: http://{upstream_address}}}}}
 catalog:
   sources: [{{id: openai.primary, provider: openai, parser: open_ai}}]
-routes:
+{overrides}routes:
   - id: chat
     listen: local
     match: {{method: POST, path: /v1/chat/completions}}
@@ -603,6 +610,34 @@ async fn a_rejected_parameter_is_dropped_before_the_upstream_request() {
     assert!(
         upstream_request.contains("\"messages\""),
         "{upstream_request}"
+    );
+}
+
+#[tokio::test]
+async fn an_operator_override_pins_a_request_field_and_outranks_vendored_facts() {
+    // The vendored snapshot records this model as rejecting `temperature`, so
+    // without the override the parameter would be dropped before the upstream
+    // call. Pinning a reasoning field at the same time proves both halves of
+    // the override reach the wire.
+    let (response, upstream_request) = proxy_a_request_with_catalog_overrides(
+        None,
+        "  overrides:\n    - model: gpt-image-1.5\n      dialect: {temperature: accepted}\n      request:\n        /reasoning_effort: high\n",
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let upstream_request = upstream_request.expect("upstream received the shaped request");
+    assert!(
+        upstream_request.contains("\"reasoning_effort\":\"high\""),
+        "an operator-pinned field must reach the upstream: {upstream_request}"
+    );
+    assert!(
+        upstream_request.contains("\"temperature\":0.7"),
+        "an operator dialect must outrank the vendored request facts: {upstream_request}"
+    );
+    assert!(
+        upstream_request.contains("\"messages\""),
+        "the caller's body must otherwise survive: {upstream_request}"
     );
 }
 

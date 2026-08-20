@@ -17,14 +17,102 @@
 //! response would turn a provider's outage into a local one.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use pooler_core::{CapabilitySet, ModelDialect};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{CatalogError, CatalogModel, ModelId, MAX_DISPLAY_NAME_BYTES};
 
 /// Maximum per-model overrides accepted for one catalog.
 pub const MAX_MODEL_OVERRIDES: usize = 1_024;
+/// Maximum request-overlay fields accepted for one model.
+pub const MAX_OVERLAY_FIELDS: usize = 32;
+/// Maximum UTF-8 bytes accepted for one overlay JSON pointer.
+pub const MAX_OVERLAY_POINTER_BYTES: usize = 256;
+/// Maximum UTF-8 bytes accepted for one serialized overlay value.
+pub const MAX_OVERLAY_VALUE_BYTES: usize = 4_096;
+
+/// Request body fields an operator pins for one model.
+///
+/// A route-level transform can already set a field for every model matching a
+/// prefix. This is the same operation scoped to one model, which is what lets
+/// an operator say "send this reasoning effort to this model" without the
+/// declaration also applying to every sibling that shares its prefix.
+///
+/// Fields are applied after the model name is rewritten and before the request
+/// leaves, in declaration order, so a later field may overwrite an earlier one
+/// at the same pointer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RequestOverlay {
+    fields: Arc<[(Arc<str>, Value)]>,
+}
+
+// `serde_json::Value` is only `PartialEq` because it can hold a non-reflexive
+// float. A value here is always produced by parsing JSON, and JSON has no
+// literal for `NaN`, so equality is reflexive for every value this type can
+// actually hold.
+impl Eq for RequestOverlay {}
+
+impl RequestOverlay {
+    /// Whether this overlay pins no fields.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    /// Pinned fields as JSON pointer and value pairs, in declaration order.
+    #[must_use]
+    pub fn fields(&self) -> &[(Arc<str>, Value)] {
+        &self.fields
+    }
+
+    fn compile(declared: BTreeMap<String, Value>, model: &ModelId) -> Result<Self, CatalogError> {
+        if declared.len() > MAX_OVERLAY_FIELDS {
+            return Err(CatalogError::OverlayLimitExceeded {
+                model: model.clone(),
+                actual: declared.len(),
+                maximum: MAX_OVERLAY_FIELDS,
+            });
+        }
+        let mut fields = Vec::with_capacity(declared.len());
+        for (pointer, value) in declared {
+            let pointer = pointer.trim();
+            if !pointer.starts_with('/') || pointer.len() > MAX_OVERLAY_POINTER_BYTES {
+                return Err(CatalogError::InvalidOverlayPointer {
+                    model: model.clone(),
+                    pointer: pointer.to_owned(),
+                });
+            }
+            if serde_json::to_string(&value)
+                .map_or(true, |text| text.len() > MAX_OVERLAY_VALUE_BYTES)
+            {
+                return Err(CatalogError::OverlayValueTooLarge {
+                    model: model.clone(),
+                    pointer: pointer.to_owned(),
+                });
+            }
+            fields.push((Arc::from(pointer), value));
+        }
+        Ok(Self {
+            fields: Arc::from(fields),
+        })
+    }
+}
+
+impl Serialize for RequestOverlay {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_map(
+            self.fields
+                .iter()
+                .map(|(pointer, value)| (pointer.as_ref(), value)),
+        )
+    }
+}
 
 /// Strict override declaration for one client-visible model.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -40,6 +128,12 @@ pub struct ModelOverrideConfig {
     pub capabilities: Option<CapabilitySet>,
     /// Replacement request-shaping facts, applied to every target.
     pub dialect: Option<ModelDialect>,
+    /// Request body fields pinned for this model, keyed by JSON pointer.
+    ///
+    /// This is where a per-model reasoning setting lives, since which field
+    /// carries it differs by provider and only the operator knows which one
+    /// their target accepts.
+    pub request: BTreeMap<String, Value>,
 }
 
 impl ModelOverrideConfig {
@@ -57,11 +151,13 @@ impl ModelOverrideConfig {
                 return Err(CatalogError::InvalidOverrideDisplayName { model });
             }
         }
+        let overlay = RequestOverlay::compile(self.request, &model)?;
         let overridden = ModelOverride {
             disabled: self.disabled,
             display_name: self.display_name,
             capabilities: self.capabilities,
             dialect: self.dialect,
+            overlay,
         };
         // An override that changes nothing is a declaration whose intent was
         // lost, most often a misspelled field name, so it is reported rather
@@ -80,6 +176,7 @@ pub struct ModelOverride {
     display_name: Option<String>,
     capabilities: Option<CapabilitySet>,
     dialect: Option<ModelDialect>,
+    overlay: RequestOverlay,
 }
 
 impl ModelOverride {
@@ -107,11 +204,18 @@ impl ModelOverride {
         self.dialect
     }
 
+    /// Request body fields pinned for this model.
+    #[must_use]
+    pub const fn overlay(&self) -> &RequestOverlay {
+        &self.overlay
+    }
+
     fn changes_anything(&self) -> bool {
         self.disabled
             || self.display_name.is_some()
             || self.capabilities.is_some()
             || self.dialect.is_some()
+            || !self.overlay.is_empty()
     }
 
     /// Rewrite one merged model with the facts this override declares.
@@ -124,6 +228,9 @@ impl ModelOverride {
     fn apply(&self, mut model: CatalogModel) -> CatalogModel {
         if let Some(display_name) = &self.display_name {
             model.display_name = Some(display_name.clone());
+        }
+        if !self.overlay.is_empty() {
+            model.request_overlay = self.overlay.clone();
         }
         for target in &mut model.targets {
             if let Some(capabilities) = self.capabilities {

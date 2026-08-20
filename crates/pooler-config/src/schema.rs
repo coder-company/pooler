@@ -182,6 +182,7 @@ fn catalog_model_override_schema() -> Value {
                 )),
             ),
             ("dialect", optional(reference("model_dialect"))),
+            ("request", optional(json_map_schema())),
         ]),
         &["model"],
         false,
@@ -925,6 +926,18 @@ fn secret_ref_schema() -> Value {
 fn string_map_schema() -> Value {
     let mut schema = BTreeMap::new();
     schema.insert("additionalProperties".to_owned(), string_schema());
+    schema.insert("type".to_owned(), Value::String("object".to_owned()));
+    Value::Object(string_map(schema))
+}
+
+/// An object whose keys are JSON pointers and whose values are any JSON.
+///
+/// The value is deliberately unconstrained: it is a request body field for a
+/// provider Pooler does not model, so narrowing it here would reject shapes a
+/// provider legitimately accepts.
+fn json_map_schema() -> Value {
+    let mut schema = BTreeMap::new();
+    schema.insert("additionalProperties".to_owned(), Value::Bool(true));
     schema.insert("type".to_owned(), Value::String("object".to_owned()));
     Value::Object(string_map(schema))
 }

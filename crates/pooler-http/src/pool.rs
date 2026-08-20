@@ -26,7 +26,7 @@ use pooler_core::{
     Capability, CapabilitySet, ConfigGeneration, CredentialId, ErrorClass, ModelDialect, ModelId,
     ProviderId, RouteId,
 };
-use pooler_model_catalog::{CatalogService, CatalogSnapshot};
+use pooler_model_catalog::{CatalogService, CatalogSnapshot, RequestOverlay};
 use pooler_policy::{
     AffinityKey, CommitmentState, CooldownScope, CredentialRegistration, CredentialRegistry,
     FailureClassification, FailureClassifier, HealthMutation, HealthSubject, HttpFailureClassifier,
@@ -203,6 +203,7 @@ pub struct PoolSelection {
     upstream_id: Arc<str>,
     upstream_model: Option<Arc<str>>,
     dialect: ModelDialect,
+    request_overlay: RequestOverlay,
     account: Option<AccountPlan>,
     lease: Option<SelectionLease>,
     policy: Option<PolicyPlan>,
@@ -222,6 +223,7 @@ impl std::fmt::Debug for PoolSelection {
             .field("upstream_id", &self.upstream_id)
             .field("upstream_model", &self.upstream_model)
             .field("dialect", &self.dialect)
+            .field("request_overlay", &self.request_overlay)
             .field("provider", &self.provider)
             .field("has_account", &self.account.is_some())
             .field("has_lease", &self.lease.is_some())
@@ -252,6 +254,16 @@ impl PoolSelection {
     #[must_use]
     pub const fn dialect(&self) -> ModelDialect {
         self.dialect
+    }
+
+    /// Request body fields an operator pinned for the selected public model.
+    ///
+    /// These are keyed by the public model the caller asked for rather than by
+    /// the committed target, so a failover to another provider still applies
+    /// the operator's intent for that model.
+    #[must_use]
+    pub const fn request_overlay(&self) -> &RequestOverlay {
+        &self.request_overlay
     }
 
     /// Account secret reference, if an account rather than static upstream
@@ -588,6 +600,7 @@ impl PoolingCoordinator {
                 upstream_id: Arc::from(static_upstream),
                 upstream_model: static_model.map(Arc::from),
                 dialect,
+                request_overlay: resolve_request_overlay(catalog.as_deref(), &logical_model),
                 account: None,
                 lease: None,
                 policy: None,
@@ -708,6 +721,7 @@ impl PoolingCoordinator {
             upstream_id: Arc::from(provider.as_str()),
             upstream_model: selected_model.map(Arc::from),
             dialect,
+            request_overlay: resolve_request_overlay(catalog.as_deref(), &logical_model),
             account,
             lease: Some(lease),
             policy: Some(policy),
@@ -936,6 +950,13 @@ impl PoolingCoordinator {
             upstream_id: Arc::from(provider.as_str()),
             upstream_model,
             dialect,
+            request_overlay: resolve_request_overlay(
+                self.catalog
+                    .as_ref()
+                    .map(|catalog| catalog.snapshot())
+                    .as_deref(),
+                registration.model().as_str(),
+            ),
             account: self.accounts.get(credential.as_str()).cloned(),
             lease: Some(lease),
             policy: failed.policy.clone(),
@@ -1641,6 +1662,18 @@ fn resolve_target_dialect(
             })
         })
         .map_or(ModelDialect::DEFAULT, |target| target.dialect())
+}
+
+/// Resolve the request-body fields an operator pinned for a public model.
+///
+/// The overlay belongs to the public model rather than to one target, because
+/// an operator pins it for the model their clients name. A statically
+/// configured model carries no catalog entry and so pins nothing.
+fn resolve_request_overlay(catalog: Option<&CatalogSnapshot>, model: &str) -> RequestOverlay {
+    catalog
+        .and_then(|catalog| catalog.get(model))
+        .map(|model| model.request_overlay().clone())
+        .unwrap_or_default()
 }
 
 fn selection_contract_is_declared(route: &RoutePlan, model: Option<&str>) -> bool {

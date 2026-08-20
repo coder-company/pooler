@@ -32,7 +32,7 @@ use pooler_config::{
     CompiledConfig, ModelSource, RequestTransform, RouteMatchError, RoutePlan, RouteRequest,
     SecretRef, UpstreamPlan,
 };
-use pooler_core::{BodyMode, ErrorClass, ModelDialect, RouteLimits};
+use pooler_core::{BodyMode, ErrorClass, RouteLimits};
 use pooler_extension::{ExtensionInput, ExtensionRegistry};
 use pooler_observe::{
     AttemptRecord, AttemptResult, CompletionClass, CooldownRecord, DecisionRecord, MetricsRegistry,
@@ -2160,7 +2160,7 @@ impl PreparedBody {
         };
         if *patch_model {
             if let Some(model) = selection.upstream_model() {
-                return patch_body_for_target(bytes, route, model, selection.dialect());
+                return patch_body_for_target(bytes, route, model, selection);
             }
         }
         Ok(bytes.clone())
@@ -2181,7 +2181,7 @@ impl PreparedBody {
             Self::Buffered { bytes, patch_model } => {
                 let bytes = if *patch_model {
                     if let Some(model) = selection.upstream_model() {
-                        patch_body_for_target(bytes, route, model, selection.dialect())?
+                        patch_body_for_target(bytes, route, model, selection)?
                     } else {
                         bytes.clone()
                     }
@@ -2417,8 +2417,9 @@ fn patch_body_for_target(
     bytes: &Bytes,
     route: &RoutePlan,
     model: &str,
-    dialect: ModelDialect,
+    selection: &PoolSelection,
 ) -> Result<Bytes, ProxyError> {
+    let dialect = selection.dialect();
     let mut document = PreservedJson::from_bytes(bytes.to_vec())
         .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
     document
@@ -2428,6 +2429,16 @@ fn patch_body_for_target(
             JsonPatchLimits::default(),
         )
         .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+    // Operator-pinned fields are applied before the dialect rules run, so a
+    // field the target rejects is still caught below rather than forwarded
+    // because configuration asked for it. An operator who means to force such a
+    // field overrides the model's dialect too, which is an explicit decision
+    // rather than an accident of ordering.
+    for (pointer, value) in selection.request_overlay().fields() {
+        document
+            .set_pointer_bounded(pointer, value.clone(), JsonPatchLimits::default())
+            .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+    }
     if !dialect.temperature.is_accepted() && document.pointer("/temperature").is_some() {
         // A patch body has no extension namespace, so `preserve` cannot keep the
         // field anywhere the target would accept. Only `degrade` drops it.

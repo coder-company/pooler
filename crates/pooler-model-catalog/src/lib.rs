@@ -25,7 +25,8 @@ pub use model_facts::{
     MODEL_FACTS_SCHEMA_VERSION,
 };
 pub use overrides::{
-    ModelOverride, ModelOverrideConfig, ModelOverrides, OverrideState, MAX_MODEL_OVERRIDES,
+    ModelOverride, ModelOverrideConfig, ModelOverrides, OverrideState, RequestOverlay,
+    MAX_MODEL_OVERRIDES, MAX_OVERLAY_FIELDS, MAX_OVERLAY_POINTER_BYTES, MAX_OVERLAY_VALUE_BYTES,
 };
 pub use provider_catalog::{
     KnownProvider, ProviderCatalog, ProviderCatalogError, MAX_PROVIDER_CATALOG_BYTES,
@@ -836,6 +837,7 @@ pub struct CatalogModel {
     id: ModelId,
     display_name: Option<String>,
     targets: Vec<CatalogTarget>,
+    request_overlay: RequestOverlay,
 }
 
 impl CatalogModel {
@@ -855,6 +857,12 @@ impl CatalogModel {
     #[must_use]
     pub fn targets(&self) -> &[CatalogTarget] {
         &self.targets
+    }
+
+    /// Request body fields an operator pinned for this model.
+    #[must_use]
+    pub const fn request_overlay(&self) -> &RequestOverlay {
+        &self.request_overlay
     }
 }
 
@@ -1278,6 +1286,7 @@ fn compile_public_model(
         id: public_id,
         display_name,
         targets,
+        request_overlay: RequestOverlay::default(),
     })
 }
 
@@ -1652,6 +1661,19 @@ pub enum CatalogError {
     /// Too many overrides in one catalog.
     #[error("catalog has {actual} model overrides; maximum is {maximum}")]
     OverrideLimitExceeded { actual: usize, maximum: usize },
+    /// Invalid request-overlay JSON pointer.
+    #[error("model override {model} has an invalid request pointer {pointer:?}")]
+    InvalidOverlayPointer { model: ModelId, pointer: String },
+    /// Request-overlay value exceeds its size bound.
+    #[error("model override {model} has an oversized request value at {pointer:?}")]
+    OverlayValueTooLarge { model: ModelId, pointer: String },
+    /// Too many request-overlay fields for one model.
+    #[error("model override {model} pins {actual} request fields; maximum is {maximum}")]
+    OverlayLimitExceeded {
+        model: ModelId,
+        actual: usize,
+        maximum: usize,
+    },
     /// Invalid alias declaration.
     #[error("catalog source {source_id} has an invalid alias: {message}")]
     InvalidAlias {

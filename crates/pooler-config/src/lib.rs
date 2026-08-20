@@ -5647,6 +5647,8 @@ catalog:
       capabilities: [text, reasoning]
       dialect:
         temperature: rejected
+      request:
+        /reasoning_effort: high
 ";
         let config = compile_yaml("overrides.yaml", text).expect("overrides compile");
         let overrides = config.catalog().expect("catalog is configured").overrides();
@@ -5673,6 +5675,39 @@ catalog:
         assert_eq!(
             reshaped.dialect().map(|dialect| dialect.temperature),
             Some(pooler_core::ParamSupport::Rejected)
+        );
+        assert_eq!(
+            reshaped
+                .overlay()
+                .fields()
+                .iter()
+                .map(|(pointer, value)| (pointer.as_ref(), value.to_string()))
+                .collect::<Vec<_>>(),
+            [("/reasoning_effort", "\"high\"".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_pinned_request_field_requires_a_json_pointer() {
+        let text = "\
+version: 1
+listeners: {l: {bind: 127.0.0.1:1}}
+upstreams: {openai: {known_provider: openai}}
+catalog:
+  sources:
+    - id: openai.primary
+      provider: openai
+      parser: openai
+  overrides:
+    - model: o3
+      request:
+        reasoning_effort: high
+";
+        let error = compile_yaml("bad-pointer.yaml", text)
+            .expect_err("a bare field name is not a JSON pointer");
+        assert!(
+            error.to_string().contains("invalid request pointer"),
+            "unexpected error: {error}"
         );
     }
 

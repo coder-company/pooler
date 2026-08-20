@@ -294,6 +294,10 @@
         },
         "model": {
           "type": "string"
+        },
+        "request": {
+          "additionalProperties": true,
+          "type": "object"
         }
       },
       "required": [
