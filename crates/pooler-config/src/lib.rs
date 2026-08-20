@@ -2917,9 +2917,24 @@ fn compile_config(
             ));
         }
         let limits = compile_limits(declaration.limits.as_ref(), &label)?;
-        if declaration.loss_policy.is_some() && ingress.mode() != BodyMode::Semantic {
-            return Err(invalid(&label, "loss_policy requires semantic ingress"));
+        if declaration.loss_policy.is_some()
+            && !matches!(ingress.mode(), BodyMode::Semantic | BodyMode::Patch)
+        {
+            return Err(invalid(
+                &label,
+                "loss_policy requires semantic or patch ingress",
+            ));
         }
+        // Semantic ingress converts between protocols, where an unrepresentable
+        // field means the caller's request cannot be honored, so the default
+        // rejects. Patch ingress forwards the caller's own body and only rewrites
+        // what reaching the selected target requires; rejecting by default there
+        // would fail requests the provider serves once the body is shaped for it.
+        let default_loss_policy = if ingress.mode() == BodyMode::Patch {
+            LossPolicy::Degrade
+        } else {
+            LossPolicy::Reject
+        };
         routes.push(RoutePlan {
             id: Arc::from(declaration.id.as_str()),
             listener: Arc::from(listener),
@@ -2932,7 +2947,7 @@ fn compile_config(
             target,
             downstream_auth,
             limits,
-            loss_policy: declaration.loss_policy.unwrap_or(LossPolicy::Reject),
+            loss_policy: declaration.loss_policy.unwrap_or(default_loss_policy),
             priority: declaration.priority.unwrap_or(0),
             order,
             source: label,
@@ -5392,6 +5407,43 @@ routes:
         let compiled = compile_yaml("alias.yaml", text).expect("alias");
         assert_eq!(compiled.routes()[0].ingress().mode(), BodyMode::Semantic);
         assert_eq!(compiled.routes()[0].loss_policy(), LossPolicy::Degrade);
+    }
+
+    #[test]
+    fn loss_policy_defaults_by_ingress_mode_and_stays_out_of_opaque_routes() {
+        let route = |mode: &str, declared: &str| {
+            format!(
+                "version: 1\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{p: {{url: http://127.0.0.1:2}}}}\nroutes: [{{id: r, listen: l, ingress: {{mode: {mode}}}, target: {{provider: p}}{declared}}}]\n"
+            )
+        };
+
+        let patched = compile_yaml("patch-default.yaml", &route("patch", ""))
+            .expect("patch ingress compiles");
+        assert_eq!(
+            patched.routes()[0].loss_policy(),
+            LossPolicy::Degrade,
+            "patch ingress shapes the caller's body for the selected target"
+        );
+
+        let semantic = compile_yaml("semantic-default.yaml", &route("semantic", ""))
+            .expect("semantic ingress compiles");
+        assert_eq!(semantic.routes()[0].loss_policy(), LossPolicy::Reject);
+
+        let declared = compile_yaml(
+            "patch-declared.yaml",
+            &route("patch", ", loss_policy: reject"),
+        )
+        .expect("patch ingress accepts an explicit policy");
+        assert_eq!(declared.routes()[0].loss_policy(), LossPolicy::Reject);
+
+        let opaque = compile_yaml(
+            "opaque-declared.yaml",
+            &route("opaque", ", loss_policy: reject"),
+        )
+        .expect_err("opaque ingress has no body to shape");
+        assert!(opaque
+            .to_string()
+            .contains("loss_policy requires semantic or patch ingress"));
     }
 
     #[test]

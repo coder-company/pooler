@@ -23,8 +23,8 @@ use pooler_config::{
     SelectionStrategy as ConfigSelectionStrategy,
 };
 use pooler_core::{
-    Capability, CapabilitySet, ConfigGeneration, CredentialId, ErrorClass, ModelId, ProviderId,
-    RouteId,
+    Capability, CapabilitySet, ConfigGeneration, CredentialId, ErrorClass, ModelDialect, ModelId,
+    ProviderId, RouteId,
 };
 use pooler_model_catalog::{CatalogService, CatalogSnapshot};
 use pooler_policy::{
@@ -202,6 +202,7 @@ impl SelectionContext {
 pub struct PoolSelection {
     upstream_id: Arc<str>,
     upstream_model: Option<Arc<str>>,
+    dialect: ModelDialect,
     account: Option<AccountPlan>,
     lease: Option<SelectionLease>,
     policy: Option<PolicyPlan>,
@@ -220,6 +221,7 @@ impl std::fmt::Debug for PoolSelection {
             .debug_struct("PoolSelection")
             .field("upstream_id", &self.upstream_id)
             .field("upstream_model", &self.upstream_model)
+            .field("dialect", &self.dialect)
             .field("provider", &self.provider)
             .field("has_account", &self.account.is_some())
             .field("has_lease", &self.lease.is_some())
@@ -240,6 +242,16 @@ impl PoolSelection {
     #[must_use]
     pub fn upstream_model(&self) -> Option<&str> {
         self.upstream_model.as_deref()
+    }
+
+    /// Request-shaping deviations recorded for the selected upstream model.
+    ///
+    /// This is resolved after the account pool commits to a provider, so a
+    /// failover to a different target carries that target's dialect rather
+    /// than the one the first candidate would have used.
+    #[must_use]
+    pub const fn dialect(&self) -> ModelDialect {
+        self.dialect
     }
 
     /// Account secret reference, if an account rather than static upstream
@@ -566,9 +578,16 @@ impl PoolingCoordinator {
                 ProviderId::new(static_upstream.clone()).map_err(|_| PoolError::InvalidProvider)?;
             let model_id =
                 ModelId::new(logical_model.to_owned()).map_err(|_| PoolError::InvalidModel)?;
+            let dialect = resolve_target_dialect(
+                catalog.as_deref(),
+                &logical_model,
+                &static_upstream,
+                static_model.as_deref(),
+            );
             return Ok(PoolSelection {
                 upstream_id: Arc::from(static_upstream),
                 upstream_model: static_model.map(Arc::from),
+                dialect,
                 account: None,
                 lease: None,
                 policy: None,
@@ -679,9 +698,16 @@ impl PoolingCoordinator {
             &lease,
             selected_model.as_deref(),
         );
+        let dialect = resolve_target_dialect(
+            catalog.as_deref(),
+            &logical_model,
+            provider.as_str(),
+            selected_model.as_deref(),
+        );
         Ok(PoolSelection {
             upstream_id: Arc::from(provider.as_str()),
             upstream_model: selected_model.map(Arc::from),
+            dialect,
             account,
             lease: Some(lease),
             policy: Some(policy),
@@ -897,9 +923,19 @@ impl PoolingCoordinator {
             &lease,
             upstream_model.as_deref(),
         );
+        let dialect = resolve_target_dialect(
+            self.catalog
+                .as_ref()
+                .map(|catalog| catalog.snapshot())
+                .as_deref(),
+            registration.model().as_str(),
+            provider.as_str(),
+            upstream_model.as_deref(),
+        );
         PoolSelection {
             upstream_id: Arc::from(provider.as_str()),
             upstream_model,
+            dialect,
             account: self.accounts.get(credential.as_str()).cloned(),
             lease: Some(lease),
             policy: failed.policy.clone(),
@@ -1579,6 +1615,32 @@ fn resolve_static_target(
         route.target().upstream().to_owned(),
         None,
     ))
+}
+
+/// Resolve the dialect of the target the pool actually committed to.
+///
+/// A public model may map to several provider targets, and account failover can
+/// commit to any of them, so the dialect is matched on the selected provider and
+/// upstream model rather than taken from the first candidate. Statically
+/// configured models carry no discovered facts and keep the protocol default.
+fn resolve_target_dialect(
+    catalog: Option<&CatalogSnapshot>,
+    model: &str,
+    provider: &str,
+    upstream_model: Option<&str>,
+) -> ModelDialect {
+    let Some(upstream_model) = upstream_model else {
+        return ModelDialect::DEFAULT;
+    };
+    catalog
+        .and_then(|catalog| catalog.get(model))
+        .and_then(|model| {
+            model.targets().iter().find(|target| {
+                target.provider().as_str() == provider
+                    && target.upstream_model().as_str() == upstream_model
+            })
+        })
+        .map_or(ModelDialect::DEFAULT, |target| target.dialect())
 }
 
 fn selection_contract_is_declared(route: &RoutePlan, model: Option<&str>) -> bool {

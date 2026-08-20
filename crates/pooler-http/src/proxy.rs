@@ -32,7 +32,7 @@ use pooler_config::{
     CompiledConfig, ModelSource, RequestTransform, RouteMatchError, RoutePlan, RouteRequest,
     SecretRef, UpstreamPlan,
 };
-use pooler_core::{BodyMode, ErrorClass, RouteLimits};
+use pooler_core::{BodyMode, ErrorClass, ModelDialect, RouteLimits};
 use pooler_extension::{ExtensionInput, ExtensionRegistry};
 use pooler_observe::{
     AttemptRecord, AttemptResult, CompletionClass, CooldownRecord, DecisionRecord, MetricsRegistry,
@@ -397,6 +397,10 @@ pub enum ProxyError {
     /// A patch request body was not valid for its compiled transform plan.
     #[error("invalid patch request: {0}")]
     InvalidPatch(String),
+    /// The selected target rejects a parameter the caller supplied, and the
+    /// route's loss policy forbids dropping it.
+    #[error("model `{model}` does not accept the `{parameter}` parameter")]
+    UnsupportedParameter { parameter: String, model: String },
     /// A buffered or transformed request body exceeded the route limit.
     #[error("request body exceeds configured limit")]
     RequestBodyTooLarge,
@@ -1415,7 +1419,7 @@ where
                 == Some(SemanticWebSocketTransport::OpenAiResponses)
                 && matches!(upstream.transport(), "ws" | "wss")
             {
-                match prepared.buffered_bytes_for_attempt(selection.upstream_model()) {
+                match prepared.buffered_bytes_for_attempt(route, &selection) {
                     Ok(bytes) => {
                         self.send_openai_responses_websocket_attempt(attempt_request, bytes)
                             .await
@@ -1423,7 +1427,7 @@ where
                     Err(error) => Err(error),
                 }
             } else {
-                match prepared.body_for_attempt(selection.upstream_model()) {
+                match prepared.body_for_attempt(route, &selection) {
                     Ok(attempt_body) => self.send_attempt(attempt_request, attempt_body).await,
                     Err(error) => Err(error),
                 }
@@ -2146,7 +2150,8 @@ struct InspectedFailureResponse {
 impl PreparedBody {
     fn buffered_bytes_for_attempt(
         &self,
-        upstream_model: Option<&str>,
+        route: &RoutePlan,
+        selection: &PoolSelection,
     ) -> Result<Bytes, ProxyError> {
         let Self::Buffered { bytes, patch_model } = self else {
             return Err(ProxyError::SemanticRequest(
@@ -2154,14 +2159,18 @@ impl PreparedBody {
             ));
         };
         if *patch_model {
-            if let Some(model) = upstream_model {
-                return patch_model_bytes(bytes, model);
+            if let Some(model) = selection.upstream_model() {
+                return patch_body_for_target(bytes, route, model, selection.dialect());
             }
         }
         Ok(bytes.clone())
     }
 
-    fn body_for_attempt(&mut self, upstream_model: Option<&str>) -> Result<ProxyBody, ProxyError> {
+    fn body_for_attempt(
+        &mut self,
+        route: &RoutePlan,
+        selection: &PoolSelection,
+    ) -> Result<ProxyBody, ProxyError> {
         match self {
             Self::Streaming(body) => {
                 body.take()
@@ -2171,8 +2180,8 @@ impl PreparedBody {
             }
             Self::Buffered { bytes, patch_model } => {
                 let bytes = if *patch_model {
-                    if let Some(model) = upstream_model {
-                        patch_model_bytes(bytes, model)?
+                    if let Some(model) = selection.upstream_model() {
+                        patch_body_for_target(bytes, route, model, selection.dialect())?
                     } else {
                         bytes.clone()
                     }
@@ -2334,6 +2343,7 @@ fn completion_class_for_status(status: StatusCode) -> CompletionClass {
 fn completion_class_for_error(error: &ProxyError) -> CompletionClass {
     match error {
         ProxyError::InvalidPatch(_)
+        | ProxyError::UnsupportedParameter { .. }
         | ProxyError::RequestBodyTooLarge
         | ProxyError::SemanticRequest(_)
         | ProxyError::Extension(_)
@@ -2395,7 +2405,20 @@ fn downstream_session_identity(headers: &HeaderMap, body: &[u8]) -> Option<Arc<s
         .map(Arc::from)
 }
 
-fn patch_model_bytes(bytes: &Bytes, model: &str) -> Result<Bytes, ProxyError> {
+/// Rewrite a buffered JSON request for the target the pool committed to.
+///
+/// Patch routes forward the caller's body with the minimum rewriting needed to
+/// reach that target. Renaming the model is already such a rewrite; dropping a
+/// sampling parameter the target rejects is the same class of change, and
+/// without it the request is forwarded only to be refused upstream. The drop is
+/// recorded rather than silent, and `loss_policy: reject` fails the request
+/// before any upstream call instead.
+fn patch_body_for_target(
+    bytes: &Bytes,
+    route: &RoutePlan,
+    model: &str,
+    dialect: ModelDialect,
+) -> Result<Bytes, ProxyError> {
     let mut document = PreservedJson::from_bytes(bytes.to_vec())
         .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
     document
@@ -2405,6 +2428,25 @@ fn patch_model_bytes(bytes: &Bytes, model: &str) -> Result<Bytes, ProxyError> {
             JsonPatchLimits::default(),
         )
         .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+    if !dialect.temperature.is_accepted() && document.pointer("/temperature").is_some() {
+        // A patch body has no extension namespace, so `preserve` cannot keep the
+        // field anywhere the target would accept. Only `degrade` drops it.
+        if !route.loss_policy().allows_degradation() {
+            return Err(ProxyError::UnsupportedParameter {
+                parameter: "temperature".to_owned(),
+                model: model.to_owned(),
+            });
+        }
+        document
+            .remove("/temperature")
+            .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+        tracing::warn!(
+            route = route.id(),
+            upstream_model = model,
+            parameter = "temperature",
+            "request parameter dropped because the target model rejects it"
+        );
+    }
     Ok(Bytes::from(document.bytes().into_owned()))
 }
 
@@ -3493,6 +3535,9 @@ fn error_response(error: ProxyError) -> Response<ProxyBody> {
         }
         ProxyError::Extension(_) => (StatusCode::BAD_GATEWAY, "external extension failed"),
         ProxyError::InvalidPatch(_) => (StatusCode::BAD_REQUEST, "invalid request"),
+        ProxyError::UnsupportedParameter { .. } => {
+            (StatusCode::BAD_REQUEST, "unsupported request parameter")
+        }
         ProxyError::InvalidWebSocketHandshake(_) => {
             (StatusCode::BAD_REQUEST, "invalid WebSocket handshake")
         }

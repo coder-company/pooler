@@ -379,6 +379,151 @@ routes:
     provider.await.expect("fake provider task");
 }
 
+/// Serve one discovery response, then hand back any inference request that
+/// arrives within a short window.
+async fn serve_discovery_then_optional_inference(
+    upstream: TcpListener,
+    models: &'static [u8],
+) -> Option<String> {
+    let (mut discovery, _) = upstream.accept().await.expect("discovery connection");
+    let request = read_http_request(&mut discovery).await;
+    assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+    discovery
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                models.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("catalog headers");
+    discovery.write_all(models).await.expect("catalog body");
+
+    let accepted = tokio::time::timeout(std::time::Duration::from_millis(500), upstream.accept())
+        .await
+        .ok()?;
+    let (mut inference, _) = accepted.expect("inference connection");
+    let request = read_http_request(&mut inference).await;
+    let response = br#"{"id":"response","model":"gpt-image-1.5"}"#;
+    inference
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("inference headers");
+    inference.write_all(response).await.expect("inference body");
+    Some(request)
+}
+
+async fn proxy_a_request_rejecting_temperature(
+    loss_policy: Option<&str>,
+) -> (String, Option<String>) {
+    let upstream = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake provider bind");
+    let upstream_address = upstream.local_addr().expect("fake provider address");
+    let provider = tokio::spawn(serve_discovery_then_optional_inference(
+        upstream,
+        br#"{"data":[{"id":"gpt-image-1.5"}]}"#,
+    ));
+
+    let loss_policy =
+        loss_policy.map_or_else(String::new, |policy| format!("    loss_policy: {policy}\n"));
+    let config = pooler_config::compile_yaml(
+        "catalog-dialect.yaml",
+        &format!(
+            r#"
+version: 1
+listeners: {{local: {{bind: 127.0.0.1:0}}}}
+upstreams: {{openai: {{url: http://{upstream_address}}}}}
+catalog:
+  sources: [{{id: openai.primary, provider: openai, parser: open_ai}}]
+routes:
+  - id: chat
+    listen: local
+    match: {{method: POST, path: /v1/chat/completions}}
+    ingress: {{mode: patch, inspectors: [inspect.openai.model]}}
+    target: {{provider: openai, model_from: request.model}}
+    response: {{mode: opaque}}
+{loss_policy}"#
+        ),
+    )
+    .expect("dialect route config");
+    let server = HttpProxyServer::bind(config)
+        .await
+        .expect("startup discovery succeeds");
+    let proxy_address = server.listener_addresses()[0].address().to_owned();
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+
+    let mut downstream = TcpStream::connect(&proxy_address)
+        .await
+        .expect("proxy connection");
+    let body = br#"{"model":"gpt-image-1.5","temperature":0.7,"messages":[{"role":"user","content":"hi"}]}"#;
+    downstream
+        .write_all(
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("downstream headers");
+    downstream.write_all(body).await.expect("downstream body");
+    let mut response = Vec::new();
+    downstream
+        .read_to_end(&mut response)
+        .await
+        .expect("downstream response");
+
+    server.begin_drain();
+    runner.await.expect("server task").expect("server shutdown");
+    let upstream_request = provider.await.expect("fake provider task");
+    (
+        String::from_utf8_lossy(&response).to_string(),
+        upstream_request,
+    )
+}
+
+#[tokio::test]
+async fn a_rejected_parameter_is_dropped_before_the_upstream_request() {
+    let (response, upstream_request) = proxy_a_request_rejecting_temperature(None).await;
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let upstream_request = upstream_request.expect("upstream received the shaped request");
+    assert!(
+        !upstream_request.contains("temperature"),
+        "the vendored dialect must drop a parameter the model rejects: {upstream_request}"
+    );
+    assert!(
+        upstream_request.contains("\"model\":\"gpt-image-1.5\""),
+        "{upstream_request}"
+    );
+    assert!(
+        upstream_request.contains("\"messages\""),
+        "{upstream_request}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejecting_loss_policy_fails_the_request_before_any_upstream_call() {
+    let (response, upstream_request) = proxy_a_request_rejecting_temperature(Some("reject")).await;
+
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        upstream_request.is_none(),
+        "no upstream request may be made: {upstream_request:?}"
+    );
+}
+
 async fn read_http_request(stream: &mut TcpStream) -> String {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
