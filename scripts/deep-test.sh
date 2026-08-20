@@ -29,6 +29,7 @@ Environment:
   POOLER_FUZZ_SECONDS   Per-target libFuzzer budget (default: 5).
   POOLER_FUZZ_TIMEOUT   Wall-clock timeout per target (default: seconds + 30).
   POOLER_FUZZ_TOOLCHAIN Rust toolchain passed to cargo-fuzz (for example: nightly).
+  POOLER_FUZZ_TARGET    Explicit libFuzzer target triple (default: rustc host).
   POOLER_SANITIZER      Sanitizer name (default: address when --sanitize is used).
   POOLER_STRESS_COMMAND Deterministic local stress command for --stress.
   POOLER_STRESS_SECONDS Wall-clock stress budget (default: 900).
@@ -109,15 +110,20 @@ run_fuzz_targets() {
         return 0
     fi
 
-    local target corpus
+    local target corpus fuzz_target
     local -a cargo_fuzz=(cargo)
     if [[ -n ${POOLER_FUZZ_TOOLCHAIN:-} ]]; then
         cargo_fuzz+=("+${POOLER_FUZZ_TOOLCHAIN}")
     fi
-    cargo_fuzz+=(fuzz run)
+    fuzz_target=${POOLER_FUZZ_TARGET:-$(rustc --version --verbose | sed -n 's/^host: //p')}
+    if [[ -z "$fuzz_target" ]]; then
+        echo "unable to determine the libFuzzer target triple" >&2
+        return 1
+    fi
+    cargo_fuzz+=(fuzz run --target "$fuzz_target")
     cd "$ROOT/fuzz"
     while read -r target corpus; do
-        echo "+ cargo fuzz run $target $corpus -- -max_total_time=$FUZZ_SECONDS"
+        echo "+ cargo fuzz run --target $fuzz_target $target $corpus -- -max_total_time=$FUZZ_SECONDS"
         run_bounded "$FUZZ_TIMEOUT" "${cargo_fuzz[@]}" "$target" "$corpus" -- \
             -max_total_time="$FUZZ_SECONDS" \
             -timeout=5 \
