@@ -2490,7 +2490,26 @@ fn upstream_uri(
     });
     url.set_path(path);
     url.set_query(downstream.query());
+    apply_upstream_query(&mut url, upstream.query());
     url.as_str().parse().map_err(|_| ProxyError::InvalidUri)
+}
+
+/// Add the query parameters an upstream requires without overriding the caller.
+///
+/// Some providers reject a request that omits a parameter the caller has no
+/// reason to know about, such as Azure OpenAI's `api-version`. A caller that
+/// did send the parameter chose a value deliberately, so configuration fills
+/// the gap rather than replacing the choice.
+fn apply_upstream_query(url: &mut url::Url, required: &[(Arc<str>, Arc<str>)]) {
+    for (name, value) in required {
+        if url
+            .query_pairs()
+            .any(|(existing, _)| existing == name.as_ref())
+        {
+            continue;
+        }
+        url.query_pairs_mut().append_pair(name, value);
+    }
 }
 
 fn request_is_websocket_upgrade(request: &Request<Incoming>) -> bool {
@@ -3366,8 +3385,9 @@ pub fn apply_configured_upstream_auth(
     let Some(auth) = upstream.auth() else {
         return Ok(());
     };
-    let placement = AuthPlacement::from_configured_kind(auth.kind())
-        .map_err(|_| ProxyError::UnsupportedAuth)?;
+    let placement =
+        AuthPlacement::from_configured_parts(auth.kind(), auth.header(), auth.value_prefix())
+            .map_err(|_| ProxyError::UnsupportedAuth)?;
     let secret = resolve_secret(auth.secret())?;
     let authorization = placement
         .materialize(&secret)

@@ -15,7 +15,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::{uri::PathAndQuery, HeaderName, Method};
+use http::{uri::PathAndQuery, HeaderName, HeaderValue, Method};
 pub use pooler_core::{
     BodyMode, Capability, CapabilitySet, ConfigGeneration, LossPolicy, RouteLimits,
 };
@@ -405,6 +405,10 @@ pub struct UpstreamConfig {
     pub oauth: Option<OAuthConfig>,
     /// Native provider declaration.
     pub native: Option<NativeProviderConfig>,
+    /// Query parameters this upstream requires on every request, such as Azure
+    /// OpenAI's `api-version`. A parameter the caller already sent is left
+    /// alone, so these act as defaults rather than overrides.
+    pub query: BTreeMap<String, String>,
 }
 
 /// Supervised external extension declaration.
@@ -761,6 +765,14 @@ pub struct AuthConfig {
     pub kind: Option<String>,
     /// Secret reference.
     pub secret: Option<SecretRef>,
+    /// Credential header name, required by and exclusive to `kind: header`.
+    /// Providers that name their own credential header, such as Azure OpenAI
+    /// with `api-key`, are configured here rather than compiled in.
+    pub header: Option<String>,
+    /// Non-secret prefix placed before the secret in a `kind: header` value,
+    /// such as `Token ` for providers that expect a scheme they do not share
+    /// with bearer authentication.
+    pub value_prefix: Option<String>,
 }
 
 /// OAuth provider endpoints and public client configuration.
@@ -1167,6 +1179,7 @@ pub struct UpstreamPlan {
     auth: Option<AuthPlan>,
     oauth: Option<OAuthPlan>,
     native: Option<NativeProviderPlan>,
+    query: UpstreamQuery,
     source: SourceLabel,
 }
 
@@ -1225,6 +1238,12 @@ impl UpstreamPlan {
     #[must_use]
     pub fn native(&self) -> Option<&NativeProviderPlan> {
         self.native.as_ref()
+    }
+
+    /// Query parameters this upstream requires, in declaration order.
+    #[must_use]
+    pub fn query(&self) -> &[(Arc<str>, Arc<str>)] {
+        &self.query
     }
 
     /// Source declaration label.
@@ -2089,6 +2108,17 @@ impl RequestTransform {
 pub struct AuthPlan {
     kind: Arc<str>,
     secret: SecretRef,
+    header: Option<CredentialHeader>,
+}
+
+/// Query parameters an upstream requires, in declaration order.
+pub type UpstreamQuery = Arc<[(Arc<str>, Arc<str>)]>;
+
+/// A credential header named by configuration rather than by an adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialHeader {
+    name: Arc<str>,
+    value_prefix: Option<Arc<str>>,
 }
 
 impl AuthPlan {
@@ -2102,6 +2132,20 @@ impl AuthPlan {
     #[must_use]
     pub const fn secret(&self) -> &SecretRef {
         &self.secret
+    }
+
+    /// Credential header name for `kind: header`, absent for every other kind.
+    #[must_use]
+    pub fn header(&self) -> Option<&str> {
+        self.header.as_ref().map(|header| header.name.as_ref())
+    }
+
+    /// Non-secret prefix placed before the secret in a `kind: header` value.
+    #[must_use]
+    pub fn value_prefix(&self) -> Option<&str> {
+        self.header
+            .as_ref()
+            .and_then(|header| header.value_prefix.as_deref())
     }
 }
 
@@ -2775,6 +2819,7 @@ fn compile_config(
             compile_upstream(declaration, &label)?;
         let (oauth, native) = compile_provider_auth(declaration, &label)?;
         let auth = compile_auth(declaration.auth.as_ref(), &label)?;
+        let query = compile_upstream_query(declaration, &label)?;
         upstreams.insert(
             Arc::from(id.as_str()),
             UpstreamPlan {
@@ -2787,6 +2832,7 @@ fn compile_config(
                 auth,
                 oauth,
                 native,
+                query,
                 source: label,
             },
         );
@@ -4340,11 +4386,11 @@ fn compile_auth(
         .replace('-', "_");
     if !matches!(
         kind.as_str(),
-        "bearer" | "bearer_secret" | "x_api_key" | "x_goog_api_key"
+        "bearer" | "bearer_secret" | "x_api_key" | "x_goog_api_key" | "header"
     ) {
         return Err(invalid(
             label,
-            "auth kind must be bearer, bearer_secret, x_api_key, or x_goog_api_key",
+            "auth kind must be bearer, bearer_secret, x_api_key, x_goog_api_key, or header",
         ));
     }
     if !matches!(
@@ -4356,10 +4402,80 @@ fn compile_auth(
             "auth secrets must use an env:, file:, or keyring: reference",
         ));
     }
+    let header = compile_auth_header(auth, &kind, label)?;
     Ok(Some(AuthPlan {
         kind: Arc::from(kind),
         secret: secret.clone(),
+        header,
     }))
+}
+
+/// Resolve the credential header name and prefix for one auth declaration.
+///
+/// `header` and `value_prefix` describe where a `kind: header` credential goes,
+/// so any other kind carrying them is a declaration whose intent cannot be
+/// honored rather than a harmless extra field.
+fn compile_auth_header(
+    auth: &AuthConfig,
+    kind: &str,
+    label: &SourceLabel,
+) -> Result<Option<CredentialHeader>, ConfigError> {
+    let header = auth
+        .header
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let value_prefix = auth.value_prefix.as_deref();
+    if kind != "header" {
+        if header.is_some() || value_prefix.is_some() {
+            return Err(invalid(
+                label,
+                "auth header and value_prefix require kind: header",
+            ));
+        }
+        return Ok(None);
+    }
+    let name = header.ok_or_else(|| invalid(label, "auth kind: header requires a header name"))?;
+    if HeaderName::from_bytes(name.as_bytes()).is_err() {
+        return Err(invalid(label, "auth header must be a valid header name"));
+    }
+    if value_prefix.is_some_and(|prefix| HeaderValue::from_str(prefix).is_err()) {
+        return Err(invalid(
+            label,
+            "auth value_prefix must be a valid header value",
+        ));
+    }
+    Ok(Some(CredentialHeader {
+        name: Arc::from(name),
+        value_prefix: value_prefix
+            .map(Arc::from)
+            .filter(|prefix: &Arc<str>| !prefix.is_empty()),
+    }))
+}
+
+/// Compile the static query parameters one upstream requires on every request.
+fn compile_upstream_query(
+    declaration: &UpstreamConfig,
+    label: &SourceLabel,
+) -> Result<UpstreamQuery, ConfigError> {
+    let mut parameters = Vec::with_capacity(declaration.query.len());
+    for (name, value) in &declaration.query {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(invalid(
+                label,
+                "upstream query parameter names must not be empty",
+            ));
+        }
+        if name.contains(['&', '=', '#', '?']) || value.contains(['&', '#']) {
+            return Err(invalid(
+                label,
+                "upstream query parameters must not contain query delimiters",
+            ));
+        }
+        parameters.push((Arc::from(name), Arc::from(value.as_str())));
+    }
+    Ok(Arc::from(parameters))
 }
 
 fn compile_management(
@@ -5407,6 +5523,87 @@ routes:
         let compiled = compile_yaml("alias.yaml", text).expect("alias");
         assert_eq!(compiled.routes()[0].ingress().mode(), BodyMode::Semantic);
         assert_eq!(compiled.routes()[0].loss_policy(), LossPolicy::Degrade);
+    }
+
+    #[test]
+    fn a_credential_header_and_prefix_belong_only_to_the_header_auth_kind() {
+        let upstream = |auth: &str| {
+            format!(
+                "version: 1\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{url: http://127.0.0.1:2, auth: {auth}}}}}\n"
+            )
+        };
+
+        let compiled = compile_yaml(
+            "header-auth.yaml",
+            &upstream(
+                "{kind: header, header: api-key, secret: 'env:AZURE_KEY', value_prefix: 'Token '}",
+            ),
+        )
+        .expect("header auth compiles");
+        let auth = compiled.upstreams()["u"].auth().expect("auth plan");
+        assert_eq!(auth.kind(), "header");
+        assert_eq!(auth.header(), Some("api-key"));
+        assert_eq!(auth.value_prefix(), Some("Token "));
+
+        let missing_name = compile_yaml(
+            "header-auth-missing.yaml",
+            &upstream("{kind: header, secret: 'env:AZURE_KEY'}"),
+        )
+        .expect_err("kind: header without a name is unusable");
+        assert!(missing_name
+            .to_string()
+            .contains("auth kind: header requires a header name"));
+
+        let stray_header = compile_yaml(
+            "bearer-with-header.yaml",
+            &upstream("{kind: bearer, header: api-key, secret: 'env:AZURE_KEY'}"),
+        )
+        .expect_err("a bearer credential cannot go in a named header");
+        assert!(stray_header
+            .to_string()
+            .contains("auth header and value_prefix require kind: header"));
+
+        let invalid_name = compile_yaml(
+            "header-auth-invalid.yaml",
+            &upstream("{kind: header, header: 'api key', secret: 'env:AZURE_KEY'}"),
+        )
+        .expect_err("a header name with a space is not a header name");
+        assert!(invalid_name
+            .to_string()
+            .contains("auth header must be a valid header name"));
+    }
+
+    #[test]
+    fn upstream_query_parameters_compile_in_order_and_reject_delimiters() {
+        let upstream = |query: &str| {
+            format!(
+                "version: 1\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{url: http://127.0.0.1:2, query: {query}}}}}\n"
+            )
+        };
+
+        let compiled = compile_yaml(
+            "upstream-query.yaml",
+            &upstream("{api-version: '2024-10-21', mode: fast}"),
+        )
+        .expect("upstream query compiles");
+        let parameters = compiled.upstreams()["u"]
+            .query()
+            .iter()
+            .map(|(name, value)| (name.as_ref(), value.as_ref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parameters,
+            vec![("api-version", "2024-10-21"), ("mode", "fast")]
+        );
+
+        let smuggled = compile_yaml(
+            "upstream-query-smuggled.yaml",
+            &upstream("{'api-version=1&key': secret}"),
+        )
+        .expect_err("a delimiter in a parameter name smuggles a second parameter");
+        assert!(smuggled
+            .to_string()
+            .contains("upstream query parameters must not contain query delimiters"));
     }
 
     #[test]

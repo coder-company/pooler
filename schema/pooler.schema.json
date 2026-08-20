@@ -95,6 +95,9 @@
     "auth": {
       "additionalProperties": false,
       "properties": {
+        "header": {
+          "type": "string"
+        },
         "kind": {
           "enum": [
             "bearer",
@@ -102,12 +105,16 @@
             "x-api-key",
             "x_api_key",
             "x-goog-api-key",
-            "x_goog_api_key"
+            "x_goog_api_key",
+            "header"
           ],
           "type": "string"
         },
         "secret": {
           "$ref": "#/$defs/secret_ref"
+        },
+        "value_prefix": {
+          "type": "string"
         }
       },
       "type": "object"
@@ -1332,6 +1339,12 @@
         },
         "oauth": {
           "$ref": "#/$defs/oauth"
+        },
+        "query": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
         },
         "remove": true,
         "transport": {

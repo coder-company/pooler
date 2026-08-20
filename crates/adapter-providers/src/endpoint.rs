@@ -92,10 +92,28 @@ pub enum AuthPlacement {
 impl AuthPlacement {
     /// Resolve one strict configured provider authentication kind.
     pub fn from_configured_kind(kind: &str) -> Result<Self, AdapterError> {
+        Self::from_configured_parts(kind, None, None)
+    }
+
+    /// Resolve a configured authentication kind together with the header name
+    /// and prefix that `kind: header` supplies.
+    ///
+    /// The named kinds stay as shorthands for the headers providers converged
+    /// on. A provider that names its own credential header is configuration
+    /// rather than a new shorthand.
+    pub fn from_configured_parts(
+        kind: &str,
+        header: Option<&str>,
+        value_prefix: Option<&str>,
+    ) -> Result<Self, AdapterError> {
         match kind.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "bearer" | "bearer_secret" => Ok(Self::Bearer),
             "x_api_key" => Self::custom("x-api-key", ""),
             "x_goog_api_key" => Self::custom("x-goog-api-key", ""),
+            "header" => Self::custom(
+                header.ok_or(AdapterError::InvalidAuthorization)?,
+                value_prefix.unwrap_or_default(),
+            ),
             _ => Err(AdapterError::InvalidAuthorization),
         }
     }

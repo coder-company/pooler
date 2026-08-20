@@ -37,6 +37,7 @@ tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
+url.workspace = true
 zeroize.workspace = true
 
 [lints]
