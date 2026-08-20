@@ -25,6 +25,9 @@ except ImportError as error:  # pragma: no cover - depends on the runner image
 CHECKOUT_REF = "${{ inputs.checkout-ref || github.ref }}"
 RELEASE_SHA = "${{ needs.resolve.outputs.sha }}"
 RELEASE_TAG_REF = "${{ inputs.tag || github.ref }}"
+CUSTOM_LINUX_LABELS = ["self-hosted", "Linux", "X64", "palantir-actions"]
+CUSTOM_MACOS_X64_LABELS = ["self-hosted", "macOS", "X64", "palantir-actions"]
+CUSTOM_MACOS_ARM64_LABELS = ["self-hosted", "macOS", "ARM64", "palantir-actions"]
 REQUIRED_RELEASE_JOBS = {
     "resolve",
     "ci",
@@ -111,6 +114,18 @@ def workflow_call_input(workflow: dict[str, Any], path: Path) -> None:
     checkout = mapping(inputs.get("checkout-ref"), f"{path} checkout-ref input")
     if checkout.get("type") != "string" or checkout.get("required") != "false":
         fail(f"{path} checkout-ref must be an optional string input")
+    if path.name == "ci.yml":
+        include_macos = mapping(
+            inputs.get("include-macos"), f"{path} include-macos input"
+        )
+        if (
+            include_macos.get("type") != "boolean"
+            or include_macos.get("required") != "false"
+            or include_macos.get("default") != "false"
+        ):
+            fail(f"{path} include-macos must be an optional boolean input defaulting to false")
+    elif "include-macos" in inputs:
+        fail(f"{path} must not define the CI-only include-macos input")
 
 
 def checkout_steps(workflow: dict[str, Any], path: Path) -> None:
@@ -143,6 +158,91 @@ def validate_reusable_workflow(path: Path) -> dict[str, Any]:
     workflow_call_input(workflow, path)
     checkout_steps(workflow, path)
     return workflow
+
+
+def require_runner(
+    job: dict[str, Any], expected: Any, context: str, key: str = "runs-on"
+) -> None:
+    if job.get(key) != expected:
+        fail(f"{context}.{key} must be {expected!r}")
+
+
+def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
+    """Keep Linux work on the labeled custom organization runners.
+
+    The organization currently exposes Linux self-hosted runners only.  The
+    macOS rows remain explicit self-hosted platform requirements so this check
+    cannot accidentally turn an unavailable macOS lane into a Linux success.
+    """
+
+    ci = workflows["ci.yml"]
+    ci_jobs = mapping(ci["jobs"], "ci.yml.jobs")
+    quality = mapping(ci_jobs["quality"], "ci.yml.jobs.quality")
+    if "strategy" in quality:
+        fail("ci.yml.jobs.quality must be the single Linux quality job")
+    require_runner(quality, CUSTOM_LINUX_LABELS, "ci.yml.jobs.quality")
+    quality_macos = mapping(ci_jobs.get("quality-macos"), "ci.yml.jobs.quality-macos")
+    if quality_macos.get("if") != "${{ inputs.include-macos }}":
+        fail("ci.yml.jobs.quality-macos must be gated by inputs.include-macos")
+    require_runner(
+        quality_macos,
+        CUSTOM_MACOS_X64_LABELS,
+        "ci.yml.jobs.quality-macos",
+    )
+    for job_id in ("fixtures-and-properties", "supply-chain"):
+        require_runner(ci_jobs[job_id], CUSTOM_LINUX_LABELS, f"ci.yml.jobs.{job_id}")
+
+    hardening = workflows["hardening.yml"]
+    hardening_jobs = mapping(hardening["jobs"], "hardening.yml.jobs")
+    for job_id, raw_job in hardening_jobs.items():
+        require_runner(
+            mapping(raw_job, f"hardening.yml.jobs.{job_id}"),
+            CUSTOM_LINUX_LABELS,
+            f"hardening.yml.jobs.{job_id}",
+        )
+
+    secret_scan = workflows["secret-scan.yml"]
+    secret_jobs = mapping(secret_scan["jobs"], "secret-scan.yml.jobs")
+    require_runner(secret_jobs["gitleaks"], CUSTOM_LINUX_LABELS, "secret-scan.yml.jobs.gitleaks")
+
+    release = workflows["release.yml"]
+    release_jobs = mapping(release["jobs"], "release.yml.jobs")
+    for job_id in ("resolve", "gates", "assemble", "publish"):
+        require_runner(release_jobs[job_id], CUSTOM_LINUX_LABELS, f"release.yml.jobs.{job_id}")
+
+    build = mapping(release_jobs["build"], "release.yml.jobs.build")
+    if build.get("runs-on") != "${{ matrix.runner }}":
+        fail("release.yml.jobs.build.runs-on must use matrix.runner")
+    build_strategy = mapping(build.get("strategy"), "release.yml.jobs.build.strategy")
+    build_matrix = mapping(build_strategy.get("matrix"), "release.yml.jobs.build.strategy.matrix")
+    build_include = sequence(
+        build_matrix.get("include"), "release.yml.jobs.build.strategy.matrix.include"
+    )
+    expected_build_runners = {
+        "x86_64-unknown-linux-gnu": CUSTOM_LINUX_LABELS,
+        "aarch64-unknown-linux-gnu": CUSTOM_LINUX_LABELS,
+        "x86_64-apple-darwin": CUSTOM_MACOS_X64_LABELS,
+        "aarch64-apple-darwin": CUSTOM_MACOS_ARM64_LABELS,
+    }
+    seen_targets: set[str] = set()
+    for index, raw_row in enumerate(build_include):
+        row = mapping(raw_row, f"release.yml.jobs.build.strategy.matrix.include[{index}]")
+        target = required_string(
+            row, "target", f"release.yml.jobs.build.strategy.matrix.include[{index}]"
+        )
+        if target in seen_targets:
+            fail(f"release.yml build matrix duplicates target {target!r}")
+        seen_targets.add(target)
+        if target not in expected_build_runners:
+            fail(f"release.yml build matrix has unexpected target {target!r}")
+        require_runner(
+            row,
+            expected_build_runners[target],
+            f"release.yml build matrix row {target}",
+            key="runner",
+        )
+    if seen_targets != set(expected_build_runners):
+        fail("release.yml build matrix must retain all Linux and macOS release targets")
 
 
 def run_contents(job: dict[str, Any], context: str) -> str:
@@ -228,6 +328,10 @@ def validate_release(path: Path, workflows: dict[str, dict[str, Any]]) -> None:
         with_values = mapping(job.get("with"), f"{path}.jobs.{job_id}.with")
         if with_values.get("checkout-ref") != RELEASE_SHA:
             fail(f"{path}.jobs.{job_id} must pass the resolved SHA")
+        if job_id == "ci" and with_values.get("include-macos") != "true":
+            fail(f"{path}.jobs.ci must opt into the gated macOS quality job")
+        if job_id != "ci" and "include-macos" in with_values:
+            fail(f"{path}.jobs.{job_id} must not pass include-macos")
 
     if needs_set(mapping(jobs["gates"], f"{path}.jobs.gates"), "gates") != {"resolve"}:
         fail(f"{path}.jobs.gates must depend directly on resolve")
@@ -271,14 +375,27 @@ def validate_release(path: Path, workflows: dict[str, dict[str, Any]]) -> None:
         hardening_jobs["sanitizer"], "hardening.yml.jobs.sanitizer"
     ):
         fail("hardening.yml sanitizer job must run scripts/deep-test.sh")
-    gitleaks_step = find_step(
+    install_gitleaks = find_step(
         secret_jobs["gitleaks"],
-        lambda step: isinstance(step.get("uses"), str)
-        and step["uses"].startswith("gitleaks/gitleaks-action@"),
+        lambda step: isinstance(step.get("run"), str)
+        and "gitleaks_8.24.2_linux_x64.tar.gz" in step["run"]
+        and "fa0500f6b7e41d28791ebc680f5dd9899cd42b58629218a5f041efa899151a8e" in step["run"]
+        and "sha256sum --check --strict" in step["run"]
+        and '>> "$GITHUB_PATH"' in step["run"],
         "secret-scan.yml.jobs.gitleaks",
     )
-    if not isinstance(gitleaks_step.get("env"), dict) or "GITLEAKS_CONFIG" not in gitleaks_step["env"]:
-        fail("secret-scan.yml gitleaks job must use the repository configuration")
+    if not install_gitleaks:
+        fail("secret-scan.yml must install a checksum-verified pinned Gitleaks CLI")
+    gitleaks_step = find_step(
+        secret_jobs["gitleaks"],
+        lambda step: isinstance(step.get("run"), str)
+        and "gitleaks git" in step["run"]
+        and ".gitleaks.toml" in step["run"]
+        and "--redact" in step["run"],
+        "secret-scan.yml.jobs.gitleaks",
+    )
+    if not gitleaks_step:
+        fail("secret-scan.yml must scan Git history with the repository config")
 
 
 def parse_args() -> argparse.Namespace:
@@ -308,6 +425,9 @@ def main() -> int:
         for name, path in paths.items()
         if name != "release.yml"
     }
+    release = load_workflow(paths["release.yml"])
+    workflows = {**reusable, "release.yml": release}
+    validate_runner_policy(workflows)
     validate_release(paths["release.yml"], reusable)
     print("release workflow dependency checks passed")
     return 0

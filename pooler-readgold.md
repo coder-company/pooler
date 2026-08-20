@@ -65,9 +65,9 @@ name or advertised without conformance evidence.
   Locked audit/deny gates, deterministic schema and compatibility reports, real
   mixed-protocol stress/benchmarks, no-import WASM extensions, deep-test/fuzz
   workflows, reproducible archives, SBOMs, checksums, signing, and provenance jobs
-  are wired. A final three-run benchmark and 15-minute stress rerun with the
-  hardened release verifier, native cross-platform CI, and signed release artifacts
-  remain publication gates.
+  are wired. The hardened three-run benchmark and 15-minute stress rerun for
+  implementation commit `60447e8` passed every enforced invariant. Native
+  cross-platform CI and signed release artifacts remain publication gates.
 - First useful release acceptance: pending; the authoritative checklist is
   [`docs/release-acceptance.md`](docs/release-acceptance.md).
 

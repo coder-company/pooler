@@ -25,7 +25,7 @@ env:
 jobs:
   resolve:
     name: Resolve and pin release source
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, palantir-actions]
     permissions:
       contents: read
     outputs:
@@ -76,6 +76,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       checkout-ref: ${{ needs.resolve.outputs.sha }}
+      include-macos: true
 
   hardening:
     name: Hardening acceptance for release source
@@ -93,13 +94,11 @@ jobs:
       pull-requests: read # Gitleaks reads pull-request metadata when scanning PRs.
     with:
       checkout-ref: ${{ needs.resolve.outputs.sha }}
-    secrets:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   gates:
     name: Release acceptance gates
     needs: resolve
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, palantir-actions]
     permissions:
       contents: read
     timeout-minutes: 35
@@ -181,16 +180,16 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: [self-hosted, Linux, X64, palantir-actions]
             run_smoke: true
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: [self-hosted, Linux, X64, palantir-actions]
             run_smoke: false
           - target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: [self-hosted, macOS, X64, palantir-actions]
             run_smoke: true
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: [self-hosted, macOS, ARM64, palantir-actions]
             run_smoke: true
 
     runs-on: ${{ matrix.runner }}
@@ -351,7 +350,7 @@ jobs:
   assemble:
     name: Assemble and smoke-test release
     needs: [resolve, build, gates, ci, hardening, secret_scan]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, palantir-actions]
     permissions:
       contents: read
     env:
@@ -461,7 +460,7 @@ jobs:
   publish:
     name: Sign, attest, and publish release
     needs: [resolve, assemble, gates, ci, hardening, secret_scan]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, palantir-actions]
     permissions:
       contents: write # Publish the signed release assets.
       id-token: write # Obtain an OIDC identity for Sigstore signing.

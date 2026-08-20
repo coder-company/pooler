@@ -58,10 +58,23 @@ it before publication:
 (cd dist && sha256sum -c SHA256SUMS)
 ```
 
-The tag workflow in `.github/workflows/release.yml` runs the same deterministic
-archive and SBOM helpers on GitHub-hosted runners, uploads the archives,
-generates the aggregate checksums, signs the checksum manifest with Cosign
-keyless signing, and attaches GitHub build provenance attestations.
+The tag workflow in `.github/workflows/release.yml` runs its Linux jobs on the
+organization's custom self-hosted runners. Each Linux job requires all four
+labels `[self-hosted, Linux, X64, palantir-actions]`; there is no fallback to a
+paid GitHub-hosted Linux runner. The macOS quality lane and the two macOS
+release targets remain explicit platform requirements, using
+`[self-hosted, macOS, X64, palantir-actions]` for x86_64 and
+`[self-hosted, macOS, ARM64, palantir-actions]` for arm64. The configured custom
+capacity is currently Linux-only, so matching macOS lanes remain
+queued/unavailable and their platform evidence must not be reported as passing.
+Ordinary push and pull-request events do not supply `include-macos`, so the
+gated job is skipped; reusable callers default the boolean to `false`. The
+release workflow passes `include-macos: true`; release acceptance is therefore
+still blocked until the required macOS runners are online.
+
+The workflow uploads the archives, generates aggregate checksums, signs the
+checksum manifest with Cosign keyless signing, and attaches GitHub build
+provenance attestations after all required platform lanes complete.
 
 Publication is blocked until the release acceptance job passes formatting,
 Clippy, the workspace tests, `cargo audit`, `cargo deny`, the generated schema
