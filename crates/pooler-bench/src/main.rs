@@ -14,10 +14,11 @@
 //! invariants being measured.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io,
     net::SocketAddr,
     path::PathBuf,
+    process::Command,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -28,19 +29,17 @@ use std::{
 use adapter_factory::{FactoryEventEncoder, FactoryLanguageModelDecoder};
 use anyhow::{anyhow, bail, Context, Result};
 use pooler_config::Config;
-use pooler_http::SseParser;
+use pooler_http::{RuntimeResourceSnapshot, SseParser};
 use pooler_protocol::{
     FinishReason, LossPolicy, OpenAiChatCodec, OpenAiChatEventDecoder, OpenAiChatEventEncoder,
     StreamEvent, StreamEventKind, Usage,
 };
 use pooler_server::HttpProxyServer;
-use pooler_testkit::{LeakCounters, LeakSnapshot};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -219,8 +218,33 @@ impl Settings {
         if self.failure_percent > 100 {
             bail!("--failure-percent must be between 0 and 100")
         }
-        if self.enforce_budgets && self.runs < 3 {
-            bail!("--runs must be at least 3 when --enforce-budgets is enabled")
+        if self.enforce_budgets && !self.release_parameters_satisfied() {
+            bail!("--enforce-budgets requires the full release workload: mode=all, no --short, at least 1000 opaque samples, at least 100 semantic samples, at least 900 seconds, at least 10000 requests, at least 100 clients, exactly 20% failures, and at least 3 runs")
+        }
+        Ok(())
+    }
+
+    fn release_parameters_satisfied(&self) -> bool {
+        self.mode == Mode::All
+            && !self.short
+            && self.opaque_samples >= 1_000
+            && self.semantic_samples >= 100
+            && self.duration_secs >= FULL_STRESS_DURATION_SECS
+            && self.requests >= FULL_STRESS_REQUESTS
+            && self.clients >= FULL_STRESS_CLIENTS
+            && self.failure_percent == FULL_FAILURE_PERCENT
+            && self.runs >= 3
+    }
+
+    fn validate_provenance(&self, provenance: &ProvenanceReport) -> Result<()> {
+        if !self.enforce_budgets {
+            return Ok(());
+        }
+        if !provenance.worktree_clean {
+            bail!("--enforce-budgets requires a clean worktree")
+        }
+        if provenance.build_profile != "release" {
+            bail!("--enforce-budgets requires a release build")
         }
         Ok(())
     }
@@ -260,12 +284,37 @@ fn print_help() {
 #[derive(Debug, Serialize)]
 struct Report {
     schema_version: u32,
+    provenance: ProvenanceReport,
+    enforcement: EnforcementReport,
     mode: String,
     short: bool,
     seed: u64,
     runs: Vec<RunReport>,
     stress: Option<StressReport>,
     all_invariants_passed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ProvenanceReport {
+    commit_sha: String,
+    worktree_clean: bool,
+    rustc_verbose_version: String,
+    host_target: String,
+    benchmark_target: String,
+    host: String,
+    build_profile: &'static str,
+    command: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EnforcementReport {
+    mode: &'static str,
+    requested: bool,
+    release_parameters_satisfied: bool,
+    clean_worktree_required: bool,
+    worktree_clean: bool,
+    release_profile_required: bool,
+    release_profile: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -299,6 +348,8 @@ struct StressReport {
     clients: usize,
     failure_percent: u8,
     seed: u64,
+    failure_schedule: &'static str,
+    failure_scope: &'static str,
     elapsed_ms: u128,
     duration_satisfied: bool,
     processed: usize,
@@ -308,11 +359,13 @@ struct StressReport {
     panics: usize,
     timed_out: bool,
     max_in_flight: usize,
-    expected_injected_failures: usize,
-    marker_requests: usize,
+    expected_injected_upstream_failures: usize,
+    scheduled_failure_requests: usize,
     issued_requests: usize,
     upstream_requests: usize,
+    observed_logical_requests: usize,
     upstream_failures: usize,
+    retries_after_injected_failure: usize,
     failovers: usize,
     cancellations_observed: usize,
     opaque_errors: usize,
@@ -325,11 +378,17 @@ struct StressReport {
 
 #[derive(Debug, Serialize)]
 struct ResourceReport {
+    source: &'static str,
     tasks: u64,
     permits: u64,
     refresh_leases: u64,
     temporary_files: u64,
     secret_material: u64,
+    peak_tasks: u64,
+    peak_permits: u64,
+    peak_refresh_leases: u64,
+    peak_temporary_files: u64,
+    peak_secret_material: u64,
     zero_after_drain: bool,
 }
 
@@ -347,7 +406,11 @@ struct StressInvariants {
     no_panics: bool,
     no_deadlock: bool,
     no_incomplete_successful_streams: bool,
-    deterministic_failure_count: bool,
+    deterministic_upstream_failures: bool,
+    exact_configured_failure_rate: bool,
+    processed_matches_issued: bool,
+    all_issued_requests_observed: bool,
+    upstream_attempt_accounting: bool,
     minimum_request_count: bool,
     duration_satisfied: bool,
     failover_observed: bool,
@@ -377,6 +440,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run(settings: Settings) -> Result<Report> {
+    let provenance = ProvenanceReport::capture()?;
+    settings.validate_provenance(&provenance)?;
     let mut runs = Vec::with_capacity(settings.runs);
     for run in 0..settings.runs {
         let opaque = if settings.mode.includes_opaque() {
@@ -412,16 +477,36 @@ async fn run(settings: Settings) -> Result<Report> {
         report.invariants.no_panics
             && report.invariants.no_deadlock
             && report.invariants.no_incomplete_successful_streams
-            && report.invariants.deterministic_failure_count
+            && report.invariants.deterministic_upstream_failures
+            && report.invariants.exact_configured_failure_rate
+            && report.invariants.processed_matches_issued
+            && report.invariants.all_issued_requests_observed
+            && report.invariants.upstream_attempt_accounting
             && report.invariants.minimum_request_count
             && report.invariants.duration_satisfied
             && report.invariants.failover_observed
             && report.invariants.cancellation_observed
             && report.invariants.tracked_resources_zero
             && report.invariants.rss_within_budget
-    });
+    }) && (!settings.enforce_budgets
+        || (provenance.worktree_clean && provenance.build_profile == "release"));
+    let enforcement = EnforcementReport {
+        mode: if settings.enforce_budgets {
+            "release"
+        } else {
+            "advisory"
+        },
+        requested: settings.enforce_budgets,
+        release_parameters_satisfied: settings.release_parameters_satisfied(),
+        clean_worktree_required: settings.enforce_budgets,
+        worktree_clean: provenance.worktree_clean,
+        release_profile_required: settings.enforce_budgets,
+        release_profile: provenance.build_profile == "release",
+    };
     Ok(Report {
-        schema_version: 1,
+        schema_version: 2,
+        provenance,
+        enforcement,
         mode: mode_name(settings.mode).to_owned(),
         short: settings.short,
         seed: settings.seed,
@@ -437,6 +522,61 @@ fn mode_name(mode: Mode) -> &'static str {
         Mode::Opaque => "opaque",
         Mode::Semantic => "semantic",
         Mode::Stress => "stress",
+    }
+}
+
+impl ProvenanceReport {
+    fn capture() -> Result<Self> {
+        let commit_sha = command_stdout("git", &["rev-parse", "HEAD"])?;
+        let status = command_stdout(
+            "git",
+            &["status", "--porcelain=v1", "--untracked-files=normal"],
+        )?;
+        let rustc_verbose_version = command_stdout("rustc", &["-vV"])?;
+        let host_target = rustc_verbose_version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .ok_or_else(|| anyhow!("rustc -vV did not report a host target"))?
+            .to_owned();
+        Ok(Self {
+            commit_sha,
+            worktree_clean: status.is_empty(),
+            rustc_verbose_version,
+            benchmark_target: host_target.clone(),
+            host_target,
+            host: host_description(),
+            build_profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            command: std::env::args().collect(),
+        })
+    }
+}
+
+fn command_stdout(program: &str, arguments: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(arguments)
+        .output()
+        .with_context(|| format!("run `{program}` for benchmark provenance"))?;
+    if !output.status.success() {
+        bail!("`{program}` failed while collecting benchmark provenance")
+    }
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("`{program}` provenance output was not UTF-8"))
+        .map(|value| value.trim().to_owned())
+}
+
+fn host_description() -> String {
+    let base = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    #[cfg(unix)]
+    {
+        command_stdout("uname", &["-srm"]).unwrap_or(base)
+    }
+    #[cfg(not(unix))]
+    {
+        base
     }
 }
 
@@ -509,16 +649,14 @@ async fn run_opaque(samples: usize) -> Result<LatencyReport> {
     tokio::task::yield_now().await;
 
     let request_body = vec![b'i'; OPAQUE_REQUEST_BYTES];
-    let mut durations = Vec::with_capacity(samples);
-    let mut direct_durations = Vec::with_capacity(samples);
+    let mut matched_samples = Vec::with_capacity(samples);
     for _ in 0..samples {
         let direct =
             measure_opaque_request(upstream.address, &request_body, response_body.as_slice()).await;
         let pooled = measure_opaque_request(address, &request_body, response_body.as_slice()).await;
         match (direct, pooled) {
             (Ok(direct), Ok(pooled)) => {
-                direct_durations.push(direct);
-                durations.push(pooled);
+                matched_samples.push(OpaqueLatencySample { direct, pooled });
             }
             (Err(error), _) | (Ok(_), Err(error)) => {
                 stop_echo_and_server(&server, runner, upstream).await?;
@@ -530,8 +668,7 @@ async fn run_opaque(samples: usize) -> Result<LatencyReport> {
     runner.await.context("opaque server task panicked")??;
     upstream.stop().await?;
     Ok(latency_report_with_baseline(
-        durations,
-        direct_durations,
+        matched_samples,
         request_body.len(),
         OPAQUE_BUDGET,
     ))
@@ -665,30 +802,42 @@ fn latency_report(
     }
 }
 
+#[derive(Clone, Copy)]
+struct OpaqueLatencySample {
+    direct: Duration,
+    pooled: Duration,
+}
+
 fn latency_report_with_baseline(
-    durations: Vec<Duration>,
-    direct_durations: Vec<Duration>,
+    matched_samples: Vec<OpaqueLatencySample>,
     payload_bytes: usize,
     budget: Duration,
 ) -> LatencyReport {
-    let mut pooled = durations;
+    let mut pooled = matched_samples
+        .iter()
+        .map(|sample| sample.pooled)
+        .collect::<Vec<_>>();
     pooled.sort_unstable();
     let mut report = latency_report(pooled.clone(), payload_bytes, budget);
-    let mut direct = direct_durations;
+    let mut direct = matched_samples
+        .iter()
+        .map(|sample| sample.direct)
+        .collect::<Vec<_>>();
     direct.sort_unstable();
     let direct_p50 = percentile(&direct, 0.50);
     let direct_p95 = percentile(&direct, 0.95);
     let direct_max = direct.last().copied().unwrap_or_default();
-    // Compare like-for-like percentile measurements. Pairing independent TCP
-    // samples makes scheduler noise dominate the hop cost; retaining both raw
-    // distributions keeps the baseline auditable while this subtraction
-    // estimates the Pooler-only p95 required by the architecture budget.
-    let pooled_p50 = percentile(&pooled, 0.50);
-    let pooled_p95 = percentile(&pooled, 0.95);
-    let pooled_max = pooled.last().copied().unwrap_or_default();
-    let overhead_p50 = pooled_p50.saturating_sub(direct_p50);
-    let overhead_p95 = pooled_p95.saturating_sub(direct_p95);
-    let overhead_max = pooled_max.saturating_sub(direct_max);
+    // Keep request pairing intact until the overhead distribution is built.
+    // Subtracting independent marginal percentiles can hide a slow Pooler
+    // request behind a different slow direct request.
+    let mut overheads = matched_samples
+        .iter()
+        .map(|sample| sample.pooled.saturating_sub(sample.direct))
+        .collect::<Vec<_>>();
+    overheads.sort_unstable();
+    let overhead_p50 = percentile(&overheads, 0.50);
+    let overhead_p95 = percentile(&overheads, 0.95);
+    let overhead_max = overheads.last().copied().unwrap_or_default();
     report.direct_p50_us = Some(micros(direct_p50));
     report.direct_p95_us = Some(micros(direct_p95));
     report.direct_max_us = Some(micros(direct_max));
@@ -724,8 +873,6 @@ async fn run_stress(settings: &Settings) -> Result<StressReport> {
     runtime.upstream.reset_workload_stats();
     let started = Instant::now();
     let deadline = started + Duration::from_secs(settings.duration_secs);
-    let counters = LeakCounters::new();
-    let semaphore = Arc::new(Semaphore::new(settings.clients));
     let successful_streams = Arc::new(AtomicUsize::new(0));
     let injected_requests = Arc::new(AtomicUsize::new(0));
     let unexpected_failures = Arc::new(AtomicUsize::new(0));
@@ -737,12 +884,11 @@ async fn run_stress(settings: &Settings) -> Result<StressReport> {
     let max_in_flight = Arc::new(AtomicUsize::new(0));
     let next_request = Arc::new(AtomicUsize::new(0));
     let issued_requests = Arc::new(AtomicUsize::new(0));
+    let stop_after = Arc::new(AtomicUsize::new(usize::MAX));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
 
     for _ in 0..settings.clients {
-        let counters = counters.clone();
-        let semaphore = semaphore.clone();
         let successful_streams = successful_streams.clone();
         let injected_requests = injected_requests.clone();
         let unexpected_failures = unexpected_failures.clone();
@@ -753,28 +899,24 @@ async fn run_stress(settings: &Settings) -> Result<StressReport> {
         let max_in_flight = max_in_flight.clone();
         let next_request = next_request.clone();
         let issued_requests = issued_requests.clone();
+        let stop_after = stop_after.clone();
         let cancellation = cancellation.clone();
         let runtime = runtime.clone();
         let body = warmup_body.clone();
         let minimum_requests = settings.requests;
         tasks.spawn(async move {
-            let _task = counters.task();
             loop {
                 if cancellation.is_cancelled() {
                     break;
                 }
                 let request = next_request.fetch_add(1, Ordering::AcqRel);
-                if request >= minimum_requests && Instant::now() >= deadline {
+                if Instant::now() >= deadline {
+                    let cohort_end = next_cohort_boundary(request.max(minimum_requests));
+                    stop_after.fetch_min(cohort_end, Ordering::AcqRel);
+                }
+                if request >= stop_after.load(Ordering::Acquire) {
                     break;
                 }
-                let permit = semaphore.acquire().await;
-                let Ok(_permit) = permit else {
-                    break;
-                };
-                let _tracked_permit = counters.permit();
-                let _credential_lease = counters.refresh_lease();
-                let _temporary_body = counters.temporary_file();
-                let _secret = counters.secret_material();
                 issued_requests.fetch_add(1, Ordering::AcqRel);
                 let current = active.fetch_add(1, Ordering::AcqRel).saturating_add(1);
                 update_max(&max_in_flight, current);
@@ -839,20 +981,21 @@ async fn run_stress(settings: &Settings) -> Result<StressReport> {
     // Force one client disconnect while a real semantic upstream stream is
     // pending. The runtime must cancel its upstream task before drain.
     let cancellation_observed = runtime.send_cancellation().await.unwrap_or(false);
-    let _ = runtime.server.drain(Duration::from_secs(5)).await;
+    runtime.server.drain(Duration::from_secs(5)).await?;
     let runner = runtime
         .runner
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     if let Some(runner) = runner {
-        let _ = runner.await;
+        runner
+            .await
+            .context("Pooler stress server task panicked")??;
     }
     runtime.upstream.stop().await?;
     tokio::task::yield_now().await;
     let post_drain = quiescent_rss().await;
-    let snapshot = counters.snapshot();
-    let resources = ResourceReport::from(snapshot);
+    let resources = ResourceReport::from(runtime.server.resource_snapshot());
     let rss = RssReport::from_values(baseline, post_drain);
     let upstream = runtime.upstream.stats();
     let processed = successful_streams.load(Ordering::Acquire)
@@ -861,13 +1004,27 @@ async fn run_stress(settings: &Settings) -> Result<StressReport> {
     let duration_satisfied = started.elapsed() >= Duration::from_secs(settings.duration_secs);
     let observed_failures = upstream.failures.load(Ordering::Acquire);
     let failovers = upstream.fallback_after_failure.load(Ordering::Acquire);
+    let retries_after_failure = upstream.retries_after_failure.load(Ordering::Acquire);
+    let upstream_requests = upstream.requests.load(Ordering::Acquire);
     let issued = issued_requests.load(Ordering::Acquire);
-    let expected_markers = expected_markers(issued, settings.seed, settings.failure_percent);
-    let marker_requests = upstream
-        .marked_ids
+    let issued_ids = (0..issued).collect::<BTreeSet<_>>();
+    let expected_failure_ids =
+        expected_failure_ids(issued, settings.seed, settings.failure_percent);
+    let injected_failure_ids = upstream
+        .injected_failure_ids
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .len();
+        .clone();
+    let exact_upstream_failures = deterministic_upstream_failures_match(
+        &expected_failure_ids,
+        &injected_failure_ids,
+        observed_failures,
+    );
+    let seen_request_ids = upstream
+        .seen_request_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let first_error = first_error
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -876,7 +1033,13 @@ async fn run_stress(settings: &Settings) -> Result<StressReport> {
         no_panics: panics.load(Ordering::Acquire) == 0,
         no_deadlock: !timed_out,
         no_incomplete_successful_streams: unexpected_failures.load(Ordering::Acquire) == 0,
-        deterministic_failure_count: marker_requests == expected_markers,
+        deterministic_upstream_failures: exact_upstream_failures,
+        exact_configured_failure_rate: (observed_failures as u128) * 100
+            == (issued as u128) * u128::from(settings.failure_percent),
+        processed_matches_issued: processed == issued,
+        all_issued_requests_observed: seen_request_ids == issued_ids,
+        upstream_attempt_accounting: upstream_requests
+            == issued.saturating_add(retries_after_failure),
         minimum_request_count: processed >= settings.requests,
         duration_satisfied,
         failover_observed: failovers > 0,
@@ -890,6 +1053,8 @@ async fn run_stress(settings: &Settings) -> Result<StressReport> {
         clients: settings.clients,
         failure_percent: settings.failure_percent,
         seed: settings.seed,
+        failure_schedule: "(seed + logical_request_index) mod 100 < failure_percent",
+        failure_scope: "first actual upstream attempt for each issued logical request",
         elapsed_ms: started.elapsed().as_millis(),
         duration_satisfied,
         processed,
@@ -899,11 +1064,13 @@ async fn run_stress(settings: &Settings) -> Result<StressReport> {
         panics: panics.load(Ordering::Acquire),
         timed_out,
         max_in_flight: max_in_flight.load(Ordering::Acquire),
-        expected_injected_failures: expected_markers,
-        marker_requests,
+        expected_injected_upstream_failures: expected_failure_ids.len(),
+        scheduled_failure_requests: expected_failure_ids.len(),
         issued_requests: issued,
-        upstream_requests: upstream.requests.load(Ordering::Acquire),
+        upstream_requests,
+        observed_logical_requests: seen_request_ids.len(),
         upstream_failures: observed_failures,
+        retries_after_injected_failure: retries_after_failure,
         failovers,
         cancellations_observed: upstream.cancellations.load(Ordering::Acquire),
         opaque_errors: opaque_errors.load(Ordering::Acquire),
@@ -947,11 +1114,12 @@ enum RequestOutcome {
 struct StressStats {
     requests: AtomicUsize,
     failures: AtomicUsize,
-    marked_primary: AtomicUsize,
     fallback_after_failure: AtomicUsize,
+    retries_after_failure: AtomicUsize,
     cancellations: AtomicUsize,
-    failed_ids: Mutex<BTreeSet<usize>>,
-    marked_ids: Mutex<BTreeSet<usize>>,
+    injected_failure_ids: Mutex<BTreeSet<usize>>,
+    failed_authorizations: Mutex<BTreeMap<usize, String>>,
+    seen_request_ids: Mutex<BTreeSet<usize>>,
 }
 
 #[derive(Clone)]
@@ -1023,18 +1191,23 @@ impl StressUpstream {
     fn reset_workload_stats(&self) {
         self.stats.requests.store(0, Ordering::Release);
         self.stats.failures.store(0, Ordering::Release);
-        self.stats.marked_primary.store(0, Ordering::Release);
         self.stats
             .fallback_after_failure
             .store(0, Ordering::Release);
+        self.stats.retries_after_failure.store(0, Ordering::Release);
         self.stats.cancellations.store(0, Ordering::Release);
         self.stats
-            .failed_ids
+            .injected_failure_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.stats
-            .marked_ids
+            .failed_authorizations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.stats
+            .seen_request_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -1124,7 +1297,7 @@ impl StressRuntime {
                 &[("x-bench-id", id.as_str())],
             )
             .await?;
-            if response.status == 500 {
+            if response.status == 429 {
                 return Ok(RequestOutcome::InjectedFailure);
             }
             if response.status != 200
@@ -1197,13 +1370,11 @@ async fn serve_stress_connection(
             Ok(Ok(request)) => request,
             _ => return,
         };
-    stats.requests.fetch_add(1, Ordering::Relaxed);
     let path = request_path(&request).unwrap_or_default();
     let request_id = request_header(&request, "x-bench-id")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_default();
     let authorization = request_header(&request, "authorization").unwrap_or_default();
-    let primary = authorization == "Bearer pooler-bench-primary";
     if request_header(&request, "x-bench-cancel").is_some() {
         if write_cancellation_response(&mut stream, &semantic_body)
             .await
@@ -1213,43 +1384,52 @@ async fn serve_stress_connection(
         }
         return;
     }
+    if path != "/bench/semantic" && path != "/bench/opaque" {
+        let _ = write_http_response(&mut stream, 404, "text/plain", b"not found").await;
+        return;
+    }
+    stats.requests.fetch_add(1, Ordering::Relaxed);
+    stats
+        .seen_request_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(request_id);
     let marker = deterministic_failure(seed, request_id, failure_percent);
-    if marker {
-        stats
-            .marked_ids
+    let first_injected_attempt = marker
+        && stats
+            .injected_failure_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(request_id);
-    }
-    if (path == "/bench/semantic" || path == "/bench/opaque") && primary && marker {
-        stats.marked_primary.fetch_add(1, Ordering::Relaxed);
+    if first_injected_attempt {
+        stats
+            .failed_authorizations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request_id, authorization);
         stats.failures.fetch_add(1, Ordering::Relaxed);
         let body = br#"{"error":"deterministic benchmark failure"}"#;
         let _ = write_http_response_with_headers(
             &mut stream,
-            if path == "/bench/semantic" { 429 } else { 500 },
+            429,
             "application/json",
             body,
             &[("X-Error-Code", "insufficient_quota"), ("Retry-After", "0")],
         )
         .await;
-        if path == "/bench/semantic" {
-            stats
-                .failed_ids
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(request_id);
-        }
         return;
     }
-    if path == "/bench/semantic" && !primary && marker {
-        let failed = stats
-            .failed_ids
+    if marker {
+        let failed_authorization = stats
+            .failed_authorizations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&request_id);
-        if failed {
-            stats.fallback_after_failure.fetch_add(1, Ordering::Relaxed);
+        if let Some(failed) = failed_authorization {
+            stats.retries_after_failure.fetch_add(1, Ordering::Relaxed);
+            if failed != authorization {
+                stats.fallback_after_failure.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     let result = match path.as_str() {
@@ -1329,6 +1509,8 @@ async fn write_http_response_with_headers(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
+    // Callers provide bare names and values; emit the field delimiter exactly
+    // once at this boundary.
     for (name, value) in extra_headers {
         headers.push_str(name);
         headers.push_str(": ");
@@ -1433,10 +1615,30 @@ fn deterministic_failure(seed: u64, request: usize, percent: u8) -> bool {
     ((seed.wrapping_add(request as u64)) % 100) < u64::from(percent)
 }
 
-fn expected_markers(requests: usize, seed: u64, percent: u8) -> usize {
+fn next_cohort_boundary(request: usize) -> usize {
+    request
+        .saturating_add(99)
+        .saturating_div(100)
+        .saturating_mul(100)
+}
+
+fn expected_failure_ids(requests: usize, seed: u64, percent: u8) -> BTreeSet<usize> {
+    // Keep the verifier independent from `deterministic_failure`. A regression
+    // in the upstream injector must not silently change its own oracle.
     (0..requests)
-        .filter(|request| deterministic_failure(seed, *request, percent))
-        .count()
+        .filter(|request| {
+            percent == 100
+                || (percent > 0 && seed.wrapping_add(*request as u64) % 100 < u64::from(percent))
+        })
+        .collect()
+}
+
+fn deterministic_upstream_failures_match(
+    expected_ids: &BTreeSet<usize>,
+    injected_ids: &BTreeSet<usize>,
+    upstream_failures: usize,
+) -> bool {
+    upstream_failures == expected_ids.len() && injected_ids == expected_ids
 }
 
 fn update_max(value: &AtomicUsize, candidate: usize) {
@@ -1449,14 +1651,20 @@ fn update_max(value: &AtomicUsize, candidate: usize) {
     }
 }
 
-impl From<LeakSnapshot> for ResourceReport {
-    fn from(snapshot: LeakSnapshot) -> Self {
+impl From<RuntimeResourceSnapshot> for ResourceReport {
+    fn from(snapshot: RuntimeResourceSnapshot) -> Self {
         Self {
+            source: "pooler_server.HttpProxyServer.resource_snapshot",
             tasks: snapshot.tasks,
             permits: snapshot.permits,
             refresh_leases: snapshot.refresh_leases,
             temporary_files: snapshot.temporary_files,
             secret_material: snapshot.secret_material,
+            peak_tasks: snapshot.peak_tasks,
+            peak_permits: snapshot.peak_permits,
+            peak_refresh_leases: snapshot.peak_refresh_leases,
+            peak_temporary_files: snapshot.peak_temporary_files,
+            peak_secret_material: snapshot.peak_secret_material,
             zero_after_drain: snapshot.is_zero(),
         }
     }
@@ -1715,8 +1923,16 @@ mod tests {
     #[test]
     fn overhead_budget_uses_pooler_minus_direct_latency() {
         let report = latency_report_with_baseline(
-            vec![Duration::from_millis(5), Duration::from_millis(6)],
-            vec![Duration::from_millis(2), Duration::from_millis(3)],
+            vec![
+                OpaqueLatencySample {
+                    pooled: Duration::from_millis(5),
+                    direct: Duration::from_millis(2),
+                },
+                OpaqueLatencySample {
+                    pooled: Duration::from_millis(6),
+                    direct: Duration::from_millis(3),
+                },
+            ],
             OPAQUE_REQUEST_BYTES,
             Duration::from_millis(3),
         );
@@ -1727,25 +1943,183 @@ mod tests {
     }
 
     #[test]
-    fn enforced_benchmarks_require_three_runs() {
-        let mut settings = Settings {
-            mode: Mode::Opaque,
-            short: true,
-            opaque_samples: 1,
-            semantic_samples: 1,
-            duration_secs: 1,
-            requests: 1,
-            clients: 1,
-            failure_percent: 20,
+    fn overhead_gate_rejects_false_pass_from_independent_percentiles() {
+        let report = latency_report_with_baseline(
+            vec![
+                OpaqueLatencySample {
+                    pooled: Duration::from_millis(100),
+                    direct: Duration::from_millis(1),
+                },
+                OpaqueLatencySample {
+                    pooled: Duration::from_millis(100),
+                    direct: Duration::from_millis(100),
+                },
+            ],
+            OPAQUE_REQUEST_BYTES,
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(report.p95_us, 100_000);
+        assert_eq!(report.direct_p95_us, Some(100_000));
+        assert_eq!(report.overhead_p95_us, Some(99_000));
+        assert!(!report.budget_passed);
+    }
+
+    #[tokio::test]
+    async fn injected_failure_headers_parse_at_the_http_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("header test listener");
+        let address = listener.local_addr().expect("header test address");
+        let writer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("header test accept");
+            write_http_response_with_headers(
+                &mut stream,
+                429,
+                "application/json",
+                br#"{"error":"deterministic benchmark failure"}"#,
+                &[("X-Error-Code", "insufficient_quota"), ("Retry-After", "0")],
+            )
+            .await
+            .expect("header test response");
+        });
+
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("header test connect");
+        let response = read_until_headers(&mut client)
+            .await
+            .expect("header test response headers");
+        writer.await.expect("header writer task");
+
+        assert_eq!(
+            request_header(&response, "X-Error-Code"),
+            Some("insufficient_quota".to_owned())
+        );
+        assert_eq!(
+            request_header(&response, "Retry-After"),
+            Some("0".to_owned())
+        );
+        let headers =
+            std::str::from_utf8(&response[..find_header_end(&response).expect("header boundary")])
+                .expect("valid response headers");
+        assert!(!headers.contains("X-Error-Code: : "));
+        assert!(!headers.contains("Retry-After: : "));
+    }
+
+    fn release_settings() -> Settings {
+        Settings {
+            mode: Mode::All,
+            short: false,
+            opaque_samples: 1_000,
+            semantic_samples: 100,
+            duration_secs: FULL_STRESS_DURATION_SECS,
+            requests: FULL_STRESS_REQUESTS,
+            clients: FULL_STRESS_CLIENTS,
+            failure_percent: FULL_FAILURE_PERCENT,
             seed: 0,
-            runs: 2,
+            runs: 3,
             json: false,
             output: None,
             enforce_budgets: true,
-        };
+        }
+    }
+
+    #[test]
+    fn enforced_benchmarks_reject_every_non_release_workload_dimension() {
+        assert!(release_settings().validate().is_ok());
+
+        let mut settings = release_settings();
+        settings.mode = Mode::Stress;
         assert!(settings.validate().is_err());
-        settings.runs = 3;
-        assert!(settings.validate().is_ok());
+        let mut settings = release_settings();
+        settings.short = true;
+        assert!(settings.validate().is_err());
+        let mut settings = release_settings();
+        settings.opaque_samples = 999;
+        assert!(settings.validate().is_err());
+        let mut settings = release_settings();
+        settings.semantic_samples = 99;
+        assert!(settings.validate().is_err());
+        let mut settings = release_settings();
+        settings.duration_secs = FULL_STRESS_DURATION_SECS - 1;
+        assert!(settings.validate().is_err());
+        let mut settings = release_settings();
+        settings.requests = FULL_STRESS_REQUESTS - 1;
+        assert!(settings.validate().is_err());
+        let mut settings = release_settings();
+        settings.clients = FULL_STRESS_CLIENTS - 1;
+        assert!(settings.validate().is_err());
+        let mut settings = release_settings();
+        settings.failure_percent = FULL_FAILURE_PERCENT - 1;
+        assert!(settings.validate().is_err());
+        let mut settings = release_settings();
+        settings.runs = 2;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn enforced_benchmarks_reject_dirty_or_non_release_provenance() {
+        let provenance = |worktree_clean, build_profile| ProvenanceReport {
+            commit_sha: "commit".to_owned(),
+            worktree_clean,
+            rustc_verbose_version: "rustc".to_owned(),
+            host_target: "host".to_owned(),
+            benchmark_target: "host".to_owned(),
+            host: "host".to_owned(),
+            build_profile,
+            command: vec!["pooler-bench".to_owned()],
+        };
+        let settings = release_settings();
+
+        assert!(settings
+            .validate_provenance(&provenance(false, "release"))
+            .is_err());
+        assert!(settings
+            .validate_provenance(&provenance(true, "debug"))
+            .is_err());
+        assert!(settings
+            .validate_provenance(&provenance(true, "release"))
+            .is_ok());
+    }
+
+    #[test]
+    fn failure_verifier_rejects_marker_only_and_count_only_evidence() {
+        let expected = expected_failure_ids(100, 0, 20);
+        let wrong_ids = (80..100).collect::<BTreeSet<_>>();
+
+        assert_eq!(expected, (0..20).collect());
+        assert_eq!(expected_failure_ids(100, 90, 20), (10..30).collect());
+
+        assert!(!deterministic_upstream_failures_match(
+            &expected, &expected, 0
+        ));
+        assert!(!deterministic_upstream_failures_match(
+            &expected,
+            &wrong_ids,
+            expected.len()
+        ));
+        assert!(deterministic_upstream_failures_match(
+            &expected,
+            &expected,
+            expected.len()
+        ));
+    }
+
+    #[test]
+    fn resource_verifier_rejects_a_live_pooler_runtime_resource() {
+        let snapshot = RuntimeResourceSnapshot {
+            tasks: 1,
+            peak_tasks: 1,
+            ..RuntimeResourceSnapshot::default()
+        };
+        let report = ResourceReport::from(snapshot);
+
+        assert_eq!(
+            report.source,
+            "pooler_server.HttpProxyServer.resource_snapshot"
+        );
+        assert!(!report.zero_after_drain);
     }
 
     #[test]

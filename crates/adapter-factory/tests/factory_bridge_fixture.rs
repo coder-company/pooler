@@ -13,10 +13,8 @@ use pooler_testkit::{
 };
 use serde_json::Value;
 
-const FIXTURE: &str = include_str!("../../../fixtures/factory/fx-cliproxy-bridge-v3.json");
-
-fn fixture() -> Fixture {
-    serde_json::from_str(FIXTURE).expect("valid sanitized Factory fixture")
+fn fixture(source: &str) -> Fixture {
+    serde_json::from_str(source).expect("valid sanitized Factory fixture")
 }
 
 fn header<'a>(request: &'a ScriptedRequest, name: &str) -> &'a str {
@@ -78,7 +76,9 @@ fn compare_event_chunks(expected: &[ScriptedChunk], actual: &[ScriptedChunk]) ->
 
 #[tokio::test]
 async fn replays_local_bridge_request_and_semantic_stream() {
-    let fixture = fixture();
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/factory/fx-cliproxy-bridge-v3.json");
+    let fixture = fixture(MANIFEST_FIXTURE);
     assert_eq!(fixture.metadata.equivalence, Equivalence::EventSemantic);
     assert!(fixture
         .metadata

@@ -1,11 +1,25 @@
 {
+  "compatibility": {
+    "schema_version": 1,
+    "adapter": "devin",
+    "protocol": "connect-rpc",
+    "version": "3000.4.16",
+    "equivalence": "protobuf_semantic",
+    "exercised_capabilities": [
+      "text",
+      "function_tools",
+      "streaming",
+      "connect_rpc",
+      "protobuf"
+    ]
+  },
   "id": "fx-devin-current-client-3000.4.16-tool-follow-up.v1",
   "client": {
     "name": "Devin CLI",
     "version": "3000.4.16"
   },
   "equivalence": "protobuf_semantic",
-  "notes": "Sanitized current-client shape: a system assistant tool call followed by a source=Tool result. No credentials, workspace paths, or provider response are retained.",
+  "notes": "Sanitized current-client follow-up shape: a system assistant tool-call context followed by a source=Tool result. No credentials, workspace paths, initial tool-call response, OS execution trace, or live-provider response are retained. The final response below is deterministic loopback data for runtime replay.",
   "request": {
     "model": "gpt-5.6-sol-low",
     "cascade_id": "cascade-live-1",
@@ -90,5 +104,71 @@
       }
     ],
     "tool_choice": "auto"
+  },
+  "expected_runtime_upstream_request": {
+    "model": "gpt-5.6-sol-low",
+    "metadata": {
+      "devin_cascade_id": "cascade-live-1",
+      "devin_execution_id": "execution-live-2"
+    },
+    "messages": [
+      {
+        "role": "assistant",
+        "content": null,
+        "id": "assistant-live-1",
+        "tool_calls": [
+          {
+            "id": "call-live-1",
+            "type": "function",
+            "function": {
+              "name": "run_command",
+              "arguments": "{\"command\":\"printf POOLER_DEVIN_TOOL_OK\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call-live-1",
+        "content": "command completed: stdout=POOLER_DEVIN_TOOL_OK; stderr=; exit_code=0; cwd=/workspace; t=0000000000000000"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "run_command",
+          "strict": false,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "command"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "runtime_upstream_sse": [
+    "{\"id\":\"chat-devin-final-1\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}",
+    "{\"id\":\"chat-devin-final-1\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"POOLER_DEVIN_FINAL_OK\"},\"finish_reason\":null}]}",
+    "{\"id\":\"chat-devin-final-1\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3,\"total_tokens\":14}}",
+    "[DONE]"
+  ],
+  "expected_runtime_response": {
+    "text": "POOLER_DEVIN_FINAL_OK",
+    "stop_reason": "stop",
+    "input_tokens": 11,
+    "output_tokens": 3
   }
 }

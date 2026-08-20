@@ -35,9 +35,15 @@ schemas, authorization, session identity, and transport-only headers are
 redacted. The provider-defined search tool is explicitly recorded as an
 optional loss under the preset's degrade policy.
 
-Replay the codec and stream fixture with:
+Replay the exact sanitized request and deterministic stream through the real
+HTTP proxy runtime with:
 
-    cargo test -p adapter-factory --test factory_current_fixture
+    cargo test -p pooler-server --test current_client_compatibility \
+      factory_current_fixture_replays_through_http_proxy_server --locked
+
+The adapter-only differential test remains available as:
+
+    cargo test -p adapter-factory --test factory_current_fixture --locked
 
 This is current-client request/stream conformance evidence only; it does not
 authorize a live provider or claim broader Factory feature compatibility.

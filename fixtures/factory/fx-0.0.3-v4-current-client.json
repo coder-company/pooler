@@ -1,4 +1,20 @@
 {
+  "compatibility": {
+    "schema_version": 1,
+    "adapter": "factory",
+    "protocol": "language-model-v4",
+    "version": "fx-0.0.3",
+    "equivalence": "event_semantic",
+    "exercised_capabilities": [
+      "text",
+      "function_tools",
+      "streaming",
+      "usage",
+      "response_metadata",
+      "v4_headers",
+      "model_id_routing"
+    ]
+  },
   "metadata": {
     "id": "fx-0.0.3.factory.v4.pooler.2026-08-20",
     "equivalence": "event_semantic",

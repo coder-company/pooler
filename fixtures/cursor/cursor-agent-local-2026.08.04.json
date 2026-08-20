@@ -1,4 +1,17 @@
 {
+  "compatibility": {
+    "schema_version": 1,
+    "adapter": "cursor",
+    "protocol": "openai-compatible-chat",
+    "version": "2026.08.04-aaa8809",
+    "equivalence": "json_structural",
+    "exercised_capabilities": [
+      "http_json",
+      "streaming",
+      "model_routing",
+      "reasoning_effort_transform"
+    ]
+  },
   "metadata": {
     "id": "cursor-agent-local.2026.08.04.pooler",
     "equivalence": "json_structural",

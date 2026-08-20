@@ -1,0 +1,13 @@
+version: 1
+upstreams:
+  local:
+    merge: true
+    url: http://127.0.0.1:2
+routes:
+  - id: obsolete
+    remove: true
+  - id: replacement
+    listen: local
+    match:
+      path_template: /v1/{model}
+    target: local

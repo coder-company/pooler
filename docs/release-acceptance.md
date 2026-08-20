@@ -17,11 +17,14 @@ cargo audit --deny warnings
 cargo deny check
 ./scripts/check-config-schema.sh
 ./scripts/check-compatibility-report.sh
+./scripts/verify-compatibility-fixtures.py
 ```
 
 The schema check compares the checked-in artifact with the deterministic
 `pooler config schema` command. The compatibility check compares the checked-in
-matrix with the sorted report generated from its versioned manifest.
+matrix with the sorted report generated from its versioned manifest. The
+fixture verifier requires an executable adapter, HTTP runtime, or config
+compiler check for every manifest row and rejects skipped or unmapped rows.
 
 ## Required evidence
 

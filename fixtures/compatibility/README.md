@@ -19,3 +19,17 @@ name. Add a current-client or provider row only with a reproducible fixture,
 provenance, and replay test. See
 [`docs/compatibility-report.md`](../../docs/compatibility-report.md) for the
 evidence rules and status meanings.
+
+Run every manifest row through its committed adapter, HTTP runtime, or config
+compiler verifier with:
+
+```sh
+./scripts/verify-compatibility-fixtures.py
+```
+
+The gate rejects new or renamed rows until they have an explicit verifier. Each
+Rust verifier must begin the mapped test with a local `MANIFEST_FIXTURE`
+`include_str!` binding to the exact manifest path. An unrelated include elsewhere
+in the source file therefore cannot satisfy the gate. Current-client fixture
+envelopes also bind adapter, protocol, version, equivalence, and exercised
+capabilities to the manifest claim.

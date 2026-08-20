@@ -57,7 +57,7 @@ use crate::{
     CacheKeyInput, CacheLeader, CacheLookup, CachePolicy, CachedResponse, DrainController,
     DrainGuard, DrainedBody, FrameLimitedBody, LimitedBody, NativeAuthorization, NativeRuntime,
     NativeRuntimeError, PoolError, PoolSelection, PoolingCoordinator, ResponseCache,
-    SelectionContext, SelectionTiming,
+    RuntimeResources, SelectionContext, SelectionTiming,
 };
 
 /// The erased body type used by responses returned from [`HttpProxy`].
@@ -341,6 +341,7 @@ pub struct HttpProxy<A = NoSemanticAdapter> {
     caches: BTreeMap<Arc<str>, Arc<ResponseCache>>,
     observability: MetricsRegistry,
     traces: TraceRecorder,
+    resources: RuntimeResources,
 }
 
 impl<A> std::fmt::Debug for HttpProxy<A>
@@ -443,12 +444,13 @@ where
         h2c_builder.http2_only(true).http2_adaptive_window(true);
         let h2c_client = h2c_builder.build(h2c_connector);
         let caches = build_route_caches(&config)?;
+        let resources = RuntimeResources::new();
         Ok(Self {
             config,
             listener,
             client,
             h2c_client,
-            drain: DrainController::new(),
+            drain: DrainController::with_resources(resources.clone()),
             semantic,
             pooling,
             native,
@@ -456,7 +458,18 @@ where
             caches,
             observability: MetricsRegistry::default(),
             traces: TraceRecorder::default(),
+            resources,
         })
+    }
+
+    /// Attach the production resource registry shared by the serving runtime.
+    ///
+    /// Call this during construction, before the proxy admits requests.
+    #[must_use]
+    pub fn with_runtime_resources(mut self, resources: RuntimeResources) -> Self {
+        self.drain = DrainController::with_resources(resources.clone());
+        self.resources = resources;
+        self
     }
 
     /// Replace the default in-process metrics registry with a shared one.
@@ -547,7 +560,12 @@ where
             return observe_response(status, observation.take(), CompletionClass::InvalidRequest);
         }
 
-        if let Err(error) = verify_downstream_auth(route, request.headers()) {
+        let downstream_secret = route
+            .downstream_auth()
+            .map(|_| self.resources.secret_material());
+        let auth_result = verify_downstream_auth(route, request.headers());
+        drop(downstream_secret);
+        if let Err(error) = auth_result {
             drop(guard);
             let response = match error {
                 DownstreamAuthError::MissingOrInvalid => unauthorized_response(),
@@ -718,6 +736,10 @@ where
                 "the selected upstream does not use ws or wss".to_owned(),
             ));
         }
+        let _secret = (self.native.supports(upstream)
+            || selection.account_secret().is_some()
+            || upstream.auth().is_some())
+        .then(|| self.resources.secret_material());
         let native_auth = if self.native.supports(upstream) {
             let credential = selection
                 .credential()
@@ -781,18 +803,24 @@ where
         self.pooling
             .persist_affinity(&selection, crate::pool::timestamp_now());
         let lease = selection.take_lease();
-        tokio::spawn(run_websocket_tunnel(
-            downstream_upgrade,
-            upstream_socket,
-            WebSocketTunnelContext {
-                max_frame_bytes: route.limits().max_frame_bytes,
-                guard,
-                cancellation,
-                deadline,
-                lease,
-                observation,
-            },
-        ));
+        let max_frame_bytes = route.limits().max_frame_bytes;
+        let task = self.resources.task();
+        tokio::spawn(async move {
+            let _task = task;
+            run_websocket_tunnel(
+                downstream_upgrade,
+                upstream_socket,
+                WebSocketTunnelContext {
+                    max_frame_bytes,
+                    guard,
+                    cancellation,
+                    deadline,
+                    lease,
+                    observation,
+                },
+            )
+            .await;
+        });
         Ok(response)
     }
 
@@ -1173,7 +1201,13 @@ where
         }
         let cancellation = cache_leader.as_ref().map_or_else(
             || cancellation.clone(),
-            |leader| link_cancellation(cancellation.clone(), leader.cancellation_token()),
+            |leader| {
+                link_cancellation(
+                    cancellation.clone(),
+                    leader.cancellation_token(),
+                    &self.resources,
+                )
+            },
         );
         let mut attempt = 1_u32;
         let mut elapsed_retry_delay = Duration::ZERO;
@@ -1224,6 +1258,10 @@ where
                     upstream: selection.upstream_id().to_owned(),
                 })?;
             let retry_deadline = retry_deadline(started, limits, upstream, selection.policy());
+            let _secret = (self.native.supports(upstream)
+                || selection.account_secret().is_some()
+                || upstream.auth().is_some())
+            .then(|| self.resources.secret_material());
             let native_auth = if self.native.supports(upstream) {
                 let credential = selection
                     .credential()
@@ -3103,10 +3141,16 @@ fn pool_selection_error(error: PoolError) -> ProxyError {
     }
 }
 
-fn link_cancellation(first: CancellationToken, second: CancellationToken) -> CancellationToken {
+fn link_cancellation(
+    first: CancellationToken,
+    second: CancellationToken,
+    resources: &RuntimeResources,
+) -> CancellationToken {
     let linked = CancellationToken::new();
     let linked_clone = linked.clone();
+    let task = resources.task();
     tokio::spawn(async move {
+        let _task = task;
         tokio::select! {
             () = first.cancelled() => linked_clone.cancel(),
             () = second.cancelled() => linked_clone.cancel(),

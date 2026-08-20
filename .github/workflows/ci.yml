@@ -3,9 +3,19 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        description: Git ref or commit to verify
+        required: false
+        type: string
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,12 +33,16 @@ jobs:
       # Action references are immutable commit pins. Dependabot updates them
       # weekly after checking the corresponding release tag.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.checkout-ref || github.ref }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
         with:
           toolchain: 1.86.0
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - run: cargo fmt --all --check
+      - run: bash scripts/check-release-workflow.sh
       - run: ./scripts/check-config-schema.sh
       - run: cargo check --workspace --all-targets --all-features --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -40,11 +54,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.checkout-ref || github.ref }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
         with:
           toolchain: 1.86.0
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - run: cargo test --workspace --all-features --locked -- --test-threads=1
+      - run: ./scripts/verify-compatibility-fixtures.py
       - run: cargo test --manifest-path fuzz/Cargo.toml --locked --no-run
       - run: >-
           cargo run --locked -p pooler-cli -- fixture report
@@ -58,6 +76,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.checkout-ref || github.ref }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # action implementation
         with:
           # cargo metadata must parse Rust-2024 target-only dependencies such

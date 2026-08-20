@@ -23,10 +23,11 @@ Run the opaque proxy with:
 POOLER_UPSTREAM_KEY=... cargo run -p pooler-cli -- serve --config config/pooler.example.yaml
 ```
 
-Replay a deterministic fixture corpus without loading server configuration:
+Verify every declared compatibility fixture through its adapter or runtime
+boundary:
 
 ```sh
-cargo run -p pooler-cli -- fixture replay fixtures/factory
+./scripts/verify-compatibility-fixtures.py
 ```
 
 Generate and check the strict source-configuration schema:

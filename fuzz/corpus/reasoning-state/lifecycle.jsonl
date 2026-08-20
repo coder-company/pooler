@@ -1,0 +1,5 @@
+{"id":"reasoning-seed","model":"gpt-seed","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"think "},"finish_reason":null}]}
+{"id":"reasoning-seed","choices":[{"index":0,"delta":{"reasoning_content":"more"},"finish_reason":null}]}
+{"id":"reasoning-seed","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}
+{"id":"reasoning-seed","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}
+[DONE]
