@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
-#![doc = "Semantic codecs for the LanguageModel V3 wire used by Pooler's Factory route.
+#![doc = "Semantic codecs for Factory's LanguageModel V3 and V4 wires.
 
-The codec intentionally implements only the documented language-model request
-and stream-part contract. A current Factory request/response fixture is still
-required before the product can claim end-to-end Factory compatibility."]
+The request and stream-part fields shared by both specifications are translated
+through Pooler's semantic model. Version-specific headers are validated at the
+HTTP boundary, and unsupported required semantics remain visible through the
+explicit conversion report."]
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
@@ -11,8 +12,8 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use pooler_config::RoutePlan;
 use pooler_http::{
-    BoxError, ProxyBody, SemanticAdapter, SemanticRequestBody, SemanticResponseBody, SseEncoder,
-    SseError, SseEvent, SseLimits, SseParser,
+    BoxError, ProxyBody, SelectionContext, SemanticAdapter, SemanticRequestBody,
+    SemanticResponseBody, SseEncoder, SseError, SseEvent, SseLimits, SseParser,
 };
 use pooler_protocol::OpenAiChatEventDecoder;
 use pooler_protocol::{
@@ -41,8 +42,14 @@ pub const MODEL_ID_HEADER: &str = "ai-language-model-id";
 pub const STREAMING_HEADER: &str = "ai-language-model-streaming";
 /// LanguageModel V3 specification version.
 pub const SPECIFICATION_VERSION_V3: &str = "3";
+/// LanguageModel V4 specification version used by the current Factory client.
+pub const SPECIFICATION_VERSION_V4: &str = "4";
+/// Header carrying the AI Gateway wire-protocol revision.
+pub const GATEWAY_PROTOCOL_VERSION_HEADER: &str = "ai-gateway-protocol-version";
+/// AI Gateway protocol revision used by Factory LanguageModel V4.
+pub const GATEWAY_PROTOCOL_VERSION: &str = "0.0.1";
 
-/// Semantic adapter mounted by the HTTP runtime for Factory LanguageModel V3.
+/// Semantic adapter mounted by the HTTP runtime for Factory LanguageModel V3/V4.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FactorySemanticAdapter;
 
@@ -101,7 +108,7 @@ pub struct FactoryRequest {
     pub report: ConversionReport,
 }
 
-/// Factory LanguageModel V3 request decoder.
+/// Factory LanguageModel request decoder shared by V3 and V4.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FactoryLanguageModelDecoder {
     options: FactoryDecodeOptions,
@@ -176,7 +183,16 @@ impl FactoryLanguageModelDecoder {
             )?;
         }
         if let Some(tool_choice) = object.get("toolChoice") {
-            request.tool_choice = Some(decode_tool_choice(tool_choice)?);
+            let tool_choice = decode_tool_choice(tool_choice)?;
+            if let ToolChoice::Tool { name } = &tool_choice {
+                if !request.tools.iter().any(|tool| tool.name == *name) {
+                    return Err(invalid_value(
+                        "toolChoice.toolName",
+                        "must name a declared function tool",
+                    ));
+                }
+            }
+            request.tool_choice = Some(tool_choice);
         }
         if let Some(response_format) = object.get("responseFormat") {
             request.response_format = Some(decode_response_format(
@@ -243,9 +259,6 @@ pub enum FactoryDecodeError {
         /// Conversion failure.
         reason: String,
     },
-    /// A provider-defined tool cannot be translated into the common tool schema.
-    #[error("Factory provider tool {0} is unsupported by this semantic adapter")]
-    UnsupportedProviderTool(String),
     /// A file was rejected before upstream execution.
     #[error("Factory file input {0} is not supported by the configured file policy")]
     UnsupportedFile(String),
@@ -602,13 +615,16 @@ fn decode_tools(
                 request.tools.push(tool);
             }
             Some("provider") => {
-                return Err(FactoryDecodeError::UnsupportedProviderTool(
-                    object
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned(),
-                ))
+                let name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                report.drop_optional(
+                    format!("tools[{index}]"),
+                    format!(
+                        "Factory provider tool {name} has no provider-neutral OpenAI representation"
+                    ),
+                );
             }
             Some(_) | None => {
                 return Err(invalid_value(
@@ -1348,10 +1364,52 @@ impl SemanticAdapter for FactorySemanticAdapter {
         })
     }
 
+    fn selection_context(
+        &self,
+        route: &RoutePlan,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<SelectionContext, BoxError> {
+        validate_factory_headers(headers)?;
+        let model = headers
+            .get(MODEL_ID_HEADER)
+            .ok_or(FactoryAdapterError::MissingModelHeader)?
+            .to_str()
+            .map_err(|_| FactoryAdapterError::InvalidModelHeader)?
+            .trim();
+        if model.is_empty() {
+            return Err(Box::new(FactoryAdapterError::MissingModelHeader));
+        }
+        let decoder = FactoryLanguageModelDecoder::new(FactoryDecodeOptions {
+            file_policy: if route.loss_policy().allows_degradation() {
+                FactoryFilePolicy::Degrade
+            } else {
+                FactoryFilePolicy::Reject
+            },
+            ..FactoryDecodeOptions::default()
+        });
+        let decoded = decoder
+            .decode(body, model)
+            .map_err(|error| Box::new(error) as BoxError)?;
+        decoded
+            .report
+            .validate(route.loss_policy())
+            .map_err(|error| Box::new(error) as BoxError)?;
+        let mut context = SelectionContext::from_semantic_request(&decoded.request);
+        context.require(pooler_core::Capability::Streaming);
+        if let Some(codec) = route.ingress().decoder() {
+            context.with_codec(codec);
+        }
+        let value: Value = serde_json::from_slice(body)?;
+        add_factory_affinity_values(&value, &mut context);
+        Ok(context)
+    }
+
     fn sanitize_request_headers(&self, headers: &mut HeaderMap) {
         headers.remove(SPECIFICATION_VERSION_HEADER);
         headers.remove(MODEL_ID_HEADER);
         headers.remove(STREAMING_HEADER);
+        headers.remove(GATEWAY_PROTOCOL_VERSION_HEADER);
     }
 
     fn decode_response(
@@ -1378,6 +1436,30 @@ impl SemanticAdapter for FactorySemanticAdapter {
     }
 }
 
+fn add_factory_affinity_values(value: &Value, context: &mut SelectionContext) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for (name, value) in object {
+        if let Some(value) = value.as_str().filter(|value| !value.is_empty()) {
+            match name.as_str() {
+                "sessionId" | "session_id" => {
+                    context.with_affinity_value("request.session_id", value);
+                    context.with_affinity_value("semantic.session_id", value);
+                }
+                "conversationId" | "conversation_id" => {
+                    context.with_affinity_value("request.session_id", value);
+                    context.with_affinity_value("semantic.session_id", value);
+                }
+                "previousResponseId" | "previous_response_id" | "previousResponseID" => {
+                    context.with_affinity_value("openai.previous_response_id", value);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 enum FactoryAdapterError {
     #[error("missing {MODEL_ID_HEADER} header")]
@@ -1386,8 +1468,10 @@ enum FactoryAdapterError {
     InvalidModelHeader,
     #[error("encoded OpenAI request is not an object")]
     EncodedRequestNotObject,
-    #[error("Factory specification version must be 3")]
+    #[error("Factory specification version must be 3 or 4")]
     InvalidSpecificationVersion,
+    #[error("Factory Gateway protocol version must be {GATEWAY_PROTOCOL_VERSION}")]
+    InvalidGatewayProtocolVersion,
     #[error("Factory streaming header is not valid")]
     InvalidStreamingHeader,
     #[error("Factory semantic route requires streaming=true")]
@@ -1395,13 +1479,31 @@ enum FactoryAdapterError {
 }
 
 fn validate_factory_headers(headers: &HeaderMap) -> Result<(), FactoryAdapterError> {
-    if let Some(value) = headers.get(SPECIFICATION_VERSION_HEADER) {
+    let specification = headers
+        .get(SPECIFICATION_VERSION_HEADER)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| FactoryAdapterError::InvalidSpecificationVersion)
+        })
+        .transpose()?
+        .map(str::trim)
+        .unwrap_or(SPECIFICATION_VERSION_V3);
+    if !matches!(
+        specification,
+        SPECIFICATION_VERSION_V3 | SPECIFICATION_VERSION_V4
+    ) {
+        return Err(FactoryAdapterError::InvalidSpecificationVersion);
+    }
+    if let Some(value) = headers.get(GATEWAY_PROTOCOL_VERSION_HEADER) {
         let value = value
             .to_str()
-            .map_err(|_| FactoryAdapterError::InvalidSpecificationVersion)?;
-        if value.trim() != SPECIFICATION_VERSION_V3 {
-            return Err(FactoryAdapterError::InvalidSpecificationVersion);
+            .map_err(|_| FactoryAdapterError::InvalidGatewayProtocolVersion)?;
+        if value.trim() != GATEWAY_PROTOCOL_VERSION || specification != SPECIFICATION_VERSION_V4 {
+            return Err(FactoryAdapterError::InvalidGatewayProtocolVersion);
         }
+    } else if specification == SPECIFICATION_VERSION_V4 {
+        return Err(FactoryAdapterError::InvalidGatewayProtocolVersion);
     }
     if let Some(value) = headers.get(STREAMING_HEADER) {
         let value = value
@@ -1943,6 +2045,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_tool_choice_targeting_a_dropped_provider_tool() {
+        let value = json!({
+            "prompt": [{"role": "user", "content": [
+                {"type": "text", "text": "hello"}
+            ]}],
+            "tools": [{
+                "type": "provider",
+                "name": "web_search"
+            }],
+            "toolChoice": {"type": "tool", "toolName": "web_search"}
+        });
+
+        let error = FactoryLanguageModelDecoder::default()
+            .decode_value(&value, "factory-model")
+            .expect_err("provider tool target must be rejected");
+
+        assert!(error.to_string().contains("toolChoice.toolName"));
+    }
+
+    #[test]
     fn accounts_for_documented_fields_without_silent_drops() {
         let value = json!({
             "prompt": [{"role": "user", "content": [
@@ -2452,7 +2574,7 @@ routes:
         headers.insert(STREAMING_HEADER, HeaderValue::from_static("true"));
         assert!(matches!(
             adapter.encode_request(&route, &headers, body),
-            Err(error) if error.to_string().contains("version must be 3")
+            Err(error) if error.to_string().contains("version must be 3 or 4")
         ));
 
         headers.insert(
@@ -2466,5 +2588,113 @@ routes:
         assert!(headers.get(MODEL_ID_HEADER).is_none());
         assert!(headers.get(SPECIFICATION_VERSION_HEADER).is_none());
         assert!(headers.get(STREAMING_HEADER).is_none());
+
+        headers.insert(MODEL_ID_HEADER, HeaderValue::from_static("gpt-test"));
+        headers.insert(
+            SPECIFICATION_VERSION_HEADER,
+            HeaderValue::from_static(SPECIFICATION_VERSION_V4),
+        );
+        assert!(matches!(
+            adapter.encode_request(&route, &headers, body),
+            Err(error) if error.to_string().contains("Gateway protocol version")
+        ));
+        headers.insert(
+            GATEWAY_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static(GATEWAY_PROTOCOL_VERSION),
+        );
+        adapter
+            .encode_request(&route, &headers, body)
+            .expect("valid Factory V4 headers");
+        adapter.sanitize_request_headers(&mut headers);
+        assert!(headers.get(GATEWAY_PROTOCOL_VERSION_HEADER).is_none());
+    }
+
+    #[test]
+    fn selection_context_prefers_body_session_and_previous_response_ids() {
+        let route = pooler_config::compile_yaml(
+            "factory-selection.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+routes:
+  - id: factory
+    listen: local
+    ingress: {mode: semantic, decoder: decode.factory.language_model}
+    target: local
+    response: {mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}
+    loss_policy: reject
+"#,
+        )
+        .expect("Factory route")
+        .routes()[0]
+            .clone();
+        let body = br#"{
+            "sessionId":"body-session",
+            "previousResponseId":"response-42",
+            "prompt":[{"role":"user","content":[{"type":"text","text":"hello"}]}]
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(MODEL_ID_HEADER, HeaderValue::from_static("gpt-test"));
+        headers.insert(
+            SPECIFICATION_VERSION_HEADER,
+            HeaderValue::from_static(SPECIFICATION_VERSION_V3),
+        );
+        let context = FactorySemanticAdapter
+            .selection_context(&route, &headers, body)
+            .expect("selection context");
+        assert_eq!(
+            context.affinity_value("request.session_id"),
+            Some("body-session")
+        );
+        assert_eq!(
+            context.affinity_value("openai.previous_response_id"),
+            Some("response-42")
+        );
+        assert!(context
+            .required_capabilities()
+            .contains(pooler_core::Capability::Text));
+        assert!(context
+            .required_capabilities()
+            .contains(pooler_core::Capability::Streaming));
+        assert_eq!(context.codec(), Some("decode.factory.language_model"));
+    }
+
+    #[test]
+    fn selection_context_ignores_nested_identity_fields() {
+        let route = pooler_config::compile_yaml(
+            "factory-selection-nested.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+routes:
+  - id: factory
+    listen: local
+    ingress: {mode: semantic, decoder: decode.factory.language_model}
+    target: local
+    response: {mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}
+    loss_policy: reject
+"#,
+        )
+        .expect("Factory route")
+        .routes()[0]
+            .clone();
+        let body = br#"{
+            "sessionId":"top-session",
+            "metadata":{"sessionId":"nested-session","previousResponseId":"nested-response"},
+            "prompt":[{"role":"user","content":[{"type":"text","text":"hello"}]}]
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(MODEL_ID_HEADER, HeaderValue::from_static("gpt-test"));
+        let context = FactorySemanticAdapter
+            .selection_context(&route, &headers, body)
+            .expect("selection context");
+
+        assert_eq!(
+            context.affinity_value("request.session_id"),
+            Some("top-session")
+        );
+        assert_eq!(context.affinity_value("openai.previous_response_id"), None);
     }
 }

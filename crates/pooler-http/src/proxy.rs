@@ -52,9 +52,12 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::{
-    extract_bearer_token, retry_after_delay, strip_hop_by_hop_headers, DrainController, DrainGuard,
-    DrainedBody, FrameLimitedBody, LimitedBody, NativeAuthorization, NativeRuntime,
-    NativeRuntimeError, PoolError, PoolSelection, PoolingCoordinator,
+    extract_bearer_token, replayable_response_headers, retry_after_delay, safe_method_for_cache,
+    safe_request_for_cache, safe_response_for_cache, strip_hop_by_hop_headers, CacheKey,
+    CacheKeyInput, CacheLeader, CacheLookup, CachePolicy, CachedResponse, DrainController,
+    DrainGuard, DrainedBody, FrameLimitedBody, LimitedBody, NativeAuthorization, NativeRuntime,
+    NativeRuntimeError, PoolError, PoolSelection, PoolingCoordinator, ResponseCache,
+    SelectionContext, SelectionTiming,
 };
 
 /// The erased body type used by responses returned from [`HttpProxy`].
@@ -96,6 +99,20 @@ pub trait SemanticAdapter: Clone + Send + Sync + 'static {
         body: &[u8],
     ) -> Result<SemanticRequestBody, BoxError>;
 
+    /// Decode request-local policy inputs before upstream translation.
+    ///
+    /// Adapters may expose non-header session identifiers and the exact codec
+    /// needed by a route. The default keeps custom adapters compatible with
+    /// header-only policy selection.
+    fn selection_context(
+        &self,
+        _route: &RoutePlan,
+        _headers: &HeaderMap,
+        _body: &[u8],
+    ) -> Result<SelectionContext, BoxError> {
+        Ok(SelectionContext::default())
+    }
+
     /// Removes downstream-only headers before the translated request is sent
     /// to an upstream protocol.
     fn sanitize_request_headers(&self, _headers: &mut HeaderMap) {}
@@ -107,6 +124,23 @@ pub trait SemanticAdapter: Clone + Send + Sync + 'static {
         body: ProxyBody,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError>;
+
+    /// Transform an upstream response using request headers that remain
+    /// meaningful to the downstream protocol.
+    ///
+    /// Most semantic adapters do not need request-local response negotiation,
+    /// so their existing [`Self::decode_response`] implementation remains the
+    /// source of truth.  Protocols such as Connect use this hook for explicit
+    /// per-request compression negotiation.
+    fn decode_response_with_request_headers(
+        &self,
+        route: &RoutePlan,
+        body: ProxyBody,
+        _request_headers: &HeaderMap,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        self.decode_response(route, body, cancellation)
+    }
 }
 
 /// Adapter used by callers that only need opaque and patch routes.
@@ -129,6 +163,15 @@ impl SemanticAdapter for NoSemanticAdapter {
         }))
     }
 
+    fn selection_context(
+        &self,
+        _route: &RoutePlan,
+        _headers: &HeaderMap,
+        _body: &[u8],
+    ) -> Result<SelectionContext, BoxError> {
+        Ok(SelectionContext::default())
+    }
+
     fn sanitize_request_headers(&self, _headers: &mut HeaderMap) {}
 
     fn decode_response(
@@ -140,6 +183,16 @@ impl SemanticAdapter for NoSemanticAdapter {
         Err(box_error(ProxyError::UnsupportedBodyMode {
             route: "semantic".to_owned(),
         }))
+    }
+
+    fn decode_response_with_request_headers(
+        &self,
+        route: &RoutePlan,
+        body: ProxyBody,
+        _request_headers: &HeaderMap,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        self.decode_response(route, body, cancellation)
     }
 }
 
@@ -285,6 +338,7 @@ pub struct HttpProxy<A = NoSemanticAdapter> {
     pooling: Arc<PoolingCoordinator>,
     native: Arc<NativeRuntime>,
     extensions: Arc<ExtensionRegistry>,
+    caches: BTreeMap<Arc<str>, Arc<ResponseCache>>,
     observability: MetricsRegistry,
     traces: TraceRecorder,
 }
@@ -300,6 +354,7 @@ where
             .field("draining", &self.drain.is_draining())
             .field("active", &self.drain.active())
             .field("semantic", &self.semantic)
+            .field("cache_routes", &self.caches.len())
             .field("observability", &self.observability)
             .field("traces", &self.traces)
             .finish_non_exhaustive()
@@ -387,6 +442,7 @@ where
         let mut h2c_builder = Client::builder(TokioExecutor::new());
         h2c_builder.http2_only(true).http2_adaptive_window(true);
         let h2c_client = h2c_builder.build(h2c_connector);
+        let caches = build_route_caches(&config)?;
         Ok(Self {
             config,
             listener,
@@ -397,6 +453,7 @@ where
             pooling,
             native,
             extensions: Arc::new(ExtensionRegistry::default()),
+            caches,
             observability: MetricsRegistry::default(),
             traces: TraceRecorder::default(),
         })
@@ -793,19 +850,63 @@ where
         let downstream_uri = request.uri().clone();
         let version = request.version();
         let limits = route.limits();
+        let downstream_headers = request.headers().clone();
+        let cache_identity_safe = self
+            .caches
+            .get(route.id())
+            .is_none_or(|cache| safe_request_for_cache(request.headers(), cache.policy()));
         let mut headers = request.headers().clone();
         strip_hop_by_hop_headers(&mut headers);
         headers.remove(header::HOST);
         headers.remove(header::AUTHORIZATION);
         let incoming = request.into_body();
         let idempotency_key_present = headers.contains_key("idempotency-key");
+        let method_safe_for_cache = safe_method_for_cache(method.as_str(), idempotency_key_present);
         let replay = ReplayCheck::for_http_method(method.as_str(), idempotency_key_present);
-        let (mut prepared, selected_model) = match route.ingress().mode() {
+        let (mut prepared, selected_model, selection_context) = match route.ingress().mode() {
             BodyMode::Opaque => {
-                let body = LimitedBody::new(incoming, bounded_usize(limits.max_request_body_bytes))
-                    .map_err(box_error)
-                    .boxed();
-                (PreparedBody::Streaming(Some(body)), None)
+                if route.cache().is_some_and(|cache| cache.enabled()) && method_safe_for_cache {
+                    let incoming =
+                        FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
+                    let bytes = tokio::select! {
+                        result = time::timeout_at(
+                            buffer_deadline,
+                            crate::collect_body_limited(
+                                incoming,
+                                bounded_usize(limits.max_request_body_bytes),
+                            ),
+                        ) => result
+                            .map_err(|_| ProxyError::Timeout)?
+                            .map_err(|error| match error {
+                                crate::BodyLimitError::TooLarge { .. }
+                                | crate::BodyLimitError::Upstream(crate::BodyLimitError::TooLarge { .. }) => {
+                                    ProxyError::RequestBodyTooLarge
+                                }
+                                other => ProxyError::Upstream(Box::new(other)),
+                            })?,
+                        () = cancellation.cancelled() => {
+                            return Err(ProxyError::Timeout);
+                        }
+                    };
+                    (
+                        PreparedBody::Buffered {
+                            bytes,
+                            patch_model: false,
+                        },
+                        None,
+                        SelectionContext::default(),
+                    )
+                } else {
+                    let body =
+                        LimitedBody::new(incoming, bounded_usize(limits.max_request_body_bytes))
+                            .map_err(box_error)
+                            .boxed();
+                    (
+                        PreparedBody::Streaming(Some(body)),
+                        None,
+                        SelectionContext::default(),
+                    )
+                }
             }
             BodyMode::Patch => {
                 let incoming =
@@ -922,6 +1023,7 @@ where
                         patch_model: selected_model.is_some(),
                     },
                     selected_model,
+                    SelectionContext::default(),
                 )
             }
             BodyMode::Semantic => {
@@ -949,6 +1051,10 @@ where
                         return Err(ProxyError::Timeout);
                     }
                 };
+                let selection_context = self
+                    .semantic
+                    .selection_context(route, &headers, &bytes)
+                    .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
                 let prepared = self
                     .semantic
                     .encode_request(route, &headers, &bytes)
@@ -965,9 +1071,10 @@ where
                 (
                     PreparedBody::Buffered {
                         bytes: Bytes::from(prepared.body),
-                        patch_model: false,
+                        patch_model: route.target().model_source().is_some(),
                     },
                     None,
+                    selection_context,
                 )
             }
             BodyMode::Inspect => {
@@ -1011,10 +1118,63 @@ where
                         patch_model: false,
                     },
                     None,
+                    SelectionContext::default(),
                 )
             }
         };
         let is_buffered = matches!(prepared, PreparedBody::Buffered { .. });
+        let mut cache_leader = None;
+        if is_buffered && cache_identity_safe && method_safe_for_cache {
+            if let Some(cache) = self.caches.get(route.id()).cloned() {
+                let body = match &prepared {
+                    PreparedBody::Buffered { bytes, .. } => bytes.as_ref(),
+                    PreparedBody::Streaming(_) => &[],
+                };
+                let target = route.target().path().map_or_else(
+                    || route.target().upstream().to_owned(),
+                    |path| format!("{}:{path}", route.target().upstream()),
+                );
+                let request_uri = downstream_uri.to_string();
+                let key = CacheKey::from_request(CacheKeyInput {
+                    generation: self.config.generation(),
+                    route: route.id(),
+                    target: &target,
+                    method: method.as_str(),
+                    uri: &request_uri,
+                    headers: &headers,
+                    key_headers: cache.policy().key_headers(),
+                    body,
+                });
+                if let Some(cached) = cache.get(&key, StdInstant::now()) {
+                    return self
+                        .finish_cached_response(route, cached, guard, observation)
+                        .await;
+                }
+                loop {
+                    match cache.begin_with_size(key, body.len()) {
+                        CacheLookup::Disabled => break,
+                        CacheLookup::Leader(owner) => {
+                            cache_leader = Some(owner);
+                            break;
+                        }
+                        CacheLookup::Follower(follower) => {
+                            if let Some(cached) = follower.wait(&cancellation).await {
+                                return self
+                                    .finish_cached_response(route, cached, guard, observation)
+                                    .await;
+                            }
+                            if cancellation.is_cancelled() {
+                                return Err(ProxyError::Timeout);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let cancellation = cache_leader.as_ref().map_or_else(
+            || cancellation.clone(),
+            |leader| link_cancellation(cancellation.clone(), leader.cancellation_token()),
+        );
         let mut attempt = 1_u32;
         let mut elapsed_retry_delay = Duration::ZERO;
         let mut elapsed_recovery_wait = Duration::ZERO;
@@ -1028,13 +1188,13 @@ where
                 selection
             } else {
                 self.pooling
-                    .select(
+                    .select_with_context(
                         &self.config,
                         route,
                         selected_model.as_deref(),
                         &headers,
-                        attempt,
-                        started,
+                        &selection_context,
+                        SelectionTiming::new(attempt, started),
                     )
                     .map_err(pool_selection_error)?
             };
@@ -1285,6 +1445,8 @@ where
                         cancellation,
                         started,
                         observation,
+                        request_headers: downstream_headers,
+                        cache_leader,
                     },
                 )
                 .await;
@@ -1474,6 +1636,38 @@ where
         }
     }
 
+    async fn finish_cached_response(
+        &self,
+        route: &RoutePlan,
+        cached: Arc<CachedResponse>,
+        guard: DrainGuard,
+        observation: &mut Option<RequestObservation>,
+    ) -> Result<Response<ProxyBody>, ProxyError> {
+        let mut observation = observation
+            .take()
+            .expect("request observation remains until cached response is ready");
+        observation.mark_headers();
+        self.traces.record(
+            TraceRecord::new(TraceStage::Persistence)
+                .route(route.id())
+                .outcome("cache_hit"),
+        );
+        let body = Full::new(cached.body().clone())
+            .map_err(|never: Infallible| match never {})
+            .boxed();
+        let body = ObservedBody::new(
+            body,
+            observation,
+            completion_class_for_status(cached.status()),
+        );
+        let body = DrainedBody::new(body, guard).boxed();
+        let mut response = Response::new(body);
+        *response.status_mut() = cached.status();
+        *response.version_mut() = cached.version();
+        *response.headers_mut() = cached.headers().clone();
+        Ok(response)
+    }
+
     async fn finish_response(
         &self,
         route: &RoutePlan,
@@ -1486,6 +1680,8 @@ where
             cancellation,
             started,
             mut observation,
+            request_headers,
+            mut cache_leader,
         } = context;
         let (parts, body) = response.into_parts();
         let mut response_headers = parts.headers;
@@ -1507,10 +1703,16 @@ where
         )
         .boxed();
         observation.mark_headers();
-        let body = if route.response().mode() == BodyMode::Semantic && parts.status.is_success() {
+        let mut body = if route.response().mode() == BodyMode::Semantic && parts.status.is_success()
+        {
             let transformed = self
                 .semantic
-                .decode_response(route, body, cancellation.clone())
+                .decode_response_with_request_headers(
+                    route,
+                    body,
+                    &request_headers,
+                    cancellation.clone(),
+                )
                 .map_err(|error| {
                     observation.complete(CompletionClass::Unsupported, None);
                     ProxyError::SemanticResponse(error.to_string())
@@ -1521,6 +1723,42 @@ where
         } else {
             body
         };
+        if let Some(mut leader) = cache_leader.take() {
+            let expected_bytes = response_headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(|value| usize::try_from(value).ok());
+            if !parts.status.is_success()
+                || !safe_response_for_cache(&response_headers)
+                || expected_bytes.is_none()
+                || !leader.reserve_response_bytes(expected_bytes.unwrap_or(0))
+            {
+                leader.fail();
+            } else {
+                let collected = tokio::select! {
+                    result = crate::collect_body_limited(
+                        body,
+                        expected_bytes.expect("cache response length was checked"),
+                    ) => result,
+                    () = cancellation.cancelled() => {
+                        leader.fail();
+                        return Err(ProxyError::Timeout);
+                    }
+                };
+                let collected_body =
+                    collected.map_err(|error| ProxyError::Upstream(Box::new(error)))?;
+                leader.publish(CachedResponse::new(
+                    parts.status,
+                    parts.version,
+                    replayable_response_headers(&response_headers),
+                    collected_body.clone(),
+                ));
+                body = Full::new(collected_body)
+                    .map_err(|never: Infallible| match never {})
+                    .boxed();
+            }
+        }
         self.pooling
             .persist_affinity(&selection, crate::pool::timestamp_now());
         let body = SelectionLeaseBody::new(body, selection.take_lease()).boxed();
@@ -1564,6 +1802,8 @@ struct FinishResponseContext {
     cancellation: CancellationToken,
     started: StdInstant,
     observation: RequestObservation,
+    request_headers: HeaderMap,
+    cache_leader: Option<CacheLeader>,
 }
 
 struct InspectedFailureResponse {
@@ -2861,6 +3101,67 @@ fn pool_selection_error(error: PoolError) -> ProxyError {
         PoolError::InvalidModel => ProxyError::InvalidPatch("request model is invalid".to_owned()),
         other => pool_error(other),
     }
+}
+
+fn link_cancellation(first: CancellationToken, second: CancellationToken) -> CancellationToken {
+    let linked = CancellationToken::new();
+    let linked_clone = linked.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = first.cancelled() => linked_clone.cancel(),
+            () = second.cancelled() => linked_clone.cancel(),
+        }
+    });
+    linked
+}
+
+fn build_route_caches(
+    config: &CompiledConfig,
+) -> Result<BTreeMap<Arc<str>, Arc<ResponseCache>>, ProxyError> {
+    let mut caches = BTreeMap::new();
+    for route in config.routes() {
+        let Some(plan) = route.cache() else {
+            continue;
+        };
+        let mut configured_headers = [
+            "accept",
+            "accept-encoding",
+            "content-type",
+            "idempotency-key",
+            "user-agent",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        for name in plan.key_headers() {
+            if !configured_headers
+                .iter()
+                .any(|configured| configured == name.as_ref())
+            {
+                configured_headers.push(name.to_string());
+            }
+        }
+        let mut key_headers = Vec::with_capacity(configured_headers.len());
+        for name in configured_headers {
+            let name = http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ProxyError::InvalidLimits("cache key header is invalid".to_owned()))?;
+            key_headers.push(name);
+        }
+        caches.insert(
+            Arc::from(route.id()),
+            Arc::new(ResponseCache::new(CachePolicy {
+                enabled: plan.enabled(),
+                ttl: plan.ttl(),
+                max_entries: plan.max_entries(),
+                max_bytes: usize::try_from(plan.max_bytes()).map_err(|_| {
+                    ProxyError::InvalidLimits("cache byte bound is too large".to_owned())
+                })?,
+                coalesce: plan.coalesce(),
+                key_headers,
+            })),
+        );
+    }
+    Ok(caches)
 }
 
 fn native_error(error: NativeRuntimeError) -> ProxyError {

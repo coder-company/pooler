@@ -422,7 +422,11 @@ fn expand_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError>
     match import.preset.as_deref() {
         Some("cursor") => expand_cursor_preset(import, path),
         Some("devin") => expand_devin_preset(import, path),
-        _ => Err(load_error(path, "unknown preset; expected cursor or devin")),
+        Some("factory") => expand_factory_preset(import, path),
+        _ => Err(load_error(
+            path,
+            "unknown preset; expected cursor, devin, or factory",
+        )),
     }
 }
 
@@ -440,10 +444,7 @@ fn expand_cursor_preset(import: &ImportSpec, path: &Path) -> Result<Value, Confi
             key.as_str(),
             "bind" | "reasoning_effort" | "model_prefix" | "upstream_url" | "secret"
         ) {
-            return Err(load_error(
-                path,
-                &format!("unknown cursor preset parameter `{key}`"),
-            ));
+            return Err(unknown_preset_parameter(path, key));
         }
     }
 
@@ -507,13 +508,103 @@ fn expand_cursor_preset(import: &ImportSpec, path: &Path) -> Result<Value, Confi
     Ok(preset)
 }
 
+fn expand_factory_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
+    for key in import.parameters.keys() {
+        if !matches!(key.as_str(), "bind" | "upstream_url" | "secret") {
+            return Err(unknown_preset_parameter(path, key));
+        }
+    }
+    let alias = import.alias.as_deref().unwrap_or("factory");
+    if alias.is_empty()
+        || !alias
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(load_error(path, "invalid preset alias"));
+    }
+    let mut preset: Value = serde_yml::from_str(include_str!("../../../presets/factory.yaml"))
+        .map_err(|error| load_error(path, &format!("invalid built-in factory preset: {error}")))?;
+    rename_named_key(&mut preset, "listeners", "factory", alias, path)?;
+    rename_named_key(&mut preset, "upstreams", "factory", alias, path)?;
+    rewrite_factory_routes(&mut preset, alias, path)?;
+
+    if let Some(value) = import.parameters.get("bind") {
+        set_named_field(
+            &mut preset,
+            "listeners",
+            alias,
+            "bind",
+            string_value(value, path)?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("upstream_url") {
+        set_named_field(
+            &mut preset,
+            "upstreams",
+            alias,
+            "url",
+            string_value(value, path)?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("secret") {
+        let upstream = named_declaration_mut(&mut preset, "upstreams", alias, path)?;
+        let auth = upstream
+            .entry(Value::String("auth".to_owned()))
+            .or_insert_with(|| Value::Mapping(Mapping::new()))
+            .as_mapping_mut()
+            .ok_or_else(|| load_error(path, "factory preset auth is invalid"))?;
+        auth.insert(
+            Value::String("secret".to_owned()),
+            Value::String(string_value(value, path)?),
+        );
+    }
+    Ok(preset)
+}
+
+fn rewrite_factory_routes(root: &mut Value, alias: &str, path: &Path) -> Result<(), ConfigError> {
+    let routes = root
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(Value::String("routes".to_owned())))
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| load_error(path, "factory preset routes are invalid"))?;
+    for route in routes {
+        let route = route
+            .as_mapping_mut()
+            .ok_or_else(|| load_error(path, "factory preset route is invalid"))?;
+        let route_id = route
+            .get(Value::String("id".to_owned()))
+            .and_then(Value::as_str)
+            .ok_or_else(|| load_error(path, "factory preset route ID is missing"))?;
+        route.insert(
+            Value::String("id".to_owned()),
+            Value::String(format!("{alias}-{route_id}")),
+        );
+        route.insert(
+            Value::String("listen".to_owned()),
+            Value::String(alias.to_owned()),
+        );
+        if let Some(Value::Mapping(target)) = route.get_mut(Value::String("target".to_owned())) {
+            if target
+                .get(Value::String("provider".to_owned()))
+                .and_then(Value::as_str)
+                == Some("factory")
+            {
+                target.insert(
+                    Value::String("provider".to_owned()),
+                    Value::String(alias.to_owned()),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn expand_devin_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
     for key in import.parameters.keys() {
         if !matches!(key.as_str(), "bind" | "upstream_url" | "secret") {
-            return Err(load_error(
-                path,
-                &format!("unknown devin preset parameter `{key}`"),
-            ));
+            return Err(unknown_preset_parameter(path, key));
         }
     }
 
@@ -580,6 +671,10 @@ fn expand_devin_preset(import: &ImportSpec, path: &Path) -> Result<Value, Config
         );
     }
     Ok(preset)
+}
+
+fn unknown_preset_parameter(path: &Path, key: &str) -> ConfigError {
+    load_error(path, &format!("unknown preset parameter `{key}`"))
 }
 
 fn rewrite_devin_routes(root: &mut Value, alias: &str, path: &Path) -> Result<(), ConfigError> {
@@ -1217,7 +1312,7 @@ imports:
 version: 1
 "#,
         );
-        let config = load_path(root)
+        let config = load_path(&root)
             .expect("cursor presets")
             .compile()
             .expect("compiled");
@@ -1271,16 +1366,44 @@ version: 1
     }
 
     #[test]
+    fn expands_factory_preset_with_v3_v4_and_discovery_routes() {
+        let dir = TestDir::new();
+        let root = dir.write(
+            "factory.yaml",
+            r#"
+imports:
+  - preset: factory
+    as: factory-local
+    with:
+      bind: 127.0.0.1:9332
+      upstream_url: http://127.0.0.1:9319
+version: 1
+"#,
+        );
+        let config = load_path(&root)
+            .expect("factory preset")
+            .compile()
+            .expect("compiled");
+        assert_eq!(config.listeners()["factory-local"].bind(), "127.0.0.1:9332");
+        assert!(config.route("factory-local-language-model-v3").is_some());
+        assert!(config.route("factory-local-language-model-v4").is_some());
+        assert!(config.route("factory-local-config-v3").is_some());
+        assert!(config.route("factory-local-config-v4").is_some());
+        let rendered = render_path(root).expect("rendered preset");
+        assert!(!rendered.contains("preset:"));
+    }
+
+    #[test]
     fn rejects_unknown_devin_preset_parameters() {
         let dir = TestDir::new();
         let root = dir.write(
             "devin-invalid.yaml",
             "imports: [{preset: devin, with: {model: custom}}]\nversion: 1\n",
         );
-        let error = load_path(root).expect_err("unknown Devin preset parameter");
+        let error = load_path(root).expect_err("unknown preset parameter");
         assert!(error
             .to_string()
-            .contains("unknown devin preset parameter `model`"));
+            .contains("unknown preset parameter `model`"));
     }
 
     #[test]

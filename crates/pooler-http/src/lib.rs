@@ -9,6 +9,7 @@
 
 mod auth;
 mod body;
+mod cache;
 mod drain;
 mod headers;
 mod native;
@@ -23,13 +24,21 @@ pub use auth::{
 pub use body::{
     collect_body_limited, read_body_limited, BodyLimitError, FrameLimitedBody, LimitedBody,
 };
+pub use cache::{
+    replayable_response_headers, response_from_cache, safe_key_header, safe_method_for_cache,
+    safe_request_for_cache, safe_response_for_cache, CacheFollower, CacheKey, CacheKeyInput,
+    CacheLeader, CacheLookup, CachePolicy, CachedResponse, ResponseCache, CACHE_KEY_VERSION,
+    DEFAULT_CACHE_MAX_BYTES, DEFAULT_CACHE_MAX_ENTRIES, DEFAULT_CACHE_TTL, MAX_CACHE_KEY_HEADERS,
+};
 pub use drain::{DrainController, DrainError, DrainGuard, DrainedBody};
 pub use headers::{
     remove_hop_by_hop_headers, retry_after_delay, sanitize_headers, strip_hop_by_hop_headers,
     HOP_BY_HOP_HEADERS,
 };
 pub use native::{NativeAuthorization, NativeRuntime, NativeRuntimeError};
-pub use pool::{PoolError, PoolFailure, PoolSelection, PoolingCoordinator};
+pub use pool::{
+    PoolError, PoolFailure, PoolSelection, PoolingCoordinator, SelectionContext, SelectionTiming,
+};
 pub use proxy::{
     BoxError, HttpProxy, NoSemanticAdapter, ProxyBody, ProxyError, SemanticAdapter,
     SemanticRequestBody, SemanticResponseBody,

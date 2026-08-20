@@ -22,7 +22,8 @@ use pooler_config::{
     SelectionStrategy as ConfigSelectionStrategy,
 };
 use pooler_core::{
-    CapabilitySet, ConfigGeneration, CredentialId, ErrorClass, ModelId, ProviderId, RouteId,
+    Capability, CapabilitySet, ConfigGeneration, CredentialId, ErrorClass, ModelId, ProviderId,
+    RouteId,
 };
 use pooler_policy::{
     AffinityKey, CommitmentState, CooldownScope, CredentialRegistration, CredentialRegistry,
@@ -36,6 +37,161 @@ use pooler_store::{
 };
 use thiserror::Error;
 use zeroize::Zeroizing;
+
+/// Request-local semantic information needed by account selection.
+///
+/// Raw identifiers are retained only until the selection decision is made;
+/// [`AffinityKey`] hashes them before mutable state or diagnostics see them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SelectionContext {
+    model: Option<String>,
+    required_capabilities: CapabilitySet,
+    codec: Option<String>,
+    affinity_values: BTreeMap<String, String>,
+}
+
+/// Attempt and monotonic-clock inputs for one selection operation.
+#[derive(Clone, Copy, Debug)]
+pub struct SelectionTiming {
+    attempt: u32,
+    started: Instant,
+}
+
+impl SelectionTiming {
+    /// Construct request timing metadata.
+    #[must_use]
+    pub const fn new(attempt: u32, started: Instant) -> Self {
+        Self { attempt, started }
+    }
+}
+
+impl SelectionContext {
+    /// Build selection requirements from a decoded semantic request.
+    #[must_use]
+    pub fn from_semantic_request(request: &pooler_protocol::SemanticRequest) -> Self {
+        let mut context = Self::default();
+        if !request.model.trim().is_empty() {
+            context.model = Some(request.model.clone());
+        }
+        if !request.tools.is_empty() {
+            context.require(Capability::Tools);
+            context.require(Capability::FunctionCalling);
+        }
+        if request.tool_choice.is_some() {
+            context.require(Capability::ToolChoice);
+        }
+        if request.reasoning.is_some() {
+            context.require(Capability::Reasoning);
+        }
+        if request.continuation_id.is_some() {
+            context.require(Capability::Continuation);
+        }
+        match request.response_format.as_ref() {
+            Some(pooler_protocol::ResponseFormat::JsonObject) => {
+                context.require(Capability::StructuredOutput);
+            }
+            Some(pooler_protocol::ResponseFormat::JsonSchema { .. }) => {
+                context.require(Capability::StructuredOutput);
+                context.require(Capability::JsonSchema);
+            }
+            Some(pooler_protocol::ResponseFormat::Text) | None => {}
+        }
+        for item in &request.input {
+            context.require_input_capabilities(item);
+        }
+        if let Some(value) = request.session_id.as_deref() {
+            context.with_affinity_value("request.session_id", value);
+            context.with_affinity_value("semantic.session_id", value);
+        }
+        if let Some(value) = request.continuation_id.as_deref() {
+            context.with_affinity_value("openai.previous_response_id", value);
+        }
+        context
+    }
+
+    /// Add a route-level requirement discovered by an adapter.
+    pub const fn require(&mut self, capability: Capability) {
+        self.required_capabilities.insert(capability);
+    }
+
+    /// Add a required codec identifier.
+    pub fn with_codec(&mut self, codec: impl Into<String>) {
+        let codec = codec.into();
+        if !codec.trim().is_empty() {
+            self.codec = Some(codec);
+        }
+    }
+
+    /// Add one semantic affinity source.
+    pub fn with_affinity_value(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let value = value.into();
+        if !value.is_empty() {
+            self.affinity_values.insert(key.into(), value);
+        }
+    }
+
+    /// Required capabilities for this request.
+    #[must_use]
+    pub const fn required_capabilities(&self) -> CapabilitySet {
+        self.required_capabilities
+    }
+
+    /// Public model identifier decoded from the request.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// Required codec identifier, if the route has one.
+    #[must_use]
+    pub fn codec(&self) -> Option<&str> {
+        self.codec.as_deref()
+    }
+
+    /// Look up a configured semantic affinity source.
+    #[must_use]
+    pub fn affinity_value(&self, key: &str) -> Option<&str> {
+        self.affinity_values.get(key).map(String::as_str)
+    }
+
+    fn require_input_capabilities(&mut self, item: &pooler_protocol::InputItem) {
+        use pooler_protocol::InputItem;
+
+        match item {
+            InputItem::Message(message) => {
+                for content in &message.content {
+                    self.require_content_capabilities(content);
+                }
+            }
+            InputItem::ToolCall(_) | InputItem::ToolResult(_) => {
+                self.require(Capability::Tools);
+                self.require(Capability::FunctionCalling);
+            }
+            InputItem::Content(content) => self.require_content_capabilities(content),
+            InputItem::Provider { .. } => {}
+        }
+    }
+
+    fn require_content_capabilities(&mut self, content: &pooler_protocol::ContentPart) {
+        use pooler_protocol::ContentPart;
+
+        match content {
+            ContentPart::Text { .. } => self.require(Capability::Text),
+            ContentPart::Image { .. } => self.require(Capability::Images),
+            ContentPart::File { .. } => self.require(Capability::Files),
+            ContentPart::Audio { .. } => {
+                self.require(Capability::Audio);
+                self.require(Capability::InputAudio);
+            }
+            ContentPart::Reasoning(_) => self.require(Capability::Reasoning),
+            ContentPart::ToolCall(_) | ContentPart::ToolResult(_) => {
+                self.require(Capability::Tools);
+                self.require(Capability::FunctionCalling);
+            }
+            ContentPart::Provider { .. } => {}
+        }
+    }
+}
 
 /// One selected upstream target and its short-lived account lease.
 pub struct PoolSelection {
@@ -231,7 +387,13 @@ impl PoolingCoordinator {
             }
             let key = route_registry_key(route.id());
             let registry = Arc::new(CredentialRegistry::new());
-            register_route_accounts(&registry, route.id(), route.target().upstream(), &accounts)?;
+            register_route_accounts(
+                &registry,
+                route.id(),
+                route.target().upstream(),
+                route.target(),
+                &accounts,
+            )?;
             registries.insert(key, registry);
         }
 
@@ -323,15 +485,48 @@ impl PoolingCoordinator {
         attempt: u32,
         started: Instant,
     ) -> Result<PoolSelection, PoolError> {
+        self.select_with_context(
+            config,
+            route,
+            model,
+            headers,
+            &SelectionContext::default(),
+            SelectionTiming::new(attempt, started),
+        )
+    }
+
+    /// Select one target with decoded semantic requirements.
+    pub fn select_with_context(
+        &self,
+        config: &CompiledConfig,
+        route: &RoutePlan,
+        model: Option<&str>,
+        headers: &HeaderMap,
+        context: &SelectionContext,
+        timing: SelectionTiming,
+    ) -> Result<PoolSelection, PoolError> {
         let policy = route
             .target()
             .policy()
             .and_then(|id| config.policies().get(id))
             .cloned();
 
+        let requested_model =
+            model.or_else(|| route.target().model_source().and_then(|_| context.model()));
         let (logical_model, static_upstream, static_model) =
-            resolve_static_target(config, route, model)?;
+            resolve_static_target(config, route, requested_model)?;
         let Some(policy) = policy else {
+            if selection_contract_is_declared(route, requested_model)
+                && !target_satisfies_context(
+                    config,
+                    route,
+                    requested_model,
+                    static_upstream,
+                    context,
+                )
+            {
+                return Err(PoolError::Selection);
+            }
             let provider = ProviderId::new(static_upstream.to_owned())
                 .map_err(|_| PoolError::InvalidProvider)?;
             let model_id =
@@ -351,7 +546,7 @@ impl PoolingCoordinator {
             });
         };
 
-        let registry_key = if model.is_some() {
+        let registry_key = if requested_model.is_some() {
             logical_model.to_owned()
         } else {
             route_registry_key(route.id())
@@ -362,7 +557,7 @@ impl PoolingCoordinator {
             self.record_no_eligible(
                 route,
                 model_id.as_str(),
-                attempt,
+                timing.attempt,
                 config.generation(),
                 &policy,
                 None,
@@ -374,9 +569,19 @@ impl PoolingCoordinator {
         let mut request = SelectionRequest::new(model_id.clone())
             .with_strategy(config_strategy(policy.selection().strategy()))
             .with_route(RouteId::new(route.id()).map_err(|_| PoolError::Selection)?)
-            .with_attempt(attempt)
+            .with_attempt(timing.attempt)
             .with_generation(ConfigGeneration::new(config.generation()))
-            .at(started);
+            .with_capabilities(required_capabilities_for_selection(
+                route,
+                requested_model,
+                context,
+            ))
+            .at(timing.started);
+        if let Some(codec) = required_codec_for_selection(route, requested_model, context) {
+            request = request
+                .with_codec(codec)
+                .map_err(|_| PoolError::Selection)?;
+        }
         if let Some(allowed) = account_allow_list(config, &policy) {
             let ids = allowed
                 .into_iter()
@@ -384,11 +589,11 @@ impl PoolingCoordinator {
                 .collect::<Vec<_>>();
             request = request.with_allowed_credentials(ids);
         }
-        let affinity_key = affinity_value(&policy, headers)
+        let affinity_key = affinity_value(&policy, headers, context)
             .and_then(|value| AffinityKey::new(value.as_bytes()).ok());
         if let Some(affinity) = policy.selection().affinity() {
             request = request.with_affinity_rebind(affinity.rebind());
-            if let Some(value) = affinity_value(&policy, headers) {
+            if let Some(value) = affinity_value(&policy, headers, context) {
                 if let Ok(key) = AffinityKey::new(value.as_bytes()) {
                     request = request
                         .with_hashed_affinity_key(key.clone(), affinity.ttl())
@@ -403,7 +608,7 @@ impl PoolingCoordinator {
                 self.record_no_eligible(
                     route,
                     model_id.as_str(),
-                    attempt,
+                    timing.attempt,
                     config.generation(),
                     &policy,
                     Some(&explanation),
@@ -432,7 +637,7 @@ impl PoolingCoordinator {
         self.record_selection(
             route,
             &logical_model,
-            attempt,
+            timing.attempt,
             config.generation(),
             &lease,
             selected_model.as_deref(),
@@ -899,6 +1104,9 @@ fn register_model_accounts(
         .map_err(|_| PoolError::Selection)?
         .with_weight(account.weight())
         .map_err(|_| PoolError::Selection)?;
+        let registration = registration
+            .with_codecs(target.codecs().iter().map(AsRef::as_ref))
+            .map_err(|_| PoolError::Selection)?;
         let registration = match account.max_concurrency() {
             Some(max) => registration
                 .with_max_in_flight(max)
@@ -916,6 +1124,7 @@ fn register_route_accounts(
     registry: &CredentialRegistry,
     route_key: &str,
     upstream: &str,
+    target: &pooler_config::TargetPlan,
     accounts: &BTreeMap<String, AccountPlan>,
 ) -> Result<(), PoolError> {
     let model = ModelId::new(route_key.to_owned()).map_err(|_| PoolError::InvalidModel)?;
@@ -927,11 +1136,14 @@ fn register_route_accounts(
             account.id(),
             account.provider(),
             model.as_str(),
-            CapabilitySet::new(),
+            target.capabilities(),
         )
         .map_err(|_| PoolError::Selection)?
         .with_weight(account.weight())
         .map_err(|_| PoolError::Selection)?;
+        let registration = registration
+            .with_codecs(target.codecs().iter().map(AsRef::as_ref))
+            .map_err(|_| PoolError::Selection)?;
         let registration = match account.max_concurrency() {
             Some(max) => registration
                 .with_max_in_flight(max)
@@ -975,6 +1187,70 @@ fn resolve_static_target<'a>(
     ))
 }
 
+fn selection_contract_is_declared(route: &RoutePlan, model: Option<&str>) -> bool {
+    model.is_some()
+        || !route.target().capabilities().is_empty()
+        || !route.target().codecs().is_empty()
+}
+
+fn required_capabilities_for_selection(
+    route: &RoutePlan,
+    model: Option<&str>,
+    context: &SelectionContext,
+) -> CapabilitySet {
+    if selection_contract_is_declared(route, model) {
+        context
+            .required_capabilities()
+            .union(route.target().capabilities())
+    } else {
+        route.target().capabilities()
+    }
+}
+
+fn required_codec_for_selection<'a>(
+    route: &RoutePlan,
+    model: Option<&str>,
+    context: &'a SelectionContext,
+) -> Option<&'a str> {
+    if selection_contract_is_declared(route, model) {
+        context.codec()
+    } else {
+        None
+    }
+}
+
+fn target_satisfies_context(
+    config: &CompiledConfig,
+    route: &RoutePlan,
+    model: Option<&str>,
+    static_upstream: &str,
+    context: &SelectionContext,
+) -> bool {
+    let (capabilities, codecs) = if let Some(model) = model {
+        let Some(plan) = config.models().get(model) else {
+            return false;
+        };
+        let Some(target) = plan
+            .targets()
+            .iter()
+            .find(|target| target.provider() == static_upstream)
+            .or_else(|| plan.targets().first())
+        else {
+            return false;
+        };
+        (target.capabilities(), target.codecs())
+    } else {
+        (route.target().capabilities(), route.target().codecs())
+    };
+    let required_capabilities = context
+        .required_capabilities()
+        .union(route.target().capabilities());
+    capabilities.contains_all(required_capabilities)
+        && context
+            .codec()
+            .is_none_or(|codec| codecs.iter().any(|value| value.as_ref() == codec))
+}
+
 fn route_registry_key(route: &str) -> String {
     format!("route:{route}")
 }
@@ -1016,7 +1292,11 @@ fn account_allow_list(config: &CompiledConfig, policy: &PolicyPlan) -> Option<BT
     None
 }
 
-fn affinity_value(policy: &PolicyPlan, headers: &HeaderMap) -> Option<String> {
+fn affinity_value(
+    policy: &PolicyPlan,
+    headers: &HeaderMap,
+    context: &SelectionContext,
+) -> Option<String> {
     let key = policy.selection().affinity()?.key();
     if let Some(header_name) = key.strip_prefix("header:") {
         return headers
@@ -1025,26 +1305,33 @@ fn affinity_value(policy: &PolicyPlan, headers: &HeaderMap) -> Option<String> {
             .map(str::to_owned);
     }
     match key {
-        "request.session_id" | "semantic.session_id" | "devin.conversation_id" => headers
-            .get("x-session-id")
-            .or_else(|| headers.get("x-conversation-id"))
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
-        "devin.cascade_id" => headers
-            .get("x-cascade-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
-        "devin.execution_id" => headers
-            .get("x-execution-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
-        "openai.previous_response_id" => headers
-            .get("x-previous-response-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
+        "request.session_id"
+        | "semantic.session_id"
+        | "devin.conversation_id"
+        | "devin.cascade_id"
+        | "devin.execution_id"
+        | "openai.previous_response_id" => context
+            .affinity_value(key)
+            .map(str::to_owned)
+            .or_else(|| semantic_header_value(key, headers)),
         "anthropic.metadata" | "hash:selected_fields" => None,
         _ => None,
     }
+}
+
+fn semantic_header_value(key: &str, headers: &HeaderMap) -> Option<String> {
+    let header = match key {
+        "request.session_id" | "semantic.session_id" | "devin.conversation_id" => {
+            ["x-session-id", "x-conversation-id"]
+                .into_iter()
+                .find_map(|name| headers.get(name))
+        }
+        "devin.cascade_id" => headers.get("x-cascade-id"),
+        "devin.execution_id" => headers.get("x-execution-id"),
+        "openai.previous_response_id" => headers.get("x-previous-response-id"),
+        _ => None,
+    }?;
+    header.to_str().ok().map(str::to_owned)
 }
 
 fn cooldown_key(scope: &CooldownScope) -> (&'static str, String) {
@@ -1172,6 +1459,115 @@ mod tests {
             headers.insert("x-session", HeaderValue::from_str(session).expect("header"));
         }
         headers
+    }
+
+    #[test]
+    fn selection_filters_model_capabilities_and_codecs_before_scoring() {
+        let config = pooler_config::compile_yaml(
+            "selection-requirements.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams:
+  capable: {url: http://127.0.0.1:1}
+  incomplete: {url: http://127.0.0.1:2}
+accounts:
+  capable: {provider: capable, secret: env:POOLER_CAPABLE}
+  incomplete: {provider: incomplete, secret: env:POOLER_INCOMPLETE}
+account_pools: {pool: {accounts: [capable, incomplete]}}
+models:
+  - id: public-model
+    targets:
+      - {provider: capable, upstream_model: capable-model, capabilities: [text, streaming], codecs: [decode.factory.language_model]}
+      - {provider: incomplete, upstream_model: incomplete-model, capabilities: [streaming], codecs: [decode.other]}
+policies:
+  pooled:
+    selection: {strategy: ordered_fallback, account_pool: pool}
+routes:
+  - id: model-route
+    listen: local
+    ingress: {mode: patch, inspectors: [inspect.openai.model]}
+    target: {provider: capable, model_from: inspected.model, policy: pooled}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("selection config");
+        let route = config.route("model-route").expect("route");
+        let mut semantic = pooler_protocol::SemanticRequest::new("public-model");
+        semantic.push_message(pooler_protocol::Message::text(
+            pooler_protocol::Role::User,
+            "hello",
+        ));
+        let mut context = SelectionContext::from_semantic_request(&semantic);
+        context.require(Capability::Streaming);
+        context.with_codec("decode.factory.language_model");
+        let selection = PoolingCoordinator::new(&config)
+            .expect("coordinator")
+            .select_with_context(
+                &config,
+                route,
+                None,
+                &HeaderMap::new(),
+                &context,
+                SelectionTiming::new(1, Instant::now()),
+            )
+            .expect("capable target selected");
+        assert_eq!(selection.provider().as_str(), "capable");
+        let candidates = selection
+            .explanation()
+            .expect("explanation")
+            .candidates
+            .iter()
+            .find(|candidate| candidate.target.provider.as_str() == "incomplete")
+            .expect("incomplete candidate");
+        assert!(candidates
+            .filter_reasons
+            .iter()
+            .any(|reason| matches!(reason, pooler_policy::FilterReason::MissingCapability(_))));
+        assert!(candidates
+            .filter_reasons
+            .iter()
+            .any(|reason| matches!(reason, pooler_policy::FilterReason::CodecUnavailable(_))));
+    }
+
+    #[test]
+    fn static_target_contract_rejects_missing_capability_or_codec() {
+        let config = pooler_config::compile_yaml(
+            "static-selection-contract.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+routes:
+  - id: semantic
+    listen: local
+    ingress: {mode: semantic, decoder: decode.factory.language_model}
+    target: {provider: local, capabilities: [text], codecs: [decode.factory.language_model]}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("static contract config");
+        let route = config.route("semantic").expect("route");
+        let mut semantic = pooler_protocol::SemanticRequest::new("public-model");
+        semantic.push_message(pooler_protocol::Message::text(
+            pooler_protocol::Role::User,
+            "hello",
+        ));
+        let mut context = SelectionContext::from_semantic_request(&semantic);
+        context.require(Capability::Streaming);
+        context.with_codec("decode.other");
+        let error = PoolingCoordinator::new(&config)
+            .expect("coordinator")
+            .select_with_context(
+                &config,
+                route,
+                None,
+                &HeaderMap::new(),
+                &context,
+                SelectionTiming::new(1, Instant::now()),
+            )
+            .expect_err("static target without requirements must not be selected");
+        assert!(matches!(error, PoolError::Selection));
     }
 
     #[test]

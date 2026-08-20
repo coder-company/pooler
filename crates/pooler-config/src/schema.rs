@@ -25,6 +25,7 @@ pub fn config_schema() -> Value {
     definitions.insert("affinity".to_owned(), affinity_schema());
     definitions.insert("auth".to_owned(), auth_schema());
     definitions.insert("body".to_owned(), body_schema());
+    definitions.insert("cache".to_owned(), cache_schema());
     definitions.insert("cooldown".to_owned(), cooldown_schema());
     definitions.insert("duration".to_owned(), duration_schema());
     definitions.insert("extension".to_owned(), extension_schema());
@@ -261,7 +262,7 @@ fn import_schema() -> Value {
     );
     let preset = object_schema(
         properties([
-            ("preset", string_enum(["cursor", "devin"])),
+            ("preset", string_enum(["cursor", "devin", "factory"])),
             ("as", string_pattern(r"^[A-Za-z0-9._-]{1,128}$")),
             ("with", string_map_schema()),
         ]),
@@ -403,6 +404,7 @@ fn model_target_schema() -> Value {
                     None,
                 ),
             ),
+            ("codecs", array_schema(string_schema(), Some(0), None)),
         ]),
         &[],
         false,
@@ -458,6 +460,30 @@ fn request_schema() -> Value {
             "steps",
             array_schema(reference("request_step"), Some(0), Some(32)),
         )]),
+        &[],
+        false,
+    )
+}
+
+fn cache_schema() -> Value {
+    object_schema(
+        properties([
+            ("enabled", optional(boolean_schema())),
+            ("ttl", optional(reference("duration"))),
+            ("max_entries", optional(u32_schema())),
+            (
+                "max_bytes",
+                optional(one_of([
+                    integer_schema(Some(0), None),
+                    byte_size_string_schema(),
+                ])),
+            ),
+            ("coalesce", optional(boolean_schema())),
+            (
+                "key_headers",
+                array_schema(string_schema(), Some(0), Some(16)),
+            ),
+        ]),
         &[],
         false,
     )
@@ -522,6 +548,7 @@ fn route_schema() -> Value {
             ("downstream_auth", optional(reference("auth"))),
             ("auth", optional(reference("auth"))),
             ("limits", optional(reference("route_limits"))),
+            ("cache", optional(reference("cache"))),
             ("ingress", optional(reference("body"))),
             ("request", optional(reference("request"))),
             ("response", optional(reference("body"))),
@@ -627,6 +654,15 @@ fn target_schema() -> Value {
             ("upstream_path", optional_string()),
             ("model_from", optional_string()),
             ("policy", optional_string()),
+            (
+                "capabilities",
+                array_schema(
+                    string_enum(Capability::ALL.map(Capability::as_str)),
+                    Some(0),
+                    None,
+                ),
+            ),
+            ("codecs", array_schema(string_schema(), Some(0), None)),
         ]),
         &[],
         false,

@@ -28,7 +28,7 @@ use pooler_extension::{
 };
 use pooler_http::{
     BoxError, DrainError, HttpProxy, NativeRuntime, PoolingCoordinator, ProxyBody, ProxyError,
-    SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
+    SelectionContext, SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
 };
 use pooler_observe::MetricsRegistry;
 use thiserror::Error;
@@ -77,6 +77,21 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         }
     }
 
+    fn selection_context(
+        &self,
+        route: &pooler_config::RoutePlan,
+        headers: &http::HeaderMap,
+        body: &[u8],
+    ) -> Result<SelectionContext, BoxError> {
+        if FactorySemanticAdapter.supports(route) {
+            FactorySemanticAdapter.selection_context(route, headers, body)
+        } else if DevinSemanticAdapter.supports(route) {
+            DevinSemanticAdapter.selection_context(route, headers, body)
+        } else {
+            Err(unsupported_semantic_route(route))
+        }
+    }
+
     fn sanitize_request_headers(&self, headers: &mut http::HeaderMap) {
         FactorySemanticAdapter.sanitize_request_headers(headers);
         DevinSemanticAdapter.sanitize_request_headers(headers);
@@ -92,6 +107,32 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
             FactorySemanticAdapter.decode_response(route, body, cancellation)
         } else if DevinSemanticAdapter.supports(route) {
             DevinSemanticAdapter.decode_response(route, body, cancellation)
+        } else {
+            Err(unsupported_semantic_route(route))
+        }
+    }
+
+    fn decode_response_with_request_headers(
+        &self,
+        route: &pooler_config::RoutePlan,
+        body: ProxyBody,
+        request_headers: &http::HeaderMap,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        if FactorySemanticAdapter.supports(route) {
+            FactorySemanticAdapter.decode_response_with_request_headers(
+                route,
+                body,
+                request_headers,
+                cancellation,
+            )
+        } else if DevinSemanticAdapter.supports(route) {
+            DevinSemanticAdapter.decode_response_with_request_headers(
+                route,
+                body,
+                request_headers,
+                cancellation,
+            )
         } else {
             Err(unsupported_semantic_route(route))
         }
@@ -2585,6 +2626,130 @@ mod tests {
                 .await
                 .is_err()
         );
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn semantic_model_selection_filters_targets_and_sticks_to_body_session() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("semantic pooling upstream binds");
+        let upstream_address = listener
+            .local_addr()
+            .expect("semantic pooling upstream address");
+        let upstream = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for index in 0..3 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("semantic pooling upstream accepts");
+                let request = read_request(&mut stream)
+                    .await
+                    .expect("semantic pooling request bytes");
+                let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let first = request_text.contains("authorization: bearer first-token");
+                let (status, reason, body, extra_headers) = if index == 0 && first {
+                    (
+                        429,
+                        "Too Many Requests",
+                        b"quota".as_slice(),
+                        "x-error-code: insufficient_quota\r\nRetry-After: 1\r\n",
+                    )
+                } else {
+                    (
+                        200,
+                        "OK",
+                        b"data: {\"id\":\"chat-1\",\"model\":\"rebound-model\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chat-1\",\"model\":\"rebound-model\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n".as_slice(),
+                        "",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n",
+                    body.len(),
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("semantic pooling response headers");
+                stream
+                    .write_all(body)
+                    .await
+                    .expect("semantic pooling response body");
+                requests.push(request);
+            }
+            requests
+        });
+
+        let first_secret = TestSecret::new("first-token");
+        let blocked_secret = TestSecret::new("blocked-token");
+        let rebound_secret = TestSecret::new("rebound-token");
+        let config = pooler_config::compile_yaml(
+            "semantic-model-selection.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{upstream_address}}}\n  blocked: {{url: http://{upstream_address}}}\n  rebound: {{url: http://{upstream_address}}}\naccounts:\n  first: {{provider: first, secret: {}}}\n  blocked: {{provider: blocked, secret: {}}}\n  rebound: {{provider: rebound, secret: {}}}\naccount_pools: {{pool: {{accounts: [first, blocked, rebound]}}}}\nmodels:\n  - id: public-model\n    targets:\n      - {{provider: first, upstream_model: first-model, capabilities: [text, streaming], codecs: [decode.factory.language_model]}}\n      - {{provider: blocked, upstream_model: blocked-model, capabilities: [streaming], codecs: [decode.other]}}\n      - {{provider: rebound, upstream_model: rebound-model, capabilities: [text, streaming], codecs: [decode.factory.language_model]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, account_pool: pool, affinity: {{key: request.session_id, ttl: 10m, rebind: true}}}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}}\nroutes:\n  - id: factory-pooled\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: first, model_from: request.model, policy: pooled}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n",
+                first_secret.reference(),
+                blocked_secret.reference(),
+                rebound_secret.reference(),
+            ),
+        )
+        .expect("semantic model-selection config compiles");
+        let server = HttpProxyServer::bind(config)
+            .await
+            .expect("semantic model-selection server binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"sessionId":"body-session","prompt":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#;
+        let request = |idempotency: &str| {
+            format!(
+                "POST /v3/ai/language-model HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nAI-Language-Model-Id: public-model\r\nAI-Language-Model-Specification-Version: 3\r\nAI-Language-Model-Streaming: true\r\nIdempotency-Key: {idempotency}\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body),
+            )
+        };
+
+        let first_response = send_request_until(
+            address,
+            request("semantic-session-1").as_bytes(),
+            b"data: [DONE]\n\n",
+        )
+        .await;
+        assert_eq!(status(&first_response), 200);
+        assert!(String::from_utf8_lossy(&first_response).contains("ok"));
+        let second_response = send_request_until(
+            address,
+            request("semantic-session-2").as_bytes(),
+            b"data: [DONE]\n\n",
+        )
+        .await;
+        assert_eq!(status(&second_response), 200);
+
+        let requests = tokio::time::timeout(TEST_TIMEOUT, upstream)
+            .await
+            .expect("semantic pooling upstream completes")
+            .expect("semantic pooling upstream task");
+        assert_eq!(requests.len(), 3);
+        let request_texts = requests
+            .iter()
+            .map(|request| String::from_utf8_lossy(request).to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        assert!(request_texts[0].contains("authorization: bearer first-token"));
+        assert!(
+            request_texts[1].contains("authorization: bearer rebound-token"),
+            "requests: {request_texts:?}"
+        );
+        assert!(
+            request_texts[2].contains("authorization: bearer rebound-token"),
+            "requests: {request_texts:?}"
+        );
+        for request in requests.iter().skip(1) {
+            let body = response_body(request);
+            let body: serde_json::Value = serde_json::from_slice(body).expect("OpenAI request");
+            assert_eq!(body["model"], "rebound-model");
+        }
         stop_server(&server, runner).await;
     }
 

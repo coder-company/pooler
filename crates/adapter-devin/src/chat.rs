@@ -1154,12 +1154,13 @@ fn decode_prompt(
                 "Devin tool result did not include the invocation identifier",
             );
         }
-        let mut result = ToolResult::text(
-            message.tool_call_id.clone().unwrap_or_default(),
-            prompt.prompt.clone(),
-        );
-        result.is_error = prompt.tool_result_is_error;
-        message.content = vec![ContentPart::ToolResult(result)];
+        if prompt.tool_result_is_error {
+            report.drop_optional(
+                format!("chat_message_prompts[{index}].tool_result_is_error"),
+                "OpenAI Chat has no standard tool-result error flag",
+            );
+        }
+        message.content = vec![ContentPart::text(prompt.prompt.clone())];
     }
     Ok((message, prompt.prompt.len() + prompt.thinking.len()))
 }
@@ -1451,8 +1452,9 @@ mod tests {
         },
     };
     use pooler_core::LossPolicy;
+    use pooler_http::SemanticAdapter;
     use pooler_protocol::{
-        ContentPart, FinishReason, Message, Role, SemanticRequest, StreamEventKind,
+        ContentPart, FinishReason, Message, OpenAiChatCodec, Role, SemanticRequest, StreamEventKind,
     };
     use prost::Message as _;
 
@@ -1532,6 +1534,205 @@ mod tests {
             123
         );
         assert_eq!(encoded.message.tools[0].name, "search");
+    }
+
+    #[test]
+    fn current_client_tool_result_maps_to_a_standalone_openai_tool_message() {
+        let result = "command completed: stdout=POOLER_DEVIN_TOOL_OK; stderr=; exit_code=0; cwd=/workspace; t=0000000000000000";
+        assert_eq!(result.len(), 104);
+        let request = GetChatMessageRequest {
+            chat_model_uid: "gpt-5.6-sol-low".into(),
+            chat_message_prompts: vec![
+                ChatMessagePrompt {
+                    message_id: "assistant-live-1".into(),
+                    source: ChatMessageSource::System as i32,
+                    tool_calls: vec![ChatToolCall {
+                        id: "call-live-1".into(),
+                        name: "run_command".into(),
+                        arguments_json: r#"{"command":"printf POOLER_DEVIN_TOOL_OK"}"#.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ChatMessagePrompt {
+                    message_id: "tool-live-1".into(),
+                    source: ChatMessageSource::Tool as i32,
+                    prompt: result.into(),
+                    tool_call_id: "call-live-1".into(),
+                    ..Default::default()
+                },
+            ],
+            tools: vec![crate::proto::ChatToolDefinition {
+                name: "run_command".into(),
+                json_schema_string: r#"{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}"#.into(),
+                ..Default::default()
+            }],
+            cascade_id: "cascade-live-1".into(),
+            execution_id: "execution-live-2".into(),
+            ..Default::default()
+        };
+        let raw = encode_connect_frame(&request.encode_to_vec(), false, false).expect("frame");
+        let decoded = decode_chat_request(&raw, DevinChatLimits::default()).expect("decode");
+        let mut semantic = decoded.request.clone();
+        semantic.session_id = None;
+        semantic.continuation_id = None;
+        semantic.extensions.remove(
+            &pooler_protocol::ExtensionKey::parse("devin.identifiers")
+                .expect("identifier extension key"),
+        );
+        let encoded =
+            OpenAiChatCodec::encode_request(&semantic, LossPolicy::Reject).expect("OpenAI request");
+        let json: serde_json::Value = serde_json::from_slice(&encoded.body).expect("JSON");
+        assert_eq!(json["messages"][0]["role"], "assistant");
+        assert_eq!(json["messages"][0]["tool_calls"][0]["id"], "call-live-1");
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(json["messages"][1]["tool_call_id"], "call-live-1");
+        assert_eq!(json["messages"][1]["content"], result);
+        assert!(decoded.report.is_lossless());
+    }
+
+    #[test]
+    fn empty_current_client_tool_result_maps_to_empty_openai_content() {
+        let request = GetChatMessageRequest {
+            chat_model_uid: "gpt-5.6-sol-low".into(),
+            chat_message_prompts: vec![
+                ChatMessagePrompt {
+                    message_id: "assistant-live-1".into(),
+                    source: ChatMessageSource::System as i32,
+                    tool_calls: vec![ChatToolCall {
+                        id: "call-live-1".into(),
+                        name: "run_command".into(),
+                        arguments_json: r#"{"command":"true"}"#.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ChatMessagePrompt {
+                    message_id: "tool-live-1".into(),
+                    source: ChatMessageSource::Tool as i32,
+                    tool_call_id: "call-live-1".into(),
+                    ..Default::default()
+                },
+            ],
+            cascade_id: "cascade-live-1".into(),
+            execution_id: "execution-live-2".into(),
+            ..Default::default()
+        };
+        let raw = encode_connect_frame(&request.encode_to_vec(), false, false).expect("frame");
+        let decoded = decode_chat_request(&raw, DevinChatLimits::default()).expect("decode");
+        let mut semantic = decoded.request.clone();
+        semantic.session_id = None;
+        semantic.continuation_id = None;
+        semantic.extensions.remove(
+            &pooler_protocol::ExtensionKey::parse("devin.identifiers")
+                .expect("identifier extension key"),
+        );
+        let encoded =
+            OpenAiChatCodec::encode_request(&semantic, LossPolicy::Reject).expect("OpenAI request");
+        let json: serde_json::Value = serde_json::from_slice(&encoded.body).expect("JSON");
+
+        assert_eq!(json["messages"][1]["role"], "tool");
+        assert_eq!(json["messages"][1]["tool_call_id"], "call-live-1");
+        assert_eq!(json["messages"][1]["content"], "");
+        assert!(decoded.report.is_lossless());
+    }
+
+    #[test]
+    fn sanitized_current_client_tool_fixture_matches_openai_shape() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/devin/current-client-tool-follow-up.json"
+        ))
+        .expect("current Devin fixture");
+        let request_value = &fixture["request"];
+        let mut prompts = Vec::new();
+        for value in request_value["messages"].as_array().expect("messages") {
+            let source = match value["source"].as_str().expect("message source") {
+                "system" => ChatMessageSource::System,
+                "tool" => ChatMessageSource::Tool,
+                other => panic!("unsupported fixture source {other}"),
+            };
+            let tool_calls = value["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|call| ChatToolCall {
+                    id: call["id"].as_str().expect("tool call id").to_owned(),
+                    name: call["name"].as_str().expect("tool name").to_owned(),
+                    arguments_json: call["arguments_json"]
+                        .as_str()
+                        .expect("tool arguments")
+                        .to_owned(),
+                    ..Default::default()
+                })
+                .collect();
+            prompts.push(ChatMessagePrompt {
+                message_id: value["message_id"].as_str().expect("message ID").to_owned(),
+                source: source as i32,
+                prompt: value["prompt"].as_str().unwrap_or_default().to_owned(),
+                tool_calls,
+                tool_call_id: value["tool_call_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                ..Default::default()
+            });
+        }
+        let tools = request_value["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .map(|tool| crate::proto::ChatToolDefinition {
+                name: tool["name"].as_str().expect("tool name").to_owned(),
+                json_schema_string: tool["json_schema_string"]
+                    .as_str()
+                    .expect("tool schema")
+                    .to_owned(),
+                ..Default::default()
+            })
+            .collect();
+        let request = GetChatMessageRequest {
+            chat_model_uid: request_value["model"].as_str().expect("model").to_owned(),
+            chat_message_prompts: prompts,
+            tools,
+            tool_choice: Some(crate::proto::ChatToolChoice {
+                choice: Some(crate::proto::chat_tool_choice::Choice::OptionName(
+                    "auto".to_owned(),
+                )),
+            }),
+            cascade_id: request_value["cascade_id"]
+                .as_str()
+                .expect("cascade ID")
+                .to_owned(),
+            execution_id: request_value["execution_id"]
+                .as_str()
+                .expect("execution ID")
+                .to_owned(),
+            ..Default::default()
+        };
+        let raw = encode_connect_frame(&request.encode_to_vec(), false, false).expect("frame");
+        let route = pooler_config::compile_yaml(
+            "devin-current-client-tool.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+routes:
+  - id: devin
+    listen: local
+    ingress: {mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}
+    target: local
+    response: {mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}
+    loss_policy: reject
+"#,
+        )
+        .expect("route")
+        .routes()[0]
+            .clone();
+        let encoded = crate::DevinSemanticAdapter
+            .encode_request(&route, &http::HeaderMap::new(), &raw)
+            .expect("OpenAI request");
+        let actual: serde_json::Value = serde_json::from_slice(&encoded.body).expect("OpenAI JSON");
+        assert_eq!(actual, fixture["expected_openai_request"]);
     }
 
     #[test]

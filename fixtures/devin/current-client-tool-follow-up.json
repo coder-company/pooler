@@ -1,0 +1,94 @@
+{
+  "id": "fx-devin-current-client-3000.4.16-tool-follow-up.v1",
+  "client": {
+    "name": "Devin CLI",
+    "version": "3000.4.16"
+  },
+  "equivalence": "protobuf_semantic",
+  "notes": "Sanitized current-client shape: a system assistant tool call followed by a source=Tool result. No credentials, workspace paths, or provider response are retained.",
+  "request": {
+    "model": "gpt-5.6-sol-low",
+    "cascade_id": "cascade-live-1",
+    "execution_id": "execution-live-2",
+    "messages": [
+      {
+        "message_id": "assistant-live-1",
+        "source": "system",
+        "tool_calls": [
+          {
+            "id": "call-live-1",
+            "name": "run_command",
+            "arguments_json": "{\"command\":\"printf POOLER_DEVIN_TOOL_OK\"}"
+          }
+        ]
+      },
+      {
+        "message_id": "tool-live-1",
+        "source": "tool",
+        "tool_call_id": "call-live-1",
+        "prompt": "command completed: stdout=POOLER_DEVIN_TOOL_OK; stderr=; exit_code=0; cwd=/workspace; t=0000000000000000",
+        "prompt_bytes": 104
+      }
+    ],
+    "tools": [
+      {
+        "name": "run_command",
+        "json_schema_string": "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}"
+      }
+    ]
+  },
+  "expected_openai_request": {
+    "model": "gpt-5.6-sol-low",
+    "metadata": {
+      "devin_cascade_id": "cascade-live-1",
+      "devin_execution_id": "execution-live-2"
+    },
+    "messages": [
+      {
+        "role": "assistant",
+        "content": null,
+        "id": "assistant-live-1",
+        "tool_calls": [
+          {
+            "id": "call-live-1",
+            "type": "function",
+            "function": {
+              "name": "run_command",
+              "arguments": "{\"command\":\"printf POOLER_DEVIN_TOOL_OK\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call-live-1",
+        "content": "command completed: stdout=POOLER_DEVIN_TOOL_OK; stderr=; exit_code=0; cwd=/workspace; t=0000000000000000"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "tools": [
+      {
+        "type": "function",
+          "function": {
+            "name": "run_command",
+            "strict": false,
+            "parameters": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "command"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  }
+}

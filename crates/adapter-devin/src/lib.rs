@@ -19,8 +19,8 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use pooler_config::RoutePlan;
 use pooler_http::{
-    BoxError, ProxyBody, SemanticAdapter, SemanticRequestBody, SemanticResponseBody, SseLimits,
-    SseParser,
+    BoxError, ProxyBody, SelectionContext, SemanticAdapter, SemanticRequestBody,
+    SemanticResponseBody, SseLimits, SseParser,
 };
 use pooler_protocol::{LossPolicy, OpenAiChatEventDecoder, StreamEvent};
 use std::{
@@ -128,6 +128,35 @@ impl SemanticAdapter for DevinSemanticAdapter {
         })
     }
 
+    fn selection_context(
+        &self,
+        route: &RoutePlan,
+        _headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<SelectionContext, BoxError> {
+        let decoded = decode_chat_request(body, chat_limits(route)).map_err(boxed)?;
+        decoded
+            .report
+            .validate(route.loss_policy())
+            .map_err(boxed)?;
+        let mut context = SelectionContext::from_semantic_request(&decoded.request);
+        context.require(pooler_core::Capability::Streaming);
+        if let Some(codec) = route.ingress().decoder() {
+            context.with_codec(codec);
+        }
+        if let Some(value) = decoded.identifiers.cascade_id.as_deref() {
+            context.with_affinity_value("request.session_id", value);
+            context.with_affinity_value("semantic.session_id", value);
+            context.with_affinity_value("devin.conversation_id", value);
+            context.with_affinity_value("devin.cascade_id", value);
+        }
+        if let Some(value) = decoded.identifiers.execution_id.as_deref() {
+            context.with_affinity_value("devin.execution_id", value);
+            context.with_affinity_value("openai.previous_response_id", value);
+        }
+        Ok(context)
+    }
+
     fn sanitize_request_headers(&self, headers: &mut HeaderMap) {
         headers.remove("connect-protocol-version");
         headers.remove("connect-content-encoding");
@@ -141,6 +170,33 @@ impl SemanticAdapter for DevinSemanticAdapter {
         body: ProxyBody,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
+        self.decode_response_with_compression(route, body, false, cancellation)
+    }
+
+    fn decode_response_with_request_headers(
+        &self,
+        route: &RoutePlan,
+        body: ProxyBody,
+        request_headers: &HeaderMap,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        self.decode_response_with_compression(
+            route,
+            body,
+            accepts_connect_gzip(request_headers),
+            cancellation,
+        )
+    }
+}
+
+impl DevinSemanticAdapter {
+    fn decode_response_with_compression(
+        &self,
+        route: &RoutePlan,
+        body: ProxyBody,
+        compress: bool,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
         let sse_limits = SseLimits::new(
             usize_limit(route.limits().max_frame_bytes),
             usize_limit(route.limits().max_event_bytes),
@@ -149,6 +205,7 @@ impl SemanticAdapter for DevinSemanticAdapter {
             body,
             DevinResponseOptions {
                 policy: route.loss_policy(),
+                compress,
                 sse_limits,
                 max_queue_items: usize_limit(u64::from(route.limits().max_queue_items)),
                 max_queue_bytes: usize_limit(route.limits().max_queue_bytes),
@@ -217,6 +274,7 @@ struct DevinResponseBody {
 
 struct DevinResponseOptions {
     policy: LossPolicy,
+    compress: bool,
     sse_limits: SseLimits,
     max_queue_items: usize,
     max_queue_bytes: usize,
@@ -232,7 +290,7 @@ impl DevinResponseBody {
             parser: SseParser::with_limits(options.sse_limits),
             openai_decoder: OpenAiChatEventDecoder::new(),
             devin_encoder: DevinChatEventEncoder {
-                compress: true,
+                compress: options.compress,
                 connect_limits: options.connect_limits,
             },
             response_tool_ids: BTreeSet::new(),
@@ -528,6 +586,29 @@ fn chat_limits(route: &RoutePlan) -> DevinChatLimits {
     }
 }
 
+fn accepts_connect_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("connect-accept-encoding")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|item| {
+            let mut parts = item.split(';');
+            let encoding = parts.next().map(str::trim).unwrap_or_default();
+            if !encoding.eq_ignore_ascii_case("gzip") {
+                return false;
+            }
+            parts
+                .filter_map(|parameter| parameter.trim().strip_prefix("q="))
+                .all(|quality| {
+                    quality
+                        .trim()
+                        .parse::<f32>()
+                        .map_or(true, |value| value > 0.0)
+                })
+        })
+}
+
 fn usize_limit(value: u64) -> usize {
     value.min(usize::MAX as u64) as usize
 }
@@ -542,13 +623,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        DevinResponseBody, DevinResponseOptions, DevinSemanticAdapter, DEVIN_CHAT_DECODER,
-        DEVIN_CONNECT_ENCODER,
+        accepts_connect_gzip, DevinResponseBody, DevinResponseOptions, DevinSemanticAdapter,
+        DEVIN_CHAT_DECODER, DEVIN_CONNECT_ENCODER,
     };
     use crate::chat::{DevinChatEventEncoder, DevinChatResponseLimits, DevinIdentifiers};
     use crate::connect::{read_connect_trailer_error, ConnectDecoder, ConnectLimits};
     use crate::proto::{GetChatMessageResponse, StopReason};
     use bytes::Bytes;
+    use http::{HeaderMap, HeaderValue};
     use http_body_util::{BodyExt, Full};
     use pooler_http::{BoxError, SemanticAdapter, SseLimits};
     use pooler_protocol::{FinishReason, LossPolicy, StreamEvent, StreamEventKind};
@@ -601,6 +683,24 @@ routes:
         )
         .expect("route compiles");
         assert!(DevinSemanticAdapter.supports(&with_framing.routes()[0]));
+    }
+
+    #[test]
+    fn response_compression_requires_an_explicit_gzip_acceptance() {
+        let mut headers = HeaderMap::new();
+        assert!(!accepts_connect_gzip(&headers));
+        headers.insert(
+            "connect-accept-encoding",
+            HeaderValue::from_static("identity"),
+        );
+        assert!(!accepts_connect_gzip(&headers));
+        headers.insert("connect-accept-encoding", HeaderValue::from_static("gzip"));
+        assert!(accepts_connect_gzip(&headers));
+        headers.insert(
+            "connect-accept-encoding",
+            HeaderValue::from_static("gzip; q=0"),
+        );
+        assert!(!accepts_connect_gzip(&headers));
     }
 
     #[test]
@@ -670,6 +770,7 @@ routes:
             upstream,
             DevinResponseOptions {
                 policy: LossPolicy::Reject,
+                compress: false,
                 sse_limits: SseLimits::default(),
                 max_queue_items: 16,
                 max_queue_bytes: 1024 * 1024,
@@ -692,5 +793,54 @@ routes:
             read_connect_trailer_error(&frames[0].payload).as_deref(),
             Some("Devin stream error provider: bad")
         );
+    }
+
+    #[test]
+    fn selection_context_uses_decoded_devin_identifiers() {
+        use crate::proto::{ChatMessagePrompt, ChatMessageSource, GetChatMessageRequest};
+        use prost::Message;
+
+        let route = pooler_config::compile_yaml(
+            "devin-selection.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+routes:
+  - id: devin
+    listen: local
+    ingress: {mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}
+    target: local
+    response: {mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}
+"#,
+        )
+        .expect("Devin route")
+        .routes()[0]
+            .clone();
+        let message = GetChatMessageRequest {
+            chat_model_uid: "gpt-test".to_owned(),
+            chat_message_prompts: vec![ChatMessagePrompt {
+                source: ChatMessageSource::User as i32,
+                prompt: "hello".to_owned(),
+                ..Default::default()
+            }],
+            cascade_id: "cascade-body".to_owned(),
+            execution_id: "execution-body".to_owned(),
+            ..Default::default()
+        };
+        let body = crate::encode_connect_frame(&message.encode_to_vec(), false, false)
+            .expect("Connect request");
+        let context = DevinSemanticAdapter
+            .selection_context(&route, &HeaderMap::new(), &body)
+            .expect("selection context");
+        assert_eq!(
+            context.affinity_value("devin.conversation_id"),
+            Some("cascade-body")
+        );
+        assert_eq!(
+            context.affinity_value("devin.execution_id"),
+            Some("execution-body")
+        );
+        assert_eq!(context.codec(), Some("decode.devin.chat"));
     }
 }

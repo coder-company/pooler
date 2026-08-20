@@ -26,3 +26,18 @@ not evidence of compatibility with a live Factory client or service.
 `fx-cliproxy-bridge-v3.json` is the broader event-semantic fixture. It adds
 reasoning and fragmented tool-call input coverage while keeping the same local
 reference and compatibility limitation.
+
+'fx-0.0.3-v4-current-client.json' records the installed fx/0.0.3 client
+through Pooler on 2026-08-20. It preserves the observed V4 specification and
+Gateway protocol headers, a representative tool shape, the OpenAI forwarding
+request, and the deterministic loopback stream. Prompt text, tool prose and
+schemas, authorization, session identity, and transport-only headers are
+redacted. The provider-defined search tool is explicitly recorded as an
+optional loss under the preset's degrade policy.
+
+Replay the codec and stream fixture with:
+
+    cargo test -p adapter-factory --test factory_current_fixture
+
+This is current-client request/stream conformance evidence only; it does not
+authorize a live provider or claim broader Factory feature compatibility.

@@ -15,7 +15,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::Method;
+use http::{HeaderName, Method};
 pub use pooler_core::{
     BodyMode, Capability, CapabilitySet, ConfigGeneration, LossPolicy, RouteLimits,
 };
@@ -59,6 +59,20 @@ pub const DEFAULT_EXTENSION_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_EXTENSION_MAX_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 /// Default number of concurrently supervised extension processes.
 pub const DEFAULT_EXTENSION_MAX_CONCURRENCY: u32 = 4;
+/// Default lifetime for an explicitly enabled route response cache.
+pub const DEFAULT_ROUTE_CACHE_TTL: Duration = Duration::from_secs(1);
+/// Default completed entries retained by one route response cache.
+pub const DEFAULT_ROUTE_CACHE_MAX_ENTRIES: usize = 64;
+/// Default response bytes retained by one route response cache.
+pub const DEFAULT_ROUTE_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum response-cache lifetime accepted by the strict configuration.
+pub const MAX_ROUTE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+/// Maximum completed entries accepted by the strict configuration.
+pub const MAX_ROUTE_CACHE_ENTRIES: usize = 4096;
+/// Maximum response bytes accepted by the strict configuration.
+pub const MAX_ROUTE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum request headers used in a response-cache key.
+pub const MAX_ROUTE_CACHE_KEY_HEADERS: usize = 16;
 
 /// Location of a declaration in its source document.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -443,6 +457,8 @@ pub struct ModelTargetConfig {
     pub upstream_model: Option<String>,
     /// Capabilities advertised by this target.
     pub capabilities: Vec<String>,
+    /// Semantic codecs advertised by this target.
+    pub codecs: Vec<String>,
 }
 
 /// One credential-bearing account.
@@ -756,6 +772,8 @@ pub struct RouteConfig {
     pub downstream_auth: Option<DownstreamAuthConfig>,
     /// Route-level resource and timeout limits.
     pub limits: Option<RouteLimitsConfig>,
+    /// Optional short cache for fully buffered responses.
+    pub cache: Option<CacheConfig>,
     /// Ingress body handling.
     pub ingress: Option<BodyConfig>,
     /// Ordered request transforms.
@@ -772,6 +790,30 @@ pub struct RouteConfig {
     pub loss_policy: Option<LossPolicy>,
     /// Explicit precedence override.
     pub priority: Option<i32>,
+}
+
+/// Optional bounded cache and in-flight coalescing policy for one route.
+///
+/// The cache is disabled unless `enabled: true` is explicit. Request-key
+/// headers are an allowlist and are validated as non-sensitive names during
+/// compilation.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Enable completed-response caching for this route.
+    pub enabled: bool,
+    /// Lifetime of a completed response. Defaults to one second.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub ttl: Option<Duration>,
+    /// Maximum completed responses retained by this route.
+    pub max_entries: Option<u32>,
+    /// Maximum aggregate response bytes retained by this route.
+    #[serde(default, deserialize_with = "deserialize_optional_byte_size")]
+    pub max_bytes: Option<u64>,
+    /// Allow equivalent misses to share one in-flight fetch.
+    pub coalesce: Option<bool>,
+    /// Additional non-sensitive request headers included in the cache key.
+    pub key_headers: Vec<String>,
 }
 
 /// Route match dimensions.
@@ -872,6 +914,10 @@ pub struct TargetConfig {
     pub model_from: Option<String>,
     /// Named selection/retry policy.
     pub policy: Option<String>,
+    /// Capabilities advertised by this route target.
+    pub capabilities: Vec<String>,
+    /// Semantic codecs advertised by this route target.
+    pub codecs: Vec<String>,
 }
 
 /// Immutable listener plan.
@@ -1616,6 +1662,7 @@ pub struct ModelTargetPlan {
     provider: Arc<str>,
     upstream_model: Arc<str>,
     capabilities: CapabilitySet,
+    codecs: Vec<Arc<str>>,
 }
 
 impl ModelTargetPlan {
@@ -1635,6 +1682,12 @@ impl ModelTargetPlan {
     #[must_use]
     pub const fn capabilities(&self) -> CapabilitySet {
         self.capabilities
+    }
+
+    /// Semantic codecs advertised by this target.
+    #[must_use]
+    pub fn codecs(&self) -> &[Arc<str>] {
+        &self.codecs
     }
 }
 
@@ -1983,6 +2036,55 @@ pub struct BodyPlan {
     inspectors: Vec<Arc<str>>,
 }
 
+/// Immutable bounded response-cache policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CachePlan {
+    enabled: bool,
+    ttl: Duration,
+    max_entries: usize,
+    max_bytes: u64,
+    coalesce: bool,
+    key_headers: Vec<Arc<str>>,
+}
+
+impl CachePlan {
+    /// Whether completed-response caching is enabled.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Completed-response lifetime.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// Maximum completed entries.
+    #[must_use]
+    pub const fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    /// Maximum aggregate response bytes.
+    #[must_use]
+    pub const fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// Whether equivalent misses may share one in-flight fetch.
+    #[must_use]
+    pub const fn coalesce(&self) -> bool {
+        self.coalesce
+    }
+
+    /// Additional non-sensitive request headers included in cache keys.
+    #[must_use]
+    pub fn key_headers(&self) -> &[Arc<str>] {
+        &self.key_headers
+    }
+}
+
 impl BodyPlan {
     /// Body mode.
     #[must_use]
@@ -2022,6 +2124,8 @@ pub struct TargetPlan {
     path: Option<Arc<str>>,
     model_source: Option<ModelSource>,
     policy: Option<Arc<str>>,
+    capabilities: CapabilitySet,
+    codecs: Vec<Arc<str>>,
 }
 
 /// JSON model value used for static model-registry selection.
@@ -2057,6 +2161,18 @@ impl TargetPlan {
     pub fn policy(&self) -> Option<&str> {
         self.policy.as_deref()
     }
+
+    /// Capabilities advertised by this route target.
+    #[must_use]
+    pub const fn capabilities(&self) -> CapabilitySet {
+        self.capabilities
+    }
+
+    /// Semantic codecs advertised by this route target.
+    #[must_use]
+    pub fn codecs(&self) -> &[Arc<str>] {
+        &self.codecs
+    }
 }
 
 /// Immutable route plan.
@@ -2069,6 +2185,7 @@ pub struct RoutePlan {
     request_steps: Vec<RequestTransform>,
     external_transforms: Vec<Arc<str>>,
     response: BodyPlan,
+    cache: Option<CachePlan>,
     target: TargetPlan,
     downstream_auth: Option<AuthPlan>,
     limits: RouteLimits,
@@ -2119,6 +2236,12 @@ impl RoutePlan {
     #[must_use]
     pub const fn response(&self) -> &BodyPlan {
         &self.response
+    }
+
+    /// Optional bounded response-cache policy.
+    #[must_use]
+    pub const fn cache(&self) -> Option<&CachePlan> {
+        self.cache.as_ref()
     }
 
     /// Target plan.
@@ -2518,7 +2641,26 @@ fn compile_config(
             "response",
         )?;
         validate_external_inspectors(&response, &extensions, &label, "response")?;
+        let cache = compile_cache(declaration.cache.as_ref(), ingress.mode(), &label)?;
         let target = compile_target(declaration, &label, &upstreams, &policies)?;
+        if cache.is_some() && target.model_source().is_some() {
+            return Err(invalid(
+                &label,
+                "response cache cannot be used with dynamic model target selection",
+            ));
+        }
+        if cache.is_some() && target.policy().is_some() {
+            return Err(invalid(
+                &label,
+                "response cache cannot be used with selection policy routes",
+            ));
+        }
+        if cache.is_some() && target.policy().is_some() {
+            return Err(invalid(
+                &label,
+                "response cache cannot be used with policy-based target selection",
+            ));
+        }
         if matcher.websocket() == Some(true)
             && target.model_source().is_none()
             && !matches!(upstreams[target.upstream()].transport(), "ws" | "wss")
@@ -2528,16 +2670,20 @@ fn compile_config(
                 "WebSocket routes require a ws or wss upstream transport",
             ));
         }
-        if target.model_source().is_some() && ingress.mode() != BodyMode::Patch {
+        if target.model_source().is_some()
+            && !matches!(ingress.mode(), BodyMode::Patch | BodyMode::Semantic)
+        {
             return Err(invalid(
                 &label,
-                "request model target selection requires patch ingress mode",
+                "request model target selection requires patch or semantic ingress mode",
             ));
         }
-        if target.model_source() == Some(ModelSource::Inspected) && !has_model_inspector(&ingress) {
+        if target.model_source() == Some(ModelSource::Inspected)
+            && (ingress.mode() == BodyMode::Semantic || !has_model_inspector(&ingress))
+        {
             return Err(invalid(
                 &label,
-                "request model target selection requires inspect.openai.model",
+                "inspected model target selection requires patch ingress with inspect.openai.model",
             ));
         }
         let downstream_auth =
@@ -2560,6 +2706,7 @@ fn compile_config(
             request_steps,
             external_transforms,
             response,
+            cache,
             target,
             downstream_auth,
             limits,
@@ -3456,10 +3603,12 @@ fn compile_models(
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| invalid(&target_label, "model target requires upstream_model"))?;
             let capabilities = compile_capabilities(&target.capabilities, &target_label)?;
+            let codecs = compile_codecs(&target.codecs, &target_label)?;
             targets.push(ModelTargetPlan {
                 provider: Arc::from(provider),
                 upstream_model: Arc::from(upstream_model),
                 capabilities,
+                codecs,
             });
         }
         models.insert(
@@ -3488,6 +3637,23 @@ fn compile_capabilities(
         capabilities.insert(capability);
     }
     Ok(capabilities)
+}
+
+fn compile_codecs(values: &[String], label: &SourceLabel) -> Result<Vec<Arc<str>>, ConfigError> {
+    let mut codecs = Vec::with_capacity(values.len());
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(invalid(label, "target codec must not be empty"));
+        }
+        validate_component_id(value, label, "target codec")?;
+        if !seen.insert(value.to_owned()) {
+            return Err(invalid(label, "target codecs must be unique"));
+        }
+        codecs.push(Arc::from(value.to_owned()));
+    }
+    Ok(codecs)
 }
 
 fn compile_extensions(
@@ -3877,6 +4043,104 @@ fn compile_limits(
     Ok(limits)
 }
 
+fn compile_cache(
+    declaration: Option<&CacheConfig>,
+    ingress_mode: BodyMode,
+    label: &SourceLabel,
+) -> Result<Option<CachePlan>, ConfigError> {
+    let Some(declaration) = declaration else {
+        return Ok(None);
+    };
+    let has_settings = declaration.ttl.is_some()
+        || declaration.max_entries.is_some()
+        || declaration.max_bytes.is_some()
+        || declaration.coalesce.is_some()
+        || !declaration.key_headers.is_empty();
+    if !declaration.enabled {
+        if has_settings {
+            return Err(invalid(label, "cache settings require enabled: true"));
+        }
+        return Ok(None);
+    }
+    if ingress_mode == BodyMode::Semantic {
+        return Err(invalid(
+            label,
+            "response cache cannot be used with semantic ingress mode",
+        ));
+    }
+    let ttl = declaration.ttl.unwrap_or(DEFAULT_ROUTE_CACHE_TTL);
+    if ttl.is_zero() || ttl > MAX_ROUTE_CACHE_TTL {
+        return Err(invalid(
+            label,
+            "cache ttl must be greater than zero and no more than one hour",
+        ));
+    }
+    let max_entries = declaration
+        .max_entries
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| invalid(label, "cache max_entries is too large"))?
+        .unwrap_or(DEFAULT_ROUTE_CACHE_MAX_ENTRIES);
+    if max_entries == 0 || max_entries > MAX_ROUTE_CACHE_ENTRIES {
+        return Err(invalid(
+            label,
+            "cache max_entries must be between one and 4096",
+        ));
+    }
+    let max_bytes = declaration
+        .max_bytes
+        .unwrap_or(DEFAULT_ROUTE_CACHE_MAX_BYTES);
+    if max_bytes == 0 || max_bytes > MAX_ROUTE_CACHE_BYTES {
+        return Err(invalid(
+            label,
+            "cache max_bytes must be greater than zero and no more than 64 MiB",
+        ));
+    }
+    if declaration.key_headers.len() > MAX_ROUTE_CACHE_KEY_HEADERS {
+        return Err(invalid(
+            label,
+            "cache key_headers contains too many headers",
+        ));
+    }
+    let mut key_headers = BTreeSet::new();
+    for value in &declaration.key_headers {
+        let value = value.trim().to_ascii_lowercase();
+        let name = HeaderName::from_bytes(value.as_bytes())
+            .map_err(|_| invalid(label, "cache key_headers contains an invalid header"))?;
+        if !safe_cache_key_header(&name) {
+            return Err(invalid(
+                label,
+                "cache key_headers cannot contain a sensitive header",
+            ));
+        }
+        key_headers.insert(value);
+    }
+    Ok(Some(CachePlan {
+        enabled: true,
+        ttl,
+        max_entries,
+        max_bytes,
+        coalesce: declaration.coalesce.unwrap_or(true),
+        key_headers: key_headers.into_iter().map(Arc::from).collect(),
+    }))
+}
+
+fn safe_cache_key_header(name: &HeaderName) -> bool {
+    !matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "x-auth-token"
+            | "x-access-token"
+            | "x-refresh-token"
+    ) && !name.as_str().ends_with("-token")
+        && !name.as_str().ends_with("-secret")
+        && !name.as_str().ends_with("-credential")
+}
+
 fn compile_match(
     declaration: Option<&MatchConfig>,
     label: &SourceLabel,
@@ -4022,15 +4286,31 @@ fn compile_target(
     policies: &BTreeMap<Arc<str>, PolicyPlan>,
 ) -> Result<TargetPlan, ConfigError> {
     let target = declaration.target.as_ref();
-    let (upstream, path, model_from, target_policy) = match target {
-        Some(TargetValue::Name(name)) => (Some(name.as_str()), None, None, None),
+    let (upstream, path, model_from, target_policy, capabilities, codecs) = match target {
+        Some(TargetValue::Name(name)) => (
+            Some(name.as_str()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
         Some(TargetValue::Config(config)) => (
             config.upstream.as_deref(),
             config.path.as_deref(),
             config.model_from.as_deref(),
             config.policy.as_deref(),
+            config.capabilities.clone(),
+            config.codecs.clone(),
         ),
-        None => (declaration.upstream.as_deref(), None, None, None),
+        None => (
+            declaration.upstream.as_deref(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
     };
     let upstream = upstream
         .filter(|name| !name.trim().is_empty())
@@ -4045,6 +4325,8 @@ fn compile_target(
     let path = path
         .map(|value| valid_path(value.to_owned(), label))
         .transpose()?;
+    let capabilities = compile_capabilities(&capabilities, label)?;
+    let codecs = compile_codecs(&codecs, label)?;
     let model_source = match model_from {
         None => None,
         Some("request.model") => Some(ModelSource::Request),
@@ -4080,6 +4362,8 @@ fn compile_target(
             path,
             model_source,
             policy: Some(Arc::from(policy)),
+            capabilities,
+            codecs,
         });
     }
     Ok(TargetPlan {
@@ -4087,6 +4371,8 @@ fn compile_target(
         path,
         model_source,
         policy: None,
+        capabilities,
+        codecs,
     })
 }
 
@@ -4744,6 +5030,145 @@ routes:
         let rendered = error.to_string();
         assert!(rendered.contains("unknown field"));
         assert!(rendered.contains("framng"));
+    }
+
+    #[test]
+    fn cache_is_disabled_by_default_and_compiles_strict_bounds() {
+        let default = compile_yaml(
+            "cache-default.yaml",
+            "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\nupstreams: {local: {url: http://127.0.0.1:2}}\nroutes: [{id: route, listen: local, ingress: {mode: patch}, target: local}]\n",
+        )
+        .expect("default cache config");
+        assert!(default.routes()[0].cache().is_none());
+
+        let enabled = compile_yaml(
+            "cache-enabled.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:2}}
+routes:
+  - id: route
+    listen: local
+    ingress: {mode: patch}
+    cache:
+      enabled: true
+      ttl: 250ms
+      max_entries: 12
+      max_bytes: 128KiB
+      coalesce: true
+      key_headers: [accept, x-tenant]
+    target: local
+"#,
+        )
+        .expect("enabled cache config");
+        let cache = enabled.routes()[0].cache().expect("cache plan");
+        assert!(cache.enabled());
+        assert_eq!(cache.ttl(), Duration::from_millis(250));
+        assert_eq!(cache.max_entries(), 12);
+        assert_eq!(cache.max_bytes(), 128 * 1024);
+        assert!(cache.coalesce());
+        assert_eq!(
+            cache
+                .key_headers()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            ["accept", "x-tenant"]
+        );
+    }
+
+    #[test]
+    fn cache_rejects_unbounded_or_sensitive_settings() {
+        let sensitive = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:2}}
+routes:
+  - id: route
+    listen: local
+    ingress: {mode: patch}
+    cache: {enabled: true, key_headers: [authorization]}
+    target: local
+"#;
+        let error = compile_yaml("cache-sensitive.yaml", sensitive).expect_err("sensitive key");
+        assert!(error.to_string().contains("sensitive header"));
+
+        let too_large = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:2}}
+routes:
+  - id: route
+    listen: local
+    ingress: {mode: patch}
+    cache: {enabled: true, max_bytes: 65MiB}
+    target: local
+"#;
+        let error = compile_yaml("cache-large.yaml", too_large).expect_err("large cache");
+        assert!(error.to_string().contains("64 MiB"));
+
+        let opaque = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:2}}
+routes:
+  - id: route
+    listen: local
+    cache: {enabled: true}
+    target: local
+"#;
+        let compiled = compile_yaml("cache-opaque.yaml", opaque).expect("opaque cache");
+        assert!(compiled.routes()[0].cache().is_some());
+
+        let policy = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:2}}
+policies:
+  pooled:
+    selection: {strategy: ordered_fallback}
+routes:
+  - id: route
+    listen: local
+    ingress: {mode: patch}
+    cache: {enabled: true}
+    target: {upstream: local, policy: pooled}
+"#;
+        let error = compile_yaml("cache-policy.yaml", policy).expect_err("policy cache");
+        assert!(error.to_string().contains("selection policy"));
+    }
+
+    #[test]
+    fn cache_rejects_semantic_and_policy_selection_routes() {
+        let semantic = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:2}}
+routes:
+  - id: route
+    listen: local
+    ingress: {mode: semantic}
+    cache: {enabled: true}
+    target: local
+"#;
+        let error = compile_yaml("cache-semantic.yaml", semantic).expect_err("semantic cache");
+        assert!(error.to_string().contains("semantic ingress mode"));
+
+        let policy = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams: {local: {url: http://127.0.0.1:2}}
+policies:
+  default: {selection: {strategy: fill_first}}
+routes:
+  - id: route
+    listen: local
+    cache: {enabled: true}
+    target: {provider: local, policy: default}
+"#;
+        let error = compile_yaml("cache-policy.yaml", policy).expect_err("policy cache");
+        assert!(error.to_string().contains("selection policy"));
     }
 
     #[test]

@@ -52,6 +52,38 @@
       ]
     },
     {
+      "adapter": "factory",
+      "protocol": "language-model-v4",
+      "version": "fx-0.0.3",
+      "fixture": "../factory/fx-0.0.3-v4-current-client.json",
+      "equivalence": "event_semantic",
+      "status": "current_client_conformance",
+      "source": "Installed fx/0.0.3 through an isolated Pooler listener and deterministic loopback OpenAI upstream",
+      "supported_capabilities": [
+        "text",
+        "function_tools",
+        "streaming",
+        "usage",
+        "response_metadata",
+        "v4_headers",
+        "model_id_routing"
+      ],
+      "unsupported_capabilities": [
+        "live_provider",
+        "provider_tools",
+        "reasoning_events",
+        "images",
+        "audio",
+        "files"
+      ],
+      "notes": [
+        "The current-client run used ai-language-model-specification-version 4 and ai-gateway-protocol-version 0.0.1.",
+        "Prompt text, tool prose and schemas, authorization, session identity, and transport-only headers were redacted before committing.",
+        "The provider-defined search tool was explicitly dropped under the preset degrade policy.",
+        "Replay: cargo test -p adapter-factory --test factory_current_fixture."
+      ]
+    },
+    {
       "adapter": "devin",
       "protocol": "connect-rpc",
       "version": "v1",
@@ -95,7 +127,33 @@
         "semantic_streaming"
       ],
       "notes": [
-        "No current Cursor client fixture is committed; compatibility is not claimed."
+        "This row covers the structural preset only; current-client evidence is tracked in the openai-compatible-chat row."
+      ]
+    },
+    {
+      "adapter": "cursor",
+      "protocol": "openai-compatible-chat",
+      "version": "2026.08.04-aaa8809",
+      "fixture": "../cursor/cursor-agent-local-2026.08.04.json",
+      "equivalence": "json_structural",
+      "status": "current_client_conformance",
+      "source": "Installed Cursor Agent CLI 2026.08.04-aaa8809 in authless local mode through an isolated Pooler listener",
+      "supported_capabilities": [
+        "http_json",
+        "streaming",
+        "model_routing",
+        "reasoning_effort_transform"
+      ],
+      "unsupported_capabilities": [
+        "live_provider",
+        "tools",
+        "images",
+        "audio"
+      ],
+      "notes": [
+        "The run used a deterministic loopback upstream and a temporary workspace; it is client conformance evidence for this request shape, not live provider authorization.",
+        "Prompt text, authorization, client identity, and transport headers were redacted before committing.",
+        "Replay: cargo run -p pooler-cli -- fixture replay fixtures/cursor/cursor-agent-local-2026.08.04.json --actual <sanitized-actual-fixture>."
       ]
     },
     {

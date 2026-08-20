@@ -127,6 +127,46 @@
       },
       "type": "object"
     },
+    "cache": {
+      "additionalProperties": false,
+      "properties": {
+        "coalesce": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "key_headers": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 0,
+          "type": "array"
+        },
+        "max_bytes": {
+          "oneOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "pattern": "^\\s*[0-9]+(b|kb|kib|mb|mib|gb|gib)\\s*$",
+              "type": "string"
+            }
+          ]
+        },
+        "max_entries": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ttl": {
+          "$ref": "#/$defs/duration"
+        }
+      },
+      "type": "object"
+    },
     "cooldown": {
       "additionalProperties": false,
       "properties": {
@@ -307,7 +347,8 @@
             "preset": {
               "enum": [
                 "cursor",
-                "devin"
+                "devin",
+                "factory"
               ],
               "type": "string"
             },
@@ -570,6 +611,13 @@
           "minItems": 0,
           "type": "array"
         },
+        "codecs": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
         "provider": {
           "type": "string"
         },
@@ -787,6 +835,9 @@
         "auth": {
           "$ref": "#/$defs/auth"
         },
+        "cache": {
+          "$ref": "#/$defs/cache"
+        },
         "downstream_auth": {
           "$ref": "#/$defs/auth"
         },
@@ -976,6 +1027,50 @@
     "target": {
       "additionalProperties": false,
       "properties": {
+        "capabilities": {
+          "items": {
+            "enum": [
+              "text",
+              "images",
+              "audio",
+              "files",
+              "tools",
+              "reasoning",
+              "streaming",
+              "usage",
+              "structured_output",
+              "json_schema",
+              "function_calling",
+              "tool_choice",
+              "cache_hints",
+              "continuation",
+              "response_metadata",
+              "encrypted_reasoning",
+              "refusal",
+              "error_events",
+              "input_audio",
+              "output_audio",
+              "code_execution",
+              "computer_use",
+              "batch",
+              "embeddings",
+              "sse",
+              "web_socket",
+              "connect_rpc",
+              "protobuf"
+            ],
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "codecs": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
         "model_from": {
           "type": "string"
         },

@@ -1,0 +1,66 @@
+version: 1
+
+listeners:
+  factory:
+    bind: 127.0.0.1:18474
+
+upstreams:
+  factory:
+    url: http://127.0.0.1:8319
+
+routes:
+  - id: language-model-v3
+    listen: factory
+    match:
+      methods: [POST]
+      path: /v3/ai/language-model
+      content_types: [application/json]
+    ingress:
+      mode: semantic
+      decoder: decode.factory.language_model
+    target:
+      provider: factory
+      path: /v1/chat/completions
+    response:
+      mode: semantic
+      decoder: decode.openai.chat.events
+      encoder: encode.factory.events
+    loss_policy: degrade
+
+  - id: language-model-v4
+    listen: factory
+    match:
+      methods: [POST]
+      path: /v4/ai/language-model
+      content_types: [application/json]
+    ingress:
+      mode: semantic
+      decoder: decode.factory.language_model
+    target:
+      provider: factory
+      path: /v1/chat/completions
+    response:
+      mode: semantic
+      decoder: decode.openai.chat.events
+      encoder: encode.factory.events
+    loss_policy: degrade
+
+  - id: config-v3
+    listen: factory
+    match:
+      methods: [GET]
+      path: /v3/ai/config
+      content_types: [application/json]
+    target:
+      provider: factory
+      path: /v3/ai/config
+
+  - id: config-v4
+    listen: factory
+    match:
+      methods: [GET]
+      path: /v4/ai/config
+      content_types: [application/json]
+    target:
+      provider: factory
+      path: /v4/ai/config

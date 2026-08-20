@@ -493,6 +493,11 @@ impl ManagementApi {
                                 .iter()
                                 .map(|capability| capability.as_str())
                                 .collect::<Vec<_>>(),
+                            "codecs": target
+                                .codecs()
+                                .iter()
+                                .map(AsRef::as_ref)
+                                .collect::<Vec<&str>>(),
                         })
                     })
                     .collect::<Vec<_>>();
