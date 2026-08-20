@@ -52,7 +52,7 @@ jobs:
           components: clippy,rustfmt
 
       - name: Install dependency policy tools
-        uses: taiki-e/install-action@a27ef18d36cfa66b0af3a360104621793b41c036 # v2.54.3
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-audit,cargo-deny
 

@@ -27,7 +27,7 @@ jobs:
         with:
           toolchain: 1.86.0
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
       - run: ./scripts/check-config-schema.sh
       - run: cargo check --workspace --all-targets --all-features --locked
@@ -43,7 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
         with:
           toolchain: 1.86.0
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --all-features --locked -- --test-threads=1
       - run: cargo test --manifest-path fuzz/Cargo.toml --locked --no-run
       - run: >-
@@ -64,7 +64,7 @@ jobs:
           # as security-framework; keep the product MSRV separate from the
           # toolchain used solely for dependency auditing.
           toolchain: 1.86.0
-      - uses: taiki-e/install-action@a27ef18d36cfa66b0af3a360104621793b41c036 # v2.54.3
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-audit,cargo-deny
       - run: cargo audit --deny warnings
