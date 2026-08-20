@@ -348,7 +348,8 @@
               "enum": [
                 "cursor",
                 "devin",
-                "factory"
+                "factory",
+                "fx"
               ],
               "type": "string"
             },

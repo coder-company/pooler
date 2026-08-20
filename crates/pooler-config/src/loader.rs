@@ -423,9 +423,10 @@ fn expand_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError>
         Some("cursor") => expand_cursor_preset(import, path),
         Some("devin") => expand_devin_preset(import, path),
         Some("factory") => expand_factory_preset(import, path),
+        Some("fx") => expand_fx_preset(import, path),
         _ => Err(load_error(
             path,
-            "unknown preset; expected cursor, devin, or factory",
+            "unknown preset; expected cursor, devin, factory, or fx",
         )),
     }
 }
@@ -590,6 +591,99 @@ fn rewrite_factory_routes(root: &mut Value, alias: &str, path: &Path) -> Result<
                 .get(Value::String("provider".to_owned()))
                 .and_then(Value::as_str)
                 == Some("factory")
+            {
+                target.insert(
+                    Value::String("provider".to_owned()),
+                    Value::String(alias.to_owned()),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expand_fx_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
+    for key in import.parameters.keys() {
+        if !matches!(key.as_str(), "bind" | "upstream_url" | "secret") {
+            return Err(unknown_preset_parameter(path, key));
+        }
+    }
+    let alias = import.alias.as_deref().unwrap_or("fx");
+    if alias.is_empty()
+        || !alias
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(load_error(path, "invalid preset alias"));
+    }
+    let mut preset: Value = serde_yml::from_str(include_str!("../../../presets/fx.yaml"))
+        .map_err(|error| load_error(path, &format!("invalid built-in fx preset: {error}")))?;
+    rename_named_key(&mut preset, "listeners", "fx", alias, path)?;
+    rename_named_key(&mut preset, "upstreams", "fx", alias, path)?;
+    rewrite_fx_routes(&mut preset, alias, path)?;
+
+    if let Some(value) = import.parameters.get("bind") {
+        set_named_field(
+            &mut preset,
+            "listeners",
+            alias,
+            "bind",
+            string_value(value, path)?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("upstream_url") {
+        set_named_field(
+            &mut preset,
+            "upstreams",
+            alias,
+            "url",
+            string_value(value, path)?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("secret") {
+        let upstream = named_declaration_mut(&mut preset, "upstreams", alias, path)?;
+        let auth = upstream
+            .entry(Value::String("auth".to_owned()))
+            .or_insert_with(|| Value::Mapping(Mapping::new()))
+            .as_mapping_mut()
+            .ok_or_else(|| load_error(path, "fx preset auth is invalid"))?;
+        auth.insert(
+            Value::String("secret".to_owned()),
+            Value::String(string_value(value, path)?),
+        );
+    }
+    Ok(preset)
+}
+
+fn rewrite_fx_routes(root: &mut Value, alias: &str, path: &Path) -> Result<(), ConfigError> {
+    let routes = root
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(Value::String("routes".to_owned())))
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| load_error(path, "fx preset routes are invalid"))?;
+    for route in routes {
+        let route = route
+            .as_mapping_mut()
+            .ok_or_else(|| load_error(path, "fx preset route is invalid"))?;
+        let route_id = route
+            .get(Value::String("id".to_owned()))
+            .and_then(Value::as_str)
+            .ok_or_else(|| load_error(path, "fx preset route ID is missing"))?;
+        route.insert(
+            Value::String("id".to_owned()),
+            Value::String(format!("{alias}-{route_id}")),
+        );
+        route.insert(
+            Value::String("listen".to_owned()),
+            Value::String(alias.to_owned()),
+        );
+        if let Some(Value::Mapping(target)) = route.get_mut(Value::String("target".to_owned())) {
+            if target
+                .get(Value::String("provider".to_owned()))
+                .and_then(Value::as_str)
+                == Some("fx")
             {
                 target.insert(
                     Value::String("provider".to_owned()),
@@ -1390,6 +1484,63 @@ version: 1
         assert!(config.route("factory-local-config-v3").is_some());
         assert!(config.route("factory-local-config-v4").is_some());
         let rendered = render_path(root).expect("rendered preset");
+        assert!(!rendered.contains("preset:"));
+    }
+
+    #[test]
+    fn expands_fx_preset_with_chat_and_model_routes() {
+        let dir = TestDir::new();
+        let root = dir.write(
+            "fx.yaml",
+            r#"
+imports:
+  - preset: fx
+    as: fx-local
+    with:
+      bind: 127.0.0.1:9333
+      upstream_url: http://127.0.0.1:9319
+      secret: env:FX_TEST_KEY
+version: 1
+"#,
+        );
+        let config = load_path(&root)
+            .expect("fx preset")
+            .compile()
+            .expect("compiled");
+        assert_eq!(config.listeners()["fx-local"].bind(), "127.0.0.1:9333");
+        for route_id in [
+            "fx-local-language-model-v3",
+            "fx-local-language-model-v4",
+            "fx-local-models-coding-agent",
+            "fx-local-models-openai",
+        ] {
+            assert!(config.route(route_id).is_some(), "missing {route_id}");
+        }
+        let chat = config
+            .route("fx-local-language-model-v3")
+            .expect("fx chat route");
+        assert_eq!(chat.ingress().decoder(), Some("decode.fx.language_model"));
+        assert_eq!(chat.response().encoder(), Some("encode.fx.events"));
+        let models = config
+            .route("fx-local-models-coding-agent")
+            .expect("fx models route");
+        assert_eq!(models.ingress().decoder(), Some("decode.fx.models.request"));
+        assert_eq!(models.response().encoder(), Some("encode.fx.models"));
+        assert_eq!(chat.target().upstream(), "fx-local");
+        assert_eq!(models.target().upstream(), "fx-local");
+        assert_eq!(
+            config.upstreams()["fx-local"]
+                .auth()
+                .expect("fx auth")
+                .secret()
+                .redacted(),
+            "env:FX_TEST_KEY"
+        );
+        let rendered = render_path(root).expect("rendered fx preset");
+        assert!(rendered.contains("decode.fx.language_model"));
+        assert!(rendered.contains("encode.fx.events"));
+        assert!(rendered.contains("decode.fx.models.request"));
+        assert!(rendered.contains("encode.fx.models"));
         assert!(!rendered.contains("preset:"));
     }
 

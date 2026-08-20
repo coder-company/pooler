@@ -11,6 +11,7 @@ mod http_runtime;
 mod lifecycle;
 mod listener;
 mod management;
+mod management_ui;
 mod server;
 mod tls;
 

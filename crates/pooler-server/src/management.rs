@@ -30,6 +30,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::http_runtime::RuntimeGeneration;
+use crate::management_ui;
 use crate::{ConfigSnapshot, ConfigStore};
 
 const DEFAULT_DECISION_LIMIT: usize = 20;
@@ -141,11 +142,15 @@ pub struct ManagementResponse {
 impl ManagementResponse {
     fn json(status: StatusCode, value: Value, head: bool) -> Self {
         let encoded = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
+        Self::body(status, "application/json", encoded, head)
+    }
+
+    fn body(status: StatusCode, content_type: &'static str, encoded: Vec<u8>, head: bool) -> Self {
         let content_length = encoded.len().to_string();
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/json"),
+            header::HeaderValue::from_static(content_type),
         );
         headers.insert(
             header::CACHE_CONTROL,
@@ -156,12 +161,46 @@ impl ManagementResponse {
             header::HeaderValue::from_str(&content_length)
                 .expect("JSON body length is a valid header value"),
         );
+        security_headers(&mut headers);
         Self {
             status,
             headers,
             body: if head { Vec::new() } else { encoded },
         }
     }
+
+    fn asset(status: StatusCode, content_type: &'static str, body: &'static str, head: bool) -> Self {
+        Self::body(status, content_type, body.as_bytes().to_vec(), head)
+    }
+}
+
+fn security_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        header::HeaderValue::from_static("camera=(), geolocation=(), microphone=()"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+        header::HeaderValue::from_static("same-origin"),
+    );
 }
 
 /// Immutable pair observed by one management request.
@@ -355,12 +394,26 @@ impl ManagementApi {
             _ => (fallback.config.as_ref(), fallback.pooling.as_ref()),
         };
         let response = match path {
+            path if management_ui::asset(path).is_some() => {
+                let (content_type, body) = management_ui::asset(path).expect("asset exists");
+                ManagementResponse::asset(StatusCode::OK, content_type, body, head)
+            }
             "/health" | "/healthz" | "/" => self.health(snapshot, pooling),
             "/config" | "/config/generation" => self.config_generation(snapshot),
+            "/listeners" => self.listeners(snapshot),
             "/routes" => self.routes(snapshot),
             "/models" => self.models(snapshot),
             "/health/providers" | "/providers/health" => self.providers(snapshot, pooling),
             "/health/credentials" | "/credentials/health" => self.credentials(snapshot, pooling),
+            "/accounts" => self.accounts(snapshot, pooling),
+            "/quota" => self.quota(snapshot, pooling),
+            "/metrics" => self.metrics(snapshot),
+            "/metrics/prometheus" => ManagementResponse::body(
+                StatusCode::OK,
+                "text/plain; version=0.0.4; charset=utf-8",
+                self.metrics.export_prometheus().into_bytes(),
+                head,
+            ),
             "/active" | "/active-counts" => self.active(),
             "/decisions" | "/decisions/recent" => {
                 let limit = uri.as_ref().and_then(|uri| uri.query()).map(parse_limit);
@@ -433,6 +486,37 @@ impl ManagementApi {
         ManagementResponse::json(
             StatusCode::OK,
             json!({"configuration_generation": snapshot.generation().value()}),
+            false,
+        )
+    }
+
+    fn listeners(&self, snapshot: &ConfigSnapshot<CompiledConfig>) -> ManagementResponse {
+        let listeners = snapshot
+            .config()
+            .listeners()
+            .values()
+            .map(|listener| {
+                let route_count = snapshot
+                    .config()
+                    .routes()
+                    .iter()
+                    .filter(|route| route.listener() == listener.id())
+                    .count();
+                json!({
+                    "id": listener.id(),
+                    "bind": listener.bind(),
+                    "protocol": listener_protocol_name(listener.protocol()),
+                    "tls": listener.tls().is_some(),
+                    "route_count": route_count,
+                })
+            })
+            .collect::<Vec<_>>();
+        ManagementResponse::json(
+            StatusCode::OK,
+            json!({
+                "configuration_generation": snapshot.generation().value(),
+                "listeners": listeners,
+            }),
             false,
         )
     }
@@ -538,6 +622,23 @@ impl ManagementApi {
         snapshot: &ConfigSnapshot<CompiledConfig>,
         pooling: &PoolingCoordinator,
     ) -> ManagementResponse {
+        self.account_view(snapshot, pooling, "credentials")
+    }
+
+    fn accounts(
+        &self,
+        snapshot: &ConfigSnapshot<CompiledConfig>,
+        pooling: &PoolingCoordinator,
+    ) -> ManagementResponse {
+        self.account_view(snapshot, pooling, "accounts")
+    }
+
+    fn account_view(
+        &self,
+        snapshot: &ConfigSnapshot<CompiledConfig>,
+        pooling: &PoolingCoordinator,
+        field: &str,
+    ) -> ManagementResponse {
         let states = pooling.credential_states().unwrap_or_default();
         let health = pooling.credential_health_states().unwrap_or_default();
         let states = states
@@ -556,9 +657,55 @@ impl ManagementApi {
                 credential_health_value(account, states.get(account.id()), health.get(account.id()))
             })
             .collect::<Vec<_>>();
+        let mut value = serde_json::Map::new();
+        value.insert(
+            "configuration_generation".to_owned(),
+            json!(snapshot.generation().value()),
+        );
+        value.insert(field.to_owned(), Value::Array(credentials));
         ManagementResponse::json(
             StatusCode::OK,
-            json!({"configuration_generation": snapshot.generation().value(), "credentials": credentials}),
+            Value::Object(value),
+            false,
+        )
+    }
+
+    fn quota(
+        &self,
+        snapshot: &ConfigSnapshot<CompiledConfig>,
+        pooling: &PoolingCoordinator,
+    ) -> ManagementResponse {
+        let entries = pooling
+            .cooldowns()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cooldown| {
+                json!({
+                    "scope": cooldown.scope,
+                    "key": cooldown.key,
+                    "until": cooldown.until,
+                    "reason": cooldown.reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        ManagementResponse::json(
+            StatusCode::OK,
+            json!({
+                "configuration_generation": snapshot.generation().value(),
+                "active": entries.len(),
+                "entries": entries,
+            }),
+            false,
+        )
+    }
+
+    fn metrics(&self, snapshot: &ConfigSnapshot<CompiledConfig>) -> ManagementResponse {
+        ManagementResponse::json(
+            StatusCode::OK,
+            json!({
+                "configuration_generation": snapshot.generation().value(),
+                "metrics": self.metrics.snapshot(),
+            }),
             false,
         )
     }
@@ -845,6 +992,14 @@ fn parse_limit(query: &str) -> usize {
         .unwrap_or(DEFAULT_DECISION_LIMIT)
 }
 
+fn listener_protocol_name(protocol: pooler_config::ListenerProtocol) -> &'static str {
+    match protocol {
+        pooler_config::ListenerProtocol::Http1 => "http1",
+        pooler_config::ListenerProtocol::Auto => "auto",
+        pooler_config::ListenerProtocol::H2c => "h2c",
+    }
+}
+
 fn health_status(state: Option<&CredentialHealthState>) -> &'static str {
     match state.map(|state| state.status) {
         Some(CredentialHealthStatus::CoolingDown) => "cooling_down",
@@ -941,6 +1096,77 @@ routes:
         assert!(String::from_utf8_lossy(&models.body).contains("public-model"));
         let providers = api.handle(&Method::GET, "/health/providers", &headers);
         assert!(String::from_utf8_lossy(&providers.body).contains("provider-a"));
+    }
+
+    #[test]
+    fn management_ui_assets_are_read_only_and_hardened() {
+        let api = api();
+        let headers = HeaderMap::new();
+        let html = api.handle(&Method::GET, "/management/ui", &headers);
+        assert_eq!(html.status, StatusCode::OK);
+        assert_eq!(
+            html.headers.get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("text/html; charset=utf-8"))
+        );
+        let html_body = String::from_utf8_lossy(&html.body);
+        assert!(html_body.contains("Pooler Control"));
+        assert!(html_body.contains("/management/ui.js"));
+        assert!(html_body.contains("Listeners"));
+        assert!(html_body.contains("Quota &amp; cooldowns"));
+        assert!(!html_body.contains("type=\"submit\""));
+        assert_eq!(
+            html.headers.get(header::CONTENT_SECURITY_POLICY),
+            Some(&header::HeaderValue::from_static(
+                "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+            ))
+        );
+        assert_eq!(
+            html.headers.get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&header::HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            html.headers.get(header::X_FRAME_OPTIONS),
+            Some(&header::HeaderValue::from_static("DENY"))
+        );
+
+        let css = api.handle(&Method::GET, "/management/ui.css", &headers);
+        assert_eq!(css.status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&css.body).contains("--surface"));
+        let js = api.handle(&Method::GET, "/management/ui.js", &headers);
+        assert_eq!(js.status, StatusCode::OK);
+        let js_body = String::from_utf8_lossy(&js.body);
+        assert!(js_body.contains("/management/metrics"));
+        assert!(js_body.contains("cache: \"no-store\""));
+        assert!(!js_body.contains("method: \"POST\""));
+    }
+
+    #[test]
+    fn management_ui_data_endpoints_cover_runtime_overview_without_secrets() {
+        let api = api();
+        let headers = HeaderMap::new();
+        for path in [
+            "/listeners",
+            "/routes",
+            "/models",
+            "/health/providers",
+            "/accounts",
+            "/quota",
+            "/metrics",
+            "/metrics/prometheus",
+        ] {
+            let response = api.handle(&Method::GET, path, &headers);
+            assert_eq!(response.status, StatusCode::OK, "{path}");
+            assert!(!response.body.is_empty(), "{path} returned an empty body");
+            let body = String::from_utf8_lossy(&response.body);
+            assert!(!body.contains("Authorization"), "{path} leaked auth material");
+            assert!(!body.contains("management-secret"), "{path} leaked a secret");
+        }
+        let listeners = api.handle(&Method::GET, "/listeners", &headers);
+        let listeners = String::from_utf8_lossy(&listeners.body);
+        assert!(listeners.contains("local"));
+        assert!(listeners.contains("route_count"));
+        let metrics = api.handle(&Method::GET, "/metrics", &headers);
+        assert!(String::from_utf8_lossy(&metrics.body).contains("dropped_series"));
     }
 
     #[test]

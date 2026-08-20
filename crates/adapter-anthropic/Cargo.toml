@@ -1,0 +1,28 @@
+[package]
+name = "adapter-anthropic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Anthropic Messages semantic request and SSE codecs"
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+pooler-config = { path = "../pooler-config" }
+pooler-core = { path = "../pooler-core" }
+pooler-http = { path = "../pooler-http" }
+pooler-protocol = { path = "../pooler-protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

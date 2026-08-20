@@ -262,7 +262,7 @@ fn import_schema() -> Value {
     );
     let preset = object_schema(
         properties([
-            ("preset", string_enum(["cursor", "devin", "factory"])),
+            ("preset", string_enum(["cursor", "devin", "factory", "fx"])),
             ("as", string_pattern(r"^[A-Za-z0-9._-]{1,128}$")),
             ("with", string_map_schema()),
         ]),

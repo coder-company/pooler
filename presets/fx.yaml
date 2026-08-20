@@ -1,0 +1,80 @@
+version: 1
+
+listeners:
+  fx:
+    bind: 127.0.0.1:18475
+
+upstreams:
+  fx:
+    url: http://127.0.0.1:8319
+
+routes:
+  - id: language-model-v3
+    listen: fx
+    match:
+      methods: [POST]
+      path: /v3/ai/language-model
+      content_types: [application/json]
+    ingress:
+      mode: semantic
+      decoder: decode.fx.language_model
+    target:
+      provider: fx
+      path: /v1/chat/completions
+    response:
+      mode: semantic
+      decoder: decode.openai.chat.events
+      encoder: encode.fx.events
+    loss_policy: degrade
+
+  - id: language-model-v4
+    listen: fx
+    match:
+      methods: [POST]
+      path: /v4/ai/language-model
+      content_types: [application/json]
+    ingress:
+      mode: semantic
+      decoder: decode.fx.language_model
+    target:
+      provider: fx
+      path: /v1/chat/completions
+    response:
+      mode: semantic
+      decoder: decode.openai.chat.events
+      encoder: encode.fx.events
+    loss_policy: degrade
+
+  - id: models-coding-agent
+    listen: fx
+    match:
+      methods: [GET]
+      path: /coding-agent/v1/models
+    ingress:
+      mode: semantic
+      decoder: decode.fx.models.request
+    target:
+      provider: fx
+      path: /v1/models
+    response:
+      mode: semantic
+      decoder: decode.openai.models
+      encoder: encode.fx.models
+    loss_policy: reject
+
+  - id: models-openai
+    listen: fx
+    match:
+      methods: [GET]
+      path: /v1/models
+    ingress:
+      mode: semantic
+      decoder: decode.fx.models.request
+    target:
+      provider: fx
+      path: /v1/models
+    response:
+      mode: semantic
+      decoder: decode.openai.models
+      encoder: encode.fx.models
+    loss_policy: reject

@@ -1,0 +1,22 @@
+[package]
+name = "pooler-model-catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic merged model discovery and refresh for Pooler"
+
+[dependencies]
+arc-swap.workspace = true
+futures-util.workspace = true
+pooler-core = { path = "../pooler-core" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_yml.workspace = true
+
+[lints]
+workspace = true

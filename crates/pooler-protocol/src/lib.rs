@@ -8,6 +8,7 @@ mod extensions;
 mod json;
 mod model;
 mod openai_chat;
+mod openai_responses;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +43,12 @@ pub use openai_chat::{
     decode_chat_request, decode_chat_request_with_report, encode_chat_request, DecodedChatRequest,
     EncodedChatChunk, EncodedChatRequest, OpenAiChatCodec, OpenAiChatError, OpenAiChatEventDecoder,
     OpenAiChatEventEncoder, OPENAI_CHAT_UNKNOWN_FIELDS_EXTENSION,
+};
+pub use openai_responses::{
+    decode_responses_request, decode_responses_request_with_report, encode_responses_request,
+    DecodedResponsesRequest, EncodedResponsesEvent, EncodedResponsesRequest,
+    OpenAiResponsesCodec, OpenAiResponsesError, OpenAiResponsesEventDecoder,
+    OpenAiResponsesEventEncoder, OPENAI_RESPONSES_UNKNOWN_FIELDS_EXTENSION,
 };
 pub use pooler_core::LossPolicy;
 

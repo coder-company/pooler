@@ -1,0 +1,16 @@
+[package]
+name = "adapter-xai"
+description = "xAI REST compatibility and Responses WebSocket codecs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pooler-protocol = { path = "../pooler-protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
