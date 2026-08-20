@@ -59,12 +59,12 @@ it before publication:
 ```
 
 The tag workflow in `.github/workflows/release.yml` runs its Linux jobs on the
-organization's Runnit self-hosted runners.  Each Linux job requires all four
+organization's custom self-hosted runners. Each Linux job requires all four
 labels `[self-hosted, Linux, X64, palantir-actions]`; there is no fallback to a
 paid GitHub-hosted Linux runner. The macOS quality lane and the two macOS
 release targets remain explicit platform requirements, using
 `[self-hosted, macOS, X64, palantir-actions]` for x86_64 and
-`[self-hosted, macOS, ARM64, palantir-actions]` for arm64. The configured Runnit
+`[self-hosted, macOS, ARM64, palantir-actions]` for arm64. The configured custom
 capacity is currently Linux-only, so matching macOS lanes remain
 queued/unavailable and their platform evidence must not be reported as passing.
 Ordinary push and pull-request events do not supply `include-macos`, so the

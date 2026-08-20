@@ -25,9 +25,9 @@ except ImportError as error:  # pragma: no cover - depends on the runner image
 CHECKOUT_REF = "${{ inputs.checkout-ref || github.ref }}"
 RELEASE_SHA = "${{ needs.resolve.outputs.sha }}"
 RELEASE_TAG_REF = "${{ inputs.tag || github.ref }}"
-RUNNIT_LINUX_LABELS = ["self-hosted", "Linux", "X64", "palantir-actions"]
-RUNNIT_MACOS_X64_LABELS = ["self-hosted", "macOS", "X64", "palantir-actions"]
-RUNNIT_MACOS_ARM64_LABELS = ["self-hosted", "macOS", "ARM64", "palantir-actions"]
+CUSTOM_LINUX_LABELS = ["self-hosted", "Linux", "X64", "palantir-actions"]
+CUSTOM_MACOS_X64_LABELS = ["self-hosted", "macOS", "X64", "palantir-actions"]
+CUSTOM_MACOS_ARM64_LABELS = ["self-hosted", "macOS", "ARM64", "palantir-actions"]
 REQUIRED_RELEASE_JOBS = {
     "resolve",
     "ci",
@@ -168,7 +168,7 @@ def require_runner(
 
 
 def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
-    """Keep Linux work on Runnit's labeled organization runners.
+    """Keep Linux work on the labeled custom organization runners.
 
     The organization currently exposes Linux self-hosted runners only.  The
     macOS rows remain explicit self-hosted platform requirements so this check
@@ -180,35 +180,35 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
     quality = mapping(ci_jobs["quality"], "ci.yml.jobs.quality")
     if "strategy" in quality:
         fail("ci.yml.jobs.quality must be the single Linux quality job")
-    require_runner(quality, RUNNIT_LINUX_LABELS, "ci.yml.jobs.quality")
+    require_runner(quality, CUSTOM_LINUX_LABELS, "ci.yml.jobs.quality")
     quality_macos = mapping(ci_jobs.get("quality-macos"), "ci.yml.jobs.quality-macos")
     if quality_macos.get("if") != "${{ inputs.include-macos }}":
         fail("ci.yml.jobs.quality-macos must be gated by inputs.include-macos")
     require_runner(
         quality_macos,
-        RUNNIT_MACOS_X64_LABELS,
+        CUSTOM_MACOS_X64_LABELS,
         "ci.yml.jobs.quality-macos",
     )
     for job_id in ("fixtures-and-properties", "supply-chain"):
-        require_runner(ci_jobs[job_id], RUNNIT_LINUX_LABELS, f"ci.yml.jobs.{job_id}")
+        require_runner(ci_jobs[job_id], CUSTOM_LINUX_LABELS, f"ci.yml.jobs.{job_id}")
 
     hardening = workflows["hardening.yml"]
     hardening_jobs = mapping(hardening["jobs"], "hardening.yml.jobs")
     for job_id, raw_job in hardening_jobs.items():
         require_runner(
             mapping(raw_job, f"hardening.yml.jobs.{job_id}"),
-            RUNNIT_LINUX_LABELS,
+            CUSTOM_LINUX_LABELS,
             f"hardening.yml.jobs.{job_id}",
         )
 
     secret_scan = workflows["secret-scan.yml"]
     secret_jobs = mapping(secret_scan["jobs"], "secret-scan.yml.jobs")
-    require_runner(secret_jobs["gitleaks"], RUNNIT_LINUX_LABELS, "secret-scan.yml.jobs.gitleaks")
+    require_runner(secret_jobs["gitleaks"], CUSTOM_LINUX_LABELS, "secret-scan.yml.jobs.gitleaks")
 
     release = workflows["release.yml"]
     release_jobs = mapping(release["jobs"], "release.yml.jobs")
     for job_id in ("resolve", "gates", "assemble", "publish"):
-        require_runner(release_jobs[job_id], RUNNIT_LINUX_LABELS, f"release.yml.jobs.{job_id}")
+        require_runner(release_jobs[job_id], CUSTOM_LINUX_LABELS, f"release.yml.jobs.{job_id}")
 
     build = mapping(release_jobs["build"], "release.yml.jobs.build")
     if build.get("runs-on") != "${{ matrix.runner }}":
@@ -219,10 +219,10 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
         build_matrix.get("include"), "release.yml.jobs.build.strategy.matrix.include"
     )
     expected_build_runners = {
-        "x86_64-unknown-linux-gnu": RUNNIT_LINUX_LABELS,
-        "aarch64-unknown-linux-gnu": RUNNIT_LINUX_LABELS,
-        "x86_64-apple-darwin": RUNNIT_MACOS_X64_LABELS,
-        "aarch64-apple-darwin": RUNNIT_MACOS_ARM64_LABELS,
+        "x86_64-unknown-linux-gnu": CUSTOM_LINUX_LABELS,
+        "aarch64-unknown-linux-gnu": CUSTOM_LINUX_LABELS,
+        "x86_64-apple-darwin": CUSTOM_MACOS_X64_LABELS,
+        "aarch64-apple-darwin": CUSTOM_MACOS_ARM64_LABELS,
     }
     seen_targets: set[str] = set()
     for index, raw_row in enumerate(build_include):
@@ -377,14 +377,15 @@ def validate_release(path: Path, workflows: dict[str, dict[str, Any]]) -> None:
         fail("hardening.yml sanitizer job must run scripts/deep-test.sh")
     install_gitleaks = find_step(
         secret_jobs["gitleaks"],
-        lambda step: isinstance(step.get("uses"), str)
-        and step["uses"].startswith("taiki-e/install-action@")
-        and isinstance(step.get("with"), dict)
-        and str(step["with"].get("tool", "")).startswith("gitleaks@"),
+        lambda step: isinstance(step.get("run"), str)
+        and "gitleaks_8.24.2_linux_x64.tar.gz" in step["run"]
+        and "fa0500f6b7e41d28791ebc680f5dd9899cd42b58629218a5f041efa899151a8e" in step["run"]
+        and "sha256sum --check --strict" in step["run"]
+        and '>> "$GITHUB_PATH"' in step["run"],
         "secret-scan.yml.jobs.gitleaks",
     )
     if not install_gitleaks:
-        fail("secret-scan.yml must install a pinned Gitleaks CLI")
+        fail("secret-scan.yml must install a checksum-verified pinned Gitleaks CLI")
     gitleaks_step = find_step(
         secret_jobs["gitleaks"],
         lambda step: isinstance(step.get("run"), str)
