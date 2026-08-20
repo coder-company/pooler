@@ -1,0 +1,8 @@
+# Custom labels used by the organization's self-hosted Runnit runners.
+self-hosted-runner:
+  labels:
+    - Linux
+    - X64
+    - macOS
+    - ARM64
+    - palantir-actions

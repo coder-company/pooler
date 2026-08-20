@@ -9,6 +9,11 @@ on:
         description: Git ref or commit to verify
         required: false
         type: string
+      include-macos:
+        description: Run the macOS quality lane when matching self-hosted capacity exists
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -23,12 +28,32 @@ env:
 
 jobs:
   quality:
-    name: Quality (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: Quality (Linux)
+    runs-on: [self-hosted, Linux, X64, palantir-actions]
+    steps:
+      # Action references are immutable commit pins. Dependabot updates them
+      # weekly after checking the corresponding release tag.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.checkout-ref || github.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+        with:
+          toolchain: 1.86.0
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: cargo fmt --all --check
+      - run: bash scripts/check-release-workflow.sh
+      - run: ./scripts/check-config-schema.sh
+      - run: cargo check --workspace --all-targets --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo test --workspace --all-features --locked --doc
+
+  quality-macos:
+    name: Quality (macOS)
+    if: ${{ inputs.include-macos }}
+    runs-on: [self-hosted, macOS, X64, palantir-actions]
     steps:
       # Action references are immutable commit pins. Dependabot updates them
       # weekly after checking the corresponding release tag.
@@ -51,7 +76,7 @@ jobs:
 
   fixtures-and-properties:
     name: Fixtures and property harnesses
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, palantir-actions]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -73,7 +98,7 @@ jobs:
 
   supply-chain:
     name: Dependency and license policy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, palantir-actions]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
