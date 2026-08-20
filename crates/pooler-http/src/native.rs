@@ -19,6 +19,8 @@ use pooler_store::SqliteOAuthTokenStore;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::{RuntimeResourceSnapshot, RuntimeResources};
+
 /// Native runtime errors are intentionally coarse and never carry token
 /// material, response bodies, or authorization headers.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -81,6 +83,7 @@ pub struct NativeRuntime {
     refresh: RefreshCoordinator,
     codex: Arc<BTreeMap<String, Arc<dyn OAuthRefresher>>>,
     account_ids: Arc<BTreeMap<String, String>>,
+    resources: RuntimeResources,
 }
 
 impl std::fmt::Debug for NativeRuntime {
@@ -123,6 +126,7 @@ impl NativeRuntime {
             refresh: RefreshCoordinator::new(),
             codex: Arc::new(codex),
             account_ids: Arc::new(BTreeMap::new()),
+            resources: RuntimeResources::new(),
         })
     }
 
@@ -160,6 +164,7 @@ impl NativeRuntime {
             refresh: RefreshCoordinator::new(),
             codex: Arc::new(codex),
             account_ids: Arc::new(BTreeMap::new()),
+            resources: RuntimeResources::new(),
         }
     }
 
@@ -173,6 +178,7 @@ impl NativeRuntime {
             refresh: RefreshCoordinator::new(),
             codex: Arc::new(BTreeMap::new()),
             account_ids: Arc::new(BTreeMap::new()),
+            resources: RuntimeResources::new(),
         }
     }
 
@@ -198,6 +204,16 @@ impl NativeRuntime {
             .native()
             .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
             && self.codex.contains_key(upstream.id())
+    }
+
+    /// Return the resources owned by native credential handling.
+    #[must_use]
+    pub fn resource_snapshot(&self) -> RuntimeResourceSnapshot {
+        let mut snapshot = self.resources.snapshot();
+        let active = u64::try_from(self.refresh.active_leases()).unwrap_or(u64::MAX);
+        snapshot.refresh_leases = snapshot.refresh_leases.max(active);
+        snapshot.peak_refresh_leases = snapshot.peak_refresh_leases.max(active);
+        snapshot
     }
 
     /// Load and materialize one credential for one outbound attempt.
@@ -254,6 +270,7 @@ impl NativeRuntime {
             .codex
             .get(upstream.id())
             .ok_or(NativeRuntimeError::Unsupported)?;
+        let _lease = self.resources.refresh_lease();
         refresh_with_store_if_generation(
             &self.refresh,
             provider.as_ref(),

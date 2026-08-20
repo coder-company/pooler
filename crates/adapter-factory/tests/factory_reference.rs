@@ -5,8 +5,6 @@ use serde_json::{json, Value};
 
 use adapter_factory::{FactoryEventEncoder, FactoryLanguageModelDecoder};
 
-const FIXTURE: &str = include_str!("../../../fixtures/factory/fx-cliproxy-bridge-text.json");
-
 #[derive(Debug, Deserialize)]
 struct ReferenceFixture {
     id: String,
@@ -21,8 +19,8 @@ struct ReferenceFixture {
     expected_pooler_factory_sse: Vec<String>,
 }
 
-fn load_fixture() -> ReferenceFixture {
-    serde_json::from_str(FIXTURE).expect("valid sanitized Factory fixture")
+fn load_fixture(source: &str) -> ReferenceFixture {
+    serde_json::from_str(source).expect("valid sanitized Factory fixture")
 }
 
 fn parse_sse(frames: &[String]) -> Vec<SseEvent> {
@@ -94,7 +92,9 @@ fn normalize_sampling_precision(mut value: Value) -> Value {
 
 #[test]
 fn replays_sanitized_fx_bridge_request_and_stream() {
-    let fixture = load_fixture();
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/factory/fx-cliproxy-bridge-text.json");
+    let fixture = load_fixture(MANIFEST_FIXTURE);
     assert_eq!(fixture.id, "fx-cliproxy-bridge.factory.v3.text");
     assert_eq!(fixture.source, "fx-cliproxy-bridge/server.mjs");
     assert_eq!(fixture.equivalence, "json_structural");

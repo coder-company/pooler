@@ -10,7 +10,7 @@ ROOT=$(git rev-parse --show-toplevel)
 REPORT=${POOLER_BENCH_REPORT:-"$ROOT/target/pooler-benchmark-report.json"}
 RUNS=${POOLER_BENCH_RUNS:-3}
 SHORT=${POOLER_BENCH_SHORT:-0}
-ENFORCE=${POOLER_BENCH_ENFORCE:-0}
+ENFORCE=${POOLER_BENCH_ENFORCE:-1}
 
 if ! [[ "$RUNS" =~ ^[1-9][0-9]*$ ]]; then
     echo "POOLER_BENCH_RUNS must be a positive integer" >&2

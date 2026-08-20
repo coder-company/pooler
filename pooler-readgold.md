@@ -41,10 +41,12 @@ name or advertised without conformance evidence.
 - Phase 4 — Devin and ConnectRPC: in progress. Pinned Prost generation, shared
   bounded Connect/gzip framing, Devin metadata/chat codecs, a namespaced preset,
   sanitized cross-language fixtures, and runtime streaming/cancellation coverage are
-  implemented. The installed Devin client model-list path is evidenced locally, and
-  a sanitized fixture covers the exact current-client `source=Tool` follow-up shape
-  observed during a real tool loop. A complete native tool conversation through
-  Pooler and live-provider authorization remain before compatibility can be claimed.
+  implemented. Installed Devin CLI `3000.4.16` completed a native text, tool-call,
+  command execution, tool-result, and final-response conversation through Pooler
+  against a deterministic loopback upstream. The sanitized fixture and HTTP-runtime
+  replay cover its exact `source=Tool` follow-up shape and deterministic final
+  response, not the initial tool-call emission, OS execution, or client orchestration.
+  Live-provider authorization remains a separate gate.
 - Phase 5 — account pooling: implemented and locally verified. Strict immutable
   account/pool/policy plans drive deterministic selection, bounded pre-commit retry,
   scoped cooldown and quota recovery, affinity with safe rebind policy, redacted
@@ -58,13 +60,14 @@ name or advertised without conformance evidence.
 - Phase 7 — management and compatibility laboratory: implemented and locally
   verified. Authenticated read-only management, atomic dependency-aware reload,
   bounded metrics/traces, owner-private sanitized capture, executable fixture replay,
-  a truthful compatibility matrix, and five cargo-fuzz targets are wired and tested.
+  a truthful compatibility matrix, and eight cargo-fuzz targets are wired and tested.
 - Phase 8 — hardening and release: implemented and locally verified on Linux x86_64.
   Locked audit/deny gates, deterministic schema and compatibility reports, real
   mixed-protocol stress/benchmarks, no-import WASM extensions, deep-test/fuzz
   workflows, reproducible archives, SBOMs, checksums, signing, and provenance jobs
-  are wired. Native cross-platform CI, signed release artifacts, and a final benchmark
-  rerun on the release commit remain publication gates.
+  are wired. A final three-run benchmark and 15-minute stress rerun with the
+  hardened release verifier, native cross-platform CI, and signed release artifacts
+  remain publication gates.
 - First useful release acceptance: pending; the authoritative checklist is
   [`docs/release-acceptance.md`](docs/release-acceptance.md).
 

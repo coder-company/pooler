@@ -94,6 +94,7 @@ run_bounded() {
 
 run_workspace_checks() {
     run cargo test --workspace --all-features --locked --test phase8_failure_injection
+    run cargo test -p pooler-server --all-features --locked --test failure_injection
     run cargo test --workspace --all-features --locked --test phase8_concurrency
     run cargo test --workspace --all-features --locked --test phase8_security
 }
@@ -128,6 +129,9 @@ connect corpus/connect
 json_patch corpus/json
 overlay corpus/overlay
 tool_deltas corpus/tool-deltas
+decompression corpus/decompression
+route_match corpus/routes
+reasoning_state corpus/reasoning-state
 EOF
     cd "$ROOT"
 }

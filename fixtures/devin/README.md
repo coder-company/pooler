@@ -18,3 +18,18 @@ and is MIT-licensed; its schema source is documented in the upstream notice as
 the Devin/Cascade definitions from
 [`can1357/oh-my-pi`](https://github.com/can1357/oh-my-pi). The applicable notice
 is preserved in [`LICENSE.widevin`](LICENSE.widevin).
+
+`current-client-tool-follow-up.json` is separate current-client evidence. It
+retains the sanitized second-turn request shape observed from Devin CLI
+`3000.4.16`: assistant tool-call context followed by a `source=Tool` result.
+Its runtime replay verifies Connect/protobuf decoding, assistant/tool OpenAI
+roles, model forwarding, and a deterministic final text/usage/completion
+response through `HttpProxyServer`:
+
+```sh
+cargo test -p pooler-server --test current_client_compatibility \
+  devin_current_tool_follow_up_replays_through_http_proxy_server --locked
+```
+
+The committed fixture does not retain or replay the initial tool-call response,
+OS command execution, client orchestration, or a live-provider response.

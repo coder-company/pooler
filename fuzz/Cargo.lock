@@ -1064,10 +1064,10 @@ dependencies = [
  "idna_adapter",
  "jobserver",
  "libfuzzer-sys",
+ "pooler-config",
  "pooler-http",
  "pooler-protocol",
  "serde_json",
- "serde_yaml_ng",
  "url",
  "uuid",
 ]

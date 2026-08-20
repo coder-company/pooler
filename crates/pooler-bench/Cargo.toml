@@ -14,7 +14,6 @@ pooler-config = { path = "../pooler-config" }
 pooler-http = { path = "../pooler-http" }
 pooler-protocol = { path = "../pooler-protocol" }
 pooler-server = { path = "../pooler-server" }
-pooler-testkit = { path = "../pooler-testkit" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

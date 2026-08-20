@@ -1,80 +1,144 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "cases": [
     {
       "id": "connection-refused",
       "kind": "connection_refused",
+      "boundary": "http",
       "outcome": "error",
-      "commitment": "before"
+      "commitment": "before",
+      "expected_attempts": 2,
+      "expected_health_mutation": "none"
     },
     {
       "id": "tls-handshake-failure",
       "kind": "tls_failure",
+      "boundary": "tls",
       "outcome": "error",
-      "commitment": "before"
+      "commitment": "before",
+      "expected_attempts": 2,
+      "expected_health_mutation": "none"
     },
     {
       "id": "slow-headers",
       "kind": "slow_headers",
+      "boundary": "http",
       "outcome": "response",
       "delay_millis": 100,
-      "commitment": "before"
+      "commitment": "before",
+      "expected_attempts": 1,
+      "expected_health_mutation": "none"
     },
     {
       "id": "downstream-disconnect-before-commit",
       "kind": "downstream_disconnect",
+      "boundary": "http",
       "outcome": "cancelled",
-      "commitment": "before"
+      "commitment": "before",
+      "expected_attempts": 1,
+      "expected_health_mutation": "none"
     },
     {
       "id": "downstream-disconnect-after-commit",
       "kind": "downstream_disconnect",
+      "boundary": "http",
       "outcome": "cancelled",
-      "commitment": "after"
+      "commitment": "after",
+      "expected_attempts": 1,
+      "expected_health_mutation": "none"
     },
     {
       "id": "provider-401-refresh",
       "kind": "status_401_refresh",
-      "outcome": "error",
+      "boundary": "http",
+      "outcome": "response",
       "status": 401,
-      "commitment": "before"
+      "commitment": "before",
+      "expected_attempts": 2,
+      "expected_health_mutation": "none"
     },
     {
       "id": "provider-429-recovery",
       "kind": "status_429_recovery",
-      "outcome": "error",
+      "boundary": "http",
+      "outcome": "response",
       "status": 429,
-      "commitment": "before"
+      "commitment": "before",
+      "expected_attempts": 2,
+      "expected_health_mutation": "credential_cooldown"
+    },
+    {
+      "id": "provider-invalid-request-no-cooldown",
+      "kind": "request_invalid",
+      "boundary": "http",
+      "outcome": "error",
+      "status": 400,
+      "commitment": "before",
+      "expected_attempts": 1,
+      "expected_health_mutation": "none"
     },
     {
       "id": "partial-sse",
       "kind": "partial_sse",
+      "boundary": "sse",
       "outcome": "error",
-      "commitment": "after"
+      "commitment": "after",
+      "expected_attempts": 1,
+      "expected_health_mutation": "none"
     },
     {
       "id": "invalid-utf8",
       "kind": "invalid_utf8",
+      "boundary": "sse",
       "outcome": "error",
-      "commitment": "before"
+      "commitment": "after",
+      "expected_attempts": 1,
+      "expected_health_mutation": "none"
     },
     {
       "id": "missing-terminal-event",
       "kind": "missing_terminal_event",
+      "boundary": "sse",
       "outcome": "error",
-      "commitment": "after"
+      "commitment": "after",
+      "expected_attempts": 1,
+      "expected_health_mutation": "none"
     },
     {
       "id": "fragmented-websocket",
       "kind": "fragmented_websocket",
+      "boundary": "websocket",
       "outcome": "response",
-      "commitment": "after"
+      "commitment": "after",
+      "expected_attempts": 1,
+      "expected_health_mutation": "none"
+    },
+    {
+      "id": "websocket-disconnect-after-upgrade",
+      "kind": "websocket_disconnect",
+      "boundary": "websocket",
+      "outcome": "error",
+      "commitment": "after",
+      "expected_attempts": 1,
+      "expected_health_mutation": "none"
     },
     {
       "id": "truncated-connect-envelope",
       "kind": "truncated_connect",
+      "boundary": "connect",
       "outcome": "error",
-      "commitment": "before"
+      "commitment": "before",
+      "expected_attempts": 0,
+      "expected_health_mutation": "none"
+    },
+    {
+      "id": "connect-missing-terminal-after-commit",
+      "kind": "partial_connect",
+      "boundary": "connect",
+      "outcome": "error",
+      "commitment": "after",
+      "expected_attempts": 1,
+      "expected_health_mutation": "none"
     }
   ]
 }

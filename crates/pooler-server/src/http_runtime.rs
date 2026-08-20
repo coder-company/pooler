@@ -28,7 +28,8 @@ use pooler_extension::{
 };
 use pooler_http::{
     BoxError, DrainError, HttpProxy, NativeRuntime, PoolingCoordinator, ProxyBody, ProxyError,
-    SelectionContext, SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
+    RuntimeResourceGuard, RuntimeResourceSnapshot, RuntimeResources, SelectionContext,
+    SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
 };
 use pooler_observe::MetricsRegistry;
 use thiserror::Error;
@@ -239,11 +240,14 @@ enum BoundListener {
     },
 }
 
-struct UnixSocketPath(PathBuf);
+struct UnixSocketPath {
+    path: PathBuf,
+    _resource: RuntimeResourceGuard,
+}
 
 impl Drop for UnixSocketPath {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -258,6 +262,7 @@ struct RuntimeState {
     management: Option<ManagementHttpServer>,
     management_api: Option<Arc<ManagementApi>>,
     cancellation: CancellationToken,
+    resources: RuntimeResources,
 }
 
 /// Immutable runtime dispatch table for one configuration generation.
@@ -345,6 +350,7 @@ impl HttpProxyServer {
         pooling: Arc<PoolingCoordinator>,
     ) -> Result<Self, HttpProxyServerError> {
         let config = Arc::new(config);
+        let resources = RuntimeResources::new();
         let dispatch = Arc::new(ArcSwap::from_pointee(RuntimeGeneration {
             config: Arc::clone(&config),
             proxies: BTreeMap::new(),
@@ -386,7 +392,8 @@ impl HttpProxyServer {
                     Arc::clone(&native),
                 )?
                 .with_extensions(Arc::clone(&extensions))
-                .with_observability(metrics.clone()),
+                .with_observability(metrics.clone())
+                .with_runtime_resources(resources.clone()),
             );
             let bind = plan.bind();
             let prepared_tls = plan
@@ -415,7 +422,10 @@ impl HttpProxyServer {
                 listeners.push(BoundListener::Unix {
                     id: Arc::clone(&id),
                     listener,
-                    path: UnixSocketPath(PathBuf::from(path)),
+                    path: UnixSocketPath {
+                        path: PathBuf::from(path),
+                        _resource: resources.temporary_file(),
+                    },
                     dispatch: Arc::clone(&dispatch),
                 });
                 addresses.push(ListenerAddress {
@@ -469,6 +479,7 @@ impl HttpProxyServer {
                 management,
                 management_api,
                 cancellation: CancellationToken::new(),
+                resources,
             }),
             addresses: Arc::new(addresses),
         })
@@ -506,6 +517,15 @@ impl HttpProxyServer {
     #[must_use]
     pub fn active(&self) -> usize {
         self.state.active.total()
+    }
+
+    /// Return live and peak counts from production runtime ownership guards.
+    #[must_use]
+    pub fn resource_snapshot(&self) -> RuntimeResourceSnapshot {
+        self.state
+            .resources
+            .snapshot()
+            .merge(self.state.native.resource_snapshot())
     }
 
     /// Whether shutdown has begun on any listener.
@@ -582,7 +602,8 @@ impl HttpProxyServer {
                     Arc::clone(&self.state.native),
                 )?
                 .with_extensions(Arc::clone(&extensions))
-                .with_observability(self.state.metrics.clone()),
+                .with_observability(self.state.metrics.clone())
+                .with_runtime_resources(self.state.resources.clone()),
             );
             proxies.insert(id, proxy);
         }
@@ -622,10 +643,17 @@ impl HttpProxyServer {
         for listener in listeners {
             let cancellation = self.state.cancellation.clone();
             let active = active.clone();
-            tasks.spawn(async move { accept_loop(listener, cancellation, active).await });
+            let task = self.state.resources.task();
+            let resources = self.state.resources.clone();
+            tasks.spawn(async move {
+                let _task = task;
+                accept_loop(listener, cancellation, active, resources).await
+            });
         }
         if let Some(management) = self.state.management.clone() {
+            let task = self.state.resources.task();
             tasks.spawn(async move {
+                let _task = task;
                 management
                     .run()
                     .await
@@ -900,6 +928,7 @@ async fn accept_loop(
     listener: BoundListener,
     cancellation: CancellationToken,
     active: ActiveCounts,
+    resources: RuntimeResources,
 ) -> Result<(), HttpProxyServerError> {
     match listener {
         BoundListener::Tcp {
@@ -927,7 +956,9 @@ async fn accept_loop(
                         let tls = generation.tls.get(id.as_ref()).cloned().flatten();
                         let cancellation = cancellation.clone();
                         let active = active.clone();
+                        let task = resources.task();
                         connections.spawn(async move {
+                            let _task = task;
                             serve_tcp_connection(
                                 stream,
                                 connection_id,
@@ -979,7 +1010,9 @@ async fn accept_loop(
                             .map_or(ListenerProtocol::Http1, |listener| listener.protocol());
                         let cancellation = cancellation.clone();
                         let active = active.clone();
+                        let task = resources.task();
                         connections.spawn(async move {
+                            let _task = task;
                             serve_connection(
                                 TokioIo::new(stream),
                                 id,
@@ -1150,6 +1183,7 @@ mod tests {
     use http_body_util::{BodyExt as _, Full};
     use pooler_auth::{OAuthFuture, OAuthRefresher, OAuthTokenStore, OAuthTokens, SecretValue};
     use pooler_store::{MasterKey, SqliteStore, Store};
+    use pooler_testkit::{normalize_json_value, Fixture, ScriptedChunk, ScriptedResult};
     use tempfile::tempdir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -3086,6 +3120,168 @@ mod tests {
         assert!(String::from_utf8_lossy(&upstream_request)
             .to_ascii_lowercase()
             .contains("authorization: bearer cursor-token"));
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn cursor_current_fixture_replays_through_http_runtime() {
+        const MANIFEST_FIXTURE: &str =
+            include_str!("../../../fixtures/cursor/cursor-agent-local-2026.08.04.json");
+        let fixture: Fixture =
+            serde_json::from_str(MANIFEST_FIXTURE).expect("Cursor current-client fixture parses");
+        assert_eq!(fixture.metadata.id, "cursor-agent-local.2026.08.04.pooler");
+        let downstream = fixture
+            .downstream_request
+            .as_ref()
+            .expect("Cursor fixture downstream request");
+        let expected_upstream = fixture
+            .expected_upstream_request
+            .as_ref()
+            .expect("Cursor fixture expected upstream request");
+        let scripted_response = match fixture
+            .upstream_script
+            .first()
+            .expect("Cursor fixture upstream script")
+        {
+            ScriptedResult::Response(response) => response.clone(),
+            other => panic!("expected Cursor response script, got {other:?}"),
+        };
+
+        let sse_body = |chunks: &[ScriptedChunk]| {
+            let mut body = Vec::new();
+            for chunk in chunks {
+                let ScriptedChunk::Sse { event, data } = chunk else {
+                    panic!("Cursor fixture must contain only SSE chunks")
+                };
+                if let Some(event) = event {
+                    body.extend_from_slice(b"event: ");
+                    body.extend_from_slice(event.as_bytes());
+                    body.extend_from_slice(b"\n");
+                }
+                for line in data.split('\n') {
+                    body.extend_from_slice(b"data: ");
+                    body.extend_from_slice(line.as_bytes());
+                    body.extend_from_slice(b"\n");
+                }
+                body.extend_from_slice(b"\n");
+            }
+            body
+        };
+        let upstream_body = sse_body(&scripted_response.chunks);
+        let expected_downstream_body = sse_body(&fixture.expected_downstream_chunks);
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Cursor fixture upstream binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("Cursor fixture upstream address");
+        let upstream_content_type = scripted_response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map_or("text/event-stream", |(_, value)| value.as_str())
+            .to_owned();
+        let upstream_status = scripted_response.status;
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener
+                .accept()
+                .await
+                .expect("Cursor fixture upstream accepts");
+            let request = read_request(&mut stream)
+                .await
+                .expect("Cursor fixture upstream request");
+            let response = format!(
+                "HTTP/1.1 {upstream_status} OK\r\nContent-Type: {upstream_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                upstream_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("Cursor fixture upstream response headers");
+            stream
+                .write_all(&upstream_body)
+                .await
+                .expect("Cursor fixture upstream response body");
+            request
+        });
+
+        let upstream_secret = TestSecret::new("cursor-fixture-token");
+        let config_file = TestSecret::new(&format!(
+            "imports:\n  - preset: cursor\n    as: cursor-fixture\n    with:\n      bind: 127.0.0.1:0\n      reasoning_effort: high\n      model_prefix: gpt-\n      upstream_url: http://{upstream_address}\n      secret: {}\nversion: 1\n",
+            upstream_secret.reference()
+        ));
+        let config = pooler_config::Config::from_path(&config_file.path)
+            .expect("Cursor fixture config loads")
+            .compile()
+            .expect("Cursor fixture config compiles");
+        let server = HttpProxyServer::bind(config)
+            .await
+            .expect("Cursor fixture server binds");
+        let address = listener_address(&server, "cursor-fixture");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let mut request = format!(
+            "{} {} HTTP/1.1\r\nHost: cursor-fixture\r\n",
+            downstream.method, downstream.uri
+        )
+        .into_bytes();
+        for (name, value) in &downstream.headers {
+            request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        request.extend_from_slice(
+            format!(
+                "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                downstream.body.len()
+            )
+            .as_bytes(),
+        );
+        request.extend_from_slice(&downstream.body);
+
+        let response = send_request_until(address, &request, b"data: [DONE]\n\n").await;
+        assert_eq!(status(&response), 200);
+        let response_headers = String::from_utf8_lossy(
+            &response[..header_end(&response).expect("Cursor response headers")],
+        )
+        .to_ascii_lowercase();
+        let actual_downstream_body = if response_headers.contains("transfer-encoding: chunked") {
+            decode_chunked_body(response_body(&response))
+        } else {
+            response_body(&response).to_vec()
+        };
+        assert_eq!(actual_downstream_body, expected_downstream_body);
+
+        let upstream_request = upstream.await.expect("Cursor fixture upstream task");
+        let upstream_request_text = String::from_utf8_lossy(&upstream_request);
+        let mut request_line = upstream_request_text.lines();
+        let mut request_parts = request_line
+            .next()
+            .expect("upstream request line")
+            .split_whitespace();
+        assert_eq!(
+            request_parts.next(),
+            Some(expected_upstream.method.as_str())
+        );
+        assert_eq!(request_parts.next(), Some(expected_upstream.uri.as_str()));
+        assert!(has_header(&upstream_request, "content-type"));
+        let actual_upstream_body: serde_json::Value =
+            serde_json::from_slice(response_body(&upstream_request))
+                .expect("Cursor upstream JSON body");
+        let expected_upstream_body: serde_json::Value =
+            serde_json::from_slice(&expected_upstream.body)
+                .expect("Cursor expected upstream JSON body");
+        assert_eq!(
+            normalize_json_value(actual_upstream_body.clone()),
+            normalize_json_value(expected_upstream_body)
+        );
+        assert_eq!(
+            actual_upstream_body["model"],
+            serde_json::Value::String(fixture.extracted_fields["model"].clone())
+        );
+        assert_eq!(actual_upstream_body["reasoning_effort"], "high");
         stop_server(&server, runner).await;
     }
 

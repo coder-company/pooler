@@ -4,10 +4,10 @@ The files under `corpus/` are small, committed starting inputs for bounded
 parser and transform fuzzing. They are intentionally sanitized and contain no
 credentials or live-provider traffic.
 
-The SSE, JSON, overlay, and tool-delta seeds are UTF-8 text. Connect seeds use
-whitespace-separated hexadecimal bytes because Connect envelopes contain binary
-length and flag fields; the replay test decodes that representation before
-feeding arbitrary transport fragments to the decoder.
+The SSE, JSON, overlay, reasoning-state, and tool-delta seeds are UTF-8 text.
+Connect and decompression seeds use whitespace-separated hexadecimal bytes when
+they represent binary envelopes; the corresponding targets decode that
+representation before feeding arbitrary fragments to the production decoders.
 
 Seed names describe the boundary they exercise. A seed is not a conformance
 claim: it only keeps an observed or deliberately adversarial input available
@@ -21,13 +21,16 @@ cargo fuzz run connect fuzz/corpus/connect
 cargo fuzz run json_patch fuzz/corpus/json
 cargo fuzz run overlay fuzz/corpus/overlay
 cargo fuzz run tool_deltas fuzz/corpus/tool-deltas
+cargo fuzz run decompression fuzz/corpus/decompression
+cargo fuzz run route_match fuzz/corpus/routes
+cargo fuzz run reasoning_state fuzz/corpus/reasoning-state
 ```
 
 The Connect target accepts both raw bytes and the hexadecimal seed files in
 this repository. Fuzz output is local work product and is not a compatibility
 fixture.
 
-The bounded release workflow runs all five targets with
+The bounded release workflow runs all eight targets with
 [`scripts/deep-test.sh`](../scripts/deep-test.sh). It also executes the
 failure-injection, cancellation, URL-boundary, and redaction suites before
 fuzzing. The default local budget is five seconds per target; CI can require

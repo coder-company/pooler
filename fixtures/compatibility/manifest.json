@@ -80,7 +80,8 @@
         "The current-client run used ai-language-model-specification-version 4 and ai-gateway-protocol-version 0.0.1.",
         "Prompt text, tool prose and schemas, authorization, session identity, and transport-only headers were redacted before committing.",
         "The provider-defined search tool was explicitly dropped under the preset degrade policy.",
-        "Replay: cargo test -p adapter-factory --test factory_current_fixture."
+        "Replay boundary: exact sanitized V4 request -> HttpProxyServer -> deterministic OpenAI SSE loopback -> semantic Factory SSE response; no live provider is exercised.",
+        "Replay: cargo test -p pooler-server --test current_client_compatibility factory_current_fixture_replays_through_http_proxy_server --locked."
       ]
     },
     {
@@ -107,6 +108,36 @@
       ],
       "notes": [
         "This fixture is not evidence of compatibility with a current Devin client."
+      ]
+    },
+    {
+      "adapter": "devin",
+      "protocol": "connect-rpc",
+      "version": "3000.4.16",
+      "fixture": "../devin/current-client-tool-follow-up.json",
+      "equivalence": "protobuf_semantic",
+      "status": "current_client_conformance",
+      "source": "Installed Devin CLI 3000.4.16 through Pooler with a deterministic loopback OpenAI upstream",
+      "supported_capabilities": [
+        "text",
+        "function_tools",
+        "streaming",
+        "connect_rpc",
+        "protobuf"
+      ],
+      "unsupported_capabilities": [
+        "live_provider",
+        "model_id_routing",
+        "audio",
+        "files",
+        "websocket"
+      ],
+      "notes": [
+        "The live run recorded text, a run_command tool call, tool-result follow-up, and a final response, but the committed sanitized fixture retains only the follow-up request shape.",
+        "Replay boundary: the retained assistant tool-call context and source=Tool result -> HttpProxyServer -> model forwarding -> deterministic final OpenAI SSE -> Devin Connect text/usage/completion frames.",
+        "The replay does not reproduce initial tool-call emission, OS command execution, client orchestration, or a live provider response.",
+        "Prompts, credentials, workspace paths, client identity, and full transcripts were not committed.",
+        "Replay: cargo test -p pooler-server --test current_client_compatibility devin_current_tool_follow_up_replays_through_http_proxy_server --locked."
       ]
     },
     {
@@ -153,7 +184,7 @@
       "notes": [
         "The run used a deterministic loopback upstream and a temporary workspace; it is client conformance evidence for this request shape, not live provider authorization.",
         "Prompt text, authorization, client identity, and transport headers were redacted before committing.",
-        "Replay: cargo run -p pooler-cli -- fixture replay fixtures/cursor/cursor-agent-local-2026.08.04.json --actual <sanitized-actual-fixture>."
+        "Replay: cargo test -p pooler-server cursor_current_fixture_replays_through_http_runtime --locked."
       ]
     },
     {

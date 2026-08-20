@@ -8,7 +8,17 @@ Regenerate and verify the report from the repository root:
 
 ```sh
 ./scripts/check-compatibility-report.sh
+./scripts/verify-compatibility-fixtures.py
 ```
+
+The report check validates the generated matrix. The fixture verifier is the
+executable acceptance gate: it compiles structural config rows and runs each
+protocol fixture through its committed adapter or HTTP runtime test. Every row
+must report `status: passed`, `equivalent: true`, and an empty `differences`
+array. Unmapped rows and mapped tests without a first-statement
+`MANIFEST_FIXTURE` binding to the declared path fail before any test runs.
+Current-client fixture envelopes must match the manifest's adapter, protocol,
+version, equivalence, and supported-capability claim.
 
 Each row records two different things:
 

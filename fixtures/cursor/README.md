@@ -16,10 +16,9 @@ markers and omits authorization, client identity, and transport headers. It
 proves the exercised client/request path only; it does not authorize a live
 provider or establish tool, media, or broader Cursor compatibility.
 
-Replay a captured sanitized actual fixture with:
+Replay the committed sanitized request and response through the real HTTP
+runtime with:
 
 ```sh
-cargo run -p pooler-cli -- fixture replay \
-  fixtures/cursor/cursor-agent-local-2026.08.04.json \
-  --actual <sanitized-actual-fixture>
+cargo test -p pooler-server cursor_current_fixture_replays_through_http_runtime --locked
 ```

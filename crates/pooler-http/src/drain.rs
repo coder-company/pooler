@@ -13,6 +13,8 @@ use thiserror::Error;
 use tokio::{sync::Notify, time};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
+use crate::{RuntimeResourceGuard, RuntimeResources};
+
 #[derive(Debug, Default)]
 struct DrainState {
     active: usize,
@@ -30,6 +32,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct DrainController {
     inner: Arc<Inner>,
+    resources: RuntimeResources,
 }
 
 impl std::fmt::Debug for DrainController {
@@ -54,6 +57,7 @@ pub enum DrainError {
 pub struct DrainGuard {
     inner: Arc<Inner>,
     released: bool,
+    resource: Option<RuntimeResourceGuard>,
 }
 
 /// A body that keeps a drain permit until its response has finished.
@@ -162,12 +166,19 @@ impl std::fmt::Debug for DrainGuard {
 impl DrainController {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_resources(RuntimeResources::new())
+    }
+
+    /// Create a drain controller backed by a runtime resource registry.
+    #[must_use]
+    pub fn with_resources(resources: RuntimeResources) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(DrainState::default()),
                 notify: Notify::new(),
                 cancellation: CancellationToken::new(),
             }),
+            resources,
         }
     }
 
@@ -187,6 +198,7 @@ impl DrainController {
         Some(DrainGuard {
             inner: Arc::clone(&self.inner),
             released: false,
+            resource: Some(self.resources.permit()),
         })
     }
 
@@ -294,6 +306,7 @@ impl DrainGuard {
             return;
         }
         self.released = true;
+        self.resource.take();
         let mut state = self
             .inner
             .state

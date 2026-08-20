@@ -52,3 +52,40 @@ fn conflict_seed_is_valid_yaml_and_keeps_both_import_declarations() {
 
     assert_eq!(imports.len(), 2);
 }
+
+#[test]
+fn semantic_overlay_seed_replays_merge_render_and_compile() {
+    let directory = tempdir().expect("temporary fixture directory");
+    let base = directory.path().join("base.yaml");
+    let overlay = directory.path().join("semantic-route-merge.yaml");
+    let root = directory.path().join("root.yaml");
+    fs::write(
+        &base,
+        "version: 1\nlisteners:\n  local:\n    bind: 127.0.0.1:0\nupstreams:\n  local:\n    url: http://127.0.0.1:1\nroutes:\n  - id: obsolete\n    listen: local\n    match:\n      path: /obsolete\n    target: local\n",
+    )
+    .expect("base fixture");
+    fs::write(
+        &overlay,
+        include_str!("../../../fuzz/corpus/overlay/semantic-route-merge.yaml"),
+    )
+    .expect("semantic overlay seed");
+    fs::write(
+        &root,
+        "version: 1\nimports:\n  - file: base.yaml\n  - overlay: semantic-route-merge.yaml\n",
+    )
+    .expect("root fixture");
+
+    let loaded = ConfigLoader::default()
+        .load(&root)
+        .expect("semantic overlay should load");
+    let rendered = ConfigLoader::default()
+        .render(&root)
+        .expect("semantic overlay should render");
+    let compiled = loaded.compile().expect("semantic overlay should compile");
+
+    assert!(rendered.contains("http://127.0.0.1:2"));
+    assert!(!rendered.contains("merge:"));
+    assert!(!rendered.contains("remove:"));
+    assert!(compiled.route("obsolete").is_none());
+    assert!(compiled.route("replacement").is_some());
+}

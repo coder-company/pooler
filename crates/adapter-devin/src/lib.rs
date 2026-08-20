@@ -332,8 +332,11 @@ impl DevinResponseBody {
                     true,
                     self.devin_encoder.connect_limits,
                 ) {
-                    let _ = self.enqueue(Bytes::from(trailer));
-                    self.terminal_emitted = true;
+                    if self.enqueue(Bytes::from(trailer)).is_ok() {
+                        self.terminal_emitted = true;
+                        self.ended = true;
+                        return;
+                    }
                 }
             }
         }

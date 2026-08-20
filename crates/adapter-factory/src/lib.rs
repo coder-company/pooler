@@ -1571,6 +1571,7 @@ impl FactoryResponseBody {
         if self.error.is_some() {
             return;
         }
+        let mut terminal_enqueued = false;
         if !self.done_seen {
             let failure = StreamEvent::new(
                 0,
@@ -1587,10 +1588,14 @@ impl FactoryResponseBody {
             {
                 if self.enqueue(Bytes::from(encoded.body)).is_ok() {
                     if let Ok(done) = self.done_bytes() {
-                        let _ = self.enqueue(done);
+                        terminal_enqueued = self.enqueue(done).is_ok();
                     }
                 }
             }
+        }
+        if terminal_enqueued {
+            self.ended = true;
+            return;
         }
         self.error = Some(error);
     }
@@ -2514,7 +2519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emits_factory_error_event_before_incomplete_stream_closes() {
+    async fn incomplete_stream_ends_with_an_explicit_factory_error() {
         let body = http_body_util::Full::new(Bytes::from_static(
             b"data: {\"id\":\"chat-1\",\"model\":\"gpt-test\",\"choices\":[]}\n\n",
         ))
@@ -2529,21 +2534,25 @@ mod tests {
             CancellationToken::new(),
         );
         let mut saw_error = false;
-        let error = loop {
+        let mut saw_done = false;
+        loop {
             match response.frame().await {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
                         saw_error |= data
                             .windows(b"\"type\":\"error\"".len())
                             .any(|window| window == b"\"type\":\"error\"");
+                        saw_done |= data
+                            .windows(b"[DONE]".len())
+                            .any(|window| window == b"[DONE]");
                     }
                 }
-                Some(Err(error)) => break error,
-                None => panic!("incomplete stream must fail"),
+                Some(Err(error)) => panic!("explicit failure must close cleanly: {error}"),
+                None => break,
             }
-        };
+        }
         assert!(saw_error);
-        assert!(error.to_string().contains("without [DONE]"));
+        assert!(saw_done);
     }
 
     #[test]

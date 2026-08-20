@@ -20,9 +20,9 @@ icu_provider = "=1.5.0"
 idna = "=1.1.0"
 idna_adapter = "=1.2.0"
 pooler-http = { path = "../crates/pooler-http" }
+pooler-config = { path = "../crates/pooler-config" }
 pooler-protocol = { path = "../crates/pooler-protocol" }
 serde_json = "1.0"
-serde_yml = { package = "serde_yaml_ng", version = "=0.10.0" }
 uuid = "=1.12.1"
 url = "=2.5.4"
 
@@ -57,6 +57,27 @@ bench = false
 [[bin]]
 name = "tool_deltas"
 path = "fuzz_targets/tool_deltas.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompression"
+path = "fuzz_targets/decompression.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "route_match"
+path = "fuzz_targets/route_match.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reasoning_state"
+path = "fuzz_targets/reasoning_state.rs"
 test = false
 doc = false
 bench = false

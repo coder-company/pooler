@@ -13,7 +13,6 @@ const TYPESCRIPT_RESPONSE: &str =
     include_str!("../../../fixtures/devin/protobuf/typescript-models-response.base64");
 const RUST_REQUEST: &str =
     include_str!("../../../fixtures/devin/protobuf/rust-models-request.base64");
-const CONNECT_FIXTURE: &str = include_str!("../../../fixtures/devin/connect/chat-stream.json");
 
 #[derive(Debug, Deserialize)]
 struct ConnectFixture {
@@ -31,8 +30,8 @@ struct FixtureSource {
     paths: Vec<String>,
 }
 
-fn connect_fixture() -> ConnectFixture {
-    serde_json::from_str(CONNECT_FIXTURE).expect("valid sanitized Devin fixture")
+fn connect_fixture(source: &str) -> ConnectFixture {
+    serde_json::from_str(source).expect("valid sanitized Devin fixture")
 }
 
 fn decode_base64(value: &str) -> Vec<u8> {
@@ -86,7 +85,8 @@ fn cross_language_model_fixtures_preserve_wire_bytes() {
 
 #[test]
 fn connect_fixture_covers_fragmentation_gzip_tools_identifiers_and_usage() {
-    let fixture = connect_fixture();
+    const MANIFEST_FIXTURE: &str = include_str!("../../../fixtures/devin/connect/chat-stream.json");
+    let fixture = connect_fixture(MANIFEST_FIXTURE);
     assert_eq!(fixture.id, "fx-widevin-devin.connect.v1");
     assert_eq!(fixture.equivalence, "protobuf_semantic");
     assert_eq!(

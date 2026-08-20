@@ -15,6 +15,7 @@ mod headers;
 mod native;
 mod pool;
 mod proxy;
+mod resources;
 mod sse;
 mod stream;
 
@@ -43,6 +44,7 @@ pub use proxy::{
     BoxError, HttpProxy, NoSemanticAdapter, ProxyBody, ProxyError, SemanticAdapter,
     SemanticRequestBody, SemanticResponseBody,
 };
+pub use resources::{RuntimeResourceGuard, RuntimeResourceSnapshot, RuntimeResources};
 pub use sse::{
     SseEncoder, SseError, SseEvent, SseLimits, SseParser, DEFAULT_SSE_MAX_EVENT_BYTES,
     DEFAULT_SSE_MAX_LINE_BYTES,

@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -23,21 +23,96 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  resolve:
+    name: Resolve and pin release source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_REF: ${{ inputs.tag || github.ref }}
+    steps:
+      - name: Check out the requested release
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Validate and pin the release tag
+        id: source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git show-ref --tags --verify --quiet "refs/tags/$RELEASE_TAG"
+          checkout_sha="$(git rev-parse --verify HEAD^{commit})"
+          tag_sha="$(git rev-parse --verify "$RELEASE_TAG^{commit}")"
+          test "$checkout_sha" = "$tag_sha"
+          {
+            printf 'tag=%s\n' "$RELEASE_TAG"
+            printf 'sha=%s\n' "$checkout_sha"
+            printf 'ref=%s\n' "$RELEASE_REF"
+          } > "$RUNNER_TEMP/release-source.txt"
+          {
+            printf 'tag=%s\n' "$RELEASE_TAG"
+            printf 'sha=%s\n' "$checkout_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact release source evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-source
+          path: ${{ runner.temp }}/release-source.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  ci:
+    name: CI acceptance for release source
+    needs: resolve
+    uses: ./.github/workflows/ci.yml
+    with:
+      checkout-ref: ${{ needs.resolve.outputs.sha }}
+
+  hardening:
+    name: Hardening acceptance for release source
+    needs: resolve
+    uses: ./.github/workflows/hardening.yml
+    with:
+      checkout-ref: ${{ needs.resolve.outputs.sha }}
+
+  secret_scan:
+    name: Secret-scan acceptance for release source
+    needs: resolve
+    uses: ./.github/workflows/secret-scan.yml
+    permissions:
+      contents: read
+      pull-requests: read # Gitleaks reads pull-request metadata when scanning PRs.
+    with:
+      checkout-ref: ${{ needs.resolve.outputs.sha }}
+    secrets:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   gates:
     name: Release acceptance gates
+    needs: resolve
     runs-on: ubuntu-24.04
     permissions:
       contents: read
     timeout-minutes: 35
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
 
     steps:
       - name: Check out the tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Validate release tag
         shell: bash
@@ -58,6 +133,9 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all --check
+
+      - name: Verify release workflow dependencies
+        run: bash scripts/check-release-workflow.sh
 
       - name: Check Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -97,6 +175,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
+    needs: resolve
     strategy:
       fail-fast: false
       matrix:
@@ -119,14 +198,16 @@ jobs:
       contents: read
     env:
       TARGET: ${{ matrix.target }}
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      RUN_SMOKE: ${{ matrix.run_smoke }}
 
     steps:
       - name: Check out the tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Validate release tag
         shell: bash
@@ -195,7 +276,7 @@ jobs:
           cmp -- "$first_binary" "$second_binary"
           file "$first_binary"
 
-          if [[ "${{ matrix.run_smoke }}" == "true" ]]; then
+          if [[ "$RUN_SMOKE" == "true" ]]; then
             "$first_binary" --version
             "$first_binary" --config config/pooler.example.yaml check
           fi
@@ -243,7 +324,7 @@ jobs:
           tar -xzf "$archive" -C "$smoke_root"
           packaged_binary="${smoke_root}/${package_name}/bin/pooler"
           test -x "$packaged_binary"
-          if [[ "${{ matrix.run_smoke }}" == "true" ]]; then
+          if [[ "$RUN_SMOKE" == "true" ]]; then
             "$packaged_binary" --version
             "$packaged_binary" \
               --config "${smoke_root}/${package_name}/config/pooler.example.yaml" check
@@ -269,19 +350,20 @@ jobs:
 
   assemble:
     name: Assemble and smoke-test release
-    needs: [build, gates]
+    needs: [resolve, build, gates, ci, hardening, secret_scan]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
 
     steps:
       - name: Check out the tagged source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Validate release tag
         shell: bash
@@ -378,14 +460,14 @@ jobs:
 
   publish:
     name: Sign, attest, and publish release
-    needs: [assemble, gates]
+    needs: [resolve, assemble, gates, ci, hardening, secret_scan]
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: write # Publish the signed release assets.
+      id-token: write # Obtain an OIDC identity for Sigstore signing.
+      attestations: write # Attach build provenance to release archives.
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
 
     steps:
