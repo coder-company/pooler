@@ -94,8 +94,6 @@ jobs:
       pull-requests: read # Gitleaks reads pull-request metadata when scanning PRs.
     with:
       checkout-ref: ${{ needs.resolve.outputs.sha }}
-    secrets:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   gates:
     name: Release acceptance gates
