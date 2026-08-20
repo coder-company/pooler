@@ -337,8 +337,97 @@
         "bind": {
           "type": "string"
         },
+        "h2c": {
+          "type": "boolean"
+        },
         "merge": true,
-        "remove": true
+        "protocol": {
+          "enum": [
+            "http1",
+            "http/1.1",
+            "h1",
+            "auto",
+            "http1+http2",
+            "http1-or-http2",
+            "h2c",
+            "http2",
+            "http/2",
+            "h2"
+          ],
+          "type": "string"
+        },
+        "remove": true,
+        "tls": {
+          "$ref": "#/$defs/listener_tls"
+        }
+      },
+      "type": "object"
+    },
+    "listener_client_auth": {
+      "additionalProperties": false,
+      "properties": {
+        "ca": {
+          "type": "string"
+        },
+        "ca_file": {
+          "type": "string"
+        },
+        "certificate_authority": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "listener_tls": {
+      "additionalProperties": false,
+      "properties": {
+        "alpn": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "alpn_protocols": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "cert": {
+          "type": "string"
+        },
+        "cert_file": {
+          "type": "string"
+        },
+        "certificate": {
+          "type": "string"
+        },
+        "certificate_file": {
+          "type": "string"
+        },
+        "client_auth": {
+          "$ref": "#/$defs/listener_client_auth"
+        },
+        "handshake_timeout": {
+          "$ref": "#/$defs/duration"
+        },
+        "key": {
+          "type": "string"
+        },
+        "key_file": {
+          "type": "string"
+        },
+        "private_key": {
+          "type": "string"
+        },
+        "private_key_file": {
+          "type": "string"
+        }
       },
       "type": "object"
     },
@@ -936,6 +1025,9 @@
         "connect_timeout": {
           "pattern": "^[0-9]+(ms|s|m|h)$",
           "type": "string"
+        },
+        "http2": {
+          "type": "boolean"
         },
         "kind": {
           "type": "string"

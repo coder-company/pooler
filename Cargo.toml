@@ -12,15 +12,17 @@ repository = "https://github.com/coder-company/pooler"
 [workspace.dependencies]
 anyhow = "1.0"
 arc-swap = "1.7"
+base64 = "0.22"
 bytes = "1.10"
 clap = { version = "=4.5.23", features = ["derive"] }
 flate2 = "1.0"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 http = "1.2"
 http-body = "1.0"
 http-body-util = "0.1"
-hyper = { version = "1.6", features = ["http1", "server"] }
-hyper-rustls = { version = "=0.27.6", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper = { version = "1.6", features = ["http1", "http2", "server"] }
+hyper-rustls = { version = "=0.27.6", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "server-auto", "tokio"] }
 indexmap = { version = "=2.7.0", features = ["serde"] }
 keyring = { version = "=3.6.3", default-features = false }
 prost = "0.13"
@@ -28,6 +30,8 @@ prost-build = "0.13"
 prost-types = "0.13"
 protoc-bin-vendored = "3"
 ring = "0.17"
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "=0.8.1"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 rustix = { version = "0.38", features = ["fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -39,8 +43,10 @@ serde_path_to_error = "0.1"
 serde_yml = { package = "serde_yaml_ng", version = "0.10" }
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["full"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio-util = "0.7"
 tempfile = "=3.19.1"
+tokio-tungstenite = { version = "=0.27.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = { version = "2.5", features = ["serde"] }

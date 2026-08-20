@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant as StdInstant},
 };
 
+use base64::Engine;
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
 use http_body::{Body, Frame, SizeHint};
@@ -36,10 +37,17 @@ use pooler_observe::{
     AttemptRecord, AttemptResult, CompletionClass, CooldownRecord, DecisionRecord, MetricsRegistry,
     QuotaRecord, RequestObservation, RetryRecord, TraceRecord, TraceRecorder, TraceStage,
 };
-use pooler_policy::ReplayCheck;
+use pooler_policy::{ReplayCheck, SelectionLease};
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
+use ring::rand::SecureRandom;
+use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use thiserror::Error;
-use tokio::time::{self, Instant, Sleep};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::TcpStream,
+    time::{self, Instant, Sleep},
+};
+use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -245,6 +253,9 @@ pub enum ProxyError {
     /// A semantic response could not be initialized after upstream headers.
     #[error("invalid semantic response: {0}")]
     SemanticResponse(String),
+    /// The downstream WebSocket upgrade request was malformed.
+    #[error("invalid WebSocket handshake: {0}")]
+    InvalidWebSocketHandshake(String),
     /// Account selection or mutable pooling state failed.
     #[error("account selection failed: {0}")]
     Pool(String),
@@ -268,6 +279,7 @@ pub struct HttpProxy<A = NoSemanticAdapter> {
     config: Arc<CompiledConfig>,
     listener: Arc<str>,
     client: UpstreamClient,
+    h2c_client: UpstreamClient,
     drain: DrainController,
     semantic: A,
     pooling: Arc<PoolingCoordinator>,
@@ -360,12 +372,26 @@ where
             .map_err(|error| ProxyError::TlsClient(error.to_string()))?
             .https_or_http()
             .enable_http1()
+            .enable_http2()
             .build();
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let mut client_builder = Client::builder(TokioExecutor::new());
+        client_builder.http2_adaptive_window(true);
+        let client = client_builder.build(connector);
+        let h2c_connector = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .map_err(|error| ProxyError::TlsClient(error.to_string()))?
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        let mut h2c_builder = Client::builder(TokioExecutor::new());
+        h2c_builder.http2_only(true).http2_adaptive_window(true);
+        let h2c_client = h2c_builder.build(h2c_connector);
         Ok(Self {
             config,
             listener,
             client,
+            h2c_client,
             drain: DrainController::new(),
             semantic,
             pooling,
@@ -484,7 +510,13 @@ where
                 .route(route.id())
                 .outcome("accepted"),
         );
-        let result = self.forward(route, request, guard, &mut observation).await;
+        let is_websocket = route.matcher().websocket() == Some(true);
+        let result = if is_websocket {
+            self.forward_websocket(route, request, guard, &mut observation)
+                .await
+        } else {
+            self.forward(route, request, guard, &mut observation).await
+        };
         match result {
             Ok(response) => {
                 tracing::info!(
@@ -581,6 +613,130 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn forward_websocket(
+        &self,
+        route: &RoutePlan,
+        mut request: Request<Incoming>,
+        guard: DrainGuard,
+        observation: &mut Option<RequestObservation>,
+    ) -> Result<Response<ProxyBody>, ProxyError> {
+        let key = validate_websocket_request(&request)?;
+        let offered_protocols = websocket_protocols(request.headers());
+        if route.ingress().mode() != BodyMode::Opaque || route.response().mode() != BodyMode::Opaque
+        {
+            return Err(ProxyError::UnsupportedBodyMode {
+                route: route.id().to_owned(),
+            });
+        }
+
+        let started = StdInstant::now();
+        let cancellation = guard.cancellation_token();
+        let downstream_uri = request.uri().clone();
+        let mut headers = request.headers().clone();
+        strip_hop_by_hop_headers(&mut headers);
+        headers.remove(header::HOST);
+        headers.remove(header::AUTHORIZATION);
+        headers.remove(header::CONTENT_LENGTH);
+        headers.remove(header::CONTENT_TYPE);
+        headers.remove("sec-websocket-key");
+        headers.remove("sec-websocket-version");
+        headers.remove("sec-websocket-extensions");
+
+        let mut selection = self
+            .pooling
+            .select(&self.config, route, None, &headers, 1, started)
+            .map_err(pool_selection_error)?;
+        let upstream = self
+            .config
+            .upstreams()
+            .get(selection.upstream_id())
+            .ok_or_else(|| ProxyError::MissingUpstream {
+                route: route.id().to_owned(),
+                upstream: selection.upstream_id().to_owned(),
+            })?;
+        if !matches!(upstream.transport(), "ws" | "wss") {
+            return Err(ProxyError::InvalidWebSocketHandshake(
+                "the selected upstream does not use ws or wss".to_owned(),
+            ));
+        }
+        let native_auth = if self.native.supports(upstream) {
+            let credential = selection
+                .credential()
+                .ok_or_else(|| ProxyError::Native("credential is not configured".to_owned()))?;
+            Some(
+                self.native
+                    .authorize(upstream, credential, &headers, cancellation.clone())
+                    .await
+                    .map_err(native_error)?,
+            )
+        } else {
+            None
+        };
+        if let Some(native_auth) = native_auth.as_ref() {
+            native_auth.apply_to(&mut headers).map_err(native_error)?;
+        } else if selection.account_secret().is_some() {
+            crate::pool::apply_account_auth(&mut headers, selection.account_secret())
+                .map_err(pool_error)?;
+        } else {
+            apply_upstream_auth(&mut headers, upstream)?;
+        }
+
+        let uri = websocket_uri(upstream, route, &downstream_uri)?;
+        let upstream_key = generate_websocket_key()?;
+        let deadline = started + request_timeout(route.limits(), upstream);
+        let connect = connect_websocket(&uri, &headers, &upstream_key, &offered_protocols);
+        let (upstream_socket, upstream_response) = tokio::select! {
+            result = time::timeout_at(Instant::from_std(deadline), connect) => {
+                result.map_err(|_| ProxyError::Timeout)?
+                    ?
+            }
+            () = cancellation.cancelled() => return Err(ProxyError::Timeout),
+        };
+
+        let downstream_upgrade = hyper::upgrade::on(&mut request);
+        let downstream_body = request.into_body();
+        drop(downstream_body);
+        let mut response = Response::new(
+            Full::new(Bytes::new())
+                .map_err(|never: Infallible| match never {})
+                .boxed(),
+        );
+        *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+        *response.version_mut() = http::Version::HTTP_11;
+        let response_headers = response.headers_mut();
+        response_headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        response_headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        response_headers.insert(
+            "sec-websocket-accept",
+            HeaderValue::from_str(&derive_websocket_accept(key.as_bytes()))
+                .map_err(|_| ProxyError::InvalidWebSocketHandshake("invalid key".to_owned()))?,
+        );
+        if let Some(protocol) = upstream_response.protocol {
+            response_headers.insert("sec-websocket-protocol", protocol);
+        }
+
+        let mut observation = observation
+            .take()
+            .expect("request observation remains until response is ready");
+        observation.mark_headers();
+        self.pooling
+            .persist_affinity(&selection, crate::pool::timestamp_now());
+        let lease = selection.take_lease();
+        tokio::spawn(run_websocket_tunnel(
+            downstream_upgrade,
+            upstream_socket,
+            WebSocketTunnelContext {
+                max_frame_bytes: route.limits().max_frame_bytes,
+                guard,
+                cancellation,
+                deadline,
+                lease,
+                observation,
+            },
+        ));
+        Ok(response)
     }
 
     async fn run_external_inspectors(
@@ -1144,7 +1300,7 @@ where
             route,
             method,
             downstream_uri,
-            version,
+            version: _downstream_version,
             headers: request_headers,
             upstream,
             selection,
@@ -1170,10 +1326,15 @@ where
             .limits()
             .check_headers(header_count, header_bytes(&headers))
             .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
-        let mut builder = Request::builder()
-            .method(method.clone())
-            .uri(uri)
-            .version(version);
+        let mut builder =
+            Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .version(if upstream.http2() {
+                    http::Version::HTTP_2
+                } else {
+                    http::Version::HTTP_11
+                });
         *builder.headers_mut().expect("request builder headers") = headers;
         let upstream_request = builder.body(body)?;
         let request_deadline = started + request_timeout(route.limits(), upstream);
@@ -1181,7 +1342,14 @@ where
             (StdInstant::now() + connect_timeout(route.limits(), upstream)).min(request_deadline),
         );
         let response = tokio::select! {
-            result = time::timeout_at(header_deadline, self.client.request(upstream_request)) => {
+            result = time::timeout_at(
+                header_deadline,
+                if upstream.http2() {
+                    self.h2c_client.request(upstream_request)
+                } else {
+                    self.client.request(upstream_request)
+                },
+            ) => {
                 result.map_err(|_| ProxyError::Timeout)?.map_err(|error| ProxyError::Upstream(Box::new(error)))?
             }
             () = cancellation.cancelled() => {
@@ -1581,7 +1749,8 @@ fn completion_class_for_error(error: &ProxyError) -> CompletionClass {
         ProxyError::InvalidPatch(_)
         | ProxyError::RequestBodyTooLarge
         | ProxyError::SemanticRequest(_)
-        | ProxyError::Extension(_) => CompletionClass::InvalidRequest,
+        | ProxyError::Extension(_)
+        | ProxyError::InvalidWebSocketHandshake(_) => CompletionClass::InvalidRequest,
         ProxyError::UnsupportedBodyMode { .. } | ProxyError::SemanticResponse(_) => {
             CompletionClass::Unsupported
         }
@@ -1638,6 +1807,861 @@ fn upstream_uri(
     url.as_str().parse().map_err(|_| ProxyError::InvalidUri)
 }
 
+fn request_is_websocket_upgrade(request: &Request<Incoming>) -> bool {
+    request
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("websocket"))
+        && request
+            .headers()
+            .get_all(header::CONNECTION)
+            .iter()
+            .any(|value| {
+                value.to_str().ok().is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+                })
+            })
+}
+
+fn validate_websocket_request(request: &Request<Incoming>) -> Result<String, ProxyError> {
+    if request.method() != http::Method::GET || request.version() != http::Version::HTTP_11 {
+        return Err(ProxyError::InvalidWebSocketHandshake(
+            "WebSocket upgrades require GET over HTTP/1.1".to_owned(),
+        ));
+    }
+    if !request_is_websocket_upgrade(request) {
+        return Err(ProxyError::InvalidWebSocketHandshake(
+            "Upgrade: websocket and Connection: Upgrade are required".to_owned(),
+        ));
+    }
+    if request
+        .headers()
+        .get("sec-websocket-version")
+        .and_then(|value| value.to_str().ok())
+        != Some("13")
+    {
+        return Err(ProxyError::InvalidWebSocketHandshake(
+            "Sec-WebSocket-Version: 13 is required".to_owned(),
+        ));
+    }
+    if request
+        .headers()
+        .get_all("sec-websocket-version")
+        .iter()
+        .count()
+        != 1
+    {
+        return Err(ProxyError::InvalidWebSocketHandshake(
+            "Sec-WebSocket-Version must appear exactly once".to_owned(),
+        ));
+    }
+    if request.headers().contains_key(header::TRANSFER_ENCODING)
+        || request
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .is_some_and(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    != Some(0)
+            })
+    {
+        return Err(ProxyError::InvalidWebSocketHandshake(
+            "WebSocket upgrades must not carry a request body".to_owned(),
+        ));
+    }
+    if request
+        .headers()
+        .get_all("sec-websocket-key")
+        .iter()
+        .count()
+        != 1
+    {
+        return Err(ProxyError::InvalidWebSocketHandshake(
+            "Sec-WebSocket-Key must appear exactly once".to_owned(),
+        ));
+    }
+    let key = request
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            ProxyError::InvalidWebSocketHandshake("Sec-WebSocket-Key is required".to_owned())
+        })?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(key.as_bytes())
+        .map_err(|_| {
+            ProxyError::InvalidWebSocketHandshake("Sec-WebSocket-Key is not base64".to_owned())
+        })?;
+    if decoded.len() != 16 {
+        return Err(ProxyError::InvalidWebSocketHandshake(
+            "Sec-WebSocket-Key must decode to 16 bytes".to_owned(),
+        ));
+    }
+    Ok(key.to_owned())
+}
+
+fn websocket_protocols(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn websocket_uri(
+    upstream: &UpstreamPlan,
+    route: &RoutePlan,
+    downstream: &Uri,
+) -> Result<String, ProxyError> {
+    if !matches!(upstream.transport(), "ws" | "wss") {
+        return Err(ProxyError::InvalidWebSocketHandshake(
+            "the selected upstream does not use ws or wss".to_owned(),
+        ));
+    }
+    let mut url = upstream.url().clone();
+    let path = route.target().path().unwrap_or_else(|| downstream.path());
+    url.set_path(path);
+    url.set_query(downstream.query());
+    Ok(url.to_string())
+}
+
+fn derive_websocket_accept(key: &[u8]) -> String {
+    const GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut input = Vec::with_capacity(key.len() + GUID.len());
+    input.extend_from_slice(key);
+    input.extend_from_slice(GUID);
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &input);
+    base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
+}
+
+fn generate_websocket_key() -> Result<String, ProxyError> {
+    let mut key = [0_u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut key)
+        .map_err(|_| ProxyError::SecretUnavailable)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(key))
+}
+
+#[derive(Debug)]
+struct WebSocketHandshakeResponse {
+    protocol: Option<HeaderValue>,
+}
+
+#[derive(Debug)]
+enum UpstreamSocket {
+    Plain(TcpStream),
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl AsyncRead for UpstreamSocket {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::Tls(stream) => Pin::new(stream).poll_read(context, buffer),
+        }
+    }
+}
+
+impl AsyncWrite for UpstreamSocket {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(context, bytes),
+            Self::Tls(stream) => Pin::new(stream).poll_write(context, bytes),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(context),
+            Self::Tls(stream) => Pin::new(stream).poll_flush(context),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(context),
+        }
+    }
+}
+
+async fn connect_websocket(
+    uri: &str,
+    headers: &HeaderMap,
+    key: &str,
+    offered_protocols: &[String],
+) -> Result<(UpstreamSocket, WebSocketHandshakeResponse), ProxyError> {
+    let parsed = uri
+        .parse::<Uri>()
+        .map_err(|_| ProxyError::InvalidWebSocketHandshake("invalid upstream URI".to_owned()))?;
+    let scheme = parsed.scheme_str().ok_or_else(|| {
+        ProxyError::InvalidWebSocketHandshake("upstream URI has no scheme".to_owned())
+    })?;
+    let authority = parsed.authority().ok_or_else(|| {
+        ProxyError::InvalidWebSocketHandshake("upstream URI has no host".to_owned())
+    })?;
+    let host = authority.host().to_owned();
+    let port = authority
+        .port_u16()
+        .unwrap_or(if scheme.eq_ignore_ascii_case("wss") {
+            443
+        } else {
+            80
+        });
+    let stream = TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|error| ProxyError::Upstream(Box::new(error)))?;
+    let mut stream = if scheme.eq_ignore_ascii_case("wss") {
+        let roots = native_root_store()?;
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = ServerName::try_from(host.clone()).map_err(|_| {
+            ProxyError::Upstream(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid upstream TLS server name",
+            )))
+        })?;
+        let stream = TlsConnector::from(Arc::new(config))
+            .connect(server_name, stream)
+            .await
+            .map_err(|error| ProxyError::Upstream(Box::new(error)))?;
+        UpstreamSocket::Tls(stream)
+    } else if scheme.eq_ignore_ascii_case("ws") {
+        UpstreamSocket::Plain(stream)
+    } else {
+        return Err(ProxyError::InvalidWebSocketHandshake(
+            "upstream URL must use ws or wss".to_owned(),
+        ));
+    };
+
+    let path = parsed
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str);
+    let mut request = Vec::with_capacity(512);
+    request.extend_from_slice(b"GET ");
+    request.extend_from_slice(path.as_bytes());
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    request.extend_from_slice(authority.as_str().as_bytes());
+    request.extend_from_slice(
+        b"\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ",
+    );
+    request.extend_from_slice(key.as_bytes());
+    request.extend_from_slice(b"\r\n");
+    for (name, value) in headers {
+        if matches!(
+            name.as_str(),
+            "host"
+                | "connection"
+                | "upgrade"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "sec-websocket-extensions"
+        ) {
+            continue;
+        }
+        request.extend_from_slice(name.as_str().as_bytes());
+        request.extend_from_slice(b": ");
+        request.extend_from_slice(value.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"\r\n");
+    stream
+        .write_all(&request)
+        .await
+        .map_err(|error| ProxyError::Upstream(Box::new(error)))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| ProxyError::Upstream(Box::new(error)))?;
+    let response = read_websocket_handshake(&mut stream, key, offered_protocols).await?;
+    Ok((stream, response))
+}
+
+fn native_root_store() -> Result<RootCertStore, ProxyError> {
+    let result = rustls_native_certs::load_native_certs();
+    if result.certs.is_empty() {
+        return Err(ProxyError::Upstream(Box::new(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no native TLS roots are available",
+        ))));
+    }
+    let mut roots = RootCertStore::empty();
+    let (added, _) = roots.add_parsable_certificates(result.certs);
+    if added == 0 {
+        return Err(ProxyError::Upstream(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native TLS roots contain no parsable certificates",
+        ))));
+    }
+    Ok(roots)
+}
+
+async fn read_websocket_handshake(
+    stream: &mut UpstreamSocket,
+    key: &str,
+    offered_protocols: &[String],
+) -> Result<WebSocketHandshakeResponse, ProxyError> {
+    const MAX_HANDSHAKE_BYTES: usize = 64 * 1024;
+    let mut bytes = Vec::with_capacity(1024);
+    loop {
+        let mut byte = [0_u8; 1];
+        stream
+            .read_exact(&mut byte)
+            .await
+            .map_err(|error| ProxyError::Upstream(Box::new(error)))?;
+        bytes.push(byte[0]);
+        if bytes.len() > MAX_HANDSHAKE_BYTES {
+            return Err(ProxyError::Upstream(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upstream WebSocket handshake is too large",
+            ))));
+        }
+        if bytes.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        ProxyError::Upstream(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "upstream WebSocket handshake is not UTF-8",
+        )))
+    })?;
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts.next();
+    let status = status_parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok());
+    if version != Some("HTTP/1.1") || status != Some(101) {
+        return Err(ProxyError::Upstream(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "upstream did not accept the WebSocket upgrade",
+        ))));
+    }
+    let expected_accept = derive_websocket_accept(key.as_bytes());
+    let mut accepted = None;
+    let mut protocol = None;
+    let mut upgrade_websocket = false;
+    let mut connection_upgrade = false;
+    let mut upgrade_seen = false;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(ProxyError::Upstream(Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upstream returned a malformed WebSocket header",
+            ))));
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("upgrade") {
+            if upgrade_seen {
+                return Err(ProxyError::Upstream(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upstream returned duplicate Upgrade headers",
+                ))));
+            }
+            upgrade_seen = true;
+            upgrade_websocket = value.eq_ignore_ascii_case("websocket");
+        } else if name.eq_ignore_ascii_case("connection") {
+            connection_upgrade = value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("upgrade"));
+        } else if name.eq_ignore_ascii_case("sec-websocket-accept") {
+            if accepted.is_some() {
+                return Err(ProxyError::Upstream(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upstream returned duplicate Sec-WebSocket-Accept headers",
+                ))));
+            }
+            accepted = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
+            if protocol.is_some() {
+                return Err(ProxyError::Upstream(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upstream returned duplicate Sec-WebSocket-Protocol headers",
+                ))));
+            }
+            if !offered_protocols.iter().any(|offered| offered == value) {
+                return Err(ProxyError::Upstream(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upstream selected an unrequested WebSocket protocol",
+                ))));
+            }
+            protocol = Some(HeaderValue::from_str(value).map_err(|_| {
+                ProxyError::Upstream(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upstream returned an invalid WebSocket protocol",
+                )))
+            })?);
+        }
+    }
+    if !upgrade_websocket || !connection_upgrade {
+        return Err(ProxyError::Upstream(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "upstream WebSocket response must include Upgrade and Connection",
+        ))));
+    }
+    if accepted.as_deref() != Some(expected_accept.as_str()) {
+        return Err(ProxyError::Upstream(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "upstream WebSocket accept key did not match",
+        ))));
+    }
+    Ok(WebSocketHandshakeResponse { protocol })
+}
+
+#[derive(Debug)]
+struct RawWebSocketFrame {
+    bytes: Vec<u8>,
+    payload: Vec<u8>,
+    fin: bool,
+    opcode: u8,
+    payload_len: u64,
+}
+
+#[derive(Debug)]
+enum WebSocketFrameError {
+    TooLarge,
+    Protocol,
+    InvalidClose,
+    InvalidText,
+    Io,
+}
+
+async fn read_raw_websocket_frame<S>(
+    stream: &mut S,
+    max_frame_bytes: usize,
+    expect_mask: bool,
+) -> Result<RawWebSocketFrame, WebSocketFrameError>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; 2];
+    stream
+        .read_exact(&mut header)
+        .await
+        .map_err(|_| WebSocketFrameError::Io)?;
+    let fin = header[0] & 0x80 != 0;
+    let reserved = header[0] & 0x70;
+    let opcode = header[0] & 0x0F;
+    let masked = header[1] & 0x80 != 0;
+    let mut length = u64::from(header[1] & 0x7F);
+    let mut bytes = Vec::with_capacity(14);
+    if reserved != 0 || !matches!(opcode, 0 | 1 | 2 | 8 | 9 | 10) || masked != expect_mask {
+        return Err(WebSocketFrameError::Protocol);
+    }
+    bytes.extend_from_slice(&header);
+    if length == 126 {
+        let mut extended = [0_u8; 2];
+        stream
+            .read_exact(&mut extended)
+            .await
+            .map_err(|_| WebSocketFrameError::Io)?;
+        length = u64::from(u16::from_be_bytes(extended));
+        bytes.extend_from_slice(&extended);
+    } else if length == 127 {
+        let mut extended = [0_u8; 8];
+        stream
+            .read_exact(&mut extended)
+            .await
+            .map_err(|_| WebSocketFrameError::Io)?;
+        if extended[0] & 0x80 != 0 {
+            return Err(WebSocketFrameError::Protocol);
+        }
+        length = u64::from_be_bytes(extended);
+        bytes.extend_from_slice(&extended);
+    }
+    let control = opcode >= 8;
+    if (control && (!fin || length > 125)) || length > max_frame_bytes as u64 {
+        return Err(if length > max_frame_bytes as u64 {
+            WebSocketFrameError::TooLarge
+        } else {
+            WebSocketFrameError::Protocol
+        });
+    }
+    let mask = if masked {
+        let mut mask = [0_u8; 4];
+        stream
+            .read_exact(&mut mask)
+            .await
+            .map_err(|_| WebSocketFrameError::Io)?;
+        bytes.extend_from_slice(&mask);
+        Some(mask)
+    } else {
+        None
+    };
+    let payload_len = usize::try_from(length).map_err(|_| WebSocketFrameError::TooLarge)?;
+    let mut payload = vec![0_u8; payload_len];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|_| WebSocketFrameError::Io)?;
+    let wire_payload = payload.clone();
+    if let Some(mask) = mask {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % mask.len()];
+        }
+    }
+    bytes.extend_from_slice(&wire_payload);
+    Ok(RawWebSocketFrame {
+        bytes,
+        payload,
+        fin,
+        opcode,
+        payload_len: length,
+    })
+}
+
+#[derive(Debug, Default)]
+struct WebSocketMessageState {
+    fragmented: bool,
+    bytes: u64,
+    text: bool,
+    text_bytes: Vec<u8>,
+}
+
+fn validate_websocket_message(
+    frame: &RawWebSocketFrame,
+    state: &mut WebSocketMessageState,
+    max_message_bytes: u64,
+) -> Result<(), WebSocketFrameError> {
+    match frame.opcode {
+        1 | 2 => {
+            if state.fragmented {
+                return Err(WebSocketFrameError::Protocol);
+            }
+            if frame.fin {
+                if frame.payload_len > max_message_bytes {
+                    return Err(WebSocketFrameError::TooLarge);
+                }
+                if frame.opcode == 1 && std::str::from_utf8(&frame.payload).is_err() {
+                    return Err(WebSocketFrameError::InvalidText);
+                }
+            } else {
+                state.fragmented = true;
+                state.bytes = frame.payload_len;
+                state.text = frame.opcode == 1;
+                state.text_bytes = if state.text {
+                    frame.payload.clone()
+                } else {
+                    Vec::new()
+                };
+            }
+        }
+        0 => {
+            if !state.fragmented {
+                return Err(WebSocketFrameError::Protocol);
+            }
+            state.bytes = state.bytes.saturating_add(frame.payload_len);
+            if state.bytes > max_message_bytes {
+                return Err(WebSocketFrameError::TooLarge);
+            }
+            if state.text {
+                state.text_bytes.extend_from_slice(&frame.payload);
+            }
+            if frame.fin {
+                if state.text && std::str::from_utf8(&state.text_bytes).is_err() {
+                    return Err(WebSocketFrameError::InvalidText);
+                }
+                state.fragmented = false;
+                state.bytes = 0;
+                state.text = false;
+                state.text_bytes.clear();
+            }
+        }
+        8 => validate_close_payload(&frame.payload)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_close_payload(payload: &[u8]) -> Result<(), WebSocketFrameError> {
+    if payload.len() == 1 {
+        return Err(WebSocketFrameError::InvalidClose);
+    }
+    if payload.len() < 2 {
+        return Ok(());
+    }
+    let code = u16::from_be_bytes([payload[0], payload[1]]);
+    let valid_code = matches!(
+        code,
+        1000..=1003 | 1007..=1014 | 3000..=4999
+    );
+    if !valid_code || std::str::from_utf8(&payload[2..]).is_err() {
+        return Err(WebSocketFrameError::InvalidClose);
+    }
+    Ok(())
+}
+
+fn websocket_error_close_code(error: &WebSocketFrameError) -> u16 {
+    match error {
+        WebSocketFrameError::TooLarge => 1009,
+        WebSocketFrameError::InvalidText => 1007,
+        WebSocketFrameError::Protocol | WebSocketFrameError::InvalidClose => 1002,
+        WebSocketFrameError::Io => 1001,
+    }
+}
+
+enum WebSocketReadEvent {
+    Down(Result<RawWebSocketFrame, WebSocketFrameError>),
+    Up(Result<RawWebSocketFrame, WebSocketFrameError>),
+    Timeout,
+    Cancelled,
+}
+
+struct WebSocketTunnelContext {
+    max_frame_bytes: u64,
+    guard: DrainGuard,
+    cancellation: CancellationToken,
+    deadline: StdInstant,
+    lease: Option<SelectionLease>,
+    observation: RequestObservation,
+}
+
+async fn run_websocket_tunnel(
+    downstream_upgrade: hyper::upgrade::OnUpgrade,
+    mut upstream: UpstreamSocket,
+    context: WebSocketTunnelContext,
+) {
+    let WebSocketTunnelContext {
+        max_frame_bytes,
+        guard,
+        cancellation,
+        deadline,
+        lease,
+        mut observation,
+    } = context;
+    let upgraded = tokio::select! {
+        result = downstream_upgrade => match result {
+            Ok(upgraded) => upgraded,
+            Err(_) => {
+                observation.complete(CompletionClass::Cancelled, None);
+                return;
+            }
+        },
+        () = cancellation.cancelled() => {
+            observation.complete(CompletionClass::Cancelled, None);
+            return;
+        }
+    };
+    let mut downstream = hyper_util::rt::TokioIo::new(upgraded);
+    let max_frame = bounded_usize(max_frame_bytes).max(1);
+    let max_message = max_frame as u64;
+    let mut downstream_state = WebSocketMessageState::default();
+    let mut upstream_state = WebSocketMessageState::default();
+    let mut timeout = Box::pin(time::sleep_until(Instant::from_std(deadline)));
+    let mut completion = CompletionClass::Success;
+
+    loop {
+        let mut downstream_read =
+            Box::pin(read_raw_websocket_frame(&mut downstream, max_frame, true));
+        let mut upstream_read = Box::pin(read_raw_websocket_frame(&mut upstream, max_frame, false));
+        let event = tokio::select! {
+            () = &mut timeout => WebSocketReadEvent::Timeout,
+            () = cancellation.cancelled() => WebSocketReadEvent::Cancelled,
+            result = &mut downstream_read => WebSocketReadEvent::Down(result),
+            result = &mut upstream_read => WebSocketReadEvent::Up(result),
+        };
+        drop(downstream_read);
+        drop(upstream_read);
+
+        match event {
+            WebSocketReadEvent::Timeout | WebSocketReadEvent::Cancelled => {
+                completion = CompletionClass::Cancelled;
+                send_websocket_closes(&mut downstream, &mut upstream, 1001).await;
+                break;
+            }
+            WebSocketReadEvent::Down(result) => match result {
+                Ok(frame) => {
+                    if let Err(error) =
+                        validate_websocket_message(&frame, &mut downstream_state, max_message)
+                    {
+                        completion = CompletionClass::IncompleteStream;
+                        send_websocket_closes(
+                            &mut downstream,
+                            &mut upstream,
+                            websocket_error_close_code(&error),
+                        )
+                        .await;
+                        break;
+                    }
+                    let close = frame.opcode == 8;
+                    if write_websocket_frame(&mut upstream, &frame.bytes, deadline, &cancellation)
+                        .await
+                        .is_err()
+                    {
+                        completion = CompletionClass::IncompleteStream;
+                        break;
+                    }
+                    if close {
+                        break;
+                    }
+                }
+                Err(WebSocketFrameError::TooLarge) => {
+                    completion = CompletionClass::IncompleteStream;
+                    send_websocket_closes(&mut downstream, &mut upstream, 1009).await;
+                    break;
+                }
+                Err(WebSocketFrameError::Protocol) => {
+                    completion = CompletionClass::IncompleteStream;
+                    send_websocket_closes(&mut downstream, &mut upstream, 1002).await;
+                    break;
+                }
+                Err(
+                    error @ (WebSocketFrameError::InvalidClose | WebSocketFrameError::InvalidText),
+                ) => {
+                    completion = CompletionClass::IncompleteStream;
+                    send_websocket_closes(
+                        &mut downstream,
+                        &mut upstream,
+                        websocket_error_close_code(&error),
+                    )
+                    .await;
+                    break;
+                }
+                Err(WebSocketFrameError::Io) => {
+                    completion = CompletionClass::Cancelled;
+                    send_websocket_closes(&mut downstream, &mut upstream, 1001).await;
+                    break;
+                }
+            },
+            WebSocketReadEvent::Up(result) => match result {
+                Ok(frame) => {
+                    if let Err(error) =
+                        validate_websocket_message(&frame, &mut upstream_state, max_message)
+                    {
+                        completion = CompletionClass::IncompleteStream;
+                        send_websocket_closes(
+                            &mut downstream,
+                            &mut upstream,
+                            websocket_error_close_code(&error),
+                        )
+                        .await;
+                        break;
+                    }
+                    let close = frame.opcode == 8;
+                    if write_websocket_frame(&mut downstream, &frame.bytes, deadline, &cancellation)
+                        .await
+                        .is_err()
+                    {
+                        completion = CompletionClass::IncompleteStream;
+                        break;
+                    }
+                    if close {
+                        break;
+                    }
+                }
+                Err(WebSocketFrameError::TooLarge) => {
+                    completion = CompletionClass::IncompleteStream;
+                    send_websocket_closes(&mut downstream, &mut upstream, 1009).await;
+                    break;
+                }
+                Err(WebSocketFrameError::Protocol) => {
+                    completion = CompletionClass::IncompleteStream;
+                    send_websocket_closes(&mut downstream, &mut upstream, 1002).await;
+                    break;
+                }
+                Err(
+                    error @ (WebSocketFrameError::InvalidClose | WebSocketFrameError::InvalidText),
+                ) => {
+                    completion = CompletionClass::IncompleteStream;
+                    send_websocket_closes(
+                        &mut downstream,
+                        &mut upstream,
+                        websocket_error_close_code(&error),
+                    )
+                    .await;
+                    break;
+                }
+                Err(WebSocketFrameError::Io) => {
+                    completion = CompletionClass::Cancelled;
+                    send_websocket_closes(&mut downstream, &mut upstream, 1001).await;
+                    break;
+                }
+            },
+        }
+    }
+    let _ = downstream.shutdown().await;
+    let _ = upstream.shutdown().await;
+    observation.complete(completion, None);
+    drop(lease);
+    drop(guard);
+}
+async fn write_websocket_frame<S>(
+    stream: &mut S,
+    bytes: &[u8],
+    deadline: StdInstant,
+    cancellation: &CancellationToken,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        result = time::timeout_at(Instant::from_std(deadline), async {
+            stream.write_all(bytes).await?;
+            stream.flush().await
+        }) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket write timed out"))?,
+        () = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "WebSocket write canceled")),
+    }
+}
+
+async fn send_websocket_closes(
+    downstream: &mut (impl AsyncWrite + Unpin),
+    upstream: &mut (impl AsyncWrite + Unpin),
+    code: u16,
+) {
+    let reason = b"pooler closed";
+    let mut server_frame = Vec::with_capacity(2 + 2 + reason.len());
+    server_frame.push(0x88);
+    server_frame.push((2 + reason.len()) as u8);
+    server_frame.extend_from_slice(&code.to_be_bytes());
+    server_frame.extend_from_slice(reason);
+    let mut client_frame = Vec::with_capacity(server_frame.len() + 4);
+    client_frame.push(0x88);
+    client_frame.push(0x80 | (2 + reason.len()) as u8);
+    let mut mask = [0_u8; 4];
+    if ring::rand::SystemRandom::new().fill(&mut mask).is_err() {
+        return;
+    }
+    client_frame.extend_from_slice(&mask);
+    client_frame.extend(
+        server_frame[2..]
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+    );
+    let _ = time::timeout(Duration::from_millis(100), async {
+        let _ = downstream.write_all(&server_frame).await;
+        let _ = downstream.flush().await;
+    })
+    .await;
+    let _ = time::timeout(Duration::from_millis(100), async {
+        let _ = upstream.write_all(&client_frame).await;
+        let _ = upstream.flush().await;
+    })
+    .await;
+}
 fn apply_upstream_auth(headers: &mut HeaderMap, upstream: &UpstreamPlan) -> Result<(), ProxyError> {
     let Some(auth) = upstream.auth() else {
         return Ok(());
@@ -1808,6 +2832,9 @@ fn error_response(error: ProxyError) -> Response<ProxyBody> {
         }
         ProxyError::Extension(_) => (StatusCode::BAD_GATEWAY, "external extension failed"),
         ProxyError::InvalidPatch(_) => (StatusCode::BAD_REQUEST, "invalid request"),
+        ProxyError::InvalidWebSocketHandshake(_) => {
+            (StatusCode::BAD_REQUEST, "invalid WebSocket handshake")
+        }
         ProxyError::SemanticRequest(_) => (StatusCode::BAD_REQUEST, "invalid request"),
         ProxyError::RequestBodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
         ProxyError::SemanticResponse(_) => (
@@ -1903,6 +2930,42 @@ routes:
         )
         .unwrap();
         assert_eq!(uri, "http://127.0.0.1:8319/v1/infer?stream=true");
+    }
+
+    #[test]
+    fn websocket_message_validation_rejects_invalid_text_and_close_codes() {
+        let mut state = WebSocketMessageState::default();
+        let first = RawWebSocketFrame {
+            bytes: Vec::new(),
+            payload: vec![0xC3],
+            fin: false,
+            opcode: 1,
+            payload_len: 1,
+        };
+        assert!(validate_websocket_message(&first, &mut state, 8).is_ok());
+        let continuation = RawWebSocketFrame {
+            bytes: Vec::new(),
+            payload: vec![0x28],
+            fin: true,
+            opcode: 0,
+            payload_len: 1,
+        };
+        assert!(matches!(
+            validate_websocket_message(&continuation, &mut state, 8),
+            Err(WebSocketFrameError::InvalidText)
+        ));
+
+        let close = RawWebSocketFrame {
+            bytes: Vec::new(),
+            payload: vec![0x03, 0xED],
+            fin: true,
+            opcode: 8,
+            payload_len: 2,
+        };
+        assert!(matches!(
+            validate_websocket_message(&close, &mut WebSocketMessageState::default(), 8),
+            Err(WebSocketFrameError::InvalidClose)
+        ));
     }
 
     #[tokio::test]

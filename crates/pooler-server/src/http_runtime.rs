@@ -18,8 +18,11 @@ use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::{body::Incoming, http, http::Request, service::service_fn};
-use hyper_util::rt::TokioIo;
-use pooler_config::CompiledConfig;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto,
+};
+use pooler_config::{CompiledConfig, ListenerProtocol};
 use pooler_extension::{
     ExtensionCapabilities, ExtensionLimits, ExtensionRegistry, ExtensionSpec, WasmExtension,
 };
@@ -37,6 +40,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::tls::{PreparedTls, TlsError};
 use crate::{
     ActiveCounts, ActiveGuard, ManagementApi, ManagementHttpServer, ManagementServerError,
 };
@@ -135,6 +139,9 @@ pub enum HttpProxyServerError {
     /// Proxy transport setup failed.
     #[error(transparent)]
     Proxy(#[from] ProxyError),
+    /// A configured TLS listener could not be prepared.
+    #[error("failed to prepare TLS listener `{listener}`: {message}")]
+    Tls { listener: String, message: String },
     /// Graceful drain exceeded its bound.
     #[error(transparent)]
     Drain(#[from] DrainError),
@@ -221,6 +228,7 @@ struct RuntimeState {
 pub(crate) struct RuntimeGeneration {
     pub(crate) config: Arc<CompiledConfig>,
     proxies: BTreeMap<Arc<str>, Arc<RuntimeProxy>>,
+    tls: BTreeMap<Arc<str>, Option<Arc<PreparedTls>>>,
     pub(crate) pooling: Arc<PoolingCoordinator>,
 }
 
@@ -299,6 +307,7 @@ impl HttpProxyServer {
         let dispatch = Arc::new(ArcSwap::from_pointee(RuntimeGeneration {
             config: Arc::clone(&config),
             proxies: BTreeMap::new(),
+            tls: BTreeMap::new(),
             pooling: Arc::clone(&pooling),
         }));
         let metrics = MetricsRegistry::default();
@@ -319,6 +328,7 @@ impl HttpProxyServer {
         };
         let mut listeners = Vec::with_capacity(config.listeners().len());
         let mut proxies = BTreeMap::new();
+        let mut tls_by_listener = BTreeMap::new();
         let mut addresses = Vec::with_capacity(config.listeners().len());
         let extensions = extension_registry(&config)?;
 
@@ -338,7 +348,23 @@ impl HttpProxyServer {
                 .with_observability(metrics.clone()),
             );
             let bind = plan.bind();
+            let prepared_tls = plan
+                .tls()
+                .map(PreparedTls::load)
+                .transpose()
+                .map_err(|error: TlsError| HttpProxyServerError::Tls {
+                    listener: id.to_string(),
+                    message: error.to_string(),
+                })?
+                .map(Arc::new);
+            tls_by_listener.insert(Arc::clone(&id), prepared_tls);
             if bind.starts_with('/') || bind.starts_with("unix:") {
+                if plan.tls().is_some() {
+                    return Err(HttpProxyServerError::Tls {
+                        listener: id.to_string(),
+                        message: "TLS is supported only on TCP listeners".to_owned(),
+                    });
+                }
                 let path = bind.strip_prefix("unix:").unwrap_or(bind);
                 let listener =
                     UnixListener::bind(path).map_err(|source| HttpProxyServerError::Bind {
@@ -386,6 +412,7 @@ impl HttpProxyServer {
         dispatch.store(Arc::new(RuntimeGeneration {
             config: Arc::clone(&config),
             proxies,
+            tls: tls_by_listener,
             pooling: Arc::clone(&pooling),
         }));
 
@@ -481,16 +508,18 @@ impl HttpProxyServer {
     ) -> Result<HttpReloadOutcome, HttpProxyServerError> {
         let _guard = self.state.reload_lock.lock().await;
         let current = self.state.dispatch.load_full();
-        if current.config.equivalent(&candidate) {
-            return Ok(HttpReloadOutcome::Unchanged {
-                generation: current.config.generation(),
-            });
-        }
         if !same_listener_bindings(&current.config, &candidate) {
             return Err(HttpProxyServerError::ListenerSetChanged);
         }
         if current.config.management() != candidate.management() {
             return Err(HttpProxyServerError::ListenerSetChanged);
+        }
+
+        let tls = prepare_tls_map(&candidate)?;
+        if current.config.equivalent(&candidate) && same_tls_map(&current.tls, &tls) {
+            return Ok(HttpReloadOutcome::Unchanged {
+                generation: current.config.generation(),
+            });
         }
 
         let generation = current.config.generation().saturating_add(1);
@@ -525,6 +554,7 @@ impl HttpProxyServer {
         self.state.dispatch.store(Arc::new(RuntimeGeneration {
             config: Arc::clone(&config),
             proxies,
+            tls,
             pooling: Arc::clone(&pooling),
         }));
         Ok(HttpReloadOutcome::Reloaded { generation })
@@ -680,11 +710,55 @@ impl HttpProxyServer {
 fn same_listener_bindings(current: &CompiledConfig, candidate: &CompiledConfig) -> bool {
     current.listeners().len() == candidate.listeners().len()
         && current.listeners().iter().all(|(id, plan)| {
-            candidate
-                .listeners()
-                .get(id)
-                .is_some_and(|other| other.bind() == plan.bind())
+            candidate.listeners().get(id).is_some_and(|other| {
+                other.bind() == plan.bind() && other.protocol() == plan.protocol()
+            })
         })
+}
+
+fn prepare_tls_map(
+    config: &CompiledConfig,
+) -> Result<BTreeMap<Arc<str>, Option<Arc<PreparedTls>>>, HttpProxyServerError> {
+    config
+        .listeners()
+        .values()
+        .map(|plan| {
+            let id: Arc<str> = Arc::from(plan.id());
+            let tls = plan
+                .tls()
+                .map(PreparedTls::load)
+                .transpose()
+                .map_err(|error: TlsError| HttpProxyServerError::Tls {
+                    listener: id.to_string(),
+                    message: error.to_string(),
+                })?
+                .map(Arc::new);
+            Ok((id, tls))
+        })
+        .collect()
+}
+
+fn same_tls_map(
+    current: &BTreeMap<Arc<str>, Option<Arc<PreparedTls>>>,
+    candidate: &BTreeMap<Arc<str>, Option<Arc<PreparedTls>>>,
+) -> bool {
+    current.len() == candidate.len()
+        && current.iter().all(|(id, current_tls)| {
+            candidate
+                .get(id)
+                .is_some_and(|candidate_tls| same_prepared_tls(current_tls, candidate_tls))
+        })
+}
+
+fn same_prepared_tls(
+    current: &Option<Arc<PreparedTls>>,
+    candidate: &Option<Arc<PreparedTls>>,
+) -> bool {
+    match (current, candidate) {
+        (None, None) => true,
+        (Some(current), Some(candidate)) => current.fingerprint() == candidate.fingerprint(),
+        _ => false,
+    }
 }
 
 fn extension_registry(
@@ -801,14 +875,23 @@ async fn accept_loop(
                             listener: id.to_string(),
                             message: source.to_string(),
                         })?;
+                        let generation = dispatch.load_full();
                         let dispatch = Arc::clone(&dispatch);
                         let connection_id = Arc::clone(&id);
+                        let protocol = generation
+                            .config
+                            .listeners()
+                            .get(id.as_ref())
+                            .map_or(ListenerProtocol::Http1, |listener| listener.protocol());
+                        let tls = generation.tls.get(id.as_ref()).cloned().flatten();
                         let cancellation = cancellation.clone();
                         let active = active.clone();
                         connections.spawn(async move {
-                            serve_connection(
-                                TokioIo::new(stream),
+                            serve_tcp_connection(
+                                stream,
                                 connection_id,
+                                protocol,
+                                tls,
                                 dispatch,
                                 cancellation,
                                 active,
@@ -847,12 +930,19 @@ async fn accept_loop(
                         })?;
                         let dispatch = Arc::clone(&dispatch);
                         let id = Arc::clone(&id);
+                        let protocol = dispatch
+                            .load()
+                            .config
+                            .listeners()
+                            .get(id.as_ref())
+                            .map_or(ListenerProtocol::Http1, |listener| listener.protocol());
                         let cancellation = cancellation.clone();
                         let active = active.clone();
                         connections.spawn(async move {
                             serve_connection(
                                 TokioIo::new(stream),
                                 id,
+                                protocol,
                                 dispatch,
                                 cancellation,
                                 active,
@@ -880,6 +970,7 @@ async fn accept_loop(
 async fn serve_connection<I>(
     io: TokioIo<I>,
     listener_id: Arc<str>,
+    protocol: ListenerProtocol,
     dispatch: Arc<ArcSwap<RuntimeGeneration>>,
     cancellation: CancellationToken,
     active: ActiveCounts,
@@ -903,9 +994,28 @@ async fn serve_connection<I>(
             Ok::<_, Infallible>(response)
         }
     });
-    let connection = hyper::server::conn::http1::Builder::new()
-        .keep_alive(true)
-        .serve_connection(io, service);
+    // HTTP/1 remains the default.  Cleartext HTTP/2 is only selected by an
+    // explicit listener protocol, while `auto` is available for deployments
+    // that intentionally accept either wire preface.  The auto builder keeps
+    // one service implementation for both protocols and runs HTTP/2 streams
+    // concurrently on the same connection.
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http1().keep_alive(true).max_headers(100);
+    {
+        let mut http2 = builder.http2();
+        http2
+            .max_concurrent_streams(Some(128))
+            .max_frame_size(Some(16 * 1024))
+            .max_header_list_size(64 * 1024)
+            .max_pending_accept_reset_streams(Some(20))
+            .max_local_error_reset_streams(Some(1024));
+    }
+    let builder = match protocol {
+        ListenerProtocol::Http1 => builder.http1_only(),
+        ListenerProtocol::Auto => builder,
+        ListenerProtocol::H2c => builder.http2_only(),
+    };
+    let connection = builder.serve_connection_with_upgrades(io, service);
     tokio::pin!(connection);
 
     tokio::select! {
@@ -923,6 +1033,66 @@ async fn serve_connection<I>(
     }
 }
 
+async fn serve_tcp_connection(
+    stream: tokio::net::TcpStream,
+    listener_id: Arc<str>,
+    protocol: ListenerProtocol,
+    tls: Option<Arc<PreparedTls>>,
+    dispatch: Arc<ArcSwap<RuntimeGeneration>>,
+    cancellation: CancellationToken,
+    active: ActiveCounts,
+) {
+    if let Some(tls) = tls {
+        match tls.accept(stream, &cancellation).await {
+            Ok(Some(stream)) => {
+                let negotiated = stream.get_ref().1.alpn_protocol();
+                let protocol = match (protocol, negotiated) {
+                    (ListenerProtocol::Http1, Some(b"h2")) => {
+                        debug!(listener = %listener_id, "rejecting h2 negotiated on h1-only listener");
+                        return;
+                    }
+                    (ListenerProtocol::Auto, Some(b"h2")) => ListenerProtocol::H2c,
+                    (ListenerProtocol::Auto, Some(b"http/1.1")) => ListenerProtocol::Http1,
+                    (ListenerProtocol::Http1, Some(b"http/1.1")) => ListenerProtocol::Http1,
+                    (_, Some(_)) => {
+                        debug!(listener = %listener_id, "rejecting TLS connection with unsupported ALPN protocol");
+                        return;
+                    }
+                    (ListenerProtocol::Auto, None) => {
+                        debug!(listener = %listener_id, "rejecting TLS connection without a configured ALPN protocol");
+                        return;
+                    }
+                    (configured, None) => configured,
+                };
+                serve_connection(
+                    TokioIo::new(stream),
+                    listener_id,
+                    protocol,
+                    dispatch,
+                    cancellation,
+                    active,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(TlsError::Cancelled) => {}
+            Err(error) => {
+                debug!(listener = %listener_id, %error, "TLS handshake failed");
+            }
+        }
+    } else {
+        serve_connection(
+            TokioIo::new(stream),
+            listener_id,
+            protocol,
+            dispatch,
+            cancellation,
+            active,
+        )
+        .await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -935,13 +1105,15 @@ mod tests {
         },
     };
 
+    use http::Response;
+    use http_body_util::{BodyExt as _, Full};
     use pooler_auth::{OAuthFuture, OAuthRefresher, OAuthTokenStore, OAuthTokens, SecretValue};
     use pooler_store::{MasterKey, SqliteStore, Store};
     use tempfile::tempdir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::Notify,
+        sync::{Barrier, Notify},
         time::{sleep, Duration},
     };
 
@@ -1240,6 +1412,477 @@ mod tests {
             .await
             .expect("proxy task does not panic")
             .expect("proxy task succeeds");
+    }
+
+    #[tokio::test]
+    async fn h2c_accepts_concurrent_streams_and_preserves_http1_upstream() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let barrier = Arc::new(Barrier::new(2));
+        let upstream = tokio::spawn({
+            let barrier = Arc::clone(&barrier);
+            async move {
+                let mut tasks = Vec::new();
+                for _ in 0..2 {
+                    let (mut stream, _) = upstream_listener
+                        .accept()
+                        .await
+                        .expect("upstream accepts both requests");
+                    let barrier = Arc::clone(&barrier);
+                    tasks.push(tokio::spawn(async move {
+                        read_request(&mut stream).await.expect("upstream request");
+                        barrier.wait().await;
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await
+                            .expect("upstream response");
+                    }));
+                }
+                for task in tasks {
+                    task.await.expect("upstream request task");
+                }
+            }
+        });
+
+        let config = pooler_config::compile_yaml(
+            "h2c.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: h2c}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: h2c\n    listen: local\n    match: {{method: GET, path: /h2c}}\n    target: local\n"
+            ),
+        )
+        .expect("h2c config compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let stream = TcpStream::connect(address).await.expect("h2c connects");
+        let (sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2c handshake");
+        let connection_task = tokio::spawn(connection);
+        let request = || {
+            Request::builder()
+                .method("GET")
+                .uri("http://localhost/h2c")
+                .version(http::Version::HTTP_2)
+                .header("host", "localhost")
+                .body(Full::new(Bytes::new()))
+                .expect("h2 request")
+        };
+        let first = sender.clone().send_request(request());
+        let second = sender.clone().send_request(request());
+        let (first, second) =
+            tokio::time::timeout(TEST_TIMEOUT, async { tokio::join!(first, second) })
+                .await
+                .expect("concurrent h2 streams complete");
+        let first = first.expect("first h2 response");
+        let second = second.expect("second h2 response");
+        assert_eq!(first.status(), http::StatusCode::OK);
+        assert_eq!(second.status(), http::StatusCode::OK);
+        assert_eq!(
+            first
+                .into_body()
+                .collect()
+                .await
+                .expect("first body")
+                .to_bytes()
+                .as_ref(),
+            b"ok"
+        );
+        assert_eq!(
+            second
+                .into_body()
+                .collect()
+                .await
+                .expect("second body")
+                .to_bytes()
+                .as_ref(),
+            b"ok"
+        );
+
+        drop(sender);
+        server.drain(TEST_TIMEOUT).await.expect("proxy drains");
+        connection_task
+            .await
+            .expect("h2 connection task does not panic")
+            .expect("h2 connection closes cleanly");
+        runner
+            .await
+            .expect("proxy task does not panic")
+            .expect("proxy task succeeds");
+        drop(server);
+        upstream.await.expect("upstream task");
+    }
+
+    #[tokio::test]
+    async fn h2_route_header_limit_is_enforced_per_stream() {
+        let config = pooler_config::compile_yaml(
+            "h2-header-limit.yaml",
+            "version: 1\nlisteners: {local: {bind: 127.0.0.1:0, protocol: h2c}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes:\n  - id: h2-header-limit\n    listen: local\n    match: {method: GET, path: /h2-header-limit}\n    limits: {max_header_bytes: 16}\n    target: local\n",
+        )
+        .expect("h2 header-limit config compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let stream = TcpStream::connect(address).await.expect("h2c connects");
+        let (mut sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2c handshake");
+        let connection_task = tokio::spawn(connection);
+        let request = Request::builder()
+            .method("GET")
+            .uri("http://localhost/h2-header-limit")
+            .version(http::Version::HTTP_2)
+            .header("host", "localhost")
+            .header("x-large", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+            .body(Full::new(Bytes::new()))
+            .expect("h2 request");
+        let response = sender
+            .send_request(request)
+            .await
+            .expect("h2 header-limit response");
+        assert_eq!(
+            response.status(),
+            http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+        drop(response);
+        drop(sender);
+        server.drain(TEST_TIMEOUT).await.expect("proxy drains");
+        connection_task
+            .await
+            .expect("h2 connection task does not panic")
+            .expect("h2 connection closes cleanly");
+        runner
+            .await
+            .expect("proxy task does not panic")
+            .expect("proxy task succeeds");
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn h2_drain_sends_goaway_and_rejects_new_streams() {
+        let (upstream_address, upstream) = spawn_one_shot_upstream(b"goaway").await;
+        let config = pooler_config::compile_yaml(
+            "h2-goaway.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: h2c}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: h2-goaway\n    listen: local\n    match: {{method: GET, path: /h2-goaway}}\n    target: local\n"
+            ),
+        )
+        .expect("h2 GOAWAY config compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let stream = TcpStream::connect(address).await.expect("h2c connects");
+        let (mut sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2c handshake");
+        let connection_task = tokio::spawn(connection);
+        let request = || {
+            Request::builder()
+                .method("GET")
+                .uri("http://localhost/h2-goaway")
+                .version(http::Version::HTTP_2)
+                .header("host", "localhost")
+                .body(Full::new(Bytes::new()))
+                .expect("h2 request")
+        };
+        let response = sender
+            .send_request(request())
+            .await
+            .expect("initial h2 response");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("initial body")
+                .to_bytes()
+                .as_ref(),
+            b"goaway"
+        );
+        server.begin_drain();
+        let second = tokio::time::timeout(TEST_TIMEOUT, sender.send_request(request()))
+            .await
+            .expect("GOAWAY response arrives");
+        assert!(
+            second.is_err()
+                || second.expect("response exists").status()
+                    == http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(sender);
+        server.drain(TEST_TIMEOUT).await.expect("proxy drains");
+        connection_task
+            .await
+            .expect("h2 connection task does not panic")
+            .expect("h2 connection closes cleanly");
+        runner
+            .await
+            .expect("proxy task does not panic")
+            .expect("proxy task succeeds");
+        drop(server);
+        upstream.await.expect("upstream task");
+    }
+
+    #[tokio::test]
+    async fn explicit_auto_listener_accepts_http1_and_http2() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let upstream = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+                tasks.push(tokio::spawn(async move {
+                    read_request(&mut stream).await.expect("upstream request");
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nauto",
+                        )
+                        .await
+                        .expect("upstream response");
+                }));
+            }
+            for task in tasks {
+                task.await.expect("upstream task");
+            }
+        });
+        let config = pooler_config::compile_yaml(
+            "auto.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: auto}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: auto-h2\n    listen: local\n    match: {{method: GET, path: /auto-h2}}\n    target: local\n  - id: auto-h1\n    listen: local\n    match: {{method: GET, path: /auto-h1}}\n    target: local\n"
+            ),
+        )
+        .expect("auto config compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let h2_stream = TcpStream::connect(address).await.expect("h2 connects");
+        let (mut sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(h2_stream),
+        )
+        .await
+        .expect("h2 handshake");
+        let connection_task = tokio::spawn(connection);
+        let h2_request = Request::builder()
+            .method("GET")
+            .uri("http://localhost/auto-h2")
+            .version(http::Version::HTTP_2)
+            .header("host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .expect("h2 request");
+        let h2_response = sender.send_request(h2_request).await.expect("h2 response");
+        assert_eq!(h2_response.status(), http::StatusCode::OK);
+        assert_eq!(
+            h2_response
+                .into_body()
+                .collect()
+                .await
+                .expect("h2 body")
+                .to_bytes()
+                .as_ref(),
+            b"auto"
+        );
+        let h1_response = send_request(
+            address,
+            b"GET /auto-h1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&h1_response), 200);
+        assert_eq!(response_body(&h1_response), b"auto");
+        drop(sender);
+        server.drain(TEST_TIMEOUT).await.expect("proxy drains");
+        connection_task
+            .await
+            .expect("h2 connection task does not panic")
+            .expect("h2 connection closes cleanly");
+        runner
+            .await
+            .expect("proxy task does not panic")
+            .expect("proxy task succeeds");
+        drop(server);
+        upstream.await.expect("upstream task");
+    }
+
+    #[tokio::test]
+    async fn h2_stream_reset_drops_the_active_proxy_body() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let headers_sent = Arc::new(Notify::new());
+        let release_body = Arc::new(Notify::new());
+        let upstream = tokio::spawn({
+            let headers_sent = Arc::clone(&headers_sent);
+            let release_body = Arc::clone(&release_body);
+            async move {
+                let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+                read_request(&mut stream).await.expect("upstream request");
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("upstream response headers");
+                headers_sent.notify_one();
+                release_body.notified().await;
+                let _ = stream.write_all(b"hello").await;
+            }
+        });
+
+        let config = pooler_config::compile_yaml(
+            "h2-reset.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: h2c}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: h2-reset\n    listen: local\n    match: {{method: GET, path: /h2-reset}}\n    target: local\n"
+            ),
+        )
+        .expect("h2 reset config compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let stream = TcpStream::connect(address).await.expect("h2c connects");
+        let (mut sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2c handshake");
+        let connection_task = tokio::spawn(connection);
+        let request = Request::builder()
+            .method("GET")
+            .uri("http://localhost/h2-reset")
+            .version(http::Version::HTTP_2)
+            .header("host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .expect("h2 request");
+        let response = sender
+            .send_request(request)
+            .await
+            .expect("h2 response headers");
+        headers_sent.notified().await;
+        drop(response);
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                if server.active() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reset releases the active proxy body");
+        release_body.notify_one();
+        drop(sender);
+        server.drain(TEST_TIMEOUT).await.expect("proxy drains");
+        connection_task
+            .await
+            .expect("h2 connection task does not panic")
+            .expect("h2 connection closes cleanly");
+        runner
+            .await
+            .expect("proxy task does not panic")
+            .expect("proxy task succeeds");
+        drop(server);
+        upstream.await.expect("upstream task");
+    }
+
+    #[tokio::test]
+    async fn explicit_upstream_http2_uses_h2c_prior_knowledge() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("upstream address available");
+        let saw_http2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let upstream = tokio::spawn({
+            let saw_http2 = Arc::clone(&saw_http2);
+            async move {
+                let (stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+                let service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                    let saw_http2 = Arc::clone(&saw_http2);
+                    async move {
+                        saw_http2.store(
+                            request.version() == http::Version::HTTP_2,
+                            Ordering::Relaxed,
+                        );
+                        let response = Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header("content-length", "8")
+                            .body(Full::new(Bytes::from_static(b"upstream")))
+                            .expect("h2 response");
+                        Ok::<_, Infallible>(response)
+                    }
+                });
+                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .expect("upstream h2 connection");
+            }
+        });
+
+        let config = pooler_config::compile_yaml(
+            "upstream-h2c.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  local:\n    transport: {{kind: http, base_url: http://{upstream_address}, http2: true}}\nroutes:\n  - id: upstream-h2c\n    listen: local\n    match: {{method: GET, path: /upstream-h2c}}\n    target: local\n"
+            ),
+        )
+        .expect("upstream h2c config compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let response = send_request(
+            address,
+            b"GET /upstream-h2c HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&response), 200);
+        assert_eq!(response_body(&response), b"upstream");
+        assert!(saw_http2.load(Ordering::Relaxed));
+        server.drain(TEST_TIMEOUT).await.expect("proxy drains");
+        runner
+            .await
+            .expect("proxy task does not panic")
+            .expect("proxy task succeeds");
+        drop(server);
+        upstream.await.expect("upstream task");
     }
 
     #[tokio::test]

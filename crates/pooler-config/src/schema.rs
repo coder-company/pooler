@@ -31,6 +31,11 @@ pub fn config_schema() -> Value {
     definitions.insert("extension_limits".to_owned(), extension_limits_schema());
     definitions.insert("import".to_owned(), import_schema());
     definitions.insert("listener".to_owned(), listener_schema());
+    definitions.insert(
+        "listener_client_auth".to_owned(),
+        listener_client_auth_schema(),
+    );
+    definitions.insert("listener_tls".to_owned(), listener_tls_schema());
     definitions.insert("management".to_owned(), management_schema());
     definitions.insert("match".to_owned(), match_schema());
     definitions.insert("model".to_owned(), model_schema());
@@ -267,7 +272,70 @@ fn import_schema() -> Value {
 }
 
 fn listener_schema() -> Value {
-    object_schema(properties([("bind", string_schema())]), &[], true)
+    object_schema(
+        properties([
+            ("bind", string_schema()),
+            (
+                "protocol",
+                optional(string_enum([
+                    "http1",
+                    "http/1.1",
+                    "h1",
+                    "auto",
+                    "http1+http2",
+                    "http1-or-http2",
+                    "h2c",
+                    "http2",
+                    "http/2",
+                    "h2",
+                ])),
+            ),
+            ("h2c", optional(boolean_schema())),
+            ("tls", optional(reference("listener_tls"))),
+        ]),
+        &[],
+        true,
+    )
+}
+
+fn listener_tls_schema() -> Value {
+    object_schema(
+        properties([
+            ("cert", optional_string()),
+            ("certificate", optional_string()),
+            ("certificate_file", optional_string()),
+            ("cert_file", optional_string()),
+            ("key", optional_string()),
+            ("private_key", optional_string()),
+            ("private_key_file", optional_string()),
+            ("key_file", optional_string()),
+            (
+                "alpn",
+                optional(array_schema(string_schema(), Some(1), None)),
+            ),
+            (
+                "alpn_protocols",
+                optional(array_schema(string_schema(), Some(1), None)),
+            ),
+            ("handshake_timeout", optional(reference("duration"))),
+            ("client_auth", optional(reference("listener_client_auth"))),
+        ]),
+        &[],
+        false,
+    )
+}
+
+fn listener_client_auth_schema() -> Value {
+    object_schema(
+        properties([
+            ("ca", optional_string()),
+            ("ca_file", optional_string()),
+            ("certificate_authority", optional_string()),
+            ("required", optional(boolean_schema())),
+        ]),
+        &[],
+        false,
+    )
 }
 
 fn management_schema() -> Value {
@@ -585,6 +653,7 @@ fn transport_schema() -> Value {
             ("base_url", optional_string()),
             ("connect_timeout", optional(duration_string_schema())),
             ("request_timeout", optional(duration_string_schema())),
+            ("http2", optional(boolean_schema())),
         ]),
         &[],
         false,

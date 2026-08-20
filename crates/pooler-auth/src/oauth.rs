@@ -336,8 +336,11 @@ impl HyperOAuthTransport {
             .map_err(|_| OAuthTransportError::Failed)?
             .https_or_http()
             .enable_http1()
+            .enable_http2()
             .build();
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let mut client_builder = Client::builder(TokioExecutor::new());
+        client_builder.http2_adaptive_window(true);
+        let client = client_builder.build(connector);
         Ok(Self {
             client,
             max_response_bytes,

@@ -12,6 +12,7 @@ mod lifecycle;
 mod listener;
 mod management;
 mod server;
+mod tls;
 
 pub use config_store::{ConfigSnapshot, ConfigStore, ConfigStoreError};
 pub use http_runtime::{HttpProxyServer, HttpProxyServerError, HttpReloadOutcome, ListenerAddress};

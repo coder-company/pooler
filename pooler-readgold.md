@@ -16,8 +16,9 @@ name or advertised without conformance evidence.
 - Phase 0 — engineering baseline: implemented; local formatting, Clippy, tests,
   config-check smoke test, and code review pass. Linux/macOS CI evidence is pending
   the pushed commit.
-- Phase 1 — opaque custom proxy: implemented and locally verified; cross-platform
-  CI evidence is pending the pushed commit.
+- Phase 1 — opaque custom proxy: implemented and locally verified across HTTP/1.1,
+  explicit h2c/HTTP/2, inbound TLS/ALPN, and bounded raw WebSocket tunneling;
+  cross-platform CI evidence is pending the pushed commit.
 - Phase 2 — patch and overlay engine: in progress. Bounded JSON inspection,
   transforms, model declarations, runtime patching, and local E2E coverage are
   implemented, including model-based provider selection and upstream-model

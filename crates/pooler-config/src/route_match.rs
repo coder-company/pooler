@@ -381,6 +381,7 @@ listeners:
   other: {bind: 127.0.0.1:8401}
 upstreams:
   local: {url: http://127.0.0.1:8319}
+  websocket: {url: ws://127.0.0.1:8320}
 routes:
   - id: prefix
     listen: shared
@@ -415,7 +416,7 @@ routes:
       headers: {x-tenant: acme}
       content_types: [application/json]
       websocket: true
-    target: local
+    target: websocket
   - id: method
     listen: shared
     match: {methods: [POST], path: /method}

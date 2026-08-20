@@ -322,6 +322,48 @@ impl Config {
 pub struct ListenerConfig {
     /// TCP socket address or Unix path.
     pub bind: String,
+    /// Inbound protocol policy. HTTP/1 is the safe default; `h2c` and
+    /// `http2` explicitly opt into prior-knowledge HTTP/2 on cleartext
+    /// listeners. `auto` accepts either HTTP/1 or an HTTP/2 preface.
+    pub protocol: Option<String>,
+    /// Convenience spelling for an explicit prior-knowledge HTTP/2 listener.
+    /// This remains separate from `protocol` so configurations can be evolved
+    /// without making cleartext HTTP/2 an accidental default.
+    pub h2c: bool,
+    /// Optional inbound TLS identity and handshake policy.
+    pub tls: Option<ListenerTlsConfig>,
+}
+
+/// Inbound TLS configuration for a TCP listener.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ListenerTlsConfig {
+    /// PEM certificate chain. The file must be owner-readable and owner-only.
+    #[serde(alias = "certificate", alias = "certificate_file", alias = "cert_file")]
+    pub cert: String,
+    /// PEM private key. The file must be owner-readable and owner-only.
+    #[serde(alias = "private_key", alias = "private_key_file", alias = "key_file")]
+    pub key: String,
+    /// ALPN protocol identifiers offered by this listener.
+    #[serde(default = "default_tls_alpn", alias = "alpn_protocols")]
+    pub alpn: Vec<String>,
+    /// Maximum time allowed for one TLS handshake.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub handshake_timeout: Option<Duration>,
+    /// Optional client certificate verification policy.
+    pub client_auth: Option<ListenerClientAuthConfig>,
+}
+
+/// Optional mTLS trust configuration for an inbound TLS listener.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ListenerClientAuthConfig {
+    /// PEM certificate-authority bundle used to verify client certificates.
+    #[serde(alias = "ca_file", alias = "certificate_authority")]
+    pub ca: String,
+    /// Require a client certificate when true; otherwise allow anonymous TLS.
+    #[serde(default)]
+    pub required: bool,
 }
 
 /// Upstream/provider declaration.
@@ -564,7 +606,7 @@ pub struct CooldownConfig {
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransportConfig {
-    /// Transport kind, normally `http` or `https`.
+    /// Transport kind, normally `http`, `https`, `ws`, or `wss`.
     pub kind: Option<String>,
     /// Base URL.
     pub base_url: Option<String>,
@@ -572,6 +614,9 @@ pub struct TransportConfig {
     pub connect_timeout: Option<String>,
     /// Request timeout such as `30m`.
     pub request_timeout: Option<String>,
+    /// Require HTTP/2 for this upstream connection. For cleartext `http`
+    /// URLs this enables prior-knowledge h2c; it is never enabled by default.
+    pub http2: bool,
 }
 
 /// Upstream authentication declaration.
@@ -830,10 +875,86 @@ pub struct TargetConfig {
 }
 
 /// Immutable listener plan.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ListenerProtocol {
+    /// Accept only HTTP/1.1 requests.
+    #[default]
+    Http1,
+    /// Detect HTTP/1.1 or an HTTP/2 prior-knowledge preface.
+    Auto,
+    /// Require an HTTP/2 prior-knowledge preface on cleartext connections.
+    H2c,
+}
+
+/// Immutable inbound TLS plan for a listener.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListenerTlsPlan {
+    cert: Arc<str>,
+    key: Arc<str>,
+    alpn: Vec<Arc<str>>,
+    handshake_timeout: Duration,
+    client_auth: Option<ListenerClientAuthPlan>,
+}
+
+impl ListenerTlsPlan {
+    /// PEM certificate-chain path.
+    #[must_use]
+    pub fn cert(&self) -> &str {
+        &self.cert
+    }
+
+    /// PEM private-key path.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Configured ALPN protocol identifiers.
+    #[must_use]
+    pub fn alpn(&self) -> &[Arc<str>] {
+        &self.alpn
+    }
+
+    /// Maximum time allowed for one handshake.
+    #[must_use]
+    pub const fn handshake_timeout(&self) -> Duration {
+        self.handshake_timeout
+    }
+
+    /// Optional client certificate policy.
+    #[must_use]
+    pub const fn client_auth(&self) -> Option<&ListenerClientAuthPlan> {
+        self.client_auth.as_ref()
+    }
+}
+
+/// Immutable client certificate verification plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListenerClientAuthPlan {
+    ca: Arc<str>,
+    required: bool,
+}
+
+impl ListenerClientAuthPlan {
+    /// PEM trust-bundle path.
+    #[must_use]
+    pub fn ca(&self) -> &str {
+        &self.ca
+    }
+
+    /// Whether a client certificate is mandatory.
+    #[must_use]
+    pub const fn required(&self) -> bool {
+        self.required
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListenerPlan {
     id: Arc<str>,
     bind: Arc<str>,
+    protocol: ListenerProtocol,
+    tls: Option<ListenerTlsPlan>,
     source: SourceLabel,
 }
 
@@ -850,6 +971,18 @@ impl ListenerPlan {
         &self.bind
     }
 
+    /// Inbound protocol policy.
+    #[must_use]
+    pub const fn protocol(&self) -> ListenerProtocol {
+        self.protocol
+    }
+
+    /// Optional inbound TLS plan.
+    #[must_use]
+    pub const fn tls(&self) -> Option<&ListenerTlsPlan> {
+        self.tls.as_ref()
+    }
+
     /// Source declaration label.
     #[must_use]
     pub const fn source(&self) -> &SourceLabel {
@@ -863,6 +996,7 @@ pub struct UpstreamPlan {
     id: Arc<str>,
     url: Url,
     transport: Arc<str>,
+    http2: bool,
     connect_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
     auth: Option<AuthPlan>,
@@ -888,6 +1022,13 @@ impl UpstreamPlan {
     #[must_use]
     pub fn transport(&self) -> &str {
         &self.transport
+    }
+
+    /// Whether this upstream requires HTTP/2, including cleartext h2c prior
+    /// knowledge when its transport is `http`.
+    #[must_use]
+    pub const fn http2(&self) -> bool {
+        self.http2
     }
 
     /// Optional connection timeout.
@@ -2268,11 +2409,15 @@ fn compile_config(
         let label = declaration_label(source, "listeners", id, listeners.len());
         validate_id("listener", id, &label)?;
         validate_bind(&declaration.bind, &label)?;
+        let protocol = compile_listener_protocol(declaration, &label)?;
+        let tls = compile_listener_tls(declaration, protocol, &label)?;
         listeners.insert(
             Arc::from(id.as_str()),
             ListenerPlan {
                 id: Arc::from(id.as_str()),
                 bind: Arc::from(declaration.bind.trim()),
+                protocol,
+                tls,
                 source: label,
             },
         );
@@ -2282,7 +2427,7 @@ fn compile_config(
     for (id, declaration) in &config.upstreams {
         let label = upstream_label(source, id, upstreams.len());
         validate_id("upstream", id, &label)?;
-        let (url, transport, connect_timeout, request_timeout) =
+        let (url, transport, http2, connect_timeout, request_timeout) =
             compile_upstream(declaration, &label)?;
         let (oauth, native) = compile_provider_auth(declaration, &label)?;
         let auth = compile_auth(declaration.auth.as_ref(), &label)?;
@@ -2292,6 +2437,7 @@ fn compile_config(
                 id: Arc::from(id.as_str()),
                 url,
                 transport,
+                http2,
                 connect_timeout,
                 request_timeout,
                 auth,
@@ -2373,6 +2519,15 @@ fn compile_config(
         )?;
         validate_external_inspectors(&response, &extensions, &label, "response")?;
         let target = compile_target(declaration, &label, &upstreams, &policies)?;
+        if matcher.websocket() == Some(true)
+            && target.model_source().is_none()
+            && !matches!(upstreams[target.upstream()].transport(), "ws" | "wss")
+        {
+            return Err(invalid(
+                &label,
+                "WebSocket routes require a ws or wss upstream transport",
+            ));
+        }
         if target.model_source().is_some() && ingress.mode() != BodyMode::Patch {
             return Err(invalid(
                 &label,
@@ -2431,6 +2586,112 @@ fn compile_config(
     })
 }
 
+fn compile_listener_protocol(
+    declaration: &ListenerConfig,
+    label: &SourceLabel,
+) -> Result<ListenerProtocol, ConfigError> {
+    let Some(protocol) = declaration.protocol.as_deref() else {
+        return Ok(if declaration.h2c {
+            ListenerProtocol::H2c
+        } else {
+            ListenerProtocol::Http1
+        });
+    };
+    let protocol = protocol.trim().to_ascii_lowercase();
+    let selected = match protocol.as_str() {
+        "http1" | "http/1.1" | "h1" => ListenerProtocol::Http1,
+        "auto" | "http1+http2" | "http1-or-http2" => ListenerProtocol::Auto,
+        "h2c" | "http2" | "http/2" | "h2" => ListenerProtocol::H2c,
+        _ => return Err(invalid(label, "unsupported listener protocol")),
+    };
+    if declaration.h2c && selected != ListenerProtocol::H2c {
+        return Err(invalid(
+            label,
+            "listener h2c cannot be combined with a non-HTTP/2 protocol",
+        ));
+    }
+    Ok(selected)
+}
+
+fn compile_listener_tls(
+    declaration: &ListenerConfig,
+    protocol: ListenerProtocol,
+    label: &SourceLabel,
+) -> Result<Option<ListenerTlsPlan>, ConfigError> {
+    let Some(tls) = declaration.tls.as_ref() else {
+        return Ok(None);
+    };
+    if declaration.bind.starts_with('/') || declaration.bind.starts_with("unix:") {
+        return Err(invalid(label, "TLS is supported only on TCP listeners"));
+    }
+    if protocol == ListenerProtocol::H2c {
+        return Err(invalid(
+            label,
+            "TLS listeners cannot use cleartext h2c protocol",
+        ));
+    }
+    let cert = nonempty(Some(tls.cert.clone()))
+        .ok_or_else(|| invalid(label, "TLS certificate path must not be empty"))?;
+    let key = nonempty(Some(tls.key.clone()))
+        .ok_or_else(|| invalid(label, "TLS private-key path must not be empty"))?;
+    if tls.alpn.is_empty() {
+        return Err(invalid(label, "TLS ALPN list must not be empty"));
+    }
+    let mut alpn = Vec::with_capacity(tls.alpn.len());
+    for protocol in &tls.alpn {
+        let protocol = protocol.trim();
+        if protocol.is_empty()
+            || protocol.len() > 255
+            || !protocol.is_ascii()
+            || protocol.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(invalid(label, "TLS ALPN protocol is invalid"));
+        }
+        alpn.push(Arc::from(protocol));
+    }
+    let offers_h2 = alpn
+        .iter()
+        .any(|protocol: &Arc<str>| protocol.as_ref() == "h2");
+    if offers_h2 && protocol != ListenerProtocol::Auto {
+        return Err(invalid(
+            label,
+            "TLS ALPN h2 requires listener protocol auto",
+        ));
+    }
+    let handshake_timeout = tls
+        .handshake_timeout
+        .unwrap_or_else(default_tls_handshake_timeout);
+    if handshake_timeout.is_zero() || handshake_timeout > Duration::from_secs(300) {
+        return Err(invalid(
+            label,
+            "TLS handshake timeout must be between 1ms and 5m",
+        ));
+    }
+    let client_auth = tls
+        .client_auth
+        .as_ref()
+        .map(|client_auth| {
+            let ca = nonempty(Some(client_auth.ca.clone()))
+                .ok_or_else(|| invalid(label, "TLS client CA path must not be empty"))?;
+            Ok(ListenerClientAuthPlan {
+                ca,
+                required: client_auth.required,
+            })
+        })
+        .transpose()?;
+    Ok(Some(ListenerTlsPlan {
+        cert,
+        key,
+        alpn,
+        handshake_timeout,
+        client_auth,
+    }))
+}
+
+fn default_tls_handshake_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
 fn listener_requires_auth(listener: &ListenerPlan) -> bool {
     listener
         .bind()
@@ -2438,7 +2699,7 @@ fn listener_requires_auth(listener: &ListenerPlan) -> bool {
         .map_or(true, |address| !address.ip().is_loopback())
 }
 
-type CompiledTransport = (Url, Arc<str>, Option<Duration>, Option<Duration>);
+type CompiledTransport = (Url, Arc<str>, bool, Option<Duration>, Option<Duration>);
 
 const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const DEFAULT_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -2918,10 +3179,10 @@ fn compile_upstream(
         .or(declaration.url.as_deref())
         .ok_or_else(|| invalid(label, "upstream requires url or transport.base_url"))?;
     let url = Url::parse(raw_url).map_err(|_| invalid(label, "upstream URL is invalid"))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") || url.host_str().is_none() {
         return Err(invalid(
             label,
-            "upstream URL must use http(s) and include a host",
+            "upstream URL must use http(s) or ws(s) and include a host",
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
@@ -2935,7 +3196,7 @@ fn compile_upstream(
     if transport_kind != url.scheme() {
         return Err(invalid(label, "transport kind does not match URL scheme"));
     }
-    if !matches!(transport_kind.as_str(), "http" | "https") {
+    if !matches!(transport_kind.as_str(), "http" | "https" | "ws" | "wss") {
         return Err(invalid(label, "unsupported upstream transport kind"));
     }
     let connect_timeout = parse_duration(
@@ -2948,9 +3209,17 @@ fn compile_upstream(
         label,
         "request_timeout",
     )?;
+    let http2 = transport.is_some_and(|value| value.http2);
+    if http2 && !matches!(transport_kind.as_str(), "http" | "https") {
+        return Err(invalid(
+            label,
+            "HTTP/2 upstream transport requires http or https",
+        ));
+    }
     Ok((
         url,
         Arc::from(transport_kind),
+        http2,
         connect_timeout,
         request_timeout,
     ))
@@ -3997,6 +4266,10 @@ where
             .map_err(serde::de::Error::custom),
         Some(ConfigDuration::Millis(value)) => Ok(Some(Duration::from_millis(value))),
     }
+}
+
+fn default_tls_alpn() -> Vec<String> {
+    vec!["http/1.1".to_owned()]
 }
 
 fn deserialize_optional_byte_size<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
