@@ -76,3 +76,27 @@ steady-state half-duration, so allocator growth during startup is not mistaken
 for post-drain retention. Keep the JSON report with the commit or release
 evidence; do not treat a skipped or unsupported measurement as compatibility
 proof.
+
+## CLIProxyAPI comparison
+
+`scripts/benchmark-cliproxyapi.py` compares a release Pooler binary with an
+installed CLIProxyAPI binary without using provider credentials or port 8319.
+It starts a deterministic loopback OpenAI-compatible upstream, writes
+owner-private temporary configurations for both proxies, and removes those
+configurations and processes after the run. External HTTP(S) traffic from the
+isolated processes is directed to a closed loopback port.
+
+```sh
+cargo build --locked --release -p pooler-cli
+python3 scripts/benchmark-cliproxyapi.py \
+  --samples 240 --warmup 24 --concurrency 8 \
+  --output-dir .omo/evidence/cliproxyapi-benchmark
+```
+
+Every endpoint receives the same valid 1 MiB OpenAI Chat request and every
+response is checked byte-for-byte against the same valid 1 MiB response. The
+report retains all raw matched samples plus direct, Pooler, and CLIProxyAPI
+p50/p95/max latency. Matched overhead is the signed proxy latency minus direct
+latency for the same sample ID. Endpoint order rotates through all six
+permutations. This comparison is diagnostic evidence; it does not replace the
+release-gate benchmark above.
