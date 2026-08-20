@@ -29,6 +29,12 @@ Replay a deterministic fixture corpus without loading server configuration:
 cargo run -p pooler-cli -- fixture replay fixtures/factory
 ```
 
+Generate and check the strict source-configuration schema:
+
+```sh
+./scripts/check-config-schema.sh
+```
+
 Capture a structured fixture to an owner-private file. Bodies are omitted by
 default; retaining bounded, recursively redacted JSON bodies requires the
 explicit flag:
@@ -37,5 +43,16 @@ explicit flag:
 cargo run -p pooler-cli -- fixture capture input.json capture.json --include-bodies
 ```
 
+Build reproducible release archives, checksums, and SBOMs for the four supported
+release targets with:
+
+```sh
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) scripts/release.sh --output dist
+```
+
+The archive layout and signing/provenance hooks are documented in
+[docs/release.md](docs/release.md).
+
 See the [delivery index](pooler-readgold.md), [product goal](GOAL.md), and
-[architecture plan](ARCHITECTURE_PLAN.md).
+[architecture plan](ARCHITECTURE_PLAN.md), [compatibility evidence](docs/compatibility-report.md),
+and [release acceptance](docs/release-acceptance.md).

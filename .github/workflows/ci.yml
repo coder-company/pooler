@@ -7,30 +7,66 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
 jobs:
-  test:
+  quality:
+    name: Quality (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.83.0
+      # Action references are immutable commit pins. Dependabot updates them
+      # weekly after checking the corresponding release tag.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
         with:
+          toolchain: 1.86.0
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
+      - run: ./scripts/check-config-schema.sh
+      - run: cargo check --workspace --all-targets --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo test --workspace --all-features --locked --doc
 
-  supply-chain:
+  fixtures-and-properties:
+    name: Fixtures and property harnesses
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.83.0
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+        with:
+          toolchain: 1.86.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: cargo test --workspace --all-features --locked -- --test-threads=1
+      - run: cargo test --manifest-path fuzz/Cargo.toml --locked --no-run
+      - run: >-
+          cargo run --locked -p pooler-cli -- fixture report
+          --manifest fixtures/compatibility/manifest.json
+          --format markdown
+          --output "$RUNNER_TEMP/compatibility.md"
+      - run: diff -u fixtures/compatibility/MATRIX.md "$RUNNER_TEMP/compatibility.md"
+
+  supply-chain:
+    name: Dependency and license policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # action implementation
+        with:
+          # cargo metadata must parse Rust-2024 target-only dependencies such
+          # as security-framework; keep the product MSRV separate from the
+          # toolchain used solely for dependency auditing.
+          toolchain: 1.86.0
+      - uses: taiki-e/install-action@a27ef18d36cfa66b0af3a360104621793b41c036 # v2.54.3
         with:
           tool: cargo-audit,cargo-deny
       - run: cargo audit --deny warnings
+      - run: cargo audit --deny warnings --file fuzz/Cargo.lock
       - run: cargo deny check
-

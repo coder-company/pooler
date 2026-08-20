@@ -1,0 +1,425 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing semantic-version tag to publish; it must already exist
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  gates:
+    name: Release acceptance gates
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 35
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+        with:
+          toolchain: 1.86.0
+          components: clippy,rustfmt
+
+      - name: Install dependency policy tools
+        uses: taiki-e/install-action@a27ef18d36cfa66b0af3a360104621793b41c036 # v2.54.3
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run the complete test suite
+        run: cargo test --workspace --all-features --locked
+
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
+
+      - name: Audit fuzz dependencies
+        run: cargo audit --deny warnings --file fuzz/Cargo.lock
+
+      - name: Check dependency and license policy
+        run: cargo deny check
+
+      - name: Verify the committed configuration schema
+        run: scripts/check-config-schema.sh
+
+      - name: Verify the committed compatibility report
+        run: scripts/check-compatibility-report.sh
+
+      - name: Run the full benchmark and stress gate
+        env:
+          POOLER_BENCH_ENFORCE: "1"
+          POOLER_BENCH_RUNS: "3"
+          POOLER_BENCH_SHORT: "0"
+        run: scripts/benchmark-release.sh
+
+      - name: Upload benchmark and stress evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-benchmark
+          path: target/pooler-benchmark-report.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            run_smoke: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            run_smoke: false
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            run_smoke: true
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            run_smoke: true
+
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ matrix.target }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+        with:
+          toolchain: 1.86.0
+          target: ${{ matrix.target }}
+
+      - name: Install the Linux ARM64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes gcc-aarch64-linux-gnu
+
+      - name: Read the package version
+        id: package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          import json
+          import sys
+          versions = {
+              package["version"]
+              for package in json.load(sys.stdin)["packages"]
+              if package["name"] == "pooler-cli"
+          }
+          if len(versions) != 1:
+              raise SystemExit("expected one pooler-cli version")
+          print(next(iter(versions)))
+          ')"
+          test "$RELEASE_TAG" = "v$version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build, verify, and package
+        shell: bash
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+
+          source_date_epoch="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH="$source_date_epoch"
+          export CARGO_INCREMENTAL=0
+          export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=/usr/src/pooler"
+          if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+
+          build_root="${RUNNER_TEMP}/pooler-build"
+          first_target_dir="${build_root}/first"
+          second_target_dir="${build_root}/second"
+          first_binary="${first_target_dir}/${TARGET}/release/pooler"
+          second_binary="${second_target_dir}/${TARGET}/release/pooler"
+          CARGO_TARGET_DIR="$first_target_dir" cargo build \
+            --locked --release --package pooler-cli --bin pooler --target "$TARGET"
+          CARGO_TARGET_DIR="$second_target_dir" cargo build \
+            --locked --release --package pooler-cli --bin pooler --target "$TARGET"
+          test -x "$first_binary"
+          test -x "$second_binary"
+          cmp -- "$first_binary" "$second_binary"
+          file "$first_binary"
+
+          if [[ "${{ matrix.run_smoke }}" == "true" ]]; then
+            "$first_binary" --version
+            "$first_binary" --config config/pooler.example.yaml check
+          fi
+
+          metadata="${RUNNER_TEMP}/metadata-${TARGET}.json"
+          cargo metadata --locked --format-version 1 --filter-platform "$TARGET" > "$metadata"
+          sbom_root="${RUNNER_TEMP}/sbom/${TARGET}"
+          mkdir -p "$sbom_root"
+          python3 scripts/sbom.py \
+            --metadata "$metadata" \
+            --version "$VERSION" \
+            --epoch "$SOURCE_DATE_EPOCH" \
+            --cyclonedx "$sbom_root/pooler.cdx.json" \
+            --spdx "$sbom_root/pooler.spdx.json"
+
+          package_name="pooler-${VERSION}-${TARGET}"
+          stage="${RUNNER_TEMP}/stage/${package_name}"
+          artifact_dir="${RUNNER_TEMP}/release/${TARGET}"
+          mkdir -p "$stage/bin" "$stage/config" "$stage/compatibility" \
+            "$stage/sbom" "$stage/schema" "$artifact_dir"
+          install -m 0755 "$first_binary" "$stage/bin/pooler"
+          install -m 0644 README.md LICENSE NOTICE "$stage/"
+          install -m 0644 config/pooler.example.yaml config/cursor.example.yaml \
+            "$stage/config/"
+          install -m 0644 schema/pooler.schema.json "$stage/schema/"
+          install -m 0644 fixtures/compatibility/manifest.json \
+            "$stage/compatibility/"
+          install -m 0644 fixtures/compatibility/MATRIX.md \
+            "$stage/compatibility/"
+          install -m 0644 "$sbom_root/pooler.cdx.json" "$stage/sbom/"
+          install -m 0644 "$sbom_root/pooler.spdx.json" "$stage/sbom/"
+
+          archive="${artifact_dir}/${package_name}.tar.gz"
+          duplicate_archive="${RUNNER_TEMP}/${package_name}.duplicate.tar.gz"
+          python3 scripts/archive.py --root "$stage" --archive "$archive" \
+            --epoch "$SOURCE_DATE_EPOCH"
+          python3 scripts/archive.py --root "$stage" --archive "$duplicate_archive" \
+            --epoch "$SOURCE_DATE_EPOCH"
+          cmp -- "$archive" "$duplicate_archive"
+          test -s "$archive"
+          tar -tzf "$archive" >/dev/null
+
+          smoke_root="${RUNNER_TEMP}/smoke/${TARGET}"
+          mkdir -p "$smoke_root"
+          tar -xzf "$archive" -C "$smoke_root"
+          packaged_binary="${smoke_root}/${package_name}/bin/pooler"
+          test -x "$packaged_binary"
+          if [[ "${{ matrix.run_smoke }}" == "true" ]]; then
+            "$packaged_binary" --version
+            "$packaged_binary" \
+              --config "${smoke_root}/${package_name}/config/pooler.example.yaml" check
+          fi
+
+          cat > "${artifact_dir}/build-info-${TARGET}.txt" <<EOF
+          target=${TARGET}
+          tag=${RELEASE_TAG}
+          version=${VERSION}
+          commit=$(git rev-parse HEAD)
+          source_date_epoch=${SOURCE_DATE_EPOCH}
+          rustc=$(rustc --version)
+          cargo=$(cargo --version)
+          EOF
+
+      - name: Upload the platform artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/release/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble and smoke-test release
+    needs: [build, gates]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+        with:
+          toolchain: 1.86.0
+
+      - name: Read the package version
+        id: package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          import json
+          import sys
+          versions = {
+              package["version"]
+              for package in json.load(sys.stdin)["packages"]
+              if package["name"] == "pooler-cli"
+          }
+          if len(versions) != 1:
+              raise SystemExit("expected one pooler-cli version")
+          print(next(iter(versions)))
+          ')"
+          test "$RELEASE_TAG" = "v$version"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download platform artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify artifacts and assemble metadata
+        shell: bash
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          source_date_epoch="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH="$source_date_epoch"
+          expected_targets=(
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+          )
+
+          for target in "${expected_targets[@]}"; do
+            archive="release/pooler-${VERSION}-${target}.tar.gz"
+            test -s "$archive"
+            tar -tzf "$archive" >/dev/null
+            tar -xOzf "$archive" "pooler-${VERSION}-${target}/bin/pooler" \
+              > "${RUNNER_TEMP}/pooler-${target}"
+            chmod +x "${RUNNER_TEMP}/pooler-${target}"
+            file "${RUNNER_TEMP}/pooler-${target}"
+          done
+
+          (cd release && sha256sum pooler-*.tar.gz | LC_ALL=C sort -k2 > SHA256SUMS)
+          (cd release && sha256sum -c SHA256SUMS)
+
+          metadata="${RUNNER_TEMP}/metadata.json"
+          cargo metadata --locked --format-version 1 > "$metadata"
+          python3 scripts/sbom.py \
+            --metadata "$metadata" \
+            --version "$VERSION" \
+            --epoch "$SOURCE_DATE_EPOCH" \
+            --cyclonedx "release/pooler-${VERSION}.cdx.json" \
+            --spdx "release/pooler-${VERSION}.spdx.json"
+
+          cat > "release/pooler-${VERSION}.manifest.txt" <<EOF
+          tag=${RELEASE_TAG}
+          version=${VERSION}
+          commit=$(git rev-parse HEAD)
+          source_date_epoch=${SOURCE_DATE_EPOCH}
+          rustc=$(rustc --version)
+          cargo=$(cargo --version)
+          artifacts=$(printf '%s,' "${expected_targets[@]}" | sed 's/,$//')
+          EOF
+
+      - name: Upload the assembled release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-bundle
+          path: release
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Sign, attest, and publish release
+    needs: [assemble, gates]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Download the assembled release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-bundle
+          path: release
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
+      - name: Sign the checksum manifest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          (cd release && sha256sum -c SHA256SUMS)
+          cosign sign-blob --yes \
+            --bundle "release/${RELEASE_TAG}.sigstore.json" \
+            release/SHA256SUMS
+          test -s "release/${RELEASE_TAG}.sigstore.json"
+
+      - name: Attest release provenance
+        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd # v2.3.0
+        with:
+          subject-path: release/*.tar.gz
+
+      - name: Publish the GitHub release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release/* \
+              --title "$RELEASE_TAG" --generate-notes
+          fi

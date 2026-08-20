@@ -225,7 +225,7 @@ impl QuotaSnapshot {
     /// Whether this state prevents a new request at `now`.
     #[must_use]
     pub fn exhausted(self, now: Instant) -> bool {
-        matches!(self.remaining, Some(0)) && self.reset_at.map_or(true, |reset_at| reset_at > now)
+        matches!(self.remaining, Some(0)) && self.reset_at.is_none_or(|reset_at| reset_at > now)
     }
 }
 

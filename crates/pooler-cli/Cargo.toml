@@ -15,6 +15,7 @@ serde_json.workspace = true
 pooler-auth = { path = "../pooler-auth" }
 pooler-config = { path = "../pooler-config" }
 pooler-http = { path = "../pooler-http" }
+pooler-extension = { path = "../pooler-extension" }
 pooler-observe = { path = "../pooler-observe" }
 pooler-store = { path = "../pooler-store" }
 pooler-server = { path = "../pooler-server" }
@@ -22,6 +23,7 @@ pooler-testkit = { path = "../pooler-testkit" }
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+rustix.workspace = true
 url.workspace = true
 zeroize.workspace = true
 

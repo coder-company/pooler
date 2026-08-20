@@ -46,6 +46,12 @@ pub struct CompatibilityEntry {
     /// Additional constraints or intentional differences.
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Capabilities exercised by the fixture or route family.
+    #[serde(default)]
+    pub supported_capabilities: Vec<String>,
+    /// Capabilities intentionally unsupported or not evidenced by this row.
+    #[serde(default)]
+    pub unsupported_capabilities: Vec<String>,
 }
 
 /// Evidence level recorded for one compatibility fixture.
@@ -155,6 +161,31 @@ impl CompatibilityManifest {
                     )));
                 }
             }
+            if entry
+                .supported_capabilities
+                .iter()
+                .any(|capability| capability.trim().is_empty())
+                || entry
+                    .unsupported_capabilities
+                    .iter()
+                    .any(|capability| capability.trim().is_empty())
+            {
+                return Err(CompatibilityError::Invalid(format!(
+                    "entry `{}` contains an empty capability",
+                    entry.adapter
+                )));
+            }
+            let supported = entry.supported_capabilities.iter().collect::<BTreeSet<_>>();
+            if entry
+                .unsupported_capabilities
+                .iter()
+                .any(|capability| supported.contains(capability))
+            {
+                return Err(CompatibilityError::Invalid(format!(
+                    "entry `{}` lists a capability as both supported and unsupported",
+                    entry.adapter
+                )));
+            }
             let key = format!(
                 "{}\u{1f}{}\u{1f}{}",
                 entry.adapter,
@@ -224,9 +255,11 @@ pub fn render_compatibility_matrix(manifest: &CompatibilityManifest) -> String {
     let mut output = String::from(concat!(
         "# Compatibility matrix\n\n",
         "This report is generated from `fixtures/compatibility/manifest.json`. ",
-        "Reference-only rows do not claim compatibility with a current client or live provider.\n\n",
-        "| Adapter | Protocol | Fixture version | Equivalence | Evidence | Provenance | Notes | Fixture |\n",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |\n",
+        "Reference-only rows do not claim compatibility with a current client or live provider. ",
+        "Supported capabilities describe the exercised Pooler surface; unsupported capabilities ",
+        "are not silently inferred from a route name.\n\n",
+        "| Adapter | Protocol | Fixture version | Equivalence | Evidence | Provenance | Supported capabilities | Unsupported capabilities | Notes | Fixture |\n",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n",
     ));
     for entry in entries {
         output.push_str("| ");
@@ -241,6 +274,10 @@ pub fn render_compatibility_matrix(manifest: &CompatibilityManifest) -> String {
         output.push_str(&markdown_cell(entry.status.label()));
         output.push_str(" | ");
         output.push_str(&markdown_cell(&entry.source));
+        output.push_str(" | ");
+        output.push_str(&markdown_cell(&entry.supported_capabilities.join(", ")));
+        output.push_str(" | ");
+        output.push_str(&markdown_cell(&entry.unsupported_capabilities.join(", ")));
         output.push_str(" | ");
         output.push_str(&markdown_cell(&entry.notes.join("; ")));
         output.push_str(" | ");
@@ -271,6 +308,8 @@ mod tests {
                 status: CompatibilityStatus::SanitizedLocalReference,
                 source: "sanitized local bridge".to_owned(),
                 notes: Vec::new(),
+                supported_capabilities: vec!["text".to_owned()],
+                unsupported_capabilities: vec!["live_provider".to_owned()],
             }],
         }
     }

@@ -1,0 +1,22 @@
+# Keep the dependency audit policy in the repository so local and CI audits
+# make the same decision. An empty ignore list is intentional: advisories are
+# fixed in the lockfile rather than waived here.
+
+[advisories]
+ignore = []
+informational_warnings = ["unmaintained"]
+severity_threshold = "low"
+
+[database]
+fetch = true
+stale = false
+
+[output]
+deny = ["unmaintained"]
+format = "terminal"
+quiet = false
+show_tree = true
+
+[yanked]
+enabled = true
+update_index = true

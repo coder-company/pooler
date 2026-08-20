@@ -1,0 +1,18 @@
+title = "Pooler secret scanning"
+
+[extend]
+useDefault = true
+
+# The repository contains deliberately synthetic values in redaction tests and
+# sanitized fixtures. Keep those exact test values allowlisted while leaving
+# the default detector set enabled for every other value.
+[allowlist]
+description = "Synthetic credentials used by redaction tests and sanitized fixtures"
+regexes = [
+  '''(?i)sk-live-1234567890''',
+  '''(?i)sk-secret-123456789''',
+  '''(?i)ghp_abcdefghijklmnopqrstuvwxyz''',
+  '''(?i)eyJhbGciOiJIUzI1NiJ9\.payload\.signature''',
+  '''(?i)Bearer (?:secret|top-secret)''',
+  '''(?i)(?:env-secret-value|refresh-live-secret|nested-password|client-secret-value|access-token-value|private-cookie|do-not-log-this|split-secret-token|proof-secret|session-secret-value)''',
+]

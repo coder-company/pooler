@@ -1,8 +1,13 @@
+[graph]
+all-features = true
+
 [advisories]
 yanked = "deny"
+ignore = []
 
 [licenses]
 confidence-threshold = 0.8
+unused-allowed-license = "deny"
 allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
@@ -11,15 +16,27 @@ allow = [
   "ISC",
   "MIT",
   "Unicode-3.0",
-  "Unicode-DFS-2016",
   "Zlib",
 ]
 
+[licenses.private]
+ignore = false
+
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Internal workspace crates intentionally use path dependencies without a
+# version. cargo-deny reports those as wildcards even though they cannot fetch
+# an untrusted registry crate; keep the report visible while rejecting unknown
+# registry/git sources below.
+wildcards = "warn"
+allow-wildcard-paths = true
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

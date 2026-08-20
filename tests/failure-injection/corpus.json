@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "connection-refused",
+      "kind": "connection_refused",
+      "outcome": "error",
+      "commitment": "before"
+    },
+    {
+      "id": "tls-handshake-failure",
+      "kind": "tls_failure",
+      "outcome": "error",
+      "commitment": "before"
+    },
+    {
+      "id": "slow-headers",
+      "kind": "slow_headers",
+      "outcome": "response",
+      "delay_millis": 100,
+      "commitment": "before"
+    },
+    {
+      "id": "downstream-disconnect-before-commit",
+      "kind": "downstream_disconnect",
+      "outcome": "cancelled",
+      "commitment": "before"
+    },
+    {
+      "id": "downstream-disconnect-after-commit",
+      "kind": "downstream_disconnect",
+      "outcome": "cancelled",
+      "commitment": "after"
+    },
+    {
+      "id": "provider-401-refresh",
+      "kind": "status_401_refresh",
+      "outcome": "error",
+      "status": 401,
+      "commitment": "before"
+    },
+    {
+      "id": "provider-429-recovery",
+      "kind": "status_429_recovery",
+      "outcome": "error",
+      "status": 429,
+      "commitment": "before"
+    },
+    {
+      "id": "partial-sse",
+      "kind": "partial_sse",
+      "outcome": "error",
+      "commitment": "after"
+    },
+    {
+      "id": "invalid-utf8",
+      "kind": "invalid_utf8",
+      "outcome": "error",
+      "commitment": "before"
+    },
+    {
+      "id": "missing-terminal-event",
+      "kind": "missing_terminal_event",
+      "outcome": "error",
+      "commitment": "after"
+    },
+    {
+      "id": "fragmented-websocket",
+      "kind": "fragmented_websocket",
+      "outcome": "response",
+      "commitment": "after"
+    },
+    {
+      "id": "truncated-connect-envelope",
+      "kind": "truncated_connect",
+      "outcome": "error",
+      "commitment": "before"
+    }
+  ]
+}

@@ -1,0 +1,81 @@
+name: Hardening
+
+on:
+  pull_request:
+  push:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  failure-and-security:
+    name: Failure injection and security boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+        with:
+          toolchain: 1.86.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: scripts/deep-test.sh --no-fuzz
+
+  fuzz:
+    name: Bounded parser fuzzing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: taiki-e/install-action@a27ef18d36cfa66b0af3a360104621793b41c036 # v2.54.3
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: >-
+          RUSTUP_TOOLCHAIN=nightly POOLER_FUZZ_TOOLCHAIN=nightly
+          POOLER_REQUIRE_FUZZ=1
+          POOLER_FUZZ_SECONDS=10 POOLER_FUZZ_TIMEOUT=45
+          scripts/deep-test.sh
+
+  benchmark-smoke:
+    name: Short benchmark and stress smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+        with:
+          toolchain: 1.86.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - name: Run bounded smoke workload
+        shell: bash
+        run: >-
+          cargo run --locked --release -p pooler-bench --
+          --mode all --short --runs 1 --json
+          --output "$RUNNER_TEMP/pooler-benchmark-smoke.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-smoke-report
+          path: ${{ runner.temp }}/pooler-benchmark-smoke.json
+          if-no-files-found: error
+
+  sanitizer:
+    name: Nightly sanitizer checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: >-
+          POOLER_REQUIRE_SANITIZER=1 POOLER_SANITIZER=address
+          scripts/deep-test.sh --sanitize --no-fuzz

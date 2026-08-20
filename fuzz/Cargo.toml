@@ -3,7 +3,7 @@ name = "pooler-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.86"
 
 [package.metadata]
 cargo-fuzz = true
@@ -22,7 +22,7 @@ idna_adapter = "=1.2.0"
 pooler-http = { path = "../crates/pooler-http" }
 pooler-protocol = { path = "../crates/pooler-protocol" }
 serde_json = "1.0"
-serde_yml = "=0.0.12"
+serde_yml = { package = "serde_yaml_ng", version = "=0.10.0" }
 uuid = "=1.12.1"
 url = "=2.5.4"
 

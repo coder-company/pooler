@@ -29,11 +29,13 @@ use url::Url;
 
 mod loader;
 mod route_match;
+mod schema;
 mod watch;
 
 pub use loader::{load_path, render_path, ConfigLoader, LoadedConfig, DEFAULT_MAX_IMPORT_DEPTH};
 use route_match::{prefix_matches, template_matches};
 pub use route_match::{RouteMatchError, RouteRequest};
+pub use schema::{config_schema, render_config_schema, CONFIG_SCHEMA_VERSION};
 pub use watch::{
     ConfigCandidate, ConfigWatcher, DEFAULT_RELOAD_DEBOUNCE, DEFAULT_RELOAD_POLL_INTERVAL,
 };
@@ -47,6 +49,16 @@ pub const MAX_REQUEST_STEP_TOTAL_VALUE_BYTES: usize = 1024 * 1024;
 /// Default callback used by the local OAuth login flow when a provider does
 /// not override it.
 pub const DEFAULT_OAUTH_CALLBACK: &str = "http://localhost:1455/auth/callback";
+/// Default maximum bytes sent to one external extension.
+pub const DEFAULT_EXTENSION_MAX_INPUT_BYTES: u64 = 1024 * 1024;
+/// Default maximum bytes accepted from one external extension.
+pub const DEFAULT_EXTENSION_MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
+/// Default external extension timeout in milliseconds.
+pub const DEFAULT_EXTENSION_TIMEOUT_MS: u64 = 5_000;
+/// Default external extension RSS bound.
+pub const DEFAULT_EXTENSION_MAX_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+/// Default number of concurrently supervised extension processes.
+pub const DEFAULT_EXTENSION_MAX_CONCURRENCY: u32 = 4;
 
 /// Location of a declaration in its source document.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -256,6 +268,8 @@ pub struct Config {
     pub policies: BTreeMap<String, PolicyConfig>,
     /// Routes in declaration order.
     pub routes: Vec<RouteConfig>,
+    /// Supervised external extension declarations keyed by stable ID.
+    pub extensions: BTreeMap<String, ExtensionConfig>,
     /// Optional read-only management listener. It is disabled by default.
     pub management: ManagementConfig,
     #[serde(skip)]
@@ -326,6 +340,40 @@ pub struct UpstreamConfig {
     pub oauth: Option<OAuthConfig>,
     /// Native provider declaration.
     pub native: Option<NativeProviderConfig>,
+}
+
+/// Supervised external extension declaration.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExtensionConfig {
+    /// Absolute executable path.
+    pub command: Option<String>,
+    /// Absolute path to a no-import WebAssembly module. Exactly one of
+    /// `command` and `wasm` is required.
+    pub wasm: Option<String>,
+    /// Fixed arguments passed to every invocation.
+    pub args: Vec<String>,
+    /// Explicit operation grants (`inspect`, `transform`).
+    pub capabilities: Vec<String>,
+    /// Resource bounds for child processes.
+    pub limits: Option<ExtensionLimitsConfig>,
+}
+
+/// Resource bounds for one external extension.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExtensionLimitsConfig {
+    /// Maximum serialized request bytes.
+    pub max_input_bytes: Option<u64>,
+    /// Maximum serialized response bytes.
+    pub max_output_bytes: Option<u64>,
+    /// Maximum invocation wall-clock duration.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub timeout: Option<Duration>,
+    /// Maximum child RSS where supported by the host.
+    pub max_memory_bytes: Option<u64>,
+    /// Maximum concurrent child processes.
+    pub max_concurrency: Option<u32>,
 }
 
 /// Public model declaration.
@@ -1477,6 +1525,110 @@ impl ModelPlan {
     }
 }
 
+/// Immutable resource bounds for a supervised external extension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtensionLimitsPlan {
+    max_input_bytes: u64,
+    max_output_bytes: u64,
+    timeout: Duration,
+    max_memory_bytes: u64,
+    max_concurrency: u32,
+}
+
+impl ExtensionLimitsPlan {
+    /// Maximum serialized request bytes.
+    #[must_use]
+    pub const fn max_input_bytes(&self) -> u64 {
+        self.max_input_bytes
+    }
+
+    /// Maximum serialized response bytes.
+    #[must_use]
+    pub const fn max_output_bytes(&self) -> u64 {
+        self.max_output_bytes
+    }
+
+    /// Maximum invocation duration.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Maximum child RSS where supported by the host.
+    #[must_use]
+    pub const fn max_memory_bytes(&self) -> u64 {
+        self.max_memory_bytes
+    }
+
+    /// Maximum concurrent child processes.
+    #[must_use]
+    pub const fn max_concurrency(&self) -> u32 {
+        self.max_concurrency
+    }
+}
+
+/// Immutable supervised external extension plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionPlan {
+    id: Arc<str>,
+    command: Option<Arc<str>>,
+    wasm: Option<Arc<str>>,
+    args: Vec<Arc<str>>,
+    capabilities: BTreeSet<Arc<str>>,
+    limits: ExtensionLimitsPlan,
+    source: SourceLabel,
+}
+
+impl ExtensionPlan {
+    /// Stable extension ID.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Absolute executable path.
+    #[must_use]
+    pub fn command(&self) -> Option<&str> {
+        self.command.as_deref()
+    }
+
+    /// Absolute WebAssembly module path, when this is a WASM extension.
+    #[must_use]
+    pub fn wasm(&self) -> Option<&str> {
+        self.wasm.as_deref()
+    }
+
+    /// Fixed executable arguments.
+    #[must_use]
+    pub fn args(&self) -> &[Arc<str>] {
+        &self.args
+    }
+
+    /// Granted capabilities.
+    #[must_use]
+    pub fn capabilities(&self) -> &BTreeSet<Arc<str>> {
+        &self.capabilities
+    }
+
+    /// Whether a capability is granted.
+    #[must_use]
+    pub fn allows(&self, capability: &str) -> bool {
+        self.capabilities.contains(capability)
+    }
+
+    /// Resource bounds.
+    #[must_use]
+    pub const fn limits(&self) -> ExtensionLimitsPlan {
+        self.limits
+    }
+
+    /// Source declaration label.
+    #[must_use]
+    pub const fn source(&self) -> &SourceLabel {
+        &self.source
+    }
+}
+
 /// A compiled request transform.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequestTransform {
@@ -1774,6 +1926,7 @@ pub struct RoutePlan {
     matcher: MatchPlan,
     ingress: BodyPlan,
     request_steps: Vec<RequestTransform>,
+    external_transforms: Vec<Arc<str>>,
     response: BodyPlan,
     target: TargetPlan,
     downstream_auth: Option<AuthPlan>,
@@ -1813,6 +1966,12 @@ impl RoutePlan {
     #[must_use]
     pub fn request_steps(&self) -> &[RequestTransform] {
         &self.request_steps
+    }
+
+    /// Ordered supervised external transform IDs.
+    #[must_use]
+    pub fn external_transforms(&self) -> &[Arc<str>] {
+        &self.external_transforms
     }
 
     /// Response plan.
@@ -1898,6 +2057,7 @@ pub struct CompiledConfig {
     account_pools: BTreeMap<Arc<str>, AccountPoolPlan>,
     policies: BTreeMap<Arc<str>, PolicyPlan>,
     models: BTreeMap<Arc<str>, ModelPlan>,
+    extensions: BTreeMap<Arc<str>, ExtensionPlan>,
     routes: Vec<RoutePlan>,
     management: Option<ManagementPlan>,
 }
@@ -1930,6 +2090,7 @@ impl CompiledConfig {
             && self.account_pools == other.account_pools
             && self.policies == other.policies
             && self.models == other.models
+            && self.extensions == other.extensions
             && self.routes == other.routes
             && self.management == other.management
     }
@@ -1974,6 +2135,12 @@ impl CompiledConfig {
     #[must_use]
     pub const fn models(&self) -> &BTreeMap<Arc<str>, ModelPlan> {
         &self.models
+    }
+
+    /// Supervised external extension plans keyed by ID.
+    #[must_use]
+    pub const fn extensions(&self) -> &BTreeMap<Arc<str>, ExtensionPlan> {
+        &self.extensions
     }
 
     /// Routes sorted by deterministic precedence.
@@ -2139,6 +2306,7 @@ fn compile_config(
     let account_pools = compile_account_pools(config, source, &accounts)?;
     let policies = compile_policies(config, source, &accounts, &account_pools)?;
     let models = compile_models(config, source, &upstreams)?;
+    let extensions = compile_extensions(config, source)?;
     let management = compile_management(&config.management, source)?;
 
     let mut routes = Vec::with_capacity(config.routes.len());
@@ -2172,8 +2340,12 @@ fn compile_config(
             &label,
             "ingress",
         )?;
-        let request_steps = compile_request(declaration.request.as_ref(), &label)?;
-        if !request_steps.is_empty() && ingress.mode() != BodyMode::Patch {
+        validate_external_inspectors(&ingress, &extensions, &label, "ingress")?;
+        let (request_steps, external_transforms) =
+            compile_request(declaration.request.as_ref(), &label, &extensions)?;
+        if (!request_steps.is_empty() || !external_transforms.is_empty())
+            && ingress.mode() != BodyMode::Patch
+        {
             return Err(invalid(
                 &label,
                 "JSON request transforms require patch ingress mode",
@@ -2199,6 +2371,7 @@ fn compile_config(
             &label,
             "response",
         )?;
+        validate_external_inspectors(&response, &extensions, &label, "response")?;
         let target = compile_target(declaration, &label, &upstreams, &policies)?;
         if target.model_source().is_some() && ingress.mode() != BodyMode::Patch {
             return Err(invalid(
@@ -2206,12 +2379,7 @@ fn compile_config(
                 "request model target selection requires patch ingress mode",
             ));
         }
-        if target.model_source() == Some(ModelSource::Inspected)
-            && !ingress
-                .inspectors()
-                .iter()
-                .any(|inspector| inspector.as_ref() == "inspect.openai.model")
-        {
+        if target.model_source() == Some(ModelSource::Inspected) && !has_model_inspector(&ingress) {
             return Err(invalid(
                 &label,
                 "request model target selection requires inspect.openai.model",
@@ -2235,6 +2403,7 @@ fn compile_config(
             matcher,
             ingress,
             request_steps,
+            external_transforms,
             response,
             target,
             downstream_auth,
@@ -2256,6 +2425,7 @@ fn compile_config(
         account_pools,
         policies,
         models,
+        extensions,
         routes,
         management,
     })
@@ -3051,20 +3221,151 @@ fn compile_capabilities(
     Ok(capabilities)
 }
 
+fn compile_extensions(
+    config: &Config,
+    source: &Source,
+) -> Result<BTreeMap<Arc<str>, ExtensionPlan>, ConfigError> {
+    let mut extensions = BTreeMap::new();
+    for (id, declaration) in &config.extensions {
+        let label = source_label_with_key(source, "extensions", id.clone());
+        validate_id("extension", id, &label)?;
+        let command = declaration
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let wasm = declaration
+            .wasm
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if command.is_some() == wasm.is_some() {
+            return Err(invalid(
+                &label,
+                "extension requires exactly one of command or wasm",
+            ));
+        }
+        if let Some(command) = command {
+            if !Path::new(command).is_absolute() {
+                return Err(invalid(
+                    &label,
+                    "extension command must be an absolute path",
+                ));
+            }
+        }
+        if let Some(wasm) = wasm {
+            if !Path::new(wasm).is_absolute() {
+                return Err(invalid(
+                    &label,
+                    "extension wasm path must be an absolute path",
+                ));
+            }
+            if !declaration.args.is_empty() {
+                return Err(invalid(&label, "WASM extensions do not accept args"));
+            }
+        }
+        if declaration.capabilities.is_empty() {
+            return Err(invalid(
+                &label,
+                "extension requires at least one capability",
+            ));
+        }
+        let mut capabilities = BTreeSet::new();
+        for capability in &declaration.capabilities {
+            let capability = capability.trim().to_ascii_lowercase();
+            if !matches!(capability.as_str(), "inspect" | "transform") {
+                return Err(invalid(&label, "unknown extension capability"));
+            }
+            if !capabilities.insert(Arc::from(capability)) {
+                return Err(invalid(&label, "duplicate extension capability"));
+            }
+        }
+        let limits = declaration.limits.as_ref();
+        let max_input_bytes = limits
+            .and_then(|value| value.max_input_bytes)
+            .unwrap_or(DEFAULT_EXTENSION_MAX_INPUT_BYTES);
+        let max_output_bytes = limits
+            .and_then(|value| value.max_output_bytes)
+            .unwrap_or(DEFAULT_EXTENSION_MAX_OUTPUT_BYTES);
+        let timeout = limits
+            .and_then(|value| value.timeout)
+            .unwrap_or(Duration::from_millis(DEFAULT_EXTENSION_TIMEOUT_MS));
+        let max_memory_bytes = limits
+            .and_then(|value| value.max_memory_bytes)
+            .unwrap_or(DEFAULT_EXTENSION_MAX_MEMORY_BYTES);
+        let max_concurrency = limits
+            .and_then(|value| value.max_concurrency)
+            .unwrap_or(DEFAULT_EXTENSION_MAX_CONCURRENCY);
+        if max_input_bytes == 0
+            || max_output_bytes == 0
+            || timeout.is_zero()
+            || max_memory_bytes == 0
+            || max_concurrency == 0
+        {
+            return Err(invalid(
+                &label,
+                "extension limits must be greater than zero",
+            ));
+        }
+        extensions.insert(
+            Arc::from(id.as_str()),
+            ExtensionPlan {
+                id: Arc::from(id.as_str()),
+                command: command.map(Arc::from),
+                wasm: wasm.map(Arc::from),
+                args: declaration
+                    .args
+                    .iter()
+                    .map(|value| Arc::from(value.as_str()))
+                    .collect(),
+                capabilities,
+                limits: ExtensionLimitsPlan {
+                    max_input_bytes,
+                    max_output_bytes,
+                    timeout,
+                    max_memory_bytes,
+                    max_concurrency,
+                },
+                source: label,
+            },
+        );
+    }
+    Ok(extensions)
+}
+
 fn compile_request(
     declaration: Option<&RequestConfig>,
     label: &SourceLabel,
-) -> Result<Vec<RequestTransform>, ConfigError> {
+    extensions: &BTreeMap<Arc<str>, ExtensionPlan>,
+) -> Result<(Vec<RequestTransform>, Vec<Arc<str>>), ConfigError> {
     let Some(declaration) = declaration else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     if declaration.steps.len() > MAX_REQUEST_STEPS {
         return Err(invalid(label, "route has too many request transforms"));
     }
     let mut steps = Vec::with_capacity(declaration.steps.len());
+    let mut external = Vec::new();
     let mut total_value_bytes = 0usize;
     for step in &declaration.steps {
         let kind = step.transform.trim().to_ascii_lowercase();
+        if let Some(id) = kind.strip_prefix("transform.external.") {
+            let extension = extensions
+                .get(id)
+                .ok_or_else(|| ConfigError::MissingReference {
+                    kind: "extension",
+                    name: id.to_owned(),
+                    label: label.clone(),
+                })?;
+            if !extension.allows("transform") {
+                return Err(invalid(
+                    label,
+                    "external transform capability is not granted",
+                ));
+            }
+            external.push(Arc::from(id));
+            continue;
+        }
         let pointer = step
             .parameters
             .pointer
@@ -3120,7 +3421,51 @@ fn compile_request(
         };
         steps.push(transform);
     }
-    Ok(steps)
+    Ok((steps, external))
+}
+
+fn validate_external_inspectors(
+    body: &BodyPlan,
+    extensions: &BTreeMap<Arc<str>, ExtensionPlan>,
+    label: &SourceLabel,
+    field: &str,
+) -> Result<(), ConfigError> {
+    for inspector in body.inspectors() {
+        let Some(id) = inspector
+            .strip_prefix("inspect.external.")
+            .or_else(|| inspector.strip_prefix("external.inspect."))
+        else {
+            continue;
+        };
+        if field == "response" {
+            return Err(invalid(
+                label,
+                "external response inspectors are not supported; attach them to ingress",
+            ));
+        }
+        let extension = extensions
+            .get(id)
+            .ok_or_else(|| ConfigError::MissingReference {
+                kind: "extension",
+                name: id.to_owned(),
+                label: label.clone(),
+            })?;
+        if !extension.allows("inspect") {
+            return Err(invalid(
+                label,
+                &format!("{field} external inspector capability is not granted"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn has_model_inspector(body: &BodyPlan) -> bool {
+    body.inspectors().iter().any(|inspector| {
+        inspector.as_ref() == "inspect.openai.model"
+            || inspector.starts_with("inspect.external.")
+            || inspector.starts_with("external.inspect.")
+    })
 }
 
 fn compile_auth(
@@ -3138,10 +3483,13 @@ fn compile_auth(
     if !matches!(kind, "bearer" | "bearer_secret") {
         return Err(invalid(label, "auth kind must be bearer or bearer_secret"));
     }
-    if !matches!(secret, SecretRef::Env(_) | SecretRef::File(_)) {
+    if !matches!(
+        secret,
+        SecretRef::Env(_) | SecretRef::File(_) | SecretRef::Keyring { .. }
+    ) {
         return Err(invalid(
             label,
-            "auth secrets must use an env: or file: reference",
+            "auth secrets must use an env:, file:, or keyring: reference",
         ));
     }
     Ok(Some(AuthPlan {
@@ -3369,14 +3717,17 @@ fn compile_body(
                 &format!("{field} patch mode cannot use decoder or encoder"),
             ));
         }
-        if declaration
-            .inspectors
-            .iter()
-            .any(|inspector| inspector.trim() != "inspect.openai.model")
-        {
+        if declaration.inspectors.iter().any(|inspector| {
+            let inspector = inspector.trim();
+            inspector != "inspect.openai.model"
+                && !inspector.starts_with("inspect.external.")
+                && !inspector.starts_with("external.inspect.")
+        }) {
             return Err(invalid(
                 label,
-                &format!("{field} patch mode only supports inspect.openai.model"),
+                &format!(
+                    "{field} patch mode only supports inspect.openai.model or inspect.external.<id>"
+                ),
             ));
         }
     }
@@ -4235,10 +4586,17 @@ routes:
     }
 
     #[test]
-    fn rejects_auth_that_the_http_runtime_cannot_execute() {
+    fn compiles_supported_auth_sources_and_rejects_unsupported_kinds() {
         let keyring = "version: 1\nupstreams: {local: {url: http://127.0.0.1:1, auth: {secret: keyring:pooler/account}}}\n";
-        let error = compile_yaml("keyring.yaml", keyring).expect_err("unsupported source");
-        assert!(error.to_string().contains("env: or file:"));
+        let config = compile_yaml("keyring.yaml", keyring).expect("keyring source");
+        assert_eq!(
+            config.upstreams()["local"]
+                .auth()
+                .expect("auth")
+                .secret()
+                .kind(),
+            "keyring"
+        );
 
         let kind = "version: 1\nupstreams: {local: {url: http://127.0.0.1:1, auth: {kind: basic, secret: env:POOLER_KEY}}}\n";
         let error = compile_yaml("kind.yaml", kind).expect_err("unsupported kind");
@@ -4654,5 +5012,91 @@ upstreams:
         let native = config.upstreams()["codex"].native().expect("native plan");
         assert_eq!(native.kind(), "codex");
         assert_eq!(native.quota_endpoint().expect("quota").path(), "/quota");
+    }
+
+    #[test]
+    fn compiles_external_extension_component_plan() {
+        let text = r#"
+version: 1
+extensions:
+  local:
+    command: /bin/cat
+    capabilities: [inspect, transform]
+    limits: {max_input_bytes: 2048, max_output_bytes: 4096, timeout: 250ms, max_concurrency: 2}
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+models:
+  - id: selected
+    targets: [{provider: local, upstream_model: selected}]
+routes:
+  - id: external
+    listen: local
+    ingress: {mode: patch, inspectors: [inspect.external.local]}
+    request:
+      steps:
+        - use: transform.external.local
+          with: {pointer: /unused, value: null}
+    target: {provider: local, model_from: inspected.model}
+  - id: external-inspect
+    listen: local
+    match: {path: /inspect}
+    ingress: {mode: inspect, inspectors: [inspect.external.local]}
+    target: local
+"#;
+        let config = compile_yaml("external.yaml", text).expect("external extension config");
+        let extension = &config.extensions()["local"];
+        assert_eq!(extension.command(), Some("/bin/cat"));
+        assert!(extension.allows("inspect"));
+        assert!(extension.allows("transform"));
+        assert_eq!(extension.limits().max_input_bytes(), 2048);
+        assert_eq!(
+            config
+                .route("external")
+                .expect("external route")
+                .external_transforms(),
+            &[Arc::from("local")]
+        );
+        assert_eq!(
+            config
+                .route("external")
+                .expect("inspect route")
+                .ingress()
+                .inspectors(),
+            &[Arc::from("inspect.external.local")]
+        );
+
+        let wasm_config = compile_yaml(
+            "wasm-extension.yaml",
+            "version: 1\nextensions: {module: {wasm: /tmp/module.wasm, capabilities: [inspect]}}\n",
+        )
+        .expect("WASM extension declaration");
+        assert_eq!(wasm_config.extensions()["module"].command(), None);
+        assert_eq!(
+            wasm_config.extensions()["module"].wasm(),
+            Some("/tmp/module.wasm")
+        );
+    }
+
+    #[test]
+    fn rejects_external_extension_without_a_granted_capability() {
+        let text = r#"
+version: 1
+extensions:
+  local: {command: /bin/cat, capabilities: [inspect]}
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+routes:
+  - id: external
+    listen: local
+    ingress: {mode: patch}
+    request:
+      steps:
+        - use: transform.external.local
+          with: {pointer: /unused, value: null}
+    target: local
+"#;
+        let error =
+            compile_yaml("external-denied.yaml", text).expect_err("missing transform grant");
+        assert!(error.to_string().contains("capability is not granted"));
     }
 }

@@ -6,6 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# The Linux backend deliberately uses the kernel keyring only.  It never
+# falls back to Secret Service, which can start an interactive unlock prompt
+# in a headless daemon.  macOS and Windows use their native stores.
+os-keyring = [
+    "dep:keyring",
+    "keyring/apple-native",
+    "keyring/linux-native",
+    "keyring/windows-native",
+]
+
 [dependencies]
 bytes.workspace = true
 http.workspace = true
@@ -13,6 +25,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
+keyring = { workspace = true, optional = true }
 pooler-core = { path = "../pooler-core" }
 ring.workspace = true
 serde_json.workspace = true

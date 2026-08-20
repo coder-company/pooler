@@ -141,6 +141,34 @@ impl SqliteStore {
             .map_err(sqlite_error)
     }
 
+    /// Verify the SQLite database without changing its contents.
+    ///
+    /// SQLite's built-in integrity check is intentionally exposed as a small
+    /// diagnostic operation. It does not open a transaction or checkpoint the
+    /// WAL, so callers can run it while another process owns the database.
+    pub fn integrity_check(&self) -> StoreResult<()> {
+        let connection = self.connection()?;
+        let result: String = connection
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .map_err(sqlite_error)?;
+        if result.eq_ignore_ascii_case("ok") {
+            Ok(())
+        } else {
+            Err(StoreError::Sqlite(format!(
+                "SQLite integrity check reported `{result}`"
+            )))
+        }
+    }
+
+    /// Return the number of encrypted credential payload rows.
+    ///
+    /// This metadata-only query lets diagnostics distinguish an unencrypted
+    /// empty store from a store whose payloads require a missing key.
+    pub fn credential_payload_count(&self) -> StoreResult<usize> {
+        let connection = self.connection()?;
+        count_rows(&connection, "credential_payloads")
+    }
+
     /// Persist one encrypted credential payload.
     ///
     /// The credential metadata row must already exist.  This ordering keeps a

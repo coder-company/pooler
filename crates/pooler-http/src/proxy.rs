@@ -4,7 +4,7 @@
 //! limit, apply the compiled transforms, and keep responses opaque.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     error::Error,
     future::Future,
@@ -31,6 +31,7 @@ use pooler_config::{
     SecretRef, UpstreamPlan,
 };
 use pooler_core::{BodyMode, ErrorClass, RouteLimits};
+use pooler_extension::{ExtensionInput, ExtensionRegistry};
 use pooler_observe::{
     AttemptRecord, AttemptResult, CompletionClass, CooldownRecord, DecisionRecord, MetricsRegistry,
     QuotaRecord, RequestObservation, RetryRecord, TraceRecord, TraceRecorder, TraceStage,
@@ -185,6 +186,24 @@ where
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_ERROR_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 
+fn external_inspector_id(component: &str) -> Option<&str> {
+    component
+        .strip_prefix("inspect.external.")
+        .or_else(|| component.strip_prefix("external.inspect."))
+}
+
+fn extension_metadata(route: &RoutePlan) -> BTreeMap<String, String> {
+    BTreeMap::from([(String::from("route"), route.id().to_owned())])
+}
+
+fn content_type_for_extension(headers: &HeaderMap) -> String {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned()
+}
+
 /// Errors that prevent an opaque proxy from being constructed or a request
 /// from being forwarded. Request-time errors are converted to HTTP responses
 /// by [`HttpProxy::handle`].
@@ -229,6 +248,9 @@ pub enum ProxyError {
     /// Account selection or mutable pooling state failed.
     #[error("account selection failed: {0}")]
     Pool(String),
+    /// A supervised external extension failed before the upstream request.
+    #[error("external extension failed: {0}")]
+    Extension(String),
     /// Native provider credential materialization or refresh failed.
     #[error("native provider request failed: {0}")]
     Native(String),
@@ -250,6 +272,7 @@ pub struct HttpProxy<A = NoSemanticAdapter> {
     semantic: A,
     pooling: Arc<PoolingCoordinator>,
     native: Arc<NativeRuntime>,
+    extensions: Arc<ExtensionRegistry>,
     observability: MetricsRegistry,
     traces: TraceRecorder,
 }
@@ -347,6 +370,7 @@ where
             semantic,
             pooling,
             native,
+            extensions: Arc::new(ExtensionRegistry::default()),
             observability: MetricsRegistry::default(),
             traces: TraceRecorder::default(),
         })
@@ -365,6 +389,13 @@ where
     #[must_use]
     pub fn with_trace_recorder(mut self, traces: TraceRecorder) -> Self {
         self.traces = traces;
+        self
+    }
+
+    /// Attach the immutable registry of supervised external extensions.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: Arc<ExtensionRegistry>) -> Self {
+        self.extensions = extensions;
         self
     }
 
@@ -552,6 +583,36 @@ where
         Ok(())
     }
 
+    async fn run_external_inspectors(
+        &self,
+        route: &RoutePlan,
+        media_type: String,
+        body: &[u8],
+        cancellation: CancellationToken,
+    ) -> Result<BTreeMap<String, String>, ProxyError> {
+        let mut metadata = BTreeMap::new();
+        for inspector in route.ingress().inspectors() {
+            let Some(id) = external_inspector_id(inspector) else {
+                continue;
+            };
+            let inspection = self
+                .extensions
+                .inspect(
+                    id,
+                    ExtensionInput {
+                        media_type: media_type.clone(),
+                        body: body.to_vec(),
+                        metadata: extension_metadata(route),
+                    },
+                    cancellation.clone(),
+                )
+                .await
+                .map_err(|error| ProxyError::Extension(error.to_string()))?;
+            metadata.extend(inspection.metadata);
+        }
+        Ok(metadata)
+    }
+
     async fn forward(
         &self,
         route: &RoutePlan,
@@ -617,12 +678,21 @@ where
                 };
                 let mut document = PreservedJson::from_bytes(bytes.to_vec())
                     .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+                let external_metadata = self
+                    .run_external_inspectors(
+                        route,
+                        content_type_for_extension(&headers),
+                        document.bytes().as_ref(),
+                        cancellation.clone(),
+                    )
+                    .await?;
                 let inspected_model =
                     if route.target().model_source() == Some(ModelSource::Inspected) {
-                        document
+                        let body_model = document
                             .extract_model()
                             .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?
-                            .map(str::to_owned)
+                            .map(str::to_owned);
+                        body_model.or_else(|| external_metadata.get("model").cloned())
                     } else {
                         None
                     };
@@ -652,6 +722,23 @@ where
                                 .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
                         }
                     }
+                }
+                for extension in route.external_transforms() {
+                    let transformed = self
+                        .extensions
+                        .transform(
+                            extension,
+                            ExtensionInput {
+                                media_type: content_type_for_extension(&headers),
+                                body: document.bytes().into_owned(),
+                                metadata: extension_metadata(route),
+                            },
+                            cancellation.clone(),
+                        )
+                        .await
+                        .map_err(|error| ProxyError::Extension(error.to_string()))?;
+                    document = PreservedJson::from_bytes(transformed)
+                        .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
                 }
                 let bytes = document.bytes().into_owned();
                 limits
@@ -728,9 +815,47 @@ where
                 )
             }
             BodyMode::Inspect => {
-                return Err(ProxyError::UnsupportedBodyMode {
-                    route: route.id().to_owned(),
-                });
+                let incoming =
+                    FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
+                let bytes = tokio::select! {
+                    result = time::timeout_at(
+                        buffer_deadline,
+                        crate::collect_body_limited(
+                            incoming,
+                            bounded_usize(limits.max_request_body_bytes),
+                        ),
+                    ) => result
+                        .map_err(|_| ProxyError::Timeout)?
+                        .map_err(|error| match error {
+                            crate::BodyLimitError::TooLarge { .. }
+                            | crate::BodyLimitError::Upstream(crate::BodyLimitError::TooLarge { .. }) => {
+                                ProxyError::RequestBodyTooLarge
+                            }
+                            other => ProxyError::InvalidPatch(other.to_string()),
+                        })?,
+                    () = cancellation.cancelled() => {
+                        return Err(ProxyError::Timeout);
+                    }
+                };
+                let _external_metadata = self
+                    .run_external_inspectors(
+                        route,
+                        content_type_for_extension(&headers),
+                        &bytes,
+                        cancellation.clone(),
+                    )
+                    .await?;
+                limits
+                    .check_request_body(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                    .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                headers.remove(header::CONTENT_LENGTH);
+                (
+                    PreparedBody::Buffered {
+                        bytes,
+                        patch_model: false,
+                    },
+                    None,
+                )
             }
         };
         let is_buffered = matches!(prepared, PreparedBody::Buffered { .. });
@@ -1455,7 +1580,8 @@ fn completion_class_for_error(error: &ProxyError) -> CompletionClass {
     match error {
         ProxyError::InvalidPatch(_)
         | ProxyError::RequestBodyTooLarge
-        | ProxyError::SemanticRequest(_) => CompletionClass::InvalidRequest,
+        | ProxyError::SemanticRequest(_)
+        | ProxyError::Extension(_) => CompletionClass::InvalidRequest,
         ProxyError::UnsupportedBodyMode { .. } | ProxyError::SemanticResponse(_) => {
             CompletionClass::Unsupported
         }
@@ -1534,7 +1660,10 @@ fn resolve_secret(secret: &SecretRef) -> Result<SecretValue, ProxyError> {
     let reference = match secret {
         SecretRef::Env(name) => AuthSecretRef::Env(name.to_string()),
         SecretRef::File(path) => AuthSecretRef::File(path.as_ref().into()),
-        SecretRef::Keyring { .. } => return Err(ProxyError::SecretUnavailable),
+        SecretRef::Keyring { service, account } => AuthSecretRef::Keyring {
+            service: service.to_string(),
+            account: account.to_string(),
+        },
     };
     let secret = reference
         .resolve()
@@ -1677,6 +1806,7 @@ fn error_response(error: ProxyError) -> Response<ProxyBody> {
         | ProxyError::UnsupportedBodyMode { .. } => {
             (StatusCode::BAD_GATEWAY, "upstream request failed")
         }
+        ProxyError::Extension(_) => (StatusCode::BAD_GATEWAY, "external extension failed"),
         ProxyError::InvalidPatch(_) => (StatusCode::BAD_REQUEST, "invalid request"),
         ProxyError::SemanticRequest(_) => (StatusCode::BAD_REQUEST, "invalid request"),
         ProxyError::RequestBodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request too large"),

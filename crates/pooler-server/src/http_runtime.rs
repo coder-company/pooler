@@ -20,6 +20,9 @@ use http_body_util::BodyExt;
 use hyper::{body::Incoming, http, http::Request, service::service_fn};
 use hyper_util::rt::TokioIo;
 use pooler_config::CompiledConfig;
+use pooler_extension::{
+    ExtensionCapabilities, ExtensionLimits, ExtensionRegistry, ExtensionSpec, WasmExtension,
+};
 use pooler_http::{
     BoxError, DrainError, HttpProxy, NativeRuntime, PoolingCoordinator, ProxyBody, ProxyError,
     SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
@@ -245,6 +248,34 @@ impl HttpProxyServer {
         Self::bind_with_native_runtime(config, Arc::new(NativeRuntime::disabled())).await
     }
 
+    /// Bind listeners with a caller-owned pooling coordinator.
+    ///
+    /// The coordinator may be backed by an encrypted SQLite store. It is
+    /// retained by every configuration generation published by this server.
+    pub async fn bind_with_pooling(
+        config: CompiledConfig,
+        pooling: Arc<PoolingCoordinator>,
+    ) -> Result<Self, HttpProxyServerError> {
+        Self::bind_with_native_runtime_and_pooling(
+            config,
+            Arc::new(NativeRuntime::disabled()),
+            pooling,
+        )
+        .await
+    }
+
+    /// Bind listeners with injected native and account-pooling runtimes.
+    ///
+    /// Both runtimes are shared by all listeners. The pooling coordinator is
+    /// also reused, through its backing store, when configuration reloads.
+    pub async fn bind_with_native_runtime_and_pooling(
+        config: CompiledConfig,
+        native: Arc<NativeRuntime>,
+        pooling: Arc<PoolingCoordinator>,
+    ) -> Result<Self, HttpProxyServerError> {
+        Self::bind_inner(config, native, pooling).await
+    }
+
     /// Bind listeners with an injected native provider runtime. This keeps
     /// credential stores and refresh policy outside immutable configuration
     /// while allowing native routes to share one refresh coordinator.
@@ -252,11 +283,19 @@ impl HttpProxyServer {
         config: CompiledConfig,
         native: Arc<NativeRuntime>,
     ) -> Result<Self, HttpProxyServerError> {
-        let config = Arc::new(config);
         let pooling =
             Arc::new(PoolingCoordinator::new(&config).map_err(|error| {
                 HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string()))
             })?);
+        Self::bind_inner(config, native, pooling).await
+    }
+
+    async fn bind_inner(
+        config: CompiledConfig,
+        native: Arc<NativeRuntime>,
+        pooling: Arc<PoolingCoordinator>,
+    ) -> Result<Self, HttpProxyServerError> {
+        let config = Arc::new(config);
         let dispatch = Arc::new(ArcSwap::from_pointee(RuntimeGeneration {
             config: Arc::clone(&config),
             proxies: BTreeMap::new(),
@@ -281,6 +320,7 @@ impl HttpProxyServer {
         let mut listeners = Vec::with_capacity(config.listeners().len());
         let mut proxies = BTreeMap::new();
         let mut addresses = Vec::with_capacity(config.listeners().len());
+        let extensions = extension_registry(&config)?;
 
         for plan in config.listeners().values() {
             let id: Arc<str> = Arc::from(plan.id());
@@ -294,6 +334,7 @@ impl HttpProxyServer {
                     Arc::clone(&pooling),
                     Arc::clone(&native),
                 )?
+                .with_extensions(Arc::clone(&extensions))
                 .with_observability(metrics.clone()),
             );
             let bind = plan.bind();
@@ -459,6 +500,7 @@ impl HttpProxyServer {
                 HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string()))
             })?);
         let mut proxies = BTreeMap::new();
+        let extensions = extension_registry(&config)?;
         for plan in config.listeners().values() {
             let id: Arc<str> = Arc::from(plan.id());
             let proxy = Arc::new(
@@ -469,6 +511,7 @@ impl HttpProxyServer {
                     Arc::clone(&pooling),
                     Arc::clone(&self.state.native),
                 )?
+                .with_extensions(Arc::clone(&extensions))
                 .with_observability(self.state.metrics.clone()),
             );
             proxies.insert(id, proxy);
@@ -642,6 +685,59 @@ fn same_listener_bindings(current: &CompiledConfig, candidate: &CompiledConfig) 
                 .get(id)
                 .is_some_and(|other| other.bind() == plan.bind())
         })
+}
+
+fn extension_registry(
+    config: &CompiledConfig,
+) -> Result<Arc<ExtensionRegistry>, HttpProxyServerError> {
+    let mut specs = Vec::with_capacity(config.extensions().len());
+    let mut wasm_extensions = Vec::new();
+    for plan in config.extensions().values() {
+        let capabilities =
+            ExtensionCapabilities::from_names(plan.capabilities().iter().map(AsRef::as_ref))
+                .map_err(|error| HttpProxyServerError::Proxy(ProxyError::Extension(error)))?;
+        let limits = plan.limits();
+        let limits = ExtensionLimits {
+            max_input_bytes: bounded_extension_usize(limits.max_input_bytes()),
+            max_output_bytes: bounded_extension_usize(limits.max_output_bytes()),
+            timeout: limits.timeout(),
+            max_memory_bytes: limits.max_memory_bytes(),
+            max_concurrency: limits.max_concurrency() as usize,
+        };
+        if let Some(command) = plan.command() {
+            let args = plan
+                .args()
+                .iter()
+                .map(|value| std::ffi::OsString::from(value.as_ref()));
+            let spec = ExtensionSpec::new(plan.id(), command, args, capabilities, limits).map_err(
+                |error| HttpProxyServerError::Proxy(ProxyError::Extension(error.to_string())),
+            )?;
+            specs.push(spec);
+        } else if let Some(path) = plan.wasm() {
+            let module = std::fs::read(path).map_err(|error| {
+                HttpProxyServerError::Proxy(ProxyError::Extension(format!(
+                    "failed to read WASM extension `{path}`: {error}"
+                )))
+            })?;
+            let extension =
+                WasmExtension::new(plan.id(), &module, capabilities, limits).map_err(|error| {
+                    HttpProxyServerError::Proxy(ProxyError::Extension(error.to_string()))
+                })?;
+            wasm_extensions.push(extension);
+        }
+    }
+    let mut registry = ExtensionRegistry::from_wasm_extensions(wasm_extensions)
+        .map_err(|error| HttpProxyServerError::Proxy(ProxyError::Extension(error.to_string())))?;
+    let process = ExtensionRegistry::from_specs(specs)
+        .map_err(|error| HttpProxyServerError::Proxy(ProxyError::Extension(error.to_string())))?;
+    registry
+        .merge(process)
+        .map_err(|error| HttpProxyServerError::Proxy(ProxyError::Extension(error.to_string())))?;
+    Ok(Arc::new(registry))
+}
+
+fn bounded_extension_usize(value: u64) -> usize {
+    value.min(usize::MAX as u64) as usize
 }
 
 /// Holds a management activity guard until the downstream response stream
@@ -840,6 +936,8 @@ mod tests {
     };
 
     use pooler_auth::{OAuthFuture, OAuthRefresher, OAuthTokenStore, OAuthTokens, SecretValue};
+    use pooler_store::{MasterKey, SqliteStore, Store};
+    use tempfile::tempdir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
@@ -1248,7 +1346,15 @@ mod tests {
             ),
         )
         .expect("mixed config compiles");
-        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let server = match HttpProxyServer::bind(config).await {
+            Ok(server) => server,
+            Err(HttpProxyServerError::Proxy(ProxyError::Extension(error)))
+                if error.contains("sandbox") =>
+            {
+                return
+            }
+            Err(error) => panic!("proxy binds: {error}"),
+        };
         let address = listener_address(&server, "shared");
         let runner = {
             let server = server.clone();
@@ -1399,6 +1505,147 @@ mod tests {
                 .await
                 .is_err()
         );
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn crashed_external_transform_returns_error_without_crashing_pooler() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener.local_addr().expect("upstream address");
+        let directory = tempfile::tempdir().expect("WASM fixture directory");
+        let module_path = directory.path().join("trap.wasm");
+        let module = wat::parse_str(
+            r#"(module
+              (memory (export "memory") 1)
+              (func (export "handle") (param i32 i32) (result i64)
+                unreachable))"#,
+        )
+        .expect("trap WAT");
+        std::fs::write(&module_path, module).expect("trap module");
+        let config = pooler_config::compile_yaml(
+            "extension-crash.yaml",
+            &format!(
+                "version: 1\nextensions:\n  broken:\n    wasm: {}\n    capabilities: [transform]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: external\n    listen: local\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.external.broken\n          with: {{pointer: /unused, value: null}}\n    response: {{mode: opaque}}\n    target: local\n",
+                module_path.display(),
+            ),
+        )
+        .expect("extension crash config compiles");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let response = send_request(
+            address,
+            b"POST / HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\n{\"x\":0}",
+        )
+        .await;
+        assert_eq!(status(&response), 502);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), upstream_listener.accept())
+                .await
+                .is_err()
+        );
+        stop_server(&server, runner).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_inspector_metadata_selects_and_rewrites_a_model() {
+        let (upstream_address, upstream) = spawn_one_shot_upstream(b"ok").await;
+        let config = pooler_config::compile_yaml(
+            "extension-inspect.yaml",
+            &format!(
+                "version: 1\nextensions:\n  selector:\n    command: /bin/sh\n    args: [-c, 'read line; printf \\\"%s\\\\n\\\" \\\"{{\\\\\"metadata\\\\\":{{\\\\\"model\\\\\":\\\\\"provider\\\\\"}}}}\\\"']\n    capabilities: [inspect]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nmodels:\n  - id: provider\n    targets: [{{provider: local, upstream_model: upstream-provider}}]\nroutes:\n  - id: external-inspect\n    listen: local\n    ingress: {{mode: patch, inspectors: [inspect.external.selector]}}\n    response: {{mode: opaque}}\n    target: {{provider: local, model_from: inspected.model}}\n"
+            ),
+        )
+        .expect("external inspector config compiles");
+        let server = match HttpProxyServer::bind(config).await {
+            Ok(server) => server,
+            Err(HttpProxyServerError::Proxy(ProxyError::Extension(error)))
+                if error.contains("sandbox") =>
+            {
+                return
+            }
+            Err(error) => panic!("proxy binds: {error}"),
+        };
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let response = send_request(
+            address,
+            b"POST / HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert_eq!(status(&response), 200);
+        let upstream_request = upstream.await.expect("upstream request");
+        assert!(
+            String::from_utf8_lossy(&upstream_request).contains("\"model\":\"upstream-provider\"")
+        );
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn wasm_inspector_selects_and_wasm_transform_changes_the_request() {
+        let (upstream_address, upstream) = spawn_one_shot_upstream(b"ok").await;
+        let directory = tempfile::tempdir().expect("WASM fixture directory");
+        let selector_path = directory.path().join("selector.wasm");
+        let transformer_path = directory.path().join("transformer.wasm");
+        let selector = wat::parse_str(
+            r#"(module
+              (memory (export "memory") 1)
+              (data (i32.const 0) "{\"metadata\":{\"model\":\"provider\"}}")
+              (func (export "handle") (param i32 i32) (result i64)
+                i64.const 141733920768)
+            )"#,
+        )
+        .expect("selector WAT");
+        let transformer = wat::parse_str(
+            r#"(module
+              (memory (export "memory") 1)
+              (data (i32.const 0) "{\"body\":[123,34,109,111,100,101,108,34,58,34,112,114,111,118,105,100,101,114,34,44,34,99,104,97,110,103,101,100,34,58,116,114,117,101,125],\"metadata\":{}}")
+              (func (export "handle") (param i32 i32) (result i64)
+                i64.const 657129996288)
+            )"#,
+        )
+        .expect("transformer WAT");
+        std::fs::write(&selector_path, selector).expect("selector module");
+        std::fs::write(&transformer_path, transformer).expect("transformer module");
+        let config = pooler_config::compile_yaml(
+            "wasm-extension.yaml",
+            &format!(
+                "version: 1\nextensions:\n  selector:\n    wasm: {}\n    capabilities: [inspect]\n  transformer:\n    wasm: {}\n    capabilities: [transform]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nmodels:\n  - id: provider\n    targets: [{{provider: local, upstream_model: upstream-provider}}]\nroutes:\n  - id: wasm\n    listen: local\n    ingress: {{mode: patch, inspectors: [inspect.external.selector]}}\n    request:\n      steps:\n        - use: transform.external.transformer\n          with: {{pointer: /unused, value: null}}\n    response: {{mode: opaque}}\n    target: {{provider: local, model_from: inspected.model}}\n",
+                selector_path.display(),
+                transformer_path.display(),
+            ),
+        )
+        .expect("WASM extension config compiles");
+        let server = HttpProxyServer::bind(config)
+            .await
+            .expect("WASM extension does not require bwrap");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let response = send_request(
+            address,
+            b"POST / HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert_eq!(status(&response), 200);
+        let upstream_request = upstream.await.expect("upstream request");
+        let upstream_request = String::from_utf8_lossy(&upstream_request);
+        assert!(upstream_request.contains("\"model\":\"upstream-provider\""));
+        assert!(upstream_request.contains("\"changed\":true"));
         stop_server(&server, runner).await;
     }
 
@@ -1775,6 +2022,186 @@ mod tests {
             String::from_utf8_lossy(&requests[1]).contains("authorization: Bearer second-token")
         );
         stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_pooling_state_survives_server_restart() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("pooling upstream binds");
+        let upstream_address = upstream_listener
+            .local_addr()
+            .expect("pooling upstream address");
+        let upstream = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = upstream_listener
+                    .accept()
+                    .await
+                    .expect("pooling upstream accepts");
+                let request = read_request(&mut stream)
+                    .await
+                    .expect("pooling request bytes");
+                let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let first = request_text.contains("bearer first-token");
+                let (status, reason, body, headers) = if first {
+                    (
+                        429,
+                        "Too Many Requests",
+                        b"quota".as_slice(),
+                        "x-error-code: insufficient_quota\r\nRetry-After: 1\r\n",
+                    )
+                } else {
+                    (200, "OK", b"ok".as_slice(), "")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n",
+                    body.len(),
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("pooling response headers");
+                stream.write_all(body).await.expect("pooling response body");
+                requests.push(request);
+            }
+            requests
+        });
+
+        let first_secret = TestSecret::new("first-token");
+        let second_secret = TestSecret::new("second-token");
+        let config = pooler_config::compile_yaml(
+            "pooling-restart.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{accounts: [first, second]}}\npolicies:\n  pooled:\n    selection:\n      strategy: ordered_fallback\n      account_pool: pool\n      affinity: {{key: header:x-session, ttl: 10m, rebind: true}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
+                first_secret.reference(),
+                second_secret.reference()
+            ),
+        )
+        .expect("pooling restart config");
+
+        let directory = tempdir().expect("pooling store directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("pooling store directory permissions");
+        }
+        let store_path = directory.path().join("credentials.sqlite3");
+        let master_key = MasterKey::from_bytes(b"pooling-restart-test-key").expect("master key");
+        let store = SqliteStore::open_encrypted(&store_path, master_key.clone()).expect("store");
+        let pooling = Arc::new(
+            PoolingCoordinator::with_store(&config, Arc::new(store.clone()))
+                .expect("pooling coordinator"),
+        );
+        let server = HttpProxyServer::bind_with_pooling(config.clone(), pooling)
+            .await
+            .expect("pooling server binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"public","value":true}"#;
+        let request = format!(
+            "POST /pooled HTTP/1.1\r\nHost: test\r\nX-Session: restart-session\r\nContent-Type: application/json\r\nIdempotency-Key: pooling-restart-1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response = send_request(address, request.as_bytes()).await;
+        assert_eq!(status(&response), 200);
+        assert_eq!(response_body(&response), b"ok");
+        upstream.await.expect("pooling upstream task");
+
+        server
+            .pooling()
+            .disable_credential(&pooler_core::CredentialId::new("first").expect("credential"));
+        stop_server(&server, runner).await;
+        drop(server);
+
+        let persisted_states = store.credential_states().expect("credential states");
+        assert!(persisted_states
+            .iter()
+            .any(|state| state.credential_id == "first" && !state.enabled));
+        assert!(store
+            .cooldowns(0)
+            .expect("cooldowns")
+            .iter()
+            .any(|cooldown| cooldown.scope == "credential" && cooldown.key == "first"));
+        assert!(!store.session_affinities(0).expect("affinities").is_empty());
+        assert!(store.decisions().expect("decisions").len() >= 2);
+
+        let restart_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("restart upstream binds");
+        let restart_address = restart_listener
+            .local_addr()
+            .expect("restart upstream address");
+        let restart_upstream = tokio::spawn(async move {
+            let (mut stream, _) = restart_listener
+                .accept()
+                .await
+                .expect("restart upstream accepts");
+            let request = read_request(&mut stream)
+                .await
+                .expect("restart request bytes");
+            let body = b"restarted";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("restart response headers");
+            stream.write_all(body).await.expect("restart response body");
+            request
+        });
+        let restart_yaml = format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{restart_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{accounts: [first, second]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, account_pool: pool, affinity: {{key: header:x-session, ttl: 10m, rebind: true}}}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
+            first_secret.reference(),
+            second_secret.reference()
+        );
+        let restarted_config = pooler_config::compile_yaml("pooling-restart.yaml", &restart_yaml)
+            .expect("restart config");
+        let restarted_store =
+            SqliteStore::open_encrypted(&store_path, master_key).expect("reopen store");
+        let restarted_pooling = Arc::new(
+            PoolingCoordinator::with_store(&restarted_config, Arc::new(restarted_store.clone()))
+                .expect("restarted pooling coordinator"),
+        );
+        let restarted_server =
+            HttpProxyServer::bind_with_pooling(restarted_config, restarted_pooling)
+                .await
+                .expect("restarted server binds");
+        let restarted_runner = {
+            let server = restarted_server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let restarted_request = format!(
+            "POST /pooled HTTP/1.1\r\nHost: test\r\nX-Session: restart-session\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let restarted_response = send_request(
+            listener_address(&restarted_server, "local"),
+            restarted_request.as_bytes(),
+        )
+        .await;
+        assert_eq!(status(&restarted_response), 200);
+        assert_eq!(response_body(&restarted_response), b"restarted");
+        let restarted_request = restart_upstream.await.expect("restart upstream task");
+        assert!(String::from_utf8_lossy(&restarted_request)
+            .to_ascii_lowercase()
+            .contains("authorization: bearer second-token"));
+        assert!(
+            restarted_store
+                .decisions()
+                .expect("restarted decisions")
+                .len()
+                >= 3
+        );
+        stop_server(&restarted_server, restarted_runner).await;
     }
 
     #[tokio::test]

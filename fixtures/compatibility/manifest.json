@@ -9,6 +9,20 @@
       "equivalence": "event_semantic",
       "status": "sanitized_local_reference",
       "source": "sanitized fx-cliproxy-bridge local reference",
+      "supported_capabilities": [
+        "text",
+        "reasoning",
+        "tools",
+        "streaming",
+        "usage",
+        "response_metadata"
+      ],
+      "unsupported_capabilities": [
+        "images",
+        "audio",
+        "files",
+        "computer_use"
+      ],
       "notes": [
         "This fixture is not evidence of compatibility with a current Factory client."
       ]
@@ -21,6 +35,18 @@
       "equivalence": "json_structural",
       "status": "sanitized_local_reference",
       "source": "sanitized fx-cliproxy-bridge local reference",
+      "supported_capabilities": [
+        "text",
+        "tools",
+        "streaming",
+        "usage",
+        "response_metadata"
+      ],
+      "unsupported_capabilities": [
+        "reasoning_events",
+        "images",
+        "audio"
+      ],
       "notes": [
         "This fixture is not evidence of compatibility with a current Factory client."
       ]
@@ -33,6 +59,20 @@
       "equivalence": "protobuf_semantic",
       "status": "sanitized_cross_language",
       "source": "sanitized widevin and oh-my-pi reference sources",
+      "supported_capabilities": [
+        "text",
+        "reasoning",
+        "tools",
+        "streaming",
+        "usage",
+        "connect_rpc",
+        "protobuf"
+      ],
+      "unsupported_capabilities": [
+        "audio",
+        "files",
+        "websocket"
+      ],
       "notes": [
         "This fixture is not evidence of compatibility with a current Devin client."
       ]
@@ -45,6 +85,15 @@
       "equivalence": "config_structural",
       "status": "not_established",
       "source": "Pooler preset example",
+      "supported_capabilities": [
+        "opaque_http",
+        "json_patch",
+        "model_routing",
+        "reasoning_effort_transform"
+      ],
+      "unsupported_capabilities": [
+        "semantic_streaming"
+      ],
       "notes": [
         "No current Cursor client fixture is committed; compatibility is not claimed."
       ]
@@ -57,6 +106,13 @@
       "equivalence": "config_structural",
       "status": "not_established",
       "source": "Pooler example configuration",
+      "supported_capabilities": [
+        "opaque_http",
+        "status_gated_native_provider"
+      ],
+      "unsupported_capabilities": [
+        "live_native_provider"
+      ],
       "notes": [
         "No live provider authorization or conformance fixture is committed."
       ]

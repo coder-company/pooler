@@ -4,13 +4,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use pooler_config::{Config, ConfigCandidate, ConfigWatcher};
-use pooler_http::NativeRuntime;
+use pooler_http::{NativeRuntime, PoolingCoordinator};
 use pooler_store::{SqliteOAuthTokenStore, SqliteStore};
 
 mod auth;
+mod doctor;
 mod fixture_replay;
 pub use auth::AuthCommand;
 
@@ -124,6 +125,12 @@ pub enum FixtureReportFormat {
 pub enum ConfigCommand {
     /// Print the source after validating it.
     Render,
+    /// Print the deterministic source-configuration JSON Schema.
+    Schema {
+        /// Write the schema to a file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Runs one CLI command.
@@ -142,6 +149,19 @@ pub fn run(cli: Cli) -> Result<()> {
             print!("{rendered}");
             Ok(())
         }
+        Command::Config {
+            command: ConfigCommand::Schema { output },
+        } => {
+            let rendered = pooler_config::render_config_schema();
+            if let Some(path) = output {
+                std::fs::write(&path, rendered.as_bytes()).with_context(|| {
+                    format!("could not write config schema `{}`", path.display())
+                })?;
+            } else {
+                print!("{rendered}");
+            }
+            Ok(())
+        }
         Command::Routes => {
             let config = load(&cli.config)?;
             for route in config.routes() {
@@ -155,7 +175,11 @@ pub fn run(cli: Cli) -> Result<()> {
             cli.credential_key_ref.as_deref(),
             cli.watch,
         ),
-        Command::Doctor => bail!("doctor is not implemented in the engineering baseline"),
+        Command::Doctor => doctor::run(
+            &cli.config,
+            cli.credential_store.as_deref(),
+            cli.credential_key_ref.as_deref(),
+        ),
         Command::Models => {
             let config = load(&cli.config)?;
             for model in config.models().values() {
@@ -205,15 +229,19 @@ fn serve(
 ) -> Result<()> {
     let watcher = ConfigWatcher::new(path)?;
     let config = watcher.active().compile()?;
-    let native = native_runtime(&config, explicit_store_path, credential_key_ref)?;
+    let resources = runtime_resources(&config, explicit_store_path, credential_key_ref)?;
     pooler_observe::init_tracing().context("failed to initialize structured logging")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to initialize the async runtime")?;
     runtime.block_on(async move {
-        let server =
-            pooler_server::HttpProxyServer::bind_with_native_runtime(config, native).await?;
+        let server = pooler_server::HttpProxyServer::bind_with_native_runtime_and_pooling(
+            config,
+            resources.native,
+            resources.pooling,
+        )
+        .await?;
         for listener in server.listener_addresses() {
             tracing::info!(
                 listener = listener.id(),
@@ -256,7 +284,6 @@ fn serve(
                 reload_runner
                     .await
                     .context("configuration reload task panicked")?
-                    .map_err(anyhow::Error::from)
             }
         }
     })
@@ -359,29 +386,44 @@ async fn apply_reload_candidate(
     Ok(())
 }
 
-fn native_runtime(
+struct RuntimeResources {
+    native: Arc<NativeRuntime>,
+    pooling: Arc<PoolingCoordinator>,
+}
+
+fn runtime_resources(
     config: &pooler_config::CompiledConfig,
     explicit_store_path: Option<&std::path::Path>,
     credential_key_ref: Option<&str>,
-) -> Result<Arc<NativeRuntime>> {
+) -> Result<RuntimeResources> {
     let has_codex = config.upstreams().values().any(|upstream| {
         upstream
             .native()
             .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
     });
-    if !has_codex {
-        return Ok(Arc::new(NativeRuntime::disabled()));
+    if explicit_store_path.is_none() && !has_codex {
+        return Ok(RuntimeResources {
+            native: Arc::new(NativeRuntime::disabled()),
+            pooling: Arc::new(PoolingCoordinator::new(config)?),
+        });
     }
     let store_path = auth::credential_store_path(explicit_store_path)?;
-    let master_key = auth::load_master_key(credential_key_ref)
-        .context("native providers require an encrypted credential-store key")?;
+    let master_key = auth::load_master_key(credential_key_ref).context(
+        "credential-store persistence requires --credential-key-ref (use env:, file:, or keyring:)",
+    )?;
     let store = SqliteStore::open_encrypted(store_path, master_key)
         .context("could not open encrypted credential store")?;
-    let token_store = Arc::new(SqliteOAuthTokenStore::new(store));
-    Ok(Arc::new(NativeRuntime::new_with_sqlite(
+    let pooling = Arc::new(PoolingCoordinator::with_store(
         config,
-        token_store,
-    )?))
+        Arc::new(store.clone()),
+    )?);
+    let native = if has_codex {
+        let token_store = Arc::new(SqliteOAuthTokenStore::new(store));
+        Arc::new(NativeRuntime::new_with_sqlite(config, token_store)?)
+    } else {
+        Arc::new(NativeRuntime::disabled())
+    };
+    Ok(RuntimeResources { native, pooling })
 }
 
 #[cfg(unix)]
@@ -417,10 +459,70 @@ mod tests {
     }
 
     #[test]
+    fn config_schema_command_accepts_an_output_path() {
+        let cli = Cli::try_parse_from(["pooler", "config", "schema", "--output", "schema.json"])
+            .expect("schema command should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Config {
+                command: ConfigCommand::Schema { output: Some(path) }
+            } if path == PathBuf::from("schema.json")
+        ));
+    }
+
+    #[test]
     fn serve_command_is_available() {
         let cli = Cli::try_parse_from(["pooler", "serve"]).expect("command should parse");
         let error = run(cli).expect_err("missing default config should be reported");
         assert!(error.to_string().contains("failed to read configuration"));
+    }
+
+    #[test]
+    fn explicit_credential_store_wires_pooling_persistence() {
+        let directory = tempfile::tempdir().expect("temporary store directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("store directory permissions");
+        }
+        let key_path = directory.path().join("store-key");
+        std::fs::write(&key_path, b"cli-pooling-test-key").expect("key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("key file permissions");
+        }
+        let store_path = directory.path().join("credentials.sqlite3");
+        let config = pooler_config::compile_yaml(
+            "cli-pooling.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+accounts:
+  account: {provider: local, secret: env:POOLER_TEST_ACCOUNT}
+account_pools: {pool: {accounts: [account]}}
+policies:
+  pooled: {selection: {strategy: fill_first, account_pool: pool}}
+routes:
+  - id: pooled
+    listen: local
+    target: {provider: local, policy: pooled}
+"#,
+        )
+        .expect("pooling config");
+        let key_reference = format!("file:{}", key_path.display());
+        let resources = runtime_resources(&config, Some(&store_path), Some(&key_reference))
+            .expect("runtime resources");
+        let states = resources
+            .pooling
+            .credential_states()
+            .expect("credential states");
+        assert!(states
+            .iter()
+            .any(|state| state.credential_id == "account" && state.enabled));
     }
 
     #[test]

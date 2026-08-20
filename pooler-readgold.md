@@ -52,8 +52,14 @@ name or advertised without conformance evidence.
   verified. Authenticated read-only management, atomic dependency-aware reload,
   bounded metrics/traces, owner-private sanitized capture, executable fixture replay,
   a truthful compatibility matrix, and five cargo-fuzz targets are wired and tested.
-- Phase 8 — hardening and release: pending.
-- First useful release acceptance: pending.
+- Phase 8 — hardening and release: implemented and locally verified on Linux x86_64.
+  Locked audit/deny gates, deterministic schema and compatibility reports, real
+  mixed-protocol stress/benchmarks, no-import WASM extensions, deep-test/fuzz
+  workflows, reproducible archives, SBOMs, checksums, signing, and provenance jobs
+  are wired. Native cross-platform CI, signed release artifacts, and a final benchmark
+  rerun on the release commit remain publication gates.
+- First useful release acceptance: pending; the authoritative checklist is
+  [`docs/release-acceptance.md`](docs/release-acceptance.md).
 
 ## Verification gates
 

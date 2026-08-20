@@ -1,11 +1,11 @@
 # Compatibility matrix
 
-This report is generated from `fixtures/compatibility/manifest.json`. Reference-only rows do not claim compatibility with a current client or live provider.
+This report is generated from `fixtures/compatibility/manifest.json`. Reference-only rows do not claim compatibility with a current client or live provider. Supported capabilities describe the exercised Pooler surface; unsupported capabilities are not silently inferred from a route name.
 
-| Adapter | Protocol | Fixture version | Equivalence | Evidence | Provenance | Notes | Fixture |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| codex | native-provider | status-gated-v1 | config_structural | not established | Pooler example configuration | No live provider authorization or conformance fixture is committed. | `../../config/pooler.example.yaml` |
-| cursor | http-json-patch | preset-v1 | config_structural | not established | Pooler preset example | No current Cursor client fixture is committed; compatibility is not claimed. | `../../config/cursor.example.yaml` |
-| devin | connect-rpc | v1 | protobuf_semantic | sanitized cross-language reference (compatibility not claimed) | sanitized widevin and oh-my-pi reference sources | This fixture is not evidence of compatibility with a current Devin client. | `../devin/connect/chat-stream.json` |
-| factory | language-model-v3 | v3 | event_semantic | sanitized local reference (compatibility not claimed) | sanitized fx-cliproxy-bridge local reference | This fixture is not evidence of compatibility with a current Factory client. | `../factory/fx-cliproxy-bridge-v3.json` |
-| factory | language-model-v3 | v3-text | json_structural | sanitized local reference (compatibility not claimed) | sanitized fx-cliproxy-bridge local reference | This fixture is not evidence of compatibility with a current Factory client. | `../factory/fx-cliproxy-bridge-text.json` |
+| Adapter | Protocol | Fixture version | Equivalence | Evidence | Provenance | Supported capabilities | Unsupported capabilities | Notes | Fixture |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| codex | native-provider | status-gated-v1 | config_structural | not established | Pooler example configuration | opaque_http, status_gated_native_provider | live_native_provider | No live provider authorization or conformance fixture is committed. | `../../config/pooler.example.yaml` |
+| cursor | http-json-patch | preset-v1 | config_structural | not established | Pooler preset example | opaque_http, json_patch, model_routing, reasoning_effort_transform | semantic_streaming | No current Cursor client fixture is committed; compatibility is not claimed. | `../../config/cursor.example.yaml` |
+| devin | connect-rpc | v1 | protobuf_semantic | sanitized cross-language reference (compatibility not claimed) | sanitized widevin and oh-my-pi reference sources | text, reasoning, tools, streaming, usage, connect_rpc, protobuf | audio, files, websocket | This fixture is not evidence of compatibility with a current Devin client. | `../devin/connect/chat-stream.json` |
+| factory | language-model-v3 | v3 | event_semantic | sanitized local reference (compatibility not claimed) | sanitized fx-cliproxy-bridge local reference | text, reasoning, tools, streaming, usage, response_metadata | images, audio, files, computer_use | This fixture is not evidence of compatibility with a current Factory client. | `../factory/fx-cliproxy-bridge-v3.json` |
+| factory | language-model-v3 | v3-text | json_structural | sanitized local reference (compatibility not claimed) | sanitized fx-cliproxy-bridge local reference | text, tools, streaming, usage, response_metadata | reasoning_events, images, audio | This fixture is not evidence of compatibility with a current Factory client. | `../factory/fx-cliproxy-bridge-text.json` |

@@ -26,3 +26,20 @@ cargo fuzz run tool_deltas fuzz/corpus/tool-deltas
 The Connect target accepts both raw bytes and the hexadecimal seed files in
 this repository. Fuzz output is local work product and is not a compatibility
 fixture.
+
+The bounded release workflow runs all five targets with
+[`scripts/deep-test.sh`](../scripts/deep-test.sh). It also executes the
+failure-injection, cancellation, URL-boundary, and redaction suites before
+fuzzing. The default local budget is five seconds per target; CI can require
+the optional cargo-fuzz and nightly sanitizer toolchains explicitly:
+
+```sh
+scripts/deep-test.sh --no-fuzz
+POOLER_FUZZ_SECONDS=30 scripts/deep-test.sh
+POOLER_REQUIRE_SANITIZER=1 scripts/deep-test.sh --sanitize --no-fuzz
+```
+
+Sanitizer runs require a nightly toolchain with `rust-src`. They are skipped
+when that toolchain is unavailable locally, unless
+`POOLER_REQUIRE_SANITIZER=1` is set. No fuzz artifacts or crash inputs are
+written into the committed corpus by the workflow.

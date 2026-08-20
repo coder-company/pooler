@@ -3,7 +3,7 @@
 //! The crate deliberately keeps secret acquisition behind explicit policy and
 //! backend boundaries.  Parsing a [`SecretRef`] never reads a source, and the
 //! default resolver will not execute commands, accept literals, or silently
-//! invent an OS keyring implementation.
+//! use an OS keyring implementation unless the optional backend is enabled.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -21,8 +21,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+mod keyring_backend;
 mod oauth;
 
+pub use keyring_backend::{KeyringBackend, KeyringProvider, OsKeyringBackend};
 pub use oauth::*;
 
 /// A secret held in memory and zeroized when dropped.
@@ -198,9 +200,12 @@ impl SecretRef {
         }
     }
 
-    /// Resolve with the default restrictive policy and no external backend.
+    /// Resolve with the default restrictive policy and optional OS keyring.
     pub fn resolve(&self) -> Result<SecretValue, SecretError> {
-        self.resolve_with(&SecretResolveOptions::default(), &EmptySecretBackend)
+        self.resolve_with(
+            &SecretResolveOptions::default(),
+            &OsKeyringBackend::default(),
+        )
     }
 
     /// Resolve with an explicit policy and backend.
@@ -243,7 +248,7 @@ impl SecretRef {
         &self,
         options: &SecretResolveOptions,
     ) -> Result<SecretValue, SecretError> {
-        self.resolve_with(options, &EmptySecretBackend)
+        self.resolve_with(options, &OsKeyringBackend::default())
     }
 }
 
@@ -400,6 +405,9 @@ pub enum SecretError {
     /// Keyring or command resolution requires a configured backend.
     #[error("secret backend is unavailable: {0}")]
     BackendUnavailable(&'static str),
+    /// The optional native OS keyring is disabled or could not be accessed.
+    #[error("OS keyring is unavailable")]
+    KeyringUnavailable,
     /// A source returned an empty value.
     #[error("secret source returned an empty value")]
     EmptySecret,
@@ -465,10 +473,6 @@ pub trait SecretBackend: Send + Sync {
         Ok(None)
     }
 }
-
-struct EmptySecretBackend;
-
-impl SecretBackend for EmptySecretBackend {}
 
 /// Check that a credential file is a regular owner-only file.
 ///

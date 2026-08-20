@@ -9,7 +9,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use pooler_auth::{SecretBackend, SecretRef, SecretResolveOptions, SecretValue};
+use pooler_auth::{OsKeyringBackend, SecretBackend, SecretRef, SecretResolveOptions, SecretValue};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::digest::{digest, SHA256};
 use ring::hkdf::{KeyType, Salt, HKDF_SHA256};
@@ -55,7 +55,11 @@ impl MasterKey {
     /// secrets for another purpose.  A production persistence key must cross
     /// an external secret boundary.
     pub fn from_secret_ref(reference: &SecretRef) -> StoreResult<Self> {
-        Self::from_secret_ref_with(reference, &SecretResolveOptions::default(), &NoBackend)
+        Self::from_secret_ref_with(
+            reference,
+            &SecretResolveOptions::default(),
+            &OsKeyringBackend::default(),
+        )
     }
 
     /// Resolve a master key with an explicit external secret backend.
@@ -295,13 +299,24 @@ fn authenticated_data(header: &[u8], associated_data: &[u8]) -> Vec<u8> {
     aad
 }
 
-struct NoBackend;
-
-impl SecretBackend for NoBackend {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MockKeyring;
+
+    impl SecretBackend for MockKeyring {
+        fn keyring(
+            &self,
+            service: &str,
+            account: &str,
+        ) -> Result<Option<SecretValue>, pooler_auth::SecretError> {
+            if service == "pooler" && account == "master" {
+                return Ok(Some(SecretValue::new("master secret")));
+            }
+            Ok(None)
+        }
+    }
 
     #[test]
     fn key_derivation_is_stable_but_debug_is_redacted() {
@@ -309,6 +324,24 @@ mod tests {
         let second = MasterKey::from_bytes(b"master secret").expect("key");
         assert_eq!(first.key_id(), second.key_id());
         assert_eq!(format!("{first:?}"), "MasterKey([REDACTED])");
+    }
+
+    #[test]
+    fn master_key_resolves_keyring_reference_through_injected_backend() {
+        let reference = SecretRef::parse("keyring:pooler/master").expect("reference");
+        let key = MasterKey::from_secret_ref_with(
+            &reference,
+            &SecretResolveOptions::default(),
+            &MockKeyring,
+        )
+        .expect("master key");
+        assert_eq!(
+            key.key_id(),
+            MasterKey::from_bytes(b"master secret")
+                .expect("master key")
+                .key_id()
+        );
+        assert_eq!(format!("{key:?}"), "MasterKey([REDACTED])");
     }
 
     #[test]

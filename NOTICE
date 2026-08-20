@@ -1,0 +1,17 @@
+Pooler
+
+Copyright 2026 Pooler contributors.
+
+Pooler is distributed under the Apache License, Version 2.0.  The complete
+license text is in LICENSE.
+
+The Devin/Cascade protobuf sources vendored under crates/adapter-devin/proto
+are derived from the widevin project at commit
+6c48392052caaecca820ec41df9d87ed818dfc21.  Those sources are distributed
+under their upstream MIT license, preserved in
+crates/adapter-devin/LICENSE.widevin.  Their provenance is documented in
+crates/adapter-devin/NOTICE and fixtures/devin/README.md.
+
+Release archives include machine-readable CycloneDX and SPDX software-bill-of-
+materials files under sbom/.  Those files identify the licenses and sources of
+the Rust dependencies used to build each archive.

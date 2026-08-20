@@ -1,0 +1,1112 @@
+{
+  "$comment": "Imports and overlay directives are resolved before strict Config parsing; semantic reference and route validation is performed by pooler check.",
+  "$defs": {
+    "account": {
+      "additionalProperties": false,
+      "not": {
+        "required": [
+          "merge",
+          "remove"
+        ]
+      },
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "max_concurrency": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "merge": true,
+        "provider": {
+          "type": "string"
+        },
+        "remove": true,
+        "secret": {
+          "$ref": "#/$defs/secret_ref"
+        },
+        "upstream": {
+          "type": "string"
+        },
+        "weight": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "account_pool": {
+      "additionalProperties": false,
+      "not": {
+        "required": [
+          "merge",
+          "remove"
+        ]
+      },
+      "properties": {
+        "accounts": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "members": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "merge": true,
+        "remove": true
+      },
+      "type": "object"
+    },
+    "affinity": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "rebind": {
+          "type": "boolean"
+        },
+        "ttl": {
+          "$ref": "#/$defs/duration"
+        }
+      },
+      "type": "object"
+    },
+    "auth": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "bearer",
+            "bearer_secret"
+          ],
+          "type": "string"
+        },
+        "secret": {
+          "$ref": "#/$defs/secret_ref"
+        }
+      },
+      "type": "object"
+    },
+    "body": {
+      "additionalProperties": false,
+      "properties": {
+        "decoder": {
+          "type": "string"
+        },
+        "encoder": {
+          "type": "string"
+        },
+        "framing": {
+          "type": "string"
+        },
+        "inspectors": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "mode": {
+          "enum": [
+            "opaque",
+            "inspect",
+            "patch",
+            "semantic"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "cooldown": {
+      "additionalProperties": false,
+      "properties": {
+        "duration": {
+          "$ref": "#/$defs/duration"
+        },
+        "scope": {
+          "enum": [
+            "credential",
+            "credential_model",
+            "model",
+            "provider",
+            "provider_model",
+            "route"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "duration": {
+      "oneOf": [
+        {
+          "pattern": "^[0-9]+(ms|s|m|h)$",
+          "type": "string"
+        },
+        {
+          "minimum": 0,
+          "type": "integer"
+        }
+      ]
+    },
+    "extension": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "args": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 0,
+              "type": "array"
+            },
+            "capabilities": {
+              "items": {
+                "enum": [
+                  "inspect",
+                  "transform"
+                ],
+                "type": "string"
+              },
+              "maxItems": 2,
+              "minItems": 1,
+              "type": "array"
+            },
+            "command": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "limits": {
+              "$ref": "#/$defs/extension_limits"
+            },
+            "wasm": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "capabilities"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "args": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 0,
+              "type": "array"
+            },
+            "capabilities": {
+              "items": {
+                "enum": [
+                  "inspect",
+                  "transform"
+                ],
+                "type": "string"
+              },
+              "maxItems": 2,
+              "minItems": 1,
+              "type": "array"
+            },
+            "command": {
+              "type": "string"
+            },
+            "limits": {
+              "$ref": "#/$defs/extension_limits"
+            },
+            "wasm": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "wasm",
+            "capabilities"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "extension_limits": {
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrency": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_input_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_memory_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_output_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration"
+        }
+      },
+      "type": "object"
+    },
+    "import": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "file": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "file"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "overlay": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "overlay"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "as": {
+              "pattern": "^[A-Za-z0-9._-]{1,128}$",
+              "type": "string"
+            },
+            "preset": {
+              "enum": [
+                "cursor",
+                "devin"
+              ],
+              "type": "string"
+            },
+            "with": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "preset"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "listener": {
+      "additionalProperties": false,
+      "not": {
+        "required": [
+          "merge",
+          "remove"
+        ]
+      },
+      "properties": {
+        "bind": {
+          "type": "string"
+        },
+        "merge": true,
+        "remove": true
+      },
+      "type": "object"
+    },
+    "management": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_remote": {
+          "type": "boolean"
+        },
+        "auth": {
+          "$ref": "#/$defs/auth"
+        },
+        "authentication": {
+          "$ref": "#/$defs/auth"
+        },
+        "bind": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "listen": {
+          "type": "string"
+        },
+        "remote": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "match": {
+      "additionalProperties": false,
+      "properties": {
+        "content_types": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "host": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "methods": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "path": {
+          "type": "string"
+        },
+        "path_prefix": {
+          "type": "string"
+        },
+        "path_template": {
+          "type": "string"
+        },
+        "websocket": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "model": {
+      "additionalProperties": false,
+      "not": {
+        "required": [
+          "merge",
+          "remove"
+        ]
+      },
+      "properties": {
+        "id": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        },
+        "merge": true,
+        "remove": true,
+        "targets": {
+          "items": {
+            "$ref": "#/$defs/model_target"
+          },
+          "minItems": 0,
+          "type": "array"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "model_target": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "items": {
+            "enum": [
+              "text",
+              "images",
+              "audio",
+              "files",
+              "tools",
+              "reasoning",
+              "streaming",
+              "usage",
+              "structured_output",
+              "json_schema",
+              "function_calling",
+              "tool_choice",
+              "cache_hints",
+              "continuation",
+              "response_metadata",
+              "encrypted_reasoning",
+              "refusal",
+              "error_events",
+              "input_audio",
+              "output_audio",
+              "code_execution",
+              "computer_use",
+              "batch",
+              "embeddings",
+              "sse",
+              "web_socket",
+              "connect_rpc",
+              "protobuf"
+            ],
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "upstream": {
+          "type": "string"
+        },
+        "upstream_model": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "native": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "quota_endpoint": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "oauth": {
+      "additionalProperties": false,
+      "properties": {
+        "authorization_endpoint": {
+          "type": "string"
+        },
+        "callback": {
+          "type": "string"
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "identity_endpoint": {
+          "type": "string"
+        },
+        "revocation_endpoint": {
+          "type": "string"
+        },
+        "revoke_endpoint": {
+          "type": "string"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "token_endpoint": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "policy": {
+      "additionalProperties": false,
+      "not": {
+        "required": [
+          "merge",
+          "remove"
+        ]
+      },
+      "properties": {
+        "account_pool": {
+          "type": "string"
+        },
+        "cooldown": {
+          "$ref": "#/$defs/cooldown"
+        },
+        "merge": true,
+        "pool": {
+          "type": "string"
+        },
+        "remove": true,
+        "retry": {
+          "$ref": "#/$defs/retry"
+        },
+        "selection": {
+          "$ref": "#/$defs/selection"
+        },
+        "stream": {
+          "$ref": "#/$defs/stream"
+        }
+      },
+      "type": "object"
+    },
+    "request": {
+      "additionalProperties": false,
+      "properties": {
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/request_step"
+          },
+          "maxItems": 32,
+          "minItems": 0,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "request_step": {
+      "additionalProperties": false,
+      "properties": {
+        "use": {
+          "pattern": "^(transform\\.json\\.set|transform\\.json\\.set_when_model_prefix|transform\\.external\\.[A-Za-z0-9._-]+)$",
+          "type": "string"
+        },
+        "with": {
+          "$ref": "#/$defs/transform_parameters"
+        }
+      },
+      "required": [
+        "use",
+        "with"
+      ],
+      "type": "object"
+    },
+    "retry": {
+      "additionalProperties": false,
+      "properties": {
+        "base_delay": {
+          "$ref": "#/$defs/duration"
+        },
+        "before_commit_only": {
+          "type": "boolean"
+        },
+        "max_attempts": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_credentials": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_delay": {
+          "$ref": "#/$defs/duration"
+        },
+        "max_elapsed": {
+          "$ref": "#/$defs/duration"
+        },
+        "max_providers": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_recovery_wait": {
+          "$ref": "#/$defs/duration"
+        },
+        "max_total_delay": {
+          "$ref": "#/$defs/duration"
+        },
+        "maximum_attempts": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_credentials": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_delay": {
+          "$ref": "#/$defs/duration"
+        },
+        "maximum_elapsed": {
+          "$ref": "#/$defs/duration"
+        },
+        "maximum_providers": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_recovery_wait": {
+          "$ref": "#/$defs/duration"
+        },
+        "maximum_total_delay": {
+          "$ref": "#/$defs/duration"
+        },
+        "retryable_statuses": {
+          "items": {
+            "maximum": 599,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "statuses": {
+          "items": {
+            "maximum": 599,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minItems": 0,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "route": {
+      "additionalProperties": false,
+      "not": {
+        "required": [
+          "merge",
+          "remove"
+        ]
+      },
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/auth"
+        },
+        "downstream_auth": {
+          "$ref": "#/$defs/auth"
+        },
+        "id": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        },
+        "ingress": {
+          "$ref": "#/$defs/body"
+        },
+        "limits": {
+          "$ref": "#/$defs/route_limits"
+        },
+        "listen": {
+          "type": "string"
+        },
+        "listener": {
+          "type": "string"
+        },
+        "loss_policy": {
+          "enum": [
+            "reject",
+            "preserve",
+            "degrade"
+          ],
+          "type": "string"
+        },
+        "match": {
+          "$ref": "#/$defs/match"
+        },
+        "merge": true,
+        "policy": {
+          "type": "string"
+        },
+        "priority": {
+          "maximum": 2147483647,
+          "minimum": -2147483648,
+          "type": "integer"
+        },
+        "remove": true,
+        "request": {
+          "$ref": "#/$defs/request"
+        },
+        "response": {
+          "$ref": "#/$defs/body"
+        },
+        "target": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/target"
+            }
+          ]
+        },
+        "upstream": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "route_limits": {
+      "additionalProperties": false,
+      "properties": {
+        "connect_timeout": {
+          "$ref": "#/$defs/duration"
+        },
+        "max_bootstrap_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_bootstrap_events": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_event_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_frame_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_header_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_header_count": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_queue_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_queue_items": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_request_body_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_response_body_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "request_timeout": {
+          "$ref": "#/$defs/duration"
+        }
+      },
+      "type": "object"
+    },
+    "secret_ref": {
+      "pattern": "^(env:[A-Za-z_][A-Za-z0-9_]*|file:.+|keyring:[^/]+/.+)$",
+      "type": "string"
+    },
+    "selection": {
+      "additionalProperties": false,
+      "properties": {
+        "account_pool": {
+          "type": "string"
+        },
+        "accounts": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "affinity": {
+          "$ref": "#/$defs/affinity"
+        },
+        "pool": {
+          "type": "string"
+        },
+        "session_affinity": {
+          "$ref": "#/$defs/duration"
+        },
+        "strategy": {
+          "enum": [
+            "round_robin",
+            "smooth_weighted_round_robin",
+            "fill_first",
+            "least_in_flight",
+            "health_weighted",
+            "ordered_fallback"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "stream": {
+      "additionalProperties": false,
+      "properties": {
+        "bootstrap_bytes": {
+          "oneOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "pattern": "^\\s*[0-9]+(b|kb|kib|mb|mib|gb|gib)\\s*$",
+              "type": "string"
+            }
+          ]
+        },
+        "bootstrap_events": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "bootstrap_timeout": {
+          "$ref": "#/$defs/duration"
+        }
+      },
+      "type": "object"
+    },
+    "target": {
+      "additionalProperties": false,
+      "properties": {
+        "model_from": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "policy": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "upstream": {
+          "type": "string"
+        },
+        "upstream_path": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "transform_parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "model_prefix": {
+          "type": "string"
+        },
+        "pointer": {
+          "type": "string"
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "value": {}
+      },
+      "required": [
+        "value"
+      ],
+      "type": "object"
+    },
+    "transport": {
+      "additionalProperties": false,
+      "properties": {
+        "base_url": {
+          "type": "string"
+        },
+        "connect_timeout": {
+          "pattern": "^[0-9]+(ms|s|m|h)$",
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "request_timeout": {
+          "pattern": "^[0-9]+(ms|s|m|h)$",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "upstream": {
+      "additionalProperties": false,
+      "not": {
+        "required": [
+          "merge",
+          "remove"
+        ]
+      },
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/auth"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "merge": true,
+        "native": {
+          "$ref": "#/$defs/native"
+        },
+        "oauth": {
+          "$ref": "#/$defs/oauth"
+        },
+        "remove": true,
+        "transport": {
+          "$ref": "#/$defs/transport"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://coder-company.github.io/pooler/schemas/config-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "account_pools": {
+      "additionalProperties": {
+        "$ref": "#/$defs/account_pool"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]{1,128}$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "accounts": {
+      "additionalProperties": {
+        "$ref": "#/$defs/account"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]{1,128}$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "credentials": {
+      "additionalProperties": {
+        "$ref": "#/$defs/account"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]{1,128}$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "extensions": {
+      "additionalProperties": {
+        "$ref": "#/$defs/extension"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]{1,128}$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "imports": {
+      "items": {
+        "$ref": "#/$defs/import"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "listeners": {
+      "additionalProperties": {
+        "$ref": "#/$defs/listener"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]{1,128}$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "management": {
+      "$ref": "#/$defs/management"
+    },
+    "models": {
+      "items": {
+        "$ref": "#/$defs/model"
+      },
+      "minItems": 0,
+      "type": "array"
+    },
+    "policies": {
+      "additionalProperties": {
+        "$ref": "#/$defs/policy"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]{1,128}$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "pools": {
+      "additionalProperties": {
+        "$ref": "#/$defs/account_pool"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]{1,128}$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "providers": {
+      "additionalProperties": {
+        "$ref": "#/$defs/upstream"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]{1,128}$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "routes": {
+      "items": {
+        "$ref": "#/$defs/route"
+      },
+      "minItems": 0,
+      "type": "array"
+    },
+    "upstreams": {
+      "additionalProperties": {
+        "$ref": "#/$defs/upstream"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]{1,128}$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "version": {
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version"
+  ],
+  "title": "Pooler source configuration",
+  "type": "object"
+}

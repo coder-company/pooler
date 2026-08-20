@@ -1,0 +1,24 @@
+[package]
+name = "pooler-bench"
+description = "Deterministic performance and stress harness for Pooler release gates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+adapter-factory = { path = "../adapter-factory" }
+anyhow.workspace = true
+pooler-config = { path = "../pooler-config" }
+pooler-http = { path = "../pooler-http" }
+pooler-protocol = { path = "../pooler-protocol" }
+pooler-server = { path = "../pooler-server" }
+pooler-testkit = { path = "../pooler-testkit" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

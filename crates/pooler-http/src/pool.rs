@@ -1127,7 +1127,10 @@ pub(crate) fn apply_account_auth(
     let reference = match secret {
         SecretRef::Env(name) => AuthSecretRef::Env(name.to_string()),
         SecretRef::File(path) => AuthSecretRef::File(path.as_ref().into()),
-        SecretRef::Keyring { .. } => return Err(PoolError::Store),
+        SecretRef::Keyring { service, account } => AuthSecretRef::Keyring {
+            service: service.to_string(),
+            account: account.to_string(),
+        },
     };
     let value = reference.resolve().map_err(|_| PoolError::Store)?;
     if value.expose_secret().chars().any(char::is_whitespace) {

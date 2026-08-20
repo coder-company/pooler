@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.86"
 license = "Apache-2.0"
 repository = "https://github.com/coder-company/pooler"
 
@@ -22,6 +22,7 @@ hyper = { version = "1.6", features = ["http1", "server"] }
 hyper-rustls = { version = "=0.27.6", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 indexmap = { version = "=2.7.0", features = ["serde"] }
+keyring = { version = "=3.6.3", default-features = false }
 prost = "0.13"
 prost-build = "0.13"
 prost-types = "0.13"
@@ -32,7 +33,10 @@ rustix = { version = "0.38", features = ["fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_path_to_error = "0.1"
-serde_yml = "0.0.12"
+# Keep the existing local API name while using the maintained serde_yaml_ng
+# fork. The old serde_yml crate is archived and has a RustSec unsoundness
+# advisory.
+serde_yml = { package = "serde_yaml_ng", version = "0.10" }
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["full"] }
 tokio-util = "0.7"
@@ -41,6 +45,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.12", features = ["serde", "v4"] }
+wasmtime = { version = "=36.0.13", default-features = false, features = ["cranelift", "runtime", "wat"] }
+wat = "1.226.0"
 zeroize = "=1.8.1"
 
 [workspace.lints.rust]
