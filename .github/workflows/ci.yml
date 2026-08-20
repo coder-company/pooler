@@ -37,7 +37,7 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
           components: clippy,rustfmt
@@ -61,7 +61,7 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
           components: clippy,rustfmt
@@ -82,7 +82,7 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -104,7 +104,7 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # action implementation
+      - uses: ./.github/actions/setup-rust
         with:
           # cargo metadata must parse Rust-2024 target-only dependencies such
           # as security-framework; keep the product MSRV separate from the

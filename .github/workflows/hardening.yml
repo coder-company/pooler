@@ -33,7 +33,7 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -47,7 +47,7 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # nightly
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
           components: rust-src
@@ -69,7 +69,7 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -93,7 +93,7 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # nightly
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
           components: rust-src

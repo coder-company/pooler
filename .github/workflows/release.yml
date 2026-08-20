@@ -120,7 +120,7 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
 
       - name: Install the pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+        uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
           components: clippy,rustfmt
@@ -215,7 +215,7 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
 
       - name: Install the pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+        uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
           target: ${{ matrix.target }}
@@ -371,7 +371,7 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
 
       - name: Install the pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
+        uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
 

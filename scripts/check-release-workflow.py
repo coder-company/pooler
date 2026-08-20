@@ -245,6 +245,42 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
         fail("release.yml build matrix must retain all Linux and macOS release targets")
 
 
+def validate_rust_setup(
+    workflows: dict[str, dict[str, Any]], root: Path
+) -> None:
+    action_root = root / ".github" / "actions" / "setup-rust"
+    for name in ("action.yml", "setup.sh"):
+        if not (action_root / name).is_file():
+            fail(f"missing local Rust setup action file: {name}")
+
+    setup_count = 0
+    for workflow_name in ("ci.yml", "hardening.yml", "release.yml"):
+        jobs = mapping(workflows[workflow_name]["jobs"], f"{workflow_name}.jobs")
+        for job_id, raw_job in jobs.items():
+            job = mapping(raw_job, f"{workflow_name}.jobs.{job_id}")
+            steps = job.get("steps")
+            if steps is None:
+                continue
+            for step in sequence(steps, f"{workflow_name}.jobs.{job_id}.steps"):
+                step_map = mapping(step, f"{workflow_name}.jobs.{job_id}.step")
+                uses = step_map.get("uses")
+                if isinstance(uses, str) and "dtolnay/rust-toolchain" in uses:
+                    fail(f"{workflow_name}.jobs.{job_id} must not use global rustup state")
+                if uses == "./.github/actions/setup-rust":
+                    inputs = mapping(
+                        step_map.get("with"),
+                        f"{workflow_name}.jobs.{job_id} setup-rust.with",
+                    )
+                    if not isinstance(inputs.get("toolchain"), str):
+                        fail(
+                            f"{workflow_name}.jobs.{job_id} setup-rust requires a toolchain"
+                        )
+                    setup_count += 1
+
+    if setup_count != 11:
+        fail(f"expected 11 job-local Rust setup steps, found {setup_count}")
+
+
 def run_contents(job: dict[str, Any], context: str) -> str:
     steps = sequence(job.get("steps"), f"{context}.steps")
     runs = [step["run"] for step in steps if isinstance(step, dict) and "run" in step]
@@ -428,6 +464,7 @@ def main() -> int:
     release = load_workflow(paths["release.yml"])
     workflows = {**reusable, "release.yml": release}
     validate_runner_policy(workflows)
+    validate_rust_setup(workflows, root)
     validate_release(paths["release.yml"], reusable)
     print("release workflow dependency checks passed")
     return 0
