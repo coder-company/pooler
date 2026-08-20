@@ -1,0 +1,36 @@
+{
+  "model": "grok-4.6",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Answer with cited sources when search is used."
+    },
+    {
+      "role": "user",
+      "content": "What changed in the latest release?"
+    }
+  ],
+  "max_completion_tokens": 512,
+  "reasoning_effort": "medium",
+  "prompt_cache_key": "fixture-conversation",
+  "search_parameters": {
+    "mode": "auto",
+    "return_citations": true,
+    "max_search_results": 5,
+    "from_date": "2026-08-01",
+    "to_date": "2026-08-20",
+    "sources": [
+      {
+        "type": "web"
+      },
+      {
+        "type": "x"
+      }
+    ]
+  },
+  "service_tier": "priority",
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  }
+}

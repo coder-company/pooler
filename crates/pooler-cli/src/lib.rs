@@ -13,7 +13,7 @@ use pooler_store::{SqliteOAuthTokenStore, SqliteStore};
 mod auth;
 mod doctor;
 mod fixture_replay;
-pub use auth::AuthCommand;
+pub use auth::{AuthCommand, AuthLoginMethod, OAuthEncodingArgument, OAuthOverrideArgs};
 
 /// Top-level command-line arguments.
 #[derive(Debug, Parser)]
@@ -57,7 +57,11 @@ pub enum Command {
     /// Run local diagnostics.
     Doctor,
     /// List configured public models.
-    Models,
+    Models {
+        /// Emit merged targets, source policy, and provenance as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect and replay sanitized compatibility fixtures.
     Fixture {
         /// Fixture operation.
@@ -180,13 +184,12 @@ pub fn run(cli: Cli) -> Result<()> {
             cli.credential_store.as_deref(),
             cli.credential_key_ref.as_deref(),
         ),
-        Command::Models => {
-            let config = load(&cli.config)?;
-            for model in config.models().values() {
-                println!("{}", model.id());
-            }
-            Ok(())
-        }
+        Command::Models { json } => models(
+            &cli.config,
+            cli.credential_store.as_deref(),
+            cli.credential_key_ref.as_deref(),
+            json,
+        ),
         Command::Fixture { command } => fixture_replay::run(command),
         Command::Auth { command } => auth::run(
             command,
@@ -219,6 +222,43 @@ fn fixture_report(
 
 fn load(path: &PathBuf) -> Result<pooler_config::CompiledConfig> {
     Config::from_path(path)?.compile().map_err(Into::into)
+}
+
+fn models(
+    path: &PathBuf,
+    explicit_store_path: Option<&std::path::Path>,
+    credential_key_ref: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let config = load(path)?;
+    let catalog = if config.catalog().is_some() {
+        let resources = runtime_resources(&config, explicit_store_path, credential_key_ref)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to initialize the model-discovery runtime")?;
+        let catalog = pooler_server::CatalogRuntime::from_config(&config, resources.native)?;
+        if let Some(catalog) = &catalog {
+            runtime
+                .block_on(catalog.refresh())
+                .context("model catalog refresh failed")?;
+        }
+        catalog
+    } else {
+        None
+    };
+    if json {
+        let view = pooler_server::merged_model_catalog_value(&config, catalog.as_deref());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&view).context("could not serialize model catalog")?
+        );
+    } else {
+        for model in pooler_server::merged_model_ids(&config, catalog.as_deref()) {
+            println!("{model}");
+        }
+    }
+    Ok(())
 }
 
 fn serve(
@@ -478,6 +518,13 @@ mod tests {
     }
 
     #[test]
+    fn models_command_accepts_json_catalog_output() {
+        let cli = Cli::try_parse_from(["pooler", "models", "--json"])
+            .expect("models JSON command should parse");
+        assert!(matches!(cli.command, Command::Models { json: true }));
+    }
+
+    #[test]
     fn explicit_credential_store_wires_pooling_persistence() {
         let directory = tempfile::tempdir().expect("temporary store directory");
         #[cfg(unix)]
@@ -569,6 +616,48 @@ routes:
             Command::Auth {
                 command: AuthCommand::Revoke { .. }
             }
+        ));
+    }
+
+    #[test]
+    fn auth_provider_profiles_and_explicit_overrides_are_available() {
+        let providers = Cli::try_parse_from(["pooler", "auth", "providers", "gemini"])
+            .expect("provider support command should parse");
+        assert!(matches!(
+            providers.command,
+            Command::Auth {
+                command: AuthCommand::Providers {
+                    profile: Some(profile)
+                }
+            } if profile == "gemini"
+        ));
+
+        let login = Cli::try_parse_from([
+            "pooler",
+            "auth",
+            "login",
+            "work-google",
+            "--profile",
+            "gemini",
+            "--method",
+            "device-code",
+            "--client-id",
+            "registered-client",
+            "--scope",
+            "scope-one",
+            "--device-authorization-endpoint",
+            "https://oauth2.googleapis.com/device/code",
+        ])
+        .expect("profiled login command should parse");
+        assert!(matches!(
+            login.command,
+            Command::Auth {
+                command: AuthCommand::Login {
+                    profile: Some(profile),
+                    method: AuthLoginMethod::DeviceCode,
+                    ..
+                }
+            } if profile == "gemini"
         ));
     }
 

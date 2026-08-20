@@ -1,0 +1,182 @@
+{
+  "openai_models": {
+    "object": "list",
+    "data": [
+      {
+        "id": "kimi-k2.6",
+        "object": "model",
+        "created": 1770000000,
+        "owned_by": "moonshot",
+        "context_length": 262144,
+        "supports_image_in": true,
+        "supports_video_in": true,
+        "supports_reasoning": true,
+        "supports_function_calling": true
+      },
+      {
+        "id": "text-only",
+        "object": "model",
+        "owned_by": "compatible"
+      }
+    ]
+  },
+  "vertex_models": {
+    "publisherModels": [
+      {
+        "name": "publishers/google/models/gemini-fixture",
+        "displayName": "Gemini Fixture",
+        "contextWindow": 1048576,
+        "supportedActions": [
+          "generateContent",
+          "streamGenerateContent",
+          "countTokens"
+        ]
+      },
+      {
+        "name": "publishers/google/models/imagen-fixture",
+        "displayName": "Imagen Fixture",
+        "supportedActions": ["predict"]
+      }
+    ]
+  },
+  "antigravity_hints": {
+    "webSearchModelIds": ["GEMINI-FIXTURE", "claude-fixture"]
+  },
+  "antigravity_credits": {
+    "paidTier": {
+      "id": "fixture-tier",
+      "availableCredits": [
+        {
+          "creditType": "OTHER",
+          "creditAmount": "0",
+          "minimumCreditAmountForUsage": "1"
+        },
+        {
+          "creditType": "GOOGLE_ONE_AI",
+          "creditAmount": "12.5",
+          "minimumCreditAmountForUsage": "1.25"
+        }
+      ]
+    }
+  },
+  "failures": [
+    {
+      "provider": "kimi",
+      "status": 429,
+      "headers": {"retry-after": "30"},
+      "body": {"error": {"type": "rate_limit_reached", "message": "user limit"}},
+      "scope": "account",
+      "class": "credential_quota_exhausted",
+      "retry_ms": 30000,
+      "credential_proven": false,
+      "has_cooldown": false
+    },
+    {
+      "provider": "vertex",
+      "status": 429,
+      "headers": {},
+      "body": {"error": {"status": "RESOURCE_EXHAUSTED", "message": "shared capacity"}},
+      "scope": "provider",
+      "class": "provider_rate_limited",
+      "retry_ms": 1000,
+      "credential_proven": false,
+      "has_cooldown": true
+    },
+    {
+      "provider": "vertex",
+      "status": 429,
+      "headers": {},
+      "body": {
+        "error": {
+          "status": "RESOURCE_EXHAUSTED",
+          "details": [
+            {
+              "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+              "reason": "QUOTA_EXCEEDED"
+            },
+            {
+              "@type": "type.googleapis.com/google.rpc.RetryInfo",
+              "retryDelay": "2.5s"
+            }
+          ]
+        }
+      },
+      "scope": "project",
+      "class": "credential_quota_exhausted",
+      "retry_ms": 2500,
+      "credential_proven": false,
+      "has_cooldown": false
+    },
+    {
+      "provider": "antigravity",
+      "status": 429,
+      "headers": {},
+      "body": {
+        "error": {
+          "status": "RESOURCE_EXHAUSTED",
+          "details": [
+            {
+              "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+              "reason": "INSUFFICIENT_G1_CREDITS_BALANCE"
+            }
+          ]
+        }
+      },
+      "scope": "account",
+      "class": "credential_quota_exhausted",
+      "retry_ms": 60000,
+      "credential_proven": true,
+      "has_cooldown": true
+    },
+    {
+      "provider": "antigravity",
+      "status": 429,
+      "headers": {},
+      "body": {
+        "error": {
+          "status": "RESOURCE_EXHAUSTED",
+          "details": [
+            {
+              "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+              "reason": "RATE_LIMIT_EXCEEDED"
+            },
+            {
+              "@type": "type.googleapis.com/google.rpc.RetryInfo",
+              "retryDelay": {"seconds": "2", "nanos": 0}
+            }
+          ]
+        }
+      },
+      "scope": "provider",
+      "class": "provider_rate_limited",
+      "retry_ms": 2000,
+      "credential_proven": false,
+      "has_cooldown": true
+    },
+    {
+      "provider": "open_ai_compatible",
+      "status": 429,
+      "headers": {
+        "x-ratelimit-remaining-requests": "0",
+        "x-ratelimit-limit-requests": "100"
+      },
+      "body": {"error": {"code": "insufficient_quota"}},
+      "scope": "account",
+      "class": "credential_quota_exhausted",
+      "retry_ms": 60000,
+      "credential_proven": false,
+      "has_cooldown": false
+    },
+    {
+      "provider": "open_ai_compatible",
+      "status": 400,
+      "headers": {},
+      "body": {"error": {"code": "invalid_request_error"}},
+      "scope": null,
+      "class": "invalid_request",
+      "retry_ms": null,
+      "credential_proven": false,
+      "has_cooldown": false
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+imports:
+  - preset: media
+    as: media
+    with:
+      bind: 127.0.0.1:18476
+      upstream_url: http://127.0.0.1:8319
+      secret: env:POOLER_UPSTREAM_KEY
+
+version: 1

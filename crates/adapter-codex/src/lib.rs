@@ -85,6 +85,9 @@ pub enum CodexCredentialError {
     /// Native requests require the account identifier observed in the bridge.
     #[error("Codex credential has no account identifier")]
     MissingAccountId,
+    /// The explicit account identifier did not match the ID-token claim.
+    #[error("Codex credential account identifier does not match its ID token")]
+    AccountIdMismatch,
     /// The owner-only credential file could not be read or validated.
     #[error("unable to read Codex credential file")]
     FileIo,
@@ -358,11 +361,21 @@ impl CodexCredential {
                 reason: "must not be empty",
             });
         }
-        let account_id = record.account_id.filter(|value| !value.trim().is_empty());
+        let explicit_account_id = record.account_id.filter(|value| !value.trim().is_empty());
         let id_token = record
             .id_token
             .filter(|value| !value.trim().is_empty())
             .map(SecretValue::new);
+        let claimed_account_id = id_token
+            .as_ref()
+            .and_then(|token| account_id_from_id_token(token.expose_secret()));
+        let account_id = match (explicit_account_id, claimed_account_id) {
+            (Some(explicit), Some(claimed)) if explicit != claimed => {
+                return Err(CodexCredentialError::AccountIdMismatch);
+            }
+            (Some(explicit), _) => Some(explicit),
+            (None, claimed) => claimed,
+        };
         let tokens = OAuthTokens::bearer(
             access_token,
             record
@@ -392,6 +405,12 @@ impl CodexCredential {
     #[must_use]
     pub fn account_id(&self) -> Option<&str> {
         self.account_id.as_deref()
+    }
+
+    /// Optional protected ID token retained for encrypted import persistence.
+    #[must_use]
+    pub const fn id_token(&self) -> Option<&SecretValue> {
+        self.id_token.as_ref()
     }
 
     /// Optional identity email from the local bridge record.
@@ -445,6 +464,25 @@ impl CodexCredential {
             metadata,
         })
     }
+}
+
+fn account_id_from_id_token(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let claims = parts.next()?;
+    let _signature = parts.next()?;
+    if parts.next().is_some() || claims.is_empty() {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(claims.as_bytes()).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn non_empty_string(value: String, field: &'static str) -> Result<String, CodexCredentialError> {
@@ -1867,6 +1905,37 @@ mod tests {
         assert_eq!(
             headers[header::USER_AGENT],
             HeaderValue::from_static("codex-tui/0.144.0")
+        );
+    }
+
+    #[test]
+    fn extracts_and_cross_checks_chatgpt_account_id_from_id_token() {
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-from-token"
+            }
+        });
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims"));
+        let id_token = format!("e30.{encoded}.signature");
+        let extracted = serde_json::json!({
+            "access_token": "access",
+            "id_token": id_token,
+            "type": "codex"
+        });
+        let credential =
+            CodexCredential::from_json(&serde_json::to_vec(&extracted).expect("credential JSON"))
+                .expect("account ID extracted");
+        assert_eq!(credential.account_id(), Some("account-from-token"));
+
+        let mismatched = serde_json::json!({
+            "access_token": "access",
+            "id_token": id_token,
+            "account_id": "different-account",
+            "type": "codex"
+        });
+        assert_eq!(
+            CodexCredential::from_json(&serde_json::to_vec(&mismatched).expect("credential JSON"),),
+            Err(CodexCredentialError::AccountIdMismatch)
         );
     }
 

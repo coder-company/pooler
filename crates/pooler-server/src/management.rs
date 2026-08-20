@@ -5,12 +5,17 @@
 //! mutable state, and never resolves or serializes credential references.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -31,10 +36,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::http_runtime::RuntimeGeneration;
 use crate::management_ui;
-use crate::{ConfigSnapshot, ConfigStore};
+use crate::{merged_model_catalog_value, CatalogRuntime, ConfigSnapshot, ConfigStore};
 
 const DEFAULT_DECISION_LIMIT: usize = 20;
 const MAX_DECISION_LIMIT: usize = 100;
+const LOOPBACK_HOST_ERROR: &str =
+    "management Host header must name localhost or a loopback address";
 
 /// A small active-request counter shared by management and the serving
 /// runtime. Counters are process-local and never persisted.
@@ -169,7 +176,12 @@ impl ManagementResponse {
         }
     }
 
-    fn asset(status: StatusCode, content_type: &'static str, body: &'static str, head: bool) -> Self {
+    fn asset(
+        status: StatusCode,
+        content_type: &'static str,
+        body: &'static str,
+        head: bool,
+    ) -> Self {
         Self::body(status, content_type, body.as_bytes().to_vec(), head)
     }
 }
@@ -203,6 +215,86 @@ fn security_headers(headers: &mut HeaderMap) {
     );
 }
 
+/// Return whether a request's Host header is safe for an unauthenticated
+/// loopback management listener. Browsers can be DNS-rebound onto loopback,
+/// so a missing or arbitrary Host must not reach an unauthenticated API.
+fn management_request_host_allowed(
+    api: &ManagementApi,
+    ui_asset: bool,
+    headers: &HeaderMap,
+) -> bool {
+    if (!ui_asset && api.plan.auth().is_some()) || !management_bind_is_loopback(api.bind()) {
+        return true;
+    }
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let Some(value) = hosts.next() else {
+        return false;
+    };
+    if hosts.next().is_some() {
+        return false;
+    }
+    value.to_str().ok().is_some_and(safe_loopback_host_value)
+}
+
+fn management_bind_is_loopback(value: &str) -> bool {
+    if value.starts_with('/') || value.starts_with("unix:") {
+        return false;
+    }
+    value
+        .parse::<SocketAddr>()
+        .map(|address| address.ip().is_loopback())
+        .unwrap_or(false)
+}
+
+fn safe_loopback_host_value(value: &str) -> bool {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_ascii_control() || character.is_whitespace())
+    {
+        return false;
+    }
+
+    if let Some(value) = value.strip_prefix('[') {
+        let Some(close) = value.find(']') else {
+            return false;
+        };
+        let host = &value[..close];
+        let suffix = &value[close + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            suffix.strip_prefix(':').and_then(parse_host_port)
+        };
+        return host
+            .parse::<IpAddr>()
+            .ok()
+            .is_some_and(|address| address.is_loopback())
+            && (suffix.is_empty() || port.is_some());
+    }
+
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, _port)) if host.contains(':') => return false,
+        Some((host, port)) => (host, Some(port)),
+        None => (value, None),
+    };
+    if let Some(port) = port {
+        if parse_host_port(port).is_none() {
+            return false;
+        }
+    }
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .ok()
+            .is_some_and(|address| address.is_loopback())
+}
+
+fn parse_host_port(value: &str) -> Option<u16> {
+    let port = value.parse::<u16>().ok()?;
+    (port != 0).then_some(port)
+}
+
 /// Immutable pair observed by one management request.
 ///
 /// Configuration and pooling state are published together so a diagnostic
@@ -219,6 +311,7 @@ pub struct ManagementApi {
     plan: ManagementPlan,
     state: Arc<ArcSwap<ManagementSnapshot>>,
     runtime_dispatch: Option<Arc<ArcSwap<RuntimeGeneration>>>,
+    catalog: Option<Arc<CatalogRuntime>>,
     metrics: pooler_observe::MetricsRegistry,
     active: ActiveCounts,
 }
@@ -272,6 +365,7 @@ impl ManagementApi {
                 pooling,
             })),
             runtime_dispatch: None,
+            catalog: None,
             metrics,
             active,
         }
@@ -308,6 +402,7 @@ impl ManagementApi {
                 pooling,
             })),
             runtime_dispatch: Some(runtime_dispatch),
+            catalog: None,
             metrics,
             active,
         }
@@ -323,6 +418,13 @@ impl ManagementApi {
     #[must_use]
     pub fn metrics(&self) -> pooler_observe::MetricsRegistry {
         self.metrics.clone()
+    }
+
+    /// Attach an injected catalog to a standalone management API.
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: Arc<CatalogRuntime>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     /// Configured management bind address.
@@ -344,6 +446,9 @@ impl ManagementApi {
         headers: &HeaderMap,
     ) -> ManagementResponse {
         let uri = path_and_query.parse::<Uri>().ok();
+        let request_path = uri.as_ref().map_or(path_and_query, Uri::path);
+        let management_prefix =
+            request_path == "/management" || request_path.starts_with("/management/");
         let path = uri
             .as_ref()
             .map_or(path_and_query, Uri::path)
@@ -352,6 +457,7 @@ impl ManagementApi {
             .unwrap_or_else(|| uri.as_ref().map_or(path_and_query, Uri::path));
         let path = if path.is_empty() { "/" } else { path };
         let head = *method == Method::HEAD;
+        let ui_asset = management_ui::asset(path).is_some() || (management_prefix && path == "/");
         if *method != Method::GET && !head {
             let mut response = ManagementResponse::json(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -363,7 +469,15 @@ impl ManagementApi {
                 .insert(header::ALLOW, header::HeaderValue::from_static("GET, HEAD"));
             return response;
         }
-        if !self.authorized(headers) {
+        if !management_request_host_allowed(self, ui_asset, headers) {
+            return ManagementResponse::json(
+                StatusCode::FORBIDDEN,
+                json!({"error": LOOPBACK_HOST_ERROR}),
+                head,
+            );
+        }
+        let local_ui_shell = ui_asset && management_bind_is_loopback(self.bind());
+        if !local_ui_shell && !self.authorized(headers) {
             let mut response = ManagementResponse::json(
                 StatusCode::UNAUTHORIZED,
                 json!({"error": "management authentication required"}),
@@ -393,7 +507,15 @@ impl ManagementApi {
             (Some(snapshot), Some(state)) => (snapshot, state.pooling.as_ref()),
             _ => (fallback.config.as_ref(), fallback.pooling.as_ref()),
         };
+        let catalog = runtime
+            .as_ref()
+            .and_then(|runtime| runtime.catalog.clone())
+            .or_else(|| self.catalog.clone());
         let response = match path {
+            "/" if management_prefix => {
+                let (content_type, body) = management_ui::asset("/ui").expect("UI asset");
+                ManagementResponse::asset(StatusCode::OK, content_type, body, head)
+            }
             path if management_ui::asset(path).is_some() => {
                 let (content_type, body) = management_ui::asset(path).expect("asset exists");
                 ManagementResponse::asset(StatusCode::OK, content_type, body, head)
@@ -402,12 +524,13 @@ impl ManagementApi {
             "/config" | "/config/generation" => self.config_generation(snapshot),
             "/listeners" => self.listeners(snapshot),
             "/routes" => self.routes(snapshot),
-            "/models" => self.models(snapshot),
+            "/models" => self.models(snapshot, catalog.as_deref()),
+            "/catalog" | "/catalog/sources" => self.catalog(snapshot, catalog.as_deref()),
             "/health/providers" | "/providers/health" => self.providers(snapshot, pooling),
             "/health/credentials" | "/credentials/health" => self.credentials(snapshot, pooling),
             "/accounts" => self.accounts(snapshot, pooling),
             "/quota" => self.quota(snapshot, pooling),
-            "/metrics" => self.metrics(snapshot),
+            "/metrics" => self.metrics_view(snapshot),
             "/metrics/prometheus" => ManagementResponse::body(
                 StatusCode::OK,
                 "text/plain; version=0.0.4; charset=utf-8",
@@ -459,16 +582,18 @@ impl ManagementApi {
         snapshot: &ConfigSnapshot<CompiledConfig>,
         pooling: &PoolingCoordinator,
     ) -> ManagementResponse {
-        let credentials = pooling
-            .credential_health_states()
-            .ok()
-            .map_or(0, |states| states.len());
-        let cooling_providers = pooling.cooldowns().ok().map_or(0, |states| {
-            states
-                .iter()
-                .filter(|state| matches!(state.scope.as_str(), "provider" | "provider_model"))
-                .count()
-        });
+        let credentials = match pooling.credential_health_states() {
+            Ok(states) => states.len(),
+            Err(_) => return state_unavailable(),
+        };
+        let cooldowns = match pooling.cooldowns() {
+            Ok(states) => states,
+            Err(_) => return state_unavailable(),
+        };
+        let cooling_providers = cooldowns
+            .iter()
+            .filter(|state| matches!(state.scope.as_str(), "provider" | "provider_model"))
+            .count();
         ManagementResponse::json(
             StatusCode::OK,
             json!({
@@ -559,40 +684,31 @@ impl ManagementApi {
         )
     }
 
-    fn models(&self, snapshot: &ConfigSnapshot<CompiledConfig>) -> ManagementResponse {
-        let models = snapshot
-            .config()
-            .models()
-            .values()
-            .map(|model| {
-                let targets = model
-                    .targets()
-                    .iter()
-                    .map(|target| {
-                        json!({
-                            "provider": target.provider(),
-                            "upstream_model": target.upstream_model(),
-                            "capabilities": target
-                                .capabilities()
-                                .iter()
-                                .map(|capability| capability.as_str())
-                                .collect::<Vec<_>>(),
-                            "codecs": target
-                                .codecs()
-                                .iter()
-                                .map(AsRef::as_ref)
-                                .collect::<Vec<&str>>(),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                json!({"id": model.id(), "targets": targets})
-            })
-            .collect::<Vec<_>>();
+    fn models(
+        &self,
+        snapshot: &ConfigSnapshot<CompiledConfig>,
+        catalog: Option<&CatalogRuntime>,
+    ) -> ManagementResponse {
+        ManagementResponse::json(
+            StatusCode::OK,
+            merged_model_catalog_value(snapshot.config(), catalog),
+            false,
+        )
+    }
+
+    fn catalog(
+        &self,
+        snapshot: &ConfigSnapshot<CompiledConfig>,
+        catalog: Option<&CatalogRuntime>,
+    ) -> ManagementResponse {
+        let view = merged_model_catalog_value(snapshot.config(), catalog);
         ManagementResponse::json(
             StatusCode::OK,
             json!({
                 "configuration_generation": snapshot.generation().value(),
-                "models": models,
+                "catalog_generation": view["catalog_generation"],
+                "catalog_refreshed_at_unix_ms": view["catalog_refreshed_at_unix_ms"],
+                "sources": view["catalog_sources"],
             }),
             false,
         )
@@ -603,7 +719,10 @@ impl ManagementApi {
         snapshot: &ConfigSnapshot<CompiledConfig>,
         pooling: &PoolingCoordinator,
     ) -> ManagementResponse {
-        let cooldowns = pooling.cooldowns().unwrap_or_default();
+        let cooldowns = match pooling.cooldowns() {
+            Ok(cooldowns) => cooldowns,
+            Err(_) => return state_unavailable(),
+        };
         let providers = snapshot
             .config()
             .upstreams()
@@ -639,8 +758,14 @@ impl ManagementApi {
         pooling: &PoolingCoordinator,
         field: &str,
     ) -> ManagementResponse {
-        let states = pooling.credential_states().unwrap_or_default();
-        let health = pooling.credential_health_states().unwrap_or_default();
+        let states = match pooling.credential_states() {
+            Ok(states) => states,
+            Err(_) => return state_unavailable(),
+        };
+        let health = match pooling.credential_health_states() {
+            Ok(health) => health,
+            Err(_) => return state_unavailable(),
+        };
         let states = states
             .into_iter()
             .map(|state| (state.credential_id.clone(), state))
@@ -663,11 +788,7 @@ impl ManagementApi {
             json!(snapshot.generation().value()),
         );
         value.insert(field.to_owned(), Value::Array(credentials));
-        ManagementResponse::json(
-            StatusCode::OK,
-            Value::Object(value),
-            false,
-        )
+        ManagementResponse::json(StatusCode::OK, Value::Object(value), false)
     }
 
     fn quota(
@@ -675,19 +796,20 @@ impl ManagementApi {
         snapshot: &ConfigSnapshot<CompiledConfig>,
         pooling: &PoolingCoordinator,
     ) -> ManagementResponse {
-        let entries = pooling
-            .cooldowns()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|cooldown| {
-                json!({
-                    "scope": cooldown.scope,
-                    "key": cooldown.key,
-                    "until": cooldown.until,
-                    "reason": cooldown.reason,
-                })
+        let entries = match pooling.cooldowns() {
+            Ok(cooldowns) => cooldowns,
+            Err(_) => return state_unavailable(),
+        }
+        .into_iter()
+        .map(|cooldown| {
+            json!({
+                "scope": cooldown.scope,
+                "key": cooldown.key,
+                "until": cooldown.until,
+                "reason": cooldown.reason,
             })
-            .collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
         ManagementResponse::json(
             StatusCode::OK,
             json!({
@@ -699,7 +821,7 @@ impl ManagementApi {
         )
     }
 
-    fn metrics(&self, snapshot: &ConfigSnapshot<CompiledConfig>) -> ManagementResponse {
+    fn metrics_view(&self, snapshot: &ConfigSnapshot<CompiledConfig>) -> ManagementResponse {
         ManagementResponse::json(
             StatusCode::OK,
             json!({
@@ -755,6 +877,13 @@ impl ManagementApi {
 /// Errors raised while binding or serving a management listener.
 #[derive(Debug, thiserror::Error)]
 pub enum ManagementServerError {
+    /// Remote management is not started because this plane has no TLS
+    /// configuration and bearer authentication cannot protect raw HTTP.
+    #[error("remote management listener `{listener}` requires TLS; raw bearer HTTP is disabled")]
+    RemoteRequiresTls {
+        /// Configured socket address or path.
+        listener: String,
+    },
     /// The configured management socket could not be bound.
     #[error("failed to bind management listener `{listener}`: {source}")]
     Bind {
@@ -787,7 +916,125 @@ struct ManagementUnixSocketPath(PathBuf);
 
 impl Drop for ManagementUnixSocketPath {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        remove_unix_socket_if_safe(&self.0);
+    }
+}
+
+#[cfg(unix)]
+fn validate_unix_socket_parent(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix management socket must have a parent directory",
+        )
+    })?;
+    let metadata = fs::symlink_metadata(parent)?;
+    let mode = metadata.mode();
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || mode & 0o077 != 0
+        || mode & 0o700 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Unix management socket parent must be an owner-private directory",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_unix_socket_parent(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix management sockets are unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn unix_socket_metadata_is_safe(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let mode = metadata.mode();
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || mode & 0o077 != 0
+        || mode & 0o600 != 0o600
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Unix management socket must be an owner-private socket",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn unix_socket_metadata_is_safe(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix management sockets are unavailable on this platform",
+    ))
+}
+
+fn validate_unix_socket_path_before_bind(path: &Path) -> io::Result<()> {
+    validate_unix_socket_parent(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            let safe_existing_socket = metadata.file_type().is_socket()
+                && metadata.uid() == rustix::process::geteuid().as_raw()
+                && metadata.mode() & 0o077 == 0
+                && metadata.mode() & 0o600 == 0o600;
+            #[cfg(not(unix))]
+            let safe_existing_socket = {
+                let _ = metadata;
+                false
+            };
+            if !safe_existing_socket {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Unix management socket path must be absent or an owner-private socket",
+                ));
+            }
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "Unix management socket path is already in use",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn harden_unix_socket(path: &Path) -> io::Result<()> {
+    validate_unix_socket_parent(path)?;
+    #[cfg(unix)]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Unix management socket ownership or type is unsafe",
+            ));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        unix_socket_metadata_is_safe(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix management sockets are unavailable on this platform",
+        ))
+    }
+}
+
+fn remove_unix_socket_if_safe(path: &Path) {
+    if validate_unix_socket_parent(path).is_ok() && unix_socket_metadata_is_safe(path).is_ok() {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -799,8 +1046,8 @@ struct ManagementServerState {
 /// Standalone HTTP/1 management listener for a [`ManagementApi`].
 ///
 /// The listener is separate from inference sockets and is intended to be
-/// spawned by process wiring after configuration has passed the loopback /
-/// remote-auth validation boundary.
+/// spawned by process wiring after configuration has passed the loopback and
+/// remote-TLS validation boundary.
 #[derive(Clone)]
 pub struct ManagementHttpServer {
     api: Arc<ManagementApi>,
@@ -821,20 +1068,40 @@ impl std::fmt::Debug for ManagementHttpServer {
 impl ManagementHttpServer {
     /// Bind the management listener described by `api`.
     pub async fn bind(api: Arc<ManagementApi>) -> Result<Self, ManagementServerError> {
+        if api.plan.remote() {
+            return Err(ManagementServerError::RemoteRequiresTls {
+                listener: api.bind().to_owned(),
+            });
+        }
         let bind = api.bind();
         let (listener, address) = if bind.starts_with('/') || bind.starts_with("unix:") {
             let path = bind.strip_prefix("unix:").unwrap_or(bind);
+            let path = Path::new(path);
+            validate_unix_socket_path_before_bind(path).map_err(|source| {
+                ManagementServerError::Bind {
+                    listener: bind.to_owned(),
+                    source,
+                }
+            })?;
             let listener =
                 UnixListener::bind(path).map_err(|source| ManagementServerError::Bind {
                     listener: bind.to_owned(),
                     source,
                 })?;
+            if let Err(source) = harden_unix_socket(path) {
+                drop(listener);
+                remove_unix_socket_if_safe(path);
+                return Err(ManagementServerError::Bind {
+                    listener: bind.to_owned(),
+                    source,
+                });
+            }
             (
                 BoundManagementListener::Unix {
                     listener,
-                    path: ManagementUnixSocketPath(PathBuf::from(path)),
+                    path: ManagementUnixSocketPath(path.to_owned()),
                 },
-                path.to_owned(),
+                path.display().to_string(),
             )
         } else {
             let listener =
@@ -947,11 +1214,26 @@ async fn serve_management_connection<I>(
     let service = service_fn(move |request: Request<Incoming>| {
         let api = Arc::clone(&api);
         async move {
-            let response = api.handle(
-                request.method(),
-                request.uri().to_string().as_str(),
-                request.headers(),
-            );
+            let request_path = request.uri().path();
+            let management_path = request_path
+                .strip_prefix("/management")
+                .filter(|path| path.is_empty() || path.starts_with('/'))
+                .unwrap_or(request_path);
+            let ui_asset = management_ui::asset(management_path).is_some()
+                || (request_path.starts_with("/management") && management_path == "/");
+            let response = if !management_request_host_allowed(&api, ui_asset, request.headers()) {
+                ManagementResponse::json(
+                    StatusCode::FORBIDDEN,
+                    json!({"error": LOOPBACK_HOST_ERROR}),
+                    false,
+                )
+            } else {
+                api.handle(
+                    request.method(),
+                    request.uri().to_string().as_str(),
+                    request.headers(),
+                )
+            };
             Ok::<_, std::convert::Infallible>(management_http_response(response))
         }
     });
@@ -1000,6 +1282,14 @@ fn listener_protocol_name(protocol: pooler_config::ListenerProtocol) -> &'static
     }
 }
 
+fn state_unavailable() -> ManagementResponse {
+    ManagementResponse::json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"error": "management state unavailable"}),
+        false,
+    )
+}
+
 fn health_status(state: Option<&CredentialHealthState>) -> &'static str {
     match state.map(|state| state.status) {
         Some(CredentialHealthStatus::CoolingDown) => "cooling_down",
@@ -1045,9 +1335,174 @@ fn provider_health_value(
 mod tests {
     use super::*;
     use pooler_core::ConfigGeneration;
+    use pooler_store::{
+        CooldownState, CredentialHealthState, CredentialState, DecisionRecord, MemoryStore,
+        PruneReport, RetentionPolicy, SessionAffinity, Store, StoreError, StoreResult, Timestamp,
+    };
     use std::net::SocketAddr;
+    use std::sync::atomic::AtomicBool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    struct FailingDiagnosticsStore {
+        inner: MemoryStore,
+        fail_reads: AtomicBool,
+    }
+
+    impl FailingDiagnosticsStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_reads: AtomicBool::new(false),
+            }
+        }
+
+        fn fail_reads(&self) {
+            self.fail_reads.store(true, Ordering::Release);
+        }
+
+        fn unavailable<T>(&self) -> StoreResult<T> {
+            Err(StoreError::Io("diagnostics unavailable".to_owned()))
+        }
+
+        fn should_fail(&self) -> bool {
+            self.fail_reads.load(Ordering::Acquire)
+        }
+    }
+
+    impl Store for FailingDiagnosticsStore {
+        fn retention(&self) -> RetentionPolicy {
+            self.inner.retention()
+        }
+
+        fn upsert_credential_state(&self, state: CredentialState) -> StoreResult<CredentialState> {
+            self.inner.upsert_credential_state(state)
+        }
+
+        fn credential_state(&self, credential_id: &str) -> StoreResult<Option<CredentialState>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.credential_state(credential_id)
+            }
+        }
+
+        fn credential_states(&self) -> StoreResult<Vec<CredentialState>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.credential_states()
+            }
+        }
+
+        fn set_credential_enabled(
+            &self,
+            credential_id: &str,
+            enabled: bool,
+            updated_at: Timestamp,
+        ) -> StoreResult<CredentialState> {
+            self.inner
+                .set_credential_enabled(credential_id, enabled, updated_at)
+        }
+
+        fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool> {
+            self.inner.remove_credential_state(credential_id)
+        }
+
+        fn upsert_credential_health(
+            &self,
+            state: CredentialHealthState,
+        ) -> StoreResult<CredentialHealthState> {
+            self.inner.upsert_credential_health(state)
+        }
+
+        fn credential_health(
+            &self,
+            credential_id: &str,
+        ) -> StoreResult<Option<CredentialHealthState>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.credential_health(credential_id)
+            }
+        }
+
+        fn credential_health_states(&self) -> StoreResult<Vec<CredentialHealthState>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.credential_health_states()
+            }
+        }
+
+        fn upsert_cooldown(&self, state: CooldownState) -> StoreResult<CooldownState> {
+            self.inner.upsert_cooldown(state)
+        }
+
+        fn cooldown(
+            &self,
+            scope: &str,
+            key: &str,
+            now: Timestamp,
+        ) -> StoreResult<Option<CooldownState>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.cooldown(scope, key, now)
+            }
+        }
+
+        fn cooldowns(&self, now: Timestamp) -> StoreResult<Vec<CooldownState>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.cooldowns(now)
+            }
+        }
+
+        fn remove_cooldown(&self, scope: &str, key: &str) -> StoreResult<bool> {
+            self.inner.remove_cooldown(scope, key)
+        }
+
+        fn upsert_session_affinity(
+            &self,
+            affinity: SessionAffinity,
+        ) -> StoreResult<SessionAffinity> {
+            self.inner.upsert_session_affinity(affinity)
+        }
+
+        fn session_affinity(
+            &self,
+            key: &str,
+            now: Timestamp,
+        ) -> StoreResult<Option<SessionAffinity>> {
+            self.inner.session_affinity(key, now)
+        }
+
+        fn session_affinities(&self, now: Timestamp) -> StoreResult<Vec<SessionAffinity>> {
+            self.inner.session_affinities(now)
+        }
+
+        fn remove_session_affinity(&self, key: &str) -> StoreResult<bool> {
+            self.inner.remove_session_affinity(key)
+        }
+
+        fn append_decision(&self, record: DecisionRecord) -> StoreResult<DecisionRecord> {
+            self.inner.append_decision(record)
+        }
+
+        fn decisions(&self) -> StoreResult<Vec<DecisionRecord>> {
+            self.inner.decisions()
+        }
+
+        fn recent_decisions(&self, limit: usize) -> StoreResult<Vec<DecisionRecord>> {
+            self.inner.recent_decisions(limit)
+        }
+
+        fn prune(&self, now: Timestamp) -> StoreResult<PruneReport> {
+            self.inner.prune(now)
+        }
+    }
 
     fn api() -> ManagementApi {
         let config = pooler_config::compile_yaml(
@@ -1078,10 +1533,59 @@ routes:
         ManagementApi::new(plan, store, pooling, ActiveCounts::new())
     }
 
+    fn loopback_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, header::HeaderValue::from_static("localhost"));
+        headers
+    }
+
+    #[test]
+    fn unauthenticated_loopback_host_validation_allows_only_local_names() {
+        let api = api();
+        let mut headers = HeaderMap::new();
+        assert!(!management_request_host_allowed(&api, false, &headers));
+        let direct = api.handle(&Method::GET, "/health", &headers);
+        assert_eq!(direct.status, StatusCode::FORBIDDEN);
+        assert!(String::from_utf8_lossy(&direct.body).contains(LOOPBACK_HOST_ERROR));
+
+        for host in [
+            "localhost",
+            "LOCALHOST:9090",
+            "127.0.0.1",
+            "127.0.0.1:9090",
+            "[::1]",
+            "[::1]:9090",
+        ] {
+            headers.insert(header::HOST, header::HeaderValue::from_static(host));
+            assert!(
+                management_request_host_allowed(&api, false, &headers),
+                "expected safe Host {host}"
+            );
+        }
+
+        for host in [
+            "example.test",
+            "0.0.0.0",
+            "localhost:0",
+            "[::2]",
+            "::1",
+            "localhost:bad",
+        ] {
+            headers.insert(header::HOST, header::HeaderValue::from_static(host));
+            assert!(
+                !management_request_host_allowed(&api, false, &headers),
+                "expected unsafe Host {host}"
+            );
+        }
+
+        headers.append(header::HOST, header::HeaderValue::from_static("localhost"));
+        assert!(!management_request_host_allowed(&api, false, &headers));
+    }
+
     #[test]
     fn read_only_endpoints_expose_generation_and_redacted_plan_views() {
         let api = api();
-        let headers = HeaderMap::new();
+        let headers = loopback_headers();
         let health = api.handle(&Method::GET, "/health", &headers);
         assert_eq!(health.status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&health.body).contains("configuration_generation"));
@@ -1101,12 +1605,14 @@ routes:
     #[test]
     fn management_ui_assets_are_read_only_and_hardened() {
         let api = api();
-        let headers = HeaderMap::new();
+        let headers = loopback_headers();
         let html = api.handle(&Method::GET, "/management/ui", &headers);
         assert_eq!(html.status, StatusCode::OK);
         assert_eq!(
             html.headers.get(header::CONTENT_TYPE),
-            Some(&header::HeaderValue::from_static("text/html; charset=utf-8"))
+            Some(&header::HeaderValue::from_static(
+                "text/html; charset=utf-8"
+            ))
         );
         let html_body = String::from_utf8_lossy(&html.body);
         assert!(html_body.contains("Pooler Control"));
@@ -1128,6 +1634,9 @@ routes:
             html.headers.get(header::X_FRAME_OPTIONS),
             Some(&header::HeaderValue::from_static("DENY"))
         );
+        let management_root = api.handle(&Method::GET, "/management", &headers);
+        assert_eq!(management_root.status, StatusCode::OK);
+        assert_eq!(management_root.body, html.body);
 
         let css = api.handle(&Method::GET, "/management/ui.css", &headers);
         assert_eq!(css.status, StatusCode::OK);
@@ -1143,7 +1652,7 @@ routes:
     #[test]
     fn management_ui_data_endpoints_cover_runtime_overview_without_secrets() {
         let api = api();
-        let headers = HeaderMap::new();
+        let headers = loopback_headers();
         for path in [
             "/listeners",
             "/routes",
@@ -1158,8 +1667,14 @@ routes:
             assert_eq!(response.status, StatusCode::OK, "{path}");
             assert!(!response.body.is_empty(), "{path} returned an empty body");
             let body = String::from_utf8_lossy(&response.body);
-            assert!(!body.contains("Authorization"), "{path} leaked auth material");
-            assert!(!body.contains("management-secret"), "{path} leaked a secret");
+            assert!(
+                !body.contains("Authorization"),
+                "{path} leaked auth material"
+            );
+            assert!(
+                !body.contains("management-secret"),
+                "{path} leaked a secret"
+            );
         }
         let listeners = api.handle(&Method::GET, "/listeners", &headers);
         let listeners = String::from_utf8_lossy(&listeners.body);
@@ -1170,9 +1685,74 @@ routes:
     }
 
     #[test]
+    fn management_state_failures_return_typed_service_unavailable() {
+        let config = pooler_config::compile_yaml(
+            "management-failing-store.yaml",
+            r#"
+version: 1
+management: {bind: 127.0.0.1:0}
+upstreams: {provider-a: {url: http://127.0.0.1:1}}
+accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
+"#,
+        )
+        .expect("failing-store config compiles");
+        let plan = config.management().cloned().expect("management plan");
+        let store = Arc::new(FailingDiagnosticsStore::new());
+        let pooling = Arc::new(
+            PoolingCoordinator::with_store(&config, store.clone()).expect("pooling coordinator"),
+        );
+        store.fail_reads();
+        let config_store = Arc::new(ConfigStore::with_generation(
+            ConfigGeneration::new(config.generation()),
+            config,
+        ));
+        let api = ManagementApi::new(plan, config_store, pooling, ActiveCounts::new());
+        let headers = loopback_headers();
+        for path in ["/health", "/health/providers", "/accounts", "/quota"] {
+            let response = api.handle(&Method::GET, path, &headers);
+            assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            assert_eq!(
+                String::from_utf8_lossy(&response.body),
+                r#"{"error":"management state unavailable"}"#,
+                "{path} must not report an empty healthy view"
+            );
+        }
+    }
+
+    #[test]
+    fn remaining_high_regression_root_health_surfaces_store_failure() {
+        let config = pooler_config::compile_yaml(
+            "management-root-health-failing-store.yaml",
+            "version: 1\nmanagement: {bind: 127.0.0.1:0}\nupstreams: {provider-a: {url: http://127.0.0.1:1}}\n",
+        )
+        .expect("config compiles");
+        let plan = config.management().cloned().expect("management plan");
+        let store = Arc::new(FailingDiagnosticsStore::new());
+        let pooling = Arc::new(
+            PoolingCoordinator::with_store(&config, store.clone()).expect("pooling coordinator"),
+        );
+        store.fail_reads();
+        let api = ManagementApi::new(
+            plan,
+            Arc::new(ConfigStore::with_generation(
+                ConfigGeneration::new(config.generation()),
+                config,
+            )),
+            pooling,
+            ActiveCounts::new(),
+        );
+        let response = api.handle(&Method::GET, "/health", &loopback_headers());
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            String::from_utf8_lossy(&response.body),
+            r#"{"error":"management state unavailable"}"#
+        );
+    }
+
+    #[test]
     fn mutation_requests_are_rejected_and_active_counts_are_bounded() {
         let api = api();
-        let headers = HeaderMap::new();
+        let headers = loopback_headers();
         let response = api.handle(&Method::POST, "/routes", &headers);
         assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
         assert!(String::from_utf8_lossy(&response.body).contains("read-only"));
@@ -1188,7 +1768,7 @@ routes:
     #[test]
     fn management_alias_and_head_keep_the_response_shape() {
         let api = api();
-        let headers = HeaderMap::new();
+        let headers = loopback_headers();
         let get = api.handle(&Method::GET, "/management/health?ignored=true", &headers);
         let head = api.handle(&Method::HEAD, "/management/health", &headers);
         assert_eq!(get.status, StatusCode::OK);
@@ -1224,6 +1804,16 @@ routes:
         let rejected = api.handle(&Method::GET, "/health", &wrong);
         assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
         assert!(!String::from_utf8_lossy(&rejected.body).contains("management-secret"));
+        let rejected_ui = api.handle(&Method::GET, "/management/routes", &wrong);
+        assert_eq!(rejected_ui.status, StatusCode::UNAUTHORIZED);
+        assert!(!String::from_utf8_lossy(&rejected_ui.body).contains("management-secret"));
+
+        let no_bearer_data = api.handle(&Method::GET, "/management/routes", &loopback_headers());
+        assert_eq!(no_bearer_data.status, StatusCode::UNAUTHORIZED);
+
+        let shell = api.handle(&Method::GET, "/management/ui", &loopback_headers());
+        assert_eq!(shell.status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&shell.body).contains("Pooler Control"));
 
         let mut correct = HeaderMap::new();
         correct.insert(
@@ -1233,6 +1823,79 @@ routes:
         let accepted = api.handle(&Method::GET, "/health", &correct);
         assert_eq!(accepted.status, StatusCode::OK);
         std::env::remove_var("POOLER_MANAGEMENT_TEST_KEY");
+    }
+
+    #[test]
+    fn remote_management_is_rejected_without_tls() {
+        let error = pooler_config::compile_yaml(
+            "management-remote-no-tls.yaml",
+            "version: 1\nmanagement: {bind: 0.0.0.0:0, remote: true, auth: {secret: env:POOLER_MANAGEMENT_TEST_KEY}}\n",
+        )
+        .expect_err("remote management must be rejected without TLS");
+        assert!(error.to_string().contains("requires TLS"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_management_socket_requires_private_parent_and_socket_mode() {
+        let parent = tempfile::tempdir().expect("Unix management parent");
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700))
+            .expect("set private Unix management parent mode");
+        let path = parent.path().join("management.sock");
+        let config = pooler_config::compile_yaml(
+            "management-unix.yaml",
+            &format!("version: 1\nmanagement: {{bind: {}}}\n", path.display()),
+        )
+        .expect("Unix management config compiles");
+        let plan = config.management().cloned().expect("management plan");
+        let pooling = Arc::new(PoolingCoordinator::new(&config).expect("pooling coordinator"));
+        let store = Arc::new(ConfigStore::with_generation(
+            ConfigGeneration::new(config.generation()),
+            config,
+        ));
+        let server = ManagementHttpServer::bind(Arc::new(ManagementApi::new(
+            plan,
+            store,
+            pooling,
+            ActiveCounts::new(),
+        )))
+        .await
+        .expect("private Unix management socket binds");
+        let metadata = fs::symlink_metadata(&path).expect("socket metadata");
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.mode() & 0o077, 0);
+        drop(server);
+        assert!(
+            !path.exists(),
+            "management socket cleanup removed only its socket"
+        );
+
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o755))
+            .expect("relax Unix management parent mode");
+        let config = pooler_config::compile_yaml(
+            "management-unix-insecure-parent.yaml",
+            &format!(
+                "version: 1\nmanagement: {{bind: {}}}\n",
+                parent.path().join("insecure.sock").display()
+            ),
+        )
+        .expect("insecure-parent config compiles");
+        let plan = config.management().cloned().expect("management plan");
+        let pooling = Arc::new(PoolingCoordinator::new(&config).expect("pooling coordinator"));
+        let store = Arc::new(ConfigStore::with_generation(
+            ConfigGeneration::new(config.generation()),
+            config,
+        ));
+        let error = ManagementHttpServer::bind(Arc::new(ManagementApi::new(
+            plan,
+            store,
+            pooling,
+            ActiveCounts::new(),
+        )))
+        .await
+        .expect_err("insecure Unix parent must be rejected");
+        assert!(error.to_string().contains("owner-private"));
     }
 
     #[tokio::test]
@@ -1248,6 +1911,25 @@ routes:
             let server = server.clone();
             tokio::spawn(async move { server.run().await })
         };
+        let mut rebinding = TcpStream::connect(address)
+            .await
+            .expect("management connects for Host validation");
+        rebinding
+            .write_all(b"GET /health HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("Host validation request writes");
+        let mut rejected = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rebinding.read_to_end(&mut rejected),
+        )
+        .await
+        .expect("Host validation response arrives")
+        .expect("Host validation response reads");
+        let rejected = String::from_utf8_lossy(&rejected);
+        assert!(rejected.contains("403 Forbidden"));
+        assert!(rejected.contains(LOOPBACK_HOST_ERROR));
+
         let mut stream = TcpStream::connect(address)
             .await
             .expect("management connects");

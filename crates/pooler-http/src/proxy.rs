@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant as StdInstant},
 };
 
+use adapter_providers::{AuthPlacement, ProviderKind, ProviderResponseClassifier};
 use base64::Engine;
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
@@ -37,7 +38,7 @@ use pooler_observe::{
     AttemptRecord, AttemptResult, CompletionClass, CooldownRecord, DecisionRecord, MetricsRegistry,
     QuotaRecord, RequestObservation, RetryRecord, TraceRecord, TraceRecorder, TraceStage,
 };
-use pooler_policy::{ReplayCheck, SelectionLease};
+use pooler_policy::{CommitmentState, QuotaObservation, ReplayCheck, SelectionLease};
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
 use ring::rand::SecureRandom;
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
@@ -49,8 +50,12 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroizing;
 
+use crate::openai_websocket::{
+    materialized_generation, ConnectionIdentity, CredentialGeneration,
+    OpenAiResponsesWebSocketAttempt, OpenAiResponsesWebSocketError, OpenAiResponsesWebSocketPool,
+    SemanticWebSocketResponse, RESPONSES_WEBSOCKET_BETA,
+};
 use crate::{
     extract_bearer_token, replayable_response_headers, retry_after_delay, safe_method_for_cache,
     safe_request_for_cache, safe_response_for_cache, strip_hop_by_hop_headers, CacheKey,
@@ -74,6 +79,38 @@ pub struct SemanticRequestBody {
     pub body: Vec<u8>,
     /// Content type to send with `body`.
     pub content_type: HeaderValue,
+    /// Request-local response representation selected while decoding the body.
+    /// This value is never forwarded as an HTTP header.
+    pub response_hint: SemanticResponseHint,
+}
+
+/// Request-local information needed while encoding the downstream response.
+/// It is retained in memory only and is never forwarded to an upstream.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SemanticResponseHint {
+    /// Response representation selected from the decoded request.
+    pub mode: SemanticResponseMode,
+    /// Model resolved from the downstream request before upstream translation.
+    pub requested_model: Option<String>,
+}
+
+/// Request-local response representation selected by a semantic adapter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SemanticResponseMode {
+    /// Let the adapter use its route-defined response behavior.
+    #[default]
+    AdapterDefault,
+    /// Decode and return one bounded JSON response document.
+    Json,
+    /// Decode and return a server-sent event stream.
+    ServerSentEvents,
+}
+
+/// Semantic protocol carried over an upstream WebSocket connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticWebSocketTransport {
+    /// OpenAI Responses `response.create` client messages and JSON server events.
+    OpenAiResponses,
 }
 
 /// A semantic adapter's transformed downstream response body.
@@ -99,6 +136,20 @@ pub trait SemanticAdapter: Clone + Send + Sync + 'static {
         body: &[u8],
     ) -> Result<SemanticRequestBody, BoxError>;
 
+    /// Decode a request with access to the actual matched URI.
+    ///
+    /// The default preserves adapters whose wire contract depends only on the
+    /// compiled route, headers, and body.
+    fn encode_request_with_uri(
+        &self,
+        route: &RoutePlan,
+        _uri: &Uri,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<SemanticRequestBody, BoxError> {
+        self.encode_request(route, headers, body)
+    }
+
     /// Decode request-local policy inputs before upstream translation.
     ///
     /// Adapters may expose non-header session identifiers and the exact codec
@@ -111,6 +162,42 @@ pub trait SemanticAdapter: Clone + Send + Sync + 'static {
         _body: &[u8],
     ) -> Result<SelectionContext, BoxError> {
         Ok(SelectionContext::default())
+    }
+
+    /// Decode policy inputs with access to the actual matched URI.
+    fn selection_context_with_uri(
+        &self,
+        route: &RoutePlan,
+        _uri: &Uri,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<SelectionContext, BoxError> {
+        self.selection_context(route, headers, body)
+    }
+
+    /// Whether model selection rewrites the conventional JSON `/model` field.
+    /// Provider protocols that carry the model in the URL return `false`.
+    fn model_in_request_body(&self, _route: &RoutePlan) -> bool {
+        true
+    }
+
+    /// Select an upstream semantic WebSocket transport for this route.
+    ///
+    /// The proxy additionally requires a `ws` or `wss` upstream. Returning
+    /// `None` preserves the ordinary HTTP semantic path.
+    fn websocket_transport(&self, _route: &RoutePlan) -> Option<SemanticWebSocketTransport> {
+        None
+    }
+
+    /// Apply provider-specific path or query rewriting after model selection.
+    fn rewrite_upstream_uri(
+        &self,
+        _route: &RoutePlan,
+        _downstream_uri: &Uri,
+        _upstream_model: Option<&str>,
+        upstream_uri: Uri,
+    ) -> Result<Uri, BoxError> {
+        Ok(upstream_uri)
     }
 
     /// Removes downstream-only headers before the translated request is sent
@@ -140,6 +227,19 @@ pub trait SemanticAdapter: Clone + Send + Sync + 'static {
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
         self.decode_response(route, body, cancellation)
+    }
+
+    /// Transform an upstream response using the representation selected while
+    /// decoding this request. The default preserves existing adapter behavior.
+    fn decode_response_with_hint(
+        &self,
+        route: &RoutePlan,
+        body: ProxyBody,
+        request_headers: &HeaderMap,
+        _hint: &SemanticResponseHint,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        self.decode_response_with_request_headers(route, body, request_headers, cancellation)
     }
 }
 
@@ -324,6 +424,9 @@ pub enum ProxyError {
     /// The upstream did not produce response headers before the deadline.
     #[error("upstream request timed out")]
     Timeout,
+    /// The provider rejected a semantic Responses WebSocket handshake.
+    #[error("upstream WebSocket handshake failed with status {0}")]
+    WebSocketHandshakeStatus(u16),
 }
 
 /// A compiled route table and shared Hyper client for one listener.
@@ -342,6 +445,7 @@ pub struct HttpProxy<A = NoSemanticAdapter> {
     observability: MetricsRegistry,
     traces: TraceRecorder,
     resources: RuntimeResources,
+    openai_websockets: OpenAiResponsesWebSocketPool,
 }
 
 impl<A> std::fmt::Debug for HttpProxy<A>
@@ -459,6 +563,7 @@ where
             observability: MetricsRegistry::default(),
             traces: TraceRecorder::default(),
             resources,
+            openai_websockets: OpenAiResponsesWebSocketPool::default(),
         })
     }
 
@@ -759,10 +864,14 @@ where
         if let Some(native_auth) = native_auth.as_ref() {
             native_auth.apply_to(&mut headers).map_err(native_error)?;
         } else if selection.account_secret().is_some() {
-            crate::pool::apply_account_auth(&mut headers, selection.account_secret())
-                .map_err(pool_error)?;
+            crate::pool::apply_configured_account_auth(
+                &mut headers,
+                selection.account_secret(),
+                upstream.auth().map(pooler_config::AuthPlan::kind),
+            )
+            .map_err(pool_error)?;
         } else {
-            apply_upstream_auth(&mut headers, upstream)?;
+            apply_configured_upstream_auth(&mut headers, upstream)?;
         }
 
         let uri = websocket_uri(upstream, route, &downstream_uri)?;
@@ -894,7 +1003,10 @@ where
         let idempotency_key_present = headers.contains_key("idempotency-key");
         let method_safe_for_cache = safe_method_for_cache(method.as_str(), idempotency_key_present);
         let replay = ReplayCheck::for_http_method(method.as_str(), idempotency_key_present);
-        let (mut prepared, selected_model, selection_context) = match route.ingress().mode() {
+        let (mut prepared, selected_model, selection_context, semantic_response_hint) = match route
+            .ingress()
+            .mode()
+        {
             BodyMode::Opaque => {
                 if route.cache().is_some_and(|cache| cache.enabled()) && method_safe_for_cache {
                     let incoming =
@@ -926,6 +1038,7 @@ where
                         },
                         None,
                         SelectionContext::default(),
+                        SemanticResponseHint::default(),
                     )
                 } else {
                     let body =
@@ -936,6 +1049,7 @@ where
                         PreparedBody::Streaming(Some(body)),
                         None,
                         SelectionContext::default(),
+                        SemanticResponseHint::default(),
                     )
                 }
             }
@@ -1055,9 +1169,11 @@ where
                     },
                     selected_model,
                     SelectionContext::default(),
+                    SemanticResponseHint::default(),
                 )
             }
             BodyMode::Semantic => {
+                strip_provider_credential_headers(&mut headers);
                 let incoming =
                     FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
                 let bytes = tokio::select! {
@@ -1084,11 +1200,11 @@ where
                 };
                 let selection_context = self
                     .semantic
-                    .selection_context(route, &headers, &bytes)
+                    .selection_context_with_uri(route, &downstream_uri, &headers, &bytes)
                     .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
                 let prepared = self
                     .semantic
-                    .encode_request(route, &headers, &bytes)
+                    .encode_request_with_uri(route, &downstream_uri, &headers, &bytes)
                     .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
                 limits
                     .check_request_body(u64::try_from(prepared.body.len()).unwrap_or(u64::MAX))
@@ -1099,13 +1215,16 @@ where
                 headers.insert(header::CONTENT_TYPE, prepared.content_type);
                 self.semantic.sanitize_request_headers(&mut headers);
                 headers.remove(header::CONTENT_LENGTH);
+                let response_hint = prepared.response_hint;
                 (
                     PreparedBody::Buffered {
                         bytes: Bytes::from(prepared.body),
-                        patch_model: route.target().model_source().is_some(),
+                        patch_model: route.target().model_source().is_some()
+                            && self.semantic.model_in_request_body(route),
                     },
                     None,
                     selection_context,
+                    response_hint,
                 )
             }
             BodyMode::Inspect => {
@@ -1150,6 +1269,7 @@ where
                     },
                     None,
                     SelectionContext::default(),
+                    SemanticResponseHint::default(),
                 )
             }
         };
@@ -1221,7 +1341,7 @@ where
         let mut native_refresh_attempted = false;
 
         loop {
-            let selection = if let Some(selection) = forced_selection.take() {
+            let mut selection = if let Some(selection) = forced_selection.take() {
                 selection
             } else {
                 self.pooling
@@ -1278,25 +1398,36 @@ where
             } else {
                 None
             };
-            let attempt_body = prepared.body_for_attempt(selection.upstream_model())?;
             let attempt_started = StdInstant::now();
-            let response = self
-                .send_attempt(
-                    AttemptRequest {
-                        route,
-                        method: &method,
-                        downstream_uri: &downstream_uri,
-                        version,
-                        headers: &headers,
-                        upstream,
-                        selection: &selection,
-                        native_auth: native_auth.as_ref(),
-                        cancellation: &cancellation,
-                        started,
-                    },
-                    attempt_body,
-                )
-                .await;
+            let attempt_request = AttemptRequest {
+                route,
+                method: &method,
+                downstream_uri: &downstream_uri,
+                version,
+                headers: &headers,
+                upstream,
+                selection: &selection,
+                native_auth: native_auth.as_ref(),
+                cancellation: &cancellation,
+                started,
+            };
+            let response = if self.semantic.websocket_transport(route)
+                == Some(SemanticWebSocketTransport::OpenAiResponses)
+                && matches!(upstream.transport(), "ws" | "wss")
+            {
+                match prepared.buffered_bytes_for_attempt(selection.upstream_model()) {
+                    Ok(bytes) => {
+                        self.send_openai_responses_websocket_attempt(attempt_request, bytes)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                match prepared.body_for_attempt(selection.upstream_model()) {
+                    Ok(attempt_body) => self.send_attempt(attempt_request, attempt_body).await,
+                    Err(error) => Err(error),
+                }
+            };
             let attempt_result = match response.as_ref() {
                 Ok(response) if response.status().is_success() => AttemptResult::Success,
                 Ok(_) => AttemptResult::Error,
@@ -1319,28 +1450,68 @@ where
             let mut response = match response {
                 Ok(response) => response,
                 Err(error) => {
+                    let failure_status = match &error {
+                        ProxyError::WebSocketHandshakeStatus(status) => Some(*status),
+                        _ => None,
+                    };
+                    if failure_status == Some(401)
+                        && is_buffered
+                        && self.native.supports(upstream)
+                        && !native_refresh_attempted
+                    {
+                        native_refresh_attempted = true;
+                        let credential = selection.credential().ok_or_else(|| {
+                            ProxyError::Native("credential is not configured".to_owned())
+                        })?;
+                        let generation = native_auth
+                            .as_ref()
+                            .map(NativeAuthorization::generation)
+                            .ok_or_else(|| {
+                                ProxyError::Native("authorization is unavailable".to_owned())
+                            })?;
+                        match self
+                            .native
+                            .refresh(upstream, credential, generation, cancellation.clone())
+                            .await
+                        {
+                            Ok(_) => {
+                                forced_selection = Some(selection);
+                                attempt = attempt.saturating_add(1);
+                                continue;
+                            }
+                            Err(NativeRuntimeError::NeedsReauth) => {
+                                self.pooling.disable_credential(credential);
+                            }
+                            Err(_) => {}
+                        }
+                    }
                     if is_buffered && selection.has_policy() {
-                        let failure = self.pooling.classify_failure(crate::pool::FailureInput {
-                            config: &self.config,
-                            route,
-                            selection: &selection,
-                            status: None,
-                            provider_code: None,
-                            message: None,
-                            native_codex: false,
-                            retry_after: None,
-                            replay,
-                            idempotency_key_present,
-                            attempt,
-                            credentials_used: u32::try_from(credentials_used.len())
-                                .unwrap_or(u32::MAX),
-                            providers_used: u32::try_from(providers_used.len()).unwrap_or(u32::MAX),
-                            elapsed_retry_delay,
-                            elapsed_recovery_wait,
-                            started,
-                        });
+                        let mut failure =
+                            self.pooling.classify_failure(crate::pool::FailureInput {
+                                config: &self.config,
+                                route,
+                                selection: &mut selection,
+                                status: failure_status,
+                                provider_code: None,
+                                message: None,
+                                native_codex: self.native.supports(upstream),
+                                quota_observations: &[],
+                                retry_after: None,
+                                replay,
+                                commitment: CommitmentState::Uncommitted,
+                                idempotency_key_present,
+                                attempt,
+                                credentials_used: u32::try_from(credentials_used.len())
+                                    .unwrap_or(u32::MAX),
+                                providers_used: u32::try_from(providers_used.len())
+                                    .unwrap_or(u32::MAX),
+                                elapsed_retry_delay,
+                                elapsed_recovery_wait,
+                                started,
+                            });
                         self.observe_failure(route, &selection, &failure);
                         if failure.decision.is_retry() {
+                            forced_selection = failure.take_replacement();
                             let delay = failure.decision.delay();
                             if delay > retry_deadline.saturating_duration_since(Instant::now()) {
                                 return Err(ProxyError::Timeout);
@@ -1370,11 +1541,12 @@ where
                 .or_else(|| response.headers().get("x-provider-code"))
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.chars().take(128).collect());
+            let mut quota_observations = Vec::new();
             if self.native.supports(upstream) && !matches!(status, 402 | 429) {
                 provider_code = None;
             }
 
-            if self.native.supports(upstream) && is_buffered && should_classify(Some(status)) {
+            if is_buffered && should_classify(Some(status)) && selection.has_policy() {
                 let inspected = self
                     .inspect_failure_response(
                         response,
@@ -1390,6 +1562,7 @@ where
                     provider_code = inspected.provider_code;
                 }
                 retry_after = retry_after.or(inspected.retry_after);
+                quota_observations = inspected.quota_observations;
             }
 
             // A native 401 is eligible for exactly one pre-commit refresh. The
@@ -1435,16 +1608,18 @@ where
             }
 
             if is_buffered && should_classify(Some(status)) && selection.has_policy() {
-                let failure = self.pooling.classify_failure(crate::pool::FailureInput {
+                let mut failure = self.pooling.classify_failure(crate::pool::FailureInput {
                     config: &self.config,
                     route,
-                    selection: &selection,
+                    selection: &mut selection,
                     status: Some(status),
                     provider_code: provider_code.clone(),
                     message: None,
                     native_codex: self.native.supports(upstream),
+                    quota_observations: &quota_observations,
                     retry_after,
                     replay,
+                    commitment: CommitmentState::Uncommitted,
                     idempotency_key_present,
                     attempt,
                     credentials_used: u32::try_from(credentials_used.len()).unwrap_or(u32::MAX),
@@ -1455,6 +1630,7 @@ where
                 });
                 self.observe_failure(route, &selection, &failure);
                 if failure.decision.is_retry() {
+                    forced_selection = failure.take_replacement();
                     self.drain_retry_response(response, limits, &cancellation, retry_deadline)
                         .await?;
                     let delay = failure.decision.delay();
@@ -1487,6 +1663,7 @@ where
                         started,
                         observation,
                         request_headers: downstream_headers,
+                        semantic_response_hint,
                         cache_leader,
                     },
                 )
@@ -1515,15 +1692,23 @@ where
         if let Some(native_auth) = native_auth {
             native_auth.apply_to(&mut headers).map_err(native_error)?;
         } else if selection.account_secret().is_some() {
-            let _ = crate::pool::apply_account_auth(&mut headers, selection.account_secret())
-                .map_err(pool_error)?;
+            let _ = crate::pool::apply_configured_account_auth(
+                &mut headers,
+                selection.account_secret(),
+                upstream.auth().map(pooler_config::AuthPlan::kind),
+            )
+            .map_err(pool_error)?;
         } else {
-            apply_upstream_auth(&mut headers, upstream)?;
+            apply_configured_upstream_auth(&mut headers, upstream)?;
         }
         let body = FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
             .map_err(box_error)
             .boxed();
         let uri = upstream_uri(upstream, route, downstream_uri)?;
+        let uri = self
+            .semantic
+            .rewrite_upstream_uri(route, downstream_uri, selection.upstream_model(), uri)
+            .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
         let header_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
         route
             .limits()
@@ -1584,6 +1769,98 @@ where
         Ok(Response::from_parts(parts, body))
     }
 
+    async fn send_openai_responses_websocket_attempt(
+        &self,
+        request: AttemptRequest<'_>,
+        body: Bytes,
+    ) -> Result<Response<ProxyBody>, ProxyError> {
+        let AttemptRequest {
+            route,
+            method: _,
+            downstream_uri,
+            version: _,
+            headers: request_headers,
+            upstream,
+            selection,
+            native_auth,
+            cancellation,
+            started,
+        } = request;
+        let mut headers = request_headers.clone();
+        if let Some(native_auth) = native_auth {
+            native_auth.apply_to(&mut headers).map_err(native_error)?;
+        } else if selection.account_secret().is_some() {
+            crate::pool::apply_configured_account_auth(
+                &mut headers,
+                selection.account_secret(),
+                upstream.auth().map(pooler_config::AuthPlan::kind),
+            )
+            .map_err(pool_error)?;
+        } else {
+            apply_configured_upstream_auth(&mut headers, upstream)?;
+        }
+        headers.insert(
+            "openai-beta",
+            HeaderValue::from_static(RESPONSES_WEBSOCKET_BETA),
+        );
+        route
+            .limits()
+            .check_headers(
+                u32::try_from(headers.len()).unwrap_or(u32::MAX),
+                header_bytes(&headers),
+            )
+            .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
+        let endpoint = websocket_uri(upstream, route, downstream_uri)?;
+        let profile = if native_auth.is_some() {
+            "codex_subscription"
+        } else {
+            "openai_api_key"
+        };
+        let account = selection
+            .credential()
+            .map_or_else(|| upstream.id(), pooler_core::CredentialId::as_str);
+        let generation = native_auth.map_or_else(
+            || materialized_generation(self.config.generation(), &headers),
+            |authorization| CredentialGeneration::Native(authorization.generation()),
+        );
+        let session = downstream_session_identity(request_headers, &body);
+        let identity = ConnectionIdentity::new(profile, account, endpoint, generation, session);
+        let request_timeout = request_timeout(route.limits(), upstream);
+        let request_deadline = started + request_timeout;
+        let connect_deadline =
+            (StdInstant::now() + connect_timeout(route.limits(), upstream)).min(request_deadline);
+        let first_event_deadline = selection
+            .policy()
+            .map(|policy| started + policy.stream().bootstrap_timeout())
+            .unwrap_or(request_deadline)
+            .min(request_deadline);
+        let body = self
+            .openai_websockets
+            .execute(OpenAiResponsesWebSocketAttempt {
+                identity,
+                headers,
+                request_body: body,
+                limits: route.limits().clone(),
+                loss_policy: route.loss_policy(),
+                connect_deadline,
+                first_event_deadline,
+                request_deadline,
+                idle_timeout: request_timeout,
+                cancellation: cancellation.clone(),
+                resources: self.resources.clone(),
+            })
+            .await
+            .map_err(openai_websocket_error)?;
+        let mut response = Response::new(body.boxed());
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response.extensions_mut().insert(SemanticWebSocketResponse);
+        Ok(response)
+    }
+
     async fn drain_retry_response(
         &self,
         response: Response<ProxyBody>,
@@ -1629,6 +1906,8 @@ where
         let (provider_code, retry_after) =
             self.native
                 .quota_evidence(upstream, status, &parts.headers, &body);
+        let quota_observations =
+            provider_quota_observations(upstream, status, &parts.headers, &body);
         let response = Response::from_parts(
             parts,
             Full::new(body)
@@ -1639,6 +1918,7 @@ where
             response,
             provider_code,
             retry_after,
+            quota_observations,
         })
     }
 
@@ -1722,9 +2002,14 @@ where
             started,
             mut observation,
             request_headers,
+            semantic_response_hint,
             mut cache_leader,
         } = context;
         let (parts, body) = response.into_parts();
+        let semantic_websocket = parts
+            .extensions
+            .get::<SemanticWebSocketResponse>()
+            .is_some();
         let mut response_headers = parts.headers;
         strip_hop_by_hop_headers(&mut response_headers);
         let upstream = self
@@ -1744,14 +2029,17 @@ where
         )
         .boxed();
         observation.mark_headers();
-        let mut body = if route.response().mode() == BodyMode::Semantic && parts.status.is_success()
+        let mut body = if route.response().mode() == BodyMode::Semantic
+            && parts.status.is_success()
+            && !semantic_websocket
         {
             let transformed = self
                 .semantic
-                .decode_response_with_request_headers(
+                .decode_response_with_hint(
                     route,
                     body,
                     &request_headers,
+                    &semantic_response_hint,
                     cancellation.clone(),
                 )
                 .map_err(|error| {
@@ -1844,6 +2132,7 @@ struct FinishResponseContext {
     started: StdInstant,
     observation: RequestObservation,
     request_headers: HeaderMap,
+    semantic_response_hint: SemanticResponseHint,
     cache_leader: Option<CacheLeader>,
 }
 
@@ -1851,9 +2140,27 @@ struct InspectedFailureResponse {
     response: Response<ProxyBody>,
     provider_code: Option<String>,
     retry_after: Option<Duration>,
+    quota_observations: Vec<QuotaObservation>,
 }
 
 impl PreparedBody {
+    fn buffered_bytes_for_attempt(
+        &self,
+        upstream_model: Option<&str>,
+    ) -> Result<Bytes, ProxyError> {
+        let Self::Buffered { bytes, patch_model } = self else {
+            return Err(ProxyError::SemanticRequest(
+                "semantic WebSocket requests must be buffered".to_owned(),
+            ));
+        };
+        if *patch_model {
+            if let Some(model) = upstream_model {
+                return patch_model_bytes(bytes, model);
+            }
+        }
+        Ok(bytes.clone())
+    }
+
     fn body_for_attempt(&mut self, upstream_model: Option<&str>) -> Result<ProxyBody, ProxyError> {
         match self {
             Self::Streaming(body) => {
@@ -2034,9 +2341,10 @@ fn completion_class_for_error(error: &ProxyError) -> CompletionClass {
         ProxyError::UnsupportedBodyMode { .. } | ProxyError::SemanticResponse(_) => {
             CompletionClass::Unsupported
         }
-        ProxyError::Upstream(_) | ProxyError::Timeout | ProxyError::Native(_) => {
-            CompletionClass::UpstreamError
-        }
+        ProxyError::Upstream(_)
+        | ProxyError::Timeout
+        | ProxyError::Native(_)
+        | ProxyError::WebSocketHandshakeStatus(_) => CompletionClass::UpstreamError,
         ProxyError::TlsClient(_)
         | ProxyError::MissingUpstream { .. }
         | ProxyError::InvalidUri
@@ -2046,6 +2354,45 @@ fn completion_class_for_error(error: &ProxyError) -> CompletionClass {
         | ProxyError::RequestBuild(_)
         | ProxyError::Pool(_) => CompletionClass::InternalError,
     }
+}
+
+fn openai_websocket_error(error: OpenAiResponsesWebSocketError) -> ProxyError {
+    error.handshake_status().map_or_else(
+        || ProxyError::Upstream(Box::new(error)),
+        ProxyError::WebSocketHandshakeStatus,
+    )
+}
+
+fn downstream_session_identity(headers: &HeaderMap, body: &[u8]) -> Option<Arc<str>> {
+    for name in [
+        "session-id",
+        "session_id",
+        "x-session-id",
+        "x-thread-id",
+        "x-conversation-id",
+    ] {
+        if let Some(value) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(Arc::from(value));
+        }
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value
+        .get("prompt_cache_key")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            let metadata = value.get("metadata")?;
+            ["session_id", "thread_id", "conversation_id"]
+                .into_iter()
+                .find_map(|key| metadata.get(key).and_then(serde_json::Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(Arc::from)
 }
 
 fn patch_model_bytes(bytes: &Bytes, model: &str) -> Result<Bytes, ProxyError> {
@@ -2063,6 +2410,23 @@ fn patch_model_bytes(bytes: &Bytes, model: &str) -> Result<Bytes, ProxyError> {
 
 fn should_classify(status: Option<u16>) -> bool {
     status.is_some_and(|status| status >= 400)
+}
+
+fn provider_quota_observations(
+    upstream: &UpstreamPlan,
+    status: u16,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Vec<QuotaObservation> {
+    let provider = match upstream.native().map(|native| native.kind()) {
+        Some(kind) if kind.eq_ignore_ascii_case("kimi") => ProviderKind::Kimi,
+        Some(kind) if kind.eq_ignore_ascii_case("vertex") => ProviderKind::Vertex,
+        Some(kind) if kind.eq_ignore_ascii_case("antigravity") => ProviderKind::Antigravity,
+        _ => ProviderKind::OpenAiCompatible,
+    };
+    ProviderResponseClassifier::new(provider)
+        .parse_policy_observations(status, headers, body)
+        .unwrap_or_default()
 }
 
 fn upstream_uri(
@@ -2208,7 +2572,17 @@ fn websocket_uri(
         ));
     }
     let mut url = upstream.url().clone();
-    let path = route.target().path().unwrap_or_else(|| downstream.path());
+    let path = route.target().path().unwrap_or_else(|| {
+        if upstream.native().is_some_and(|native| {
+            native
+                .kind()
+                .eq_ignore_ascii_case(adapter_codex::CODEX_PROVIDER_ID)
+        }) {
+            adapter_codex::CODEX_RESPONSES_PATH
+        } else {
+            downstream.path()
+        }
+    });
     url.set_path(path);
     url.set_query(downstream.query());
     Ok(url.to_string())
@@ -2942,22 +3316,28 @@ async fn send_websocket_closes(
     })
     .await;
 }
-fn apply_upstream_auth(headers: &mut HeaderMap, upstream: &UpstreamPlan) -> Result<(), ProxyError> {
+/// Resolve and apply one compiled upstream credential at the outbound boundary.
+pub fn apply_configured_upstream_auth(
+    headers: &mut HeaderMap,
+    upstream: &UpstreamPlan,
+) -> Result<(), ProxyError> {
     let Some(auth) = upstream.auth() else {
         return Ok(());
     };
-    if !auth.kind().eq_ignore_ascii_case("bearer_secret")
-        && !auth.kind().eq_ignore_ascii_case("bearer")
-    {
-        return Err(ProxyError::UnsupportedAuth);
-    }
+    let placement = AuthPlacement::from_configured_kind(auth.kind())
+        .map_err(|_| ProxyError::UnsupportedAuth)?;
     let secret = resolve_secret(auth.secret())?;
-    let mut value = Zeroizing::new(Vec::with_capacity(7 + secret.expose_bytes().len()));
-    value.extend_from_slice(b"Bearer ");
-    value.extend_from_slice(secret.expose_bytes());
-    let value = HeaderValue::from_bytes(&value).map_err(|_| ProxyError::SecretUnavailable)?;
-    headers.insert(header::AUTHORIZATION, value);
+    let authorization = placement
+        .materialize(&secret)
+        .map_err(|_| ProxyError::SecretUnavailable)?;
+    authorization.apply_to(headers);
     Ok(())
+}
+
+fn strip_provider_credential_headers(headers: &mut HeaderMap) {
+    headers.remove(header::AUTHORIZATION);
+    headers.remove("x-api-key");
+    headers.remove("x-goog-api-key");
 }
 
 fn resolve_secret(secret: &SecretRef) -> Result<SecretValue, ProxyError> {
@@ -3105,6 +3485,7 @@ fn error_response(error: ProxyError) -> Response<ProxyBody> {
         | ProxyError::InvalidLimits(_)
         | ProxyError::RequestBuild(_)
         | ProxyError::Upstream(_)
+        | ProxyError::WebSocketHandshakeStatus(_)
         | ProxyError::Native(_)
         | ProxyError::Pool(_)
         | ProxyError::UnsupportedBodyMode { .. } => {
@@ -3252,6 +3633,42 @@ routes:
             .match_route_request(&request)
             .expect("template route matches");
         assert_eq!(route.id(), "templated");
+    }
+
+    #[test]
+    fn remaining_high_regression_provider_dispatch_parses_mixed_quota_dimensions() {
+        let config = compile_yaml(
+            "provider-quota-dispatch.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {provider: {url: http://127.0.0.1:8319}}
+routes: [{id: route, listen: local, target: provider}]
+"#,
+        )
+        .expect("quota dispatch config");
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-ratelimit-limit-requests", "100"),
+            ("x-ratelimit-remaining-requests", "7"),
+            ("x-ratelimit-reset-requests", "2s"),
+            ("x-ratelimit-limit-tokens", "10000"),
+            ("x-ratelimit-remaining-tokens", "0"),
+            ("x-ratelimit-reset-tokens", "30s"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        let observations = provider_quota_observations(
+            &config.upstreams()["provider"],
+            429,
+            &headers,
+            br#"{"error":{"code":"rate_limit_exceeded"}}"#,
+        );
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].unit, pooler_policy::QuotaUnit::Requests);
+        assert_eq!(observations[0].remaining, Some(7));
+        assert_eq!(observations[1].unit, pooler_policy::QuotaUnit::Tokens);
+        assert_eq!(observations[1].remaining, Some(0));
     }
 
     #[test]

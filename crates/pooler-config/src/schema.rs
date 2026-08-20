@@ -26,6 +26,10 @@ pub fn config_schema() -> Value {
     definitions.insert("auth".to_owned(), auth_schema());
     definitions.insert("body".to_owned(), body_schema());
     definitions.insert("cache".to_owned(), cache_schema());
+    definitions.insert("catalog".to_owned(), catalog_schema());
+    definitions.insert("catalog_alias".to_owned(), catalog_alias_schema());
+    definitions.insert("catalog_refresh".to_owned(), catalog_refresh_schema());
+    definitions.insert("catalog_source".to_owned(), catalog_source_schema());
     definitions.insert("cooldown".to_owned(), cooldown_schema());
     definitions.insert("duration".to_owned(), duration_schema());
     definitions.insert("extension".to_owned(), extension_schema());
@@ -66,6 +70,7 @@ pub fn config_schema() -> Value {
     properties.insert("upstreams", named_map_schema(reference("upstream")));
     properties.insert("providers", named_map_schema(reference("upstream")));
     properties.insert("models", array_schema(reference("model"), Some(0), None));
+    properties.insert("catalog", optional(reference("catalog")));
     properties.insert("accounts", named_map_schema(reference("account")));
     properties.insert("credentials", named_map_schema(reference("account")));
     properties.insert("account_pools", named_map_schema(reference("account_pool")));
@@ -117,12 +122,150 @@ fn account_schema() -> Value {
             ("provider", optional_string()),
             ("upstream", optional_string()),
             ("secret", optional(reference("secret_ref"))),
+            (
+                "auth_kind",
+                optional(string_enum(["api_key", "oauth", "subscription"])),
+            ),
             ("enabled", optional(boolean_schema())),
             ("weight", optional(u32_schema())),
             ("max_concurrency", optional(u32_schema())),
+            ("quota_project", optional(id_schema())),
         ]),
         &[],
         true,
+    )
+}
+
+fn catalog_schema() -> Value {
+    object_schema(
+        properties([
+            (
+                "sources",
+                array_schema(
+                    reference("catalog_source"),
+                    Some(1),
+                    Some(pooler_model_catalog::HARD_MAX_SOURCES as u64),
+                ),
+            ),
+            ("refresh", optional(reference("catalog_refresh"))),
+        ]),
+        &["sources"],
+        false,
+    )
+}
+
+fn catalog_alias_schema() -> Value {
+    object_schema(
+        properties([
+            ("name", string_schema()),
+            ("alias", string_schema()),
+            ("fork", optional(boolean_schema())),
+            ("display_name", optional(string_schema())),
+            ("force_mapping", optional(boolean_schema())),
+        ]),
+        &["name", "alias"],
+        false,
+    )
+}
+
+fn catalog_refresh_schema() -> Value {
+    object_schema(
+        properties([
+            (
+                "timeout_ms",
+                optional(integer_schema(Some(1), Some(300_000))),
+            ),
+            (
+                "max_sources",
+                optional(integer_schema(
+                    Some(1),
+                    Some(pooler_model_catalog::HARD_MAX_SOURCES as u64),
+                )),
+            ),
+            (
+                "max_models_per_source",
+                optional(integer_schema(
+                    Some(1),
+                    Some(pooler_model_catalog::HARD_MAX_MODELS_PER_SOURCE as u64),
+                )),
+            ),
+            (
+                "max_total_models",
+                optional(integer_schema(
+                    Some(1),
+                    Some(pooler_model_catalog::HARD_MAX_TOTAL_MODELS as u64),
+                )),
+            ),
+            (
+                "max_concurrency",
+                optional(integer_schema(
+                    Some(1),
+                    Some(pooler_model_catalog::HARD_MAX_REFRESH_CONCURRENCY as u64),
+                )),
+            ),
+            (
+                "max_merge_operations",
+                optional(integer_schema(
+                    Some(1),
+                    Some(pooler_model_catalog::HARD_MAX_MERGE_OPERATIONS as u64),
+                )),
+            ),
+        ]),
+        &[],
+        false,
+    )
+}
+
+fn catalog_source_schema() -> Value {
+    object_schema(
+        properties([
+            ("id", id_schema()),
+            ("provider", id_schema()),
+            ("account", optional(id_schema())),
+            (
+                "parser",
+                string_enum(["openai", "open_ai", "kimi", "vertex", "antigravity"]),
+            ),
+            ("path", optional(string_schema())),
+            (
+                "max_response_bytes",
+                optional(integer_schema(
+                    Some(1),
+                    Some(crate::MAX_CATALOG_RESPONSE_BYTES),
+                )),
+            ),
+            ("prefix", optional(string_schema())),
+            (
+                "priority",
+                optional(signed_integer_schema(i32::MIN, i32::MAX)),
+            ),
+            (
+                "aliases",
+                array_schema(
+                    reference("catalog_alias"),
+                    Some(0),
+                    Some(pooler_model_catalog::MAX_ALIASES_PER_SOURCE as u64),
+                ),
+            ),
+            (
+                "included_models",
+                array_schema(
+                    string_schema(),
+                    Some(0),
+                    Some(pooler_model_catalog::MAX_INCLUSIONS_PER_SOURCE as u64),
+                ),
+            ),
+            (
+                "excluded_models",
+                array_schema(
+                    string_schema(),
+                    Some(0),
+                    Some(pooler_model_catalog::MAX_EXCLUSIONS_PER_SOURCE as u64),
+                ),
+            ),
+        ]),
+        &["id", "provider", "parser"],
+        false,
     )
 }
 
@@ -152,7 +295,17 @@ fn affinity_schema() -> Value {
 fn auth_schema() -> Value {
     object_schema(
         properties([
-            ("kind", optional(string_enum(["bearer", "bearer_secret"]))),
+            (
+                "kind",
+                optional(string_enum([
+                    "bearer",
+                    "bearer_secret",
+                    "x-api-key",
+                    "x_api_key",
+                    "x-goog-api-key",
+                    "x_goog_api_key",
+                ])),
+            ),
             ("secret", optional(reference("secret_ref"))),
         ]),
         &[],
@@ -262,7 +415,10 @@ fn import_schema() -> Value {
     );
     let preset = object_schema(
         properties([
-            ("preset", string_enum(["cursor", "devin", "factory", "fx"])),
+            (
+                "preset",
+                string_enum(["cursor", "devin", "factory", "fx", "media", "xai"]),
+            ),
             ("as", string_pattern(r"^[A-Za-z0-9._-]{1,128}$")),
             ("with", string_map_schema()),
         ]),

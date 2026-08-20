@@ -38,6 +38,21 @@ Factory's `fx` CLI is not Factory Droid.
 | Devin | installed CLI and local bridge | Devin metadata and semantic chat through Pooler | Text pass |
 | Devin | installed CLI and local bridge | Terminal tool call and follow-up through Pooler | Pass; the client created a file containing the requested exact marker |
 
+After the native protocol expansion, the following bridge-free checks also
+passed against real providers through CLIProxyAPI's existing credentials:
+
+| Client/protocol | Native Pooler path | Result |
+| --- | --- | --- |
+| FX 0.0.3 text | AI LanguageModel V3 -> OpenAI Chat | Pass; exact `POOLER_NATIVE_FX_TEXT_OK` |
+| FX 0.0.3 tool loop | AI LanguageModel V3 -> OpenAI Chat | Pass; one real `file_info` call and exact `POOLER_NATIVE_FX_TOOL_OK` follow-up |
+| Droid 0.149.0 OpenAI | OpenAI Responses | Pass; exact `POOLER_NATIVE_DROID_OK` with usage |
+| Droid 0.149.0 Anthropic | Anthropic Messages | Pass; exact `POOLER_NATIVE_ANTHROPIC_OK` with usage |
+| Gemini streaming | Gemini `streamGenerateContent` | The route reached the provider, which returned `PERMISSION_DENIED` for both available Foundry Gemini aliases; no completion compatibility claim is made |
+
+The first native FX run exposed a current-client wire change: FX now sent the
+reasoning effort as a string instead of the previously captured object. Pooler
+normalizes that observed representation and has a regression test for it.
+
 Droid required `/v1/responses`; the first run correctly failed with Pooler's
 `404 no route matched` when the temporary listener exposed only
 `/v1/chat/completions`. After adding an opaque Responses route, the same

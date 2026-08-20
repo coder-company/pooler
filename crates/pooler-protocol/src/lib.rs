@@ -6,6 +6,7 @@ mod conversion;
 mod events;
 mod extensions;
 mod json;
+mod media;
 mod model;
 mod openai_chat;
 mod openai_responses;
@@ -34,6 +35,13 @@ pub use json::{
     DEFAULT_JSON_PATCH_MAX_POINTER_BYTES, DEFAULT_JSON_PATCH_MAX_POINTER_DEPTH,
     DEFAULT_JSON_PATCH_MAX_VALUE_BYTES,
 };
+pub use media::{
+    decode_binary_media, decode_multipart_media, encode_binary_media, encode_multipart_media,
+    DecodedMultipartMedia, EncodedBinaryMedia, EncodedMultipartMedia, MediaCodec, MediaCodecError,
+    MediaLimits, MultipartMediaPart, DEFAULT_MEDIA_MAX_BODY_BYTES,
+    DEFAULT_MEDIA_MAX_HEADERS_PER_PART, DEFAULT_MEDIA_MAX_HEADER_BYTES, DEFAULT_MEDIA_MAX_PARTS,
+    DEFAULT_MEDIA_MAX_PART_BYTES,
+};
 pub use model::{
     CacheHints, ContentPart, InputItem, MediaSource, Message, ReasoningBlock, ReasoningConfig,
     ReasoningEffort, Request, RequestValidationError, ResponseFormat, Role, SamplingParameters,
@@ -46,9 +54,9 @@ pub use openai_chat::{
 };
 pub use openai_responses::{
     decode_responses_request, decode_responses_request_with_report, encode_responses_request,
-    DecodedResponsesRequest, EncodedResponsesEvent, EncodedResponsesRequest,
-    OpenAiResponsesCodec, OpenAiResponsesError, OpenAiResponsesEventDecoder,
-    OpenAiResponsesEventEncoder, OPENAI_RESPONSES_UNKNOWN_FIELDS_EXTENSION,
+    DecodedResponsesRequest, EncodedResponsesEvent, EncodedResponsesRequest, OpenAiResponsesCodec,
+    OpenAiResponsesError, OpenAiResponsesEventDecoder, OpenAiResponsesEventEncoder,
+    OPENAI_RESPONSES_UNKNOWN_FIELDS_EXTENSION,
 };
 pub use pooler_core::LossPolicy;
 

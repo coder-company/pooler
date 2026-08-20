@@ -299,7 +299,7 @@ jobs:
           install -m 0755 "$first_binary" "$stage/bin/pooler"
           install -m 0644 README.md LICENSE NOTICE "$stage/"
           install -m 0644 config/pooler.example.yaml config/cursor.example.yaml \
-            "$stage/config/"
+            config/media.example.yaml "$stage/config/"
           install -m 0644 schema/pooler.schema.json "$stage/schema/"
           install -m 0644 fixtures/compatibility/manifest.json \
             "$stage/compatibility/"

@@ -15,7 +15,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::{HeaderName, Method};
+use http::{uri::PathAndQuery, HeaderName, Method};
 pub use pooler_core::{
     BodyMode, Capability, CapabilitySet, ConfigGeneration, LossPolicy, RouteLimits,
 };
@@ -23,7 +23,7 @@ use pooler_protocol::{
     DEFAULT_JSON_PATCH_MAX_POINTER_BYTES, DEFAULT_JSON_PATCH_MAX_POINTER_DEPTH,
     DEFAULT_JSON_PATCH_MAX_VALUE_BYTES,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
@@ -33,6 +33,9 @@ mod schema;
 mod watch;
 
 pub use loader::{load_path, render_path, ConfigLoader, LoadedConfig, DEFAULT_MAX_IMPORT_DEPTH};
+pub use pooler_model_catalog::{
+    AliasConfig as CatalogAliasConfig, RefreshConfig as CatalogRefreshConfig,
+};
 use route_match::{prefix_matches, template_matches};
 pub use route_match::{RouteMatchError, RouteRequest};
 pub use schema::{config_schema, render_config_schema, CONFIG_SCHEMA_VERSION};
@@ -73,6 +76,10 @@ pub const MAX_ROUTE_CACHE_ENTRIES: usize = 4096;
 pub const MAX_ROUTE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum request headers used in a response-cache key.
 pub const MAX_ROUTE_CACHE_KEY_HEADERS: usize = 16;
+/// Default maximum bytes accepted from one provider model-list response.
+pub const DEFAULT_CATALOG_MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+/// Hard maximum bytes accepted from one provider model-list response.
+pub const MAX_CATALOG_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Location of a declaration in its source document.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -270,6 +277,8 @@ pub struct Config {
     pub upstreams: BTreeMap<String, UpstreamConfig>,
     /// Public model declarations and their static upstream targets.
     pub models: Vec<ModelConfig>,
+    /// Optional remote model discovery and public exposure policy.
+    pub catalog: Option<ModelCatalogConfig>,
     /// Credential-bearing account declarations keyed by stable ID.
     pub accounts: BTreeMap<String, AccountConfig>,
     /// Compatibility alias for account declarations.
@@ -461,6 +470,83 @@ pub struct ModelTargetConfig {
     pub codecs: Vec<String>,
 }
 
+/// Optional remote model-catalog declaration.
+///
+/// Sources reference existing upstream IDs. Authentication therefore stays on
+/// the upstream/account boundary and is never copied into catalog policy.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelCatalogConfig {
+    /// Discovery sources and their public exposure policy.
+    pub sources: Vec<ModelCatalogSourceConfig>,
+    /// Bounds shared by fetch, parse, merge, and publication.
+    pub refresh: CatalogRefreshConfig,
+}
+
+/// Provider response parser selected for one catalog source.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogParserKind {
+    /// OpenAI-compatible `data[]` model list.
+    #[serde(rename = "openai", alias = "open_ai")]
+    OpenAi,
+    /// Kimi Open Platform model list with documented baseline capabilities.
+    Kimi,
+    /// Vertex publisher-model catalog export.
+    Vertex,
+    /// Antigravity compatibility model-hint response.
+    Antigravity,
+}
+
+impl CatalogParserKind {
+    /// Stable configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Kimi => "kimi",
+            Self::Vertex => "vertex",
+            Self::Antigravity => "antigravity",
+        }
+    }
+
+    const fn default_path(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAi | Self::Kimi => Some("/v1/models"),
+            Self::Vertex => None,
+            Self::Antigravity => Some("/v1internal:fetchAvailableModels"),
+        }
+    }
+}
+
+/// One remote discovery source plus its public exposure rules.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelCatalogSourceConfig {
+    /// Stable, non-secret source ID.
+    pub id: String,
+    /// Existing upstream/provider ID used for transport and authentication.
+    pub provider: String,
+    /// Optional existing account used for account or native OAuth auth.
+    pub account: Option<String>,
+    /// Bounded provider response parser.
+    pub parser: Option<CatalogParserKind>,
+    /// Relative provider endpoint. OpenAI/Kimi/Antigravity have safe defaults.
+    pub path: Option<String>,
+    /// Maximum response bytes for this source.
+    pub max_response_bytes: Option<u64>,
+    /// Optional client-visible namespace, emitted as `prefix/model`.
+    pub prefix: Option<String>,
+    /// Higher-priority targets are listed first.
+    pub priority: i32,
+    /// Exact upstream-to-public aliases.
+    pub aliases: Vec<CatalogAliasConfig>,
+    /// Optional case-sensitive exact or `*` wildcard allow-list.
+    pub included_models: Vec<String>,
+    /// Case-sensitive exact or `*` wildcard deny-list.
+    pub excluded_models: Vec<String>,
+}
+
 /// One credential-bearing account.
 ///
 /// The secret remains a [`SecretRef`].  Configuration compilation never reads
@@ -474,12 +560,40 @@ pub struct AccountConfig {
     pub provider: Option<String>,
     /// Reference to the account's credential material.
     pub secret: Option<SecretRef>,
+    /// Explicit credential kind. OAuth is inferred for legacy native OAuth
+    /// accounts; all other accounts default to API keys.
+    pub auth_kind: Option<AccountAuthKind>,
     /// Whether selection may use this account. Omitted means enabled.
     pub enabled: Option<bool>,
     /// Relative selection weight. Omitted means one.
     pub weight: Option<u32>,
     /// Optional per-account in-flight bound.
     pub max_concurrency: Option<u32>,
+    /// Optional provider-local project, organization, tenant, or billing ID
+    /// used only to group project-scoped quota state.
+    pub quota_project: Option<String>,
+}
+
+/// Authentication material configured for an account.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAuthKind {
+    /// Usage-based API key resolved from `secret`.
+    ApiKey,
+    /// Encrypted OAuth credential, including subscription accounts.
+    #[serde(rename = "oauth", alias = "o_auth", alias = "subscription")]
+    OAuth,
+}
+
+impl AccountAuthKind {
+    /// Stable configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::OAuth => "oauth",
+        }
+    }
 }
 
 /// A named, explicit account pool.
@@ -694,8 +808,9 @@ pub type DownstreamAuthConfig = AuthConfig;
 /// Read-only management HTTP listener declaration.
 ///
 /// Management is disabled unless `enabled` is true (or `bind` is supplied).
-/// A loopback listener may run without authentication. Non-loopback listeners
-/// require both `remote: true` and a bearer secret reference.
+/// A loopback listener may run without authentication. Remote management is
+/// rejected until a management TLS plan is available; raw bearer HTTP is not
+/// a supported remote transport.
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ManagementConfig {
@@ -1197,10 +1312,12 @@ impl NativeProviderPlan {
 pub struct AccountPlan {
     id: Arc<str>,
     provider: Arc<str>,
-    secret: SecretRef,
+    secret: Option<SecretRef>,
+    auth_kind: AccountAuthKind,
     enabled: bool,
     weight: u32,
     max_concurrency: Option<u32>,
+    quota_project: Option<Arc<str>>,
     source: SourceLabel,
 }
 
@@ -1219,8 +1336,14 @@ impl AccountPlan {
 
     /// Secret reference. The referenced value is never held in this plan.
     #[must_use]
-    pub const fn secret(&self) -> &SecretRef {
-        &self.secret
+    pub const fn secret(&self) -> Option<&SecretRef> {
+        self.secret.as_ref()
+    }
+
+    /// Explicit credential kind used by runtime authorization.
+    #[must_use]
+    pub const fn auth_kind(&self) -> AccountAuthKind {
+        self.auth_kind
     }
 
     /// Whether selection may use this account.
@@ -1239,6 +1362,15 @@ impl AccountPlan {
     #[must_use]
     pub const fn max_concurrency(&self) -> Option<u32> {
         self.max_concurrency
+    }
+
+    /// Optional provider-local project grouping for scoped quota state.
+    ///
+    /// The value is configuration metadata, not credential material. Runtime
+    /// policy hashes it before it enters diagnostics or persisted quota state.
+    #[must_use]
+    pub fn quota_project(&self) -> Option<&str> {
+        self.quota_project.as_deref()
     }
 
     /// Source declaration label.
@@ -1716,6 +1848,76 @@ impl ModelPlan {
     #[must_use]
     pub const fn source(&self) -> &SourceLabel {
         &self.source
+    }
+}
+
+/// Immutable remote model-catalog plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCatalogPlan {
+    limits: pooler_model_catalog::RefreshLimits,
+    sources: Vec<ModelCatalogSourcePlan>,
+}
+
+impl ModelCatalogPlan {
+    /// Bounds shared by fetch, parse, merge, and publication.
+    #[must_use]
+    pub const fn limits(&self) -> pooler_model_catalog::RefreshLimits {
+        self.limits
+    }
+
+    /// Sources in deterministic priority/source-ID order.
+    #[must_use]
+    pub fn sources(&self) -> &[ModelCatalogSourcePlan] {
+        &self.sources
+    }
+}
+
+/// Immutable transport/parser plan for one catalog source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCatalogSourcePlan {
+    source: pooler_model_catalog::CatalogSource,
+    parser: CatalogParserKind,
+    account: Option<Arc<str>>,
+    path: Arc<str>,
+    max_response_bytes: u64,
+    source_label: SourceLabel,
+}
+
+impl ModelCatalogSourcePlan {
+    /// Public exposure policy compiled by `pooler-model-catalog`.
+    #[must_use]
+    pub const fn source(&self) -> &pooler_model_catalog::CatalogSource {
+        &self.source
+    }
+
+    /// Provider response parser.
+    #[must_use]
+    pub const fn parser(&self) -> CatalogParserKind {
+        self.parser
+    }
+
+    /// Explicit account used for discovery authentication.
+    #[must_use]
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+
+    /// Relative provider endpoint including an optional query string.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Maximum response bytes accepted before parser allocation.
+    #[must_use]
+    pub const fn max_response_bytes(&self) -> u64 {
+        self.max_response_bytes
+    }
+
+    /// Source declaration label.
+    #[must_use]
+    pub const fn source_label(&self) -> &SourceLabel {
+        &self.source_label
     }
 }
 
@@ -2321,6 +2523,7 @@ pub struct CompiledConfig {
     account_pools: BTreeMap<Arc<str>, AccountPoolPlan>,
     policies: BTreeMap<Arc<str>, PolicyPlan>,
     models: BTreeMap<Arc<str>, ModelPlan>,
+    catalog: Option<ModelCatalogPlan>,
     extensions: BTreeMap<Arc<str>, ExtensionPlan>,
     routes: Vec<RoutePlan>,
     management: Option<ManagementPlan>,
@@ -2354,6 +2557,7 @@ impl CompiledConfig {
             && self.account_pools == other.account_pools
             && self.policies == other.policies
             && self.models == other.models
+            && self.catalog == other.catalog
             && self.extensions == other.extensions
             && self.routes == other.routes
             && self.management == other.management
@@ -2399,6 +2603,12 @@ impl CompiledConfig {
     #[must_use]
     pub const fn models(&self) -> &BTreeMap<Arc<str>, ModelPlan> {
         &self.models
+    }
+
+    /// Optional remote model discovery plan.
+    #[must_use]
+    pub const fn catalog(&self) -> Option<&ModelCatalogPlan> {
+        self.catalog.as_ref()
     }
 
     /// Supervised external extension plans keyed by ID.
@@ -2575,6 +2785,7 @@ fn compile_config(
     let account_pools = compile_account_pools(config, source, &accounts)?;
     let policies = compile_policies(config, source, &accounts, &account_pools)?;
     let models = compile_models(config, source, &upstreams)?;
+    let catalog = compile_catalog(config.catalog.as_ref(), source, &upstreams, &accounts)?;
     let extensions = compile_extensions(config, source)?;
     let management = compile_management(&config.management, source)?;
 
@@ -2727,6 +2938,7 @@ fn compile_config(
         account_pools,
         policies,
         models,
+        catalog,
         extensions,
         routes,
         management,
@@ -2884,15 +3096,39 @@ fn compile_accounts(
                     label,
                 });
             }
-            let secret = declaration
-                .secret
-                .as_ref()
-                .ok_or_else(|| invalid(&label, "account requires a secret reference"))?;
-            if !matches!(
-                secret,
-                SecretRef::Env(_) | SecretRef::File(_) | SecretRef::Keyring { .. }
-            ) {
+            let upstream = &upstreams[provider];
+            let inferred_oauth = upstream.native().is_some() && upstream.oauth().is_some();
+            let auth_kind = declaration.auth_kind.unwrap_or(if inferred_oauth {
+                AccountAuthKind::OAuth
+            } else {
+                AccountAuthKind::ApiKey
+            });
+            let secret = declaration.secret.as_ref();
+            if auth_kind == AccountAuthKind::ApiKey && secret.is_none() {
+                return Err(invalid(
+                    &label,
+                    "API-key account requires a secret reference",
+                ));
+            }
+            if secret.is_some_and(|secret| {
+                !matches!(
+                    secret,
+                    SecretRef::Env(_) | SecretRef::File(_) | SecretRef::Keyring { .. }
+                )
+            }) {
                 return Err(invalid(&label, "account secret reference is unsupported"));
+            }
+            if auth_kind == AccountAuthKind::OAuth && upstream.oauth().is_none() {
+                return Err(invalid(
+                    &label,
+                    "OAuth account requires explicit upstream oauth configuration",
+                ));
+            }
+            if auth_kind == AccountAuthKind::ApiKey && upstream.native().is_some() {
+                return Err(invalid(
+                    &label,
+                    "API-key account cannot use a native subscription upstream",
+                ));
             }
             let weight = declaration.weight.unwrap_or(1);
             if weight == 0 {
@@ -2904,15 +3140,25 @@ fn compile_accounts(
                     "account max_concurrency must be greater than zero",
                 ));
             }
+            let quota_project = declaration
+                .quota_project
+                .as_deref()
+                .map(|value| {
+                    validate_id("quota project", value, &label)?;
+                    Ok::<Arc<str>, ConfigError>(Arc::from(value))
+                })
+                .transpose()?;
             accounts.insert(
                 Arc::from(id.as_str()),
                 AccountPlan {
                     id: Arc::from(id.as_str()),
                     provider: Arc::from(provider),
-                    secret: secret.clone(),
+                    secret: secret.cloned(),
+                    auth_kind,
                     enabled: declaration.enabled.unwrap_or(true),
                     weight,
                     max_concurrency: declaration.max_concurrency,
+                    quota_project,
                     source: label,
                 },
             );
@@ -3623,6 +3869,134 @@ fn compile_models(
     Ok(models)
 }
 
+fn compile_catalog(
+    declaration: Option<&ModelCatalogConfig>,
+    source: &Source,
+    upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
+    accounts: &BTreeMap<Arc<str>, AccountPlan>,
+) -> Result<Option<ModelCatalogPlan>, ConfigError> {
+    let Some(declaration) = declaration else {
+        return Ok(None);
+    };
+    let catalog_label = source_label(source, "catalog".to_owned());
+    if declaration.sources.is_empty() {
+        return Err(invalid(
+            &catalog_label,
+            "catalog requires at least one discovery source",
+        ));
+    }
+
+    let policy = pooler_model_catalog::CatalogConfig {
+        sources: declaration
+            .sources
+            .iter()
+            .map(|source| pooler_model_catalog::CatalogSourceConfig {
+                id: source.id.clone(),
+                provider: source.provider.clone(),
+                prefix: source.prefix.clone(),
+                priority: source.priority,
+                aliases: source.aliases.clone(),
+                included_models: source.included_models.clone(),
+                excluded_models: source.excluded_models.clone(),
+            })
+            .collect(),
+        refresh: declaration.refresh.clone(),
+    }
+    .compile()
+    .map_err(|error| invalid(&catalog_label, &error.to_string()))?;
+
+    let mut runtime = BTreeMap::new();
+    for (ordinal, source_declaration) in declaration.sources.iter().enumerate() {
+        let label = source_label(source, format!("catalog.sources[{ordinal}]"));
+        if !upstreams.contains_key(source_declaration.provider.as_str()) {
+            return Err(ConfigError::MissingReference {
+                kind: "upstream",
+                name: source_declaration.provider.clone(),
+                label,
+            });
+        }
+        let account = source_declaration
+            .account
+            .as_deref()
+            .map(str::trim)
+            .filter(|account| !account.is_empty());
+        if let Some(account) = account {
+            let Some(account_plan) = accounts.get(account) else {
+                return Err(ConfigError::MissingReference {
+                    kind: "account",
+                    name: account.to_owned(),
+                    label,
+                });
+            };
+            if account_plan.provider() != source_declaration.provider {
+                return Err(invalid(
+                    &label,
+                    "catalog source account provider does not match source provider",
+                ));
+            }
+        }
+        let parser = source_declaration
+            .parser
+            .ok_or_else(|| invalid(&label, "catalog source requires parser"))?;
+        let path = source_declaration
+            .path
+            .as_deref()
+            .or_else(|| parser.default_path())
+            .ok_or_else(|| invalid(&label, "catalog source parser requires an explicit path"))?;
+        let path = path
+            .parse::<PathAndQuery>()
+            .ok()
+            .filter(|path| path.as_str().starts_with('/') && !path.as_str().starts_with("//"))
+            .ok_or_else(|| {
+                invalid(
+                    &label,
+                    "catalog source path must be an absolute path with no authority or fragment",
+                )
+            })?;
+        let max_response_bytes = source_declaration
+            .max_response_bytes
+            .unwrap_or(DEFAULT_CATALOG_MAX_RESPONSE_BYTES);
+        if max_response_bytes == 0 || max_response_bytes > MAX_CATALOG_RESPONSE_BYTES {
+            return Err(invalid(
+                &label,
+                &format!("catalog max_response_bytes must be 1..={MAX_CATALOG_RESPONSE_BYTES}"),
+            ));
+        }
+        runtime.insert(
+            source_declaration.id.clone(),
+            (
+                parser,
+                account.map(Arc::<str>::from),
+                Arc::<str>::from(path.as_str()),
+                max_response_bytes,
+                label,
+            ),
+        );
+    }
+
+    let sources = policy
+        .sources()
+        .iter()
+        .map(|source_policy| {
+            let (parser, account, path, max_response_bytes, source_label) = runtime
+                .remove(source_policy.id().as_str())
+                .expect("compiled catalog sources retain declaration IDs");
+            ModelCatalogSourcePlan {
+                source: source_policy.clone(),
+                parser,
+                account,
+                path,
+                max_response_bytes,
+                source_label,
+            }
+        })
+        .collect();
+    Ok(Some(ModelCatalogPlan {
+        limits: policy.limits(),
+        sources,
+    }))
+}
+
 fn compile_capabilities(
     values: &[String],
     label: &SourceLabel,
@@ -3914,9 +4288,21 @@ fn compile_auth(
         .secret
         .as_ref()
         .ok_or_else(|| invalid(label, "auth requires a secret reference"))?;
-    let kind = auth.kind.as_deref().unwrap_or("bearer_secret").trim();
-    if !matches!(kind, "bearer" | "bearer_secret") {
-        return Err(invalid(label, "auth kind must be bearer or bearer_secret"));
+    let kind = auth
+        .kind
+        .as_deref()
+        .unwrap_or("bearer_secret")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    if !matches!(
+        kind.as_str(),
+        "bearer" | "bearer_secret" | "x_api_key" | "x_goog_api_key"
+    ) {
+        return Err(invalid(
+            label,
+            "auth kind must be bearer, bearer_secret, x_api_key, or x_goog_api_key",
+        ));
     }
     if !matches!(
         secret,
@@ -3960,7 +4346,23 @@ fn compile_management(
         ));
     }
 
+    if remote {
+        return Err(invalid(
+            &label,
+            "remote management requires TLS; management TLS is not configured",
+        ));
+    }
+
     let auth = compile_auth(declaration.auth.as_ref(), &label)?;
+    if auth
+        .as_ref()
+        .is_some_and(|auth| !matches!(auth.kind(), "bearer" | "bearer_secret"))
+    {
+        return Err(invalid(
+            &label,
+            "management authentication requires a bearer auth kind",
+        ));
+    }
     if (remote || !loopback) && auth.is_none() {
         return Err(invalid(
             &label,
@@ -3994,6 +4396,12 @@ fn compile_downstream_auth(
         return Ok(None);
     };
     let plan = compile_auth(Some(declaration), label)?.expect("auth declaration was present");
+    if !matches!(plan.kind(), "bearer" | "bearer_secret") {
+        return Err(invalid(
+            label,
+            "downstream authentication requires a bearer auth kind",
+        ));
+    }
     Ok(Some(plan))
 }
 
@@ -5256,6 +5664,96 @@ routes:
     }
 
     #[test]
+    fn compiles_strict_catalog_sources_without_copying_credentials_or_static_models() {
+        let text = r#"
+version: 1
+upstreams:
+  provider-a:
+    url: https://provider.example/v1
+    auth: {secret: env:POOLER_PROVIDER_KEY}
+catalog:
+  refresh:
+    timeout_ms: 2500
+    max_concurrency: 2
+    max_merge_operations: 10000
+  sources:
+    - id: provider-a.primary
+      provider: provider-a
+      parser: open_ai
+      path: /v1/models?active=true
+      max_response_bytes: 4096
+      prefix: team
+      priority: 20
+      included_models: ['gpt-*']
+      excluded_models: ['*-deprecated']
+      aliases:
+        - {name: gpt-current, alias: latest, fork: true, force_mapping: true}
+"#;
+        let config = compile_yaml("catalog.yaml", text).expect("catalog compiles");
+        assert!(
+            config.models().is_empty(),
+            "static registry stays independent"
+        );
+        let catalog = config.catalog().expect("catalog plan");
+        assert_eq!(catalog.limits().timeout(), Duration::from_millis(2_500));
+        assert_eq!(catalog.sources().len(), 1);
+        let source = &catalog.sources()[0];
+        assert_eq!(source.source().id().as_str(), "provider-a.primary");
+        assert_eq!(source.source().provider().as_str(), "provider-a");
+        assert_eq!(source.parser(), CatalogParserKind::OpenAi);
+        assert_eq!(source.path(), "/v1/models?active=true");
+        assert_eq!(source.max_response_bytes(), 4096);
+        assert_eq!(source.source().prefix(), Some("team"));
+        assert_eq!(source.source().aliases()[0].public_id().as_str(), "latest");
+        assert_eq!(
+            source.source().included_models().collect::<Vec<_>>(),
+            vec!["gpt-*"]
+        );
+        assert_eq!(
+            source.source().excluded_models().collect::<Vec<_>>(),
+            vec!["*-deprecated"]
+        );
+        assert_eq!(
+            config.upstreams()["provider-a"]
+                .auth()
+                .expect("upstream auth")
+                .secret()
+                .redacted(),
+            "env:POOLER_PROVIDER_KEY"
+        );
+    }
+
+    #[test]
+    fn catalog_rejects_unknown_providers_unsafe_paths_and_unknown_fields() {
+        let missing = r#"
+version: 1
+catalog:
+  sources: [{id: missing.primary, provider: missing, parser: open_ai}]
+"#;
+        let error = compile_yaml("catalog-missing.yaml", missing).expect_err("missing provider");
+        assert!(error.to_string().contains("missing upstream `missing`"));
+
+        let unsafe_path = r#"
+version: 1
+upstreams: {local: {url: http://127.0.0.1:1}}
+catalog:
+  sources: [{id: local.primary, provider: local, parser: open_ai, path: //other.example/models}]
+"#;
+        let error =
+            compile_yaml("catalog-path.yaml", unsafe_path).expect_err("authority-like path");
+        assert!(error.to_string().contains("no authority or fragment"));
+
+        let unknown = r#"
+version: 1
+upstreams: {local: {url: http://127.0.0.1:1}}
+catalog:
+  sources: [{id: local.primary, provider: local, parser: open_ai, surprise: true}]
+"#;
+        let error = parse_yaml("catalog-unknown.yaml", unknown).expect_err("unknown field");
+        assert!(error.to_string().contains("unknown field `surprise`"));
+    }
+
+    #[test]
     fn management_requires_explicit_remote_enablement_and_authentication() {
         let without_enablement = compile_yaml(
             "management-remote-disabled.yaml",
@@ -5268,19 +5766,15 @@ routes:
             "management-remote-unauthenticated.yaml",
             "version: 1\nmanagement: {bind: 0.0.0.0:9090, remote: true}\n",
         )
-        .expect_err("remote management needs auth");
-        assert!(without_auth.to_string().contains("authentication"));
+        .expect_err("remote management needs TLS");
+        assert!(without_auth.to_string().contains("requires TLS"));
 
         let authenticated = compile_yaml(
             "management-remote-authenticated.yaml",
             "version: 1\nmanagement: {bind: 0.0.0.0:9090, remote: true, auth: {secret: env:POOLER_MANAGEMENT_KEY}}\n",
         )
-        .expect("authenticated remote management compiles");
-        assert!(authenticated
-            .management()
-            .expect("management plan")
-            .auth()
-            .is_some());
+        .expect_err("authenticated remote management still needs TLS");
+        assert!(authenticated.to_string().contains("requires TLS"));
     }
 
     #[test]
@@ -5298,7 +5792,27 @@ routes:
 
         let kind = "version: 1\nupstreams: {local: {url: http://127.0.0.1:1, auth: {kind: basic, secret: env:POOLER_KEY}}}\n";
         let error = compile_yaml("kind.yaml", kind).expect_err("unsupported kind");
-        assert!(error.to_string().contains("bearer or bearer_secret"));
+        assert!(error.to_string().contains("x_goog_api_key"));
+
+        for (kind, expected) in [
+            ("bearer", "bearer"),
+            ("x-api-key", "x_api_key"),
+            ("x-goog-api-key", "x_goog_api_key"),
+        ] {
+            let text = format!(
+                "version: 1\nupstreams: {{local: {{url: http://127.0.0.1:1, auth: {{kind: {kind}, secret: env:POOLER_KEY}}}}}}\n"
+            );
+            let config = compile_yaml("provider-header.yaml", &text).expect("provider auth kind");
+            assert_eq!(
+                config.upstreams()["local"].auth().expect("auth").kind(),
+                expected
+            );
+        }
+
+        let downstream = "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\nupstreams: {local: {url: http://127.0.0.1:2}}\nroutes: [{id: r, listen: local, downstream_auth: {kind: x-api-key, secret: env:POOLER_KEY}, target: {provider: local}}]\n";
+        let error = compile_yaml("downstream-header.yaml", downstream)
+            .expect_err("downstream auth remains bearer-only");
+        assert!(error.to_string().contains("requires a bearer auth kind"));
     }
 
     #[test]
@@ -5437,6 +5951,7 @@ accounts:
     secret: env:POOLER_PRIMARY
     weight: 2
     max_concurrency: 4
+    quota_project: billing-project-1
   backup:
     provider: local
     secret: file:/run/pooler/backup.token
@@ -5468,6 +5983,15 @@ routes:
         let config = compile_yaml("pooling.yaml", text).expect("pooling config");
         assert_eq!(config.accounts().len(), 2);
         assert_eq!(config.accounts()["primary"].weight(), 2);
+        assert_eq!(
+            config.accounts()["primary"].quota_project(),
+            Some("billing-project-1")
+        );
+        assert_eq!(
+            config.accounts()["primary"].source().path.as_ref(),
+            "accounts.primary"
+        );
+        assert_eq!(config.accounts()["backup"].quota_project(), None);
         assert_eq!(config.account_pools()["default"].accounts().len(), 2);
         let policy = &config.policies()["default"];
         assert_eq!(
@@ -5557,6 +6081,16 @@ accounts: {primary: {provider: absent, secret: env:POOLER_PRIMARY}}
         let error =
             compile_yaml("provider-ref.yaml", missing_provider).expect_err("missing provider");
         assert!(error.to_string().contains("missing upstream `absent`"));
+
+        let invalid_quota_project = r#"
+version: 1
+upstreams: {local: {url: http://127.0.0.1:1}}
+accounts:
+  primary: {provider: local, secret: env:POOLER_PRIMARY, quota_project: "tenant/unsafe"}
+"#;
+        let error = compile_yaml("quota-project.yaml", invalid_quota_project)
+            .expect_err("quota project IDs are bounded identifiers");
+        assert!(error.to_string().contains("invalid quota project ID"));
 
         let missing_account = r#"
 version: 1

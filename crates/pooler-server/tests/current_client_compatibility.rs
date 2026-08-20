@@ -194,6 +194,54 @@ async fn factory_current_fixture_replays_through_http_proxy_server() {
 }
 
 #[tokio::test]
+async fn fx_body_model_hint_survives_http_runtime_without_upstream_echo() {
+    let upstream_body = string_sse_body(&[
+        r#"{"id":"chat-body-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_owned(),
+        "[DONE]".to_owned(),
+    ]);
+    let (upstream_address, upstream_task) = spawn_upstream(upstream_body).await;
+    let config = compile_yaml(
+        "fx-body-model-runtime.yaml",
+        &format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: fx-body-model\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.fx.language_model}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.fx.events}}\n    loss_policy: degrade\n"
+        ),
+    )
+    .expect("fx body-model runtime config");
+    let running = start_server(config).await;
+    let request = serde_json::to_vec(&serde_json::json!({
+        "model": "body-model",
+        "prompt": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}]
+        }]
+    }))
+    .expect("fx body-model request");
+
+    let response = send_request(
+        running.address,
+        "/v3/ai/language-model",
+        &[("content-type", "application/json")],
+        &request,
+    )
+    .await;
+    assert_eq!(response_status(&response), 200);
+    let events = parse_sse(&decoded_response_body(&response));
+    let metadata: Value = serde_json::from_str(&events[0].data).expect("fx response metadata");
+    assert_eq!(metadata["type"], "response-metadata");
+    assert_eq!(metadata["modelId"], "body-model");
+
+    let upstream_request = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("fx upstream completes")
+        .expect("fx upstream task");
+    assert_request_line(&upstream_request, "POST", "/v1/chat/completions");
+    let upstream_json: Value =
+        serde_json::from_slice(http_body(&upstream_request)).expect("OpenAI request JSON");
+    assert_eq!(upstream_json["model"], "body-model");
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn devin_current_tool_follow_up_replays_through_http_proxy_server() {
     const MANIFEST_FIXTURE: &str =
         include_str!("../../../fixtures/devin/current-client-tool-follow-up.json");

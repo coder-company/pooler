@@ -23,6 +23,8 @@ use tokio::sync::Semaphore;
 
 /// Maximum aliases accepted for one discovery source.
 pub const MAX_ALIASES_PER_SOURCE: usize = 1_024;
+/// Maximum inclusion patterns accepted for one discovery source.
+pub const MAX_INCLUSIONS_PER_SOURCE: usize = 1_024;
 /// Maximum exclusion patterns accepted for one discovery source.
 pub const MAX_EXCLUSIONS_PER_SOURCE: usize = 1_024;
 /// Maximum UTF-8 bytes accepted for a model display name.
@@ -39,13 +41,15 @@ pub const HARD_MAX_TOTAL_MODELS: usize = 100_000;
 pub const HARD_MAX_REFRESH_CONCURRENCY: usize = 64;
 /// Hard upper bound for a complete refresh.
 pub const HARD_MAX_REFRESH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Hard upper bound for model/rule comparisons during one merge.
+pub const HARD_MAX_MERGE_OPERATIONS: usize = 20_000_000;
 
 const DEFAULT_MAX_SOURCES: usize = 64;
 const DEFAULT_MAX_MODELS_PER_SOURCE: usize = 5_000;
 const DEFAULT_MAX_TOTAL_MODELS: usize = 20_000;
 const DEFAULT_MAX_REFRESH_CONCURRENCY: usize = 8;
+const DEFAULT_MAX_MERGE_OPERATIONS: usize = 5_000_000;
 const DEFAULT_REFRESH_TIMEOUT_MS: u64 = 30_000;
-const MAX_DIAGNOSTIC_BYTES: usize = 512;
 
 /// Stable, non-secret identifier for one model discovery source.
 ///
@@ -120,10 +124,11 @@ impl CatalogConfig {
             .map(CatalogSourceConfig::compile)
             .collect::<Result<Vec<_>, _>>()?;
         sources.sort_by(source_order);
-        for pair in sources.windows(2) {
-            if pair[0].id == pair[1].id {
+        let mut source_ids = BTreeSet::new();
+        for source in &sources {
+            if !source_ids.insert(source.id.clone()) {
                 return Err(CatalogError::DuplicateSource {
-                    source: pair[0].id.clone(),
+                    source_id: source.id.clone(),
                 });
             }
         }
@@ -145,6 +150,8 @@ pub struct CatalogSourceConfig {
     pub priority: i32,
     /// Exact upstream-name aliases.
     pub aliases: Vec<AliasConfig>,
+    /// Case-sensitive exact or `*` wildcard allow-list, empty to include all.
+    pub included_models: Vec<String>,
     /// Case-sensitive exact or `*` wildcard patterns evaluated upstream-first.
     pub excluded_models: Vec<String>,
 }
@@ -157,7 +164,7 @@ impl CatalogSourceConfig {
         })?;
         let provider =
             ProviderId::new(self.provider).map_err(|error| CatalogError::InvalidProviderId {
-                source: source.clone(),
+                source_id: source.clone(),
                 message: error.to_string(),
             })?;
         let prefix = self
@@ -167,14 +174,21 @@ impl CatalogSourceConfig {
 
         if self.aliases.len() > MAX_ALIASES_PER_SOURCE {
             return Err(CatalogError::AliasLimitExceeded {
-                source,
+                source_id: source,
                 actual: self.aliases.len(),
                 maximum: MAX_ALIASES_PER_SOURCE,
             });
         }
+        if self.included_models.len() > MAX_INCLUSIONS_PER_SOURCE {
+            return Err(CatalogError::InclusionLimitExceeded {
+                source_id: source,
+                actual: self.included_models.len(),
+                maximum: MAX_INCLUSIONS_PER_SOURCE,
+            });
+        }
         if self.excluded_models.len() > MAX_EXCLUSIONS_PER_SOURCE {
             return Err(CatalogError::ExclusionLimitExceeded {
-                source,
+                source_id: source,
                 actual: self.excluded_models.len(),
                 maximum: MAX_EXCLUSIONS_PER_SOURCE,
             });
@@ -193,26 +207,14 @@ impl CatalogSourceConfig {
         for pair in aliases.windows(2) {
             if pair[0].public_id == pair[1].public_id {
                 return Err(CatalogError::DuplicateAlias {
-                    source,
+                    source_id: source,
                     alias: pair[0].public_id.clone(),
                 });
             }
         }
 
-        let mut exclusions = self
-            .excluded_models
-            .into_iter()
-            .map(|pattern| ExclusionPattern::new(&source, pattern))
-            .collect::<Result<Vec<_>, _>>()?;
-        exclusions.sort_by(|left, right| left.pattern.cmp(&right.pattern));
-        for pair in exclusions.windows(2) {
-            if pair[0].pattern == pair[1].pattern {
-                return Err(CatalogError::DuplicateExclusion {
-                    source,
-                    pattern: pair[0].pattern.clone(),
-                });
-            }
-        }
+        let inclusions = compile_patterns(&source, self.included_models, PatternKind::Inclusion)?;
+        let exclusions = compile_patterns(&source, self.excluded_models, PatternKind::Exclusion)?;
 
         Ok(CatalogSource {
             id: source,
@@ -220,6 +222,7 @@ impl CatalogSourceConfig {
             prefix,
             priority: self.priority,
             aliases,
+            inclusions,
             exclusions,
         })
     }
@@ -242,19 +245,19 @@ pub struct AliasConfig {
 }
 
 impl AliasConfig {
-    fn compile(self, source: &SourceId) -> Result<AliasRule, CatalogError> {
+    fn compile(self, source: &SourceId) -> Result<CatalogAlias, CatalogError> {
         let upstream_id = ModelId::new(self.name).map_err(|error| CatalogError::InvalidAlias {
-            source: source.clone(),
+            source_id: source.clone(),
             message: format!("invalid upstream model: {error}"),
         })?;
         let public_id = ModelId::new(self.alias).map_err(|error| CatalogError::InvalidAlias {
-            source: source.clone(),
+            source_id: source.clone(),
             message: format!("invalid public model: {error}"),
         })?;
         if let Some(display_name) = &self.display_name {
             validate_display_name(source, display_name)?;
         }
-        Ok(AliasRule {
+        Ok(CatalogAlias {
             upstream_id,
             public_id,
             fork: self.fork,
@@ -278,6 +281,8 @@ pub struct RefreshConfig {
     pub max_total_models: usize,
     /// Maximum simultaneous source calls.
     pub max_concurrency: usize,
+    /// Maximum model/rule comparisons performed by a merge.
+    pub max_merge_operations: usize,
 }
 
 impl Default for RefreshConfig {
@@ -288,6 +293,7 @@ impl Default for RefreshConfig {
             max_models_per_source: DEFAULT_MAX_MODELS_PER_SOURCE,
             max_total_models: DEFAULT_MAX_TOTAL_MODELS,
             max_concurrency: DEFAULT_MAX_REFRESH_CONCURRENCY,
+            max_merge_operations: DEFAULT_MAX_MERGE_OPERATIONS,
         }
     }
 }
@@ -311,6 +317,11 @@ impl RefreshConfig {
             self.max_concurrency,
             HARD_MAX_REFRESH_CONCURRENCY,
         )?;
+        validate_limit(
+            "max_merge_operations",
+            self.max_merge_operations,
+            HARD_MAX_MERGE_OPERATIONS,
+        )?;
         let timeout = Duration::from_millis(self.timeout_ms);
         if timeout.is_zero() || timeout > HARD_MAX_REFRESH_TIMEOUT {
             return Err(CatalogError::InvalidRefreshTimeout {
@@ -324,6 +335,7 @@ impl RefreshConfig {
             max_models_per_source: self.max_models_per_source,
             max_total_models: self.max_total_models,
             max_concurrency: self.max_concurrency,
+            max_merge_operations: self.max_merge_operations,
         })
     }
 }
@@ -336,6 +348,7 @@ pub struct RefreshLimits {
     max_models_per_source: usize,
     max_total_models: usize,
     max_concurrency: usize,
+    max_merge_operations: usize,
 }
 
 impl RefreshLimits {
@@ -368,10 +381,16 @@ impl RefreshLimits {
     pub const fn max_concurrency(self) -> usize {
         self.max_concurrency
     }
+
+    /// Maximum model/rule comparisons performed by one merge.
+    #[must_use]
+    pub const fn max_merge_operations(self) -> usize {
+        self.max_merge_operations
+    }
 }
 
 /// Fully validated catalog configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledCatalogConfig {
     limits: RefreshLimits,
     sources: Vec<CatalogSource>,
@@ -392,14 +411,15 @@ impl CompiledCatalogConfig {
 }
 
 /// Validated public exposure rules for one discovery source.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogSource {
     id: SourceId,
     provider: ProviderId,
     prefix: Option<String>,
     priority: i32,
-    aliases: Vec<AliasRule>,
-    exclusions: Vec<ExclusionPattern>,
+    aliases: Vec<CatalogAlias>,
+    inclusions: Vec<ModelPattern>,
+    exclusions: Vec<ModelPattern>,
 }
 
 impl CatalogSource {
@@ -426,10 +446,27 @@ impl CatalogSource {
     pub const fn priority(&self) -> i32 {
         self.priority
     }
+
+    /// Compiled upstream-to-public alias rules.
+    #[must_use]
+    pub fn aliases(&self) -> &[CatalogAlias] {
+        &self.aliases
+    }
+
+    /// Upstream model allow-list patterns. Empty means all models are included.
+    pub fn included_models(&self) -> impl Iterator<Item = &str> {
+        self.inclusions.iter().map(ModelPattern::as_str)
+    }
+
+    /// Upstream model deny-list patterns.
+    pub fn excluded_models(&self) -> impl Iterator<Item = &str> {
+        self.exclusions.iter().map(ModelPattern::as_str)
+    }
 }
 
-#[derive(Clone, Debug)]
-struct AliasRule {
+/// Validated upstream-to-public alias rule.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CatalogAlias {
     upstream_id: ModelId,
     public_id: ModelId,
     fork: bool,
@@ -437,30 +474,103 @@ struct AliasRule {
     force_mapping: bool,
 }
 
-#[derive(Clone, Debug)]
-struct ExclusionPattern {
+impl CatalogAlias {
+    /// Provider-native model ID matched by this rule.
+    #[must_use]
+    pub const fn upstream_id(&self) -> &ModelId {
+        &self.upstream_id
+    }
+
+    /// Client-visible model ID before an optional source prefix.
+    #[must_use]
+    pub const fn public_id(&self) -> &ModelId {
+        &self.public_id
+    }
+
+    /// Whether the native public ID remains visible beside the alias.
+    #[must_use]
+    pub const fn fork(&self) -> bool {
+        self.fork
+    }
+
+    /// Alias-specific display name.
+    #[must_use]
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    /// Whether provider response model fields must use the public ID.
+    #[must_use]
+    pub const fn force_mapping(&self) -> bool {
+        self.force_mapping
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelPattern {
     pattern: String,
 }
 
-impl ExclusionPattern {
-    fn new(source: &SourceId, pattern: String) -> Result<Self, CatalogError> {
+impl ModelPattern {
+    fn new(source: &SourceId, pattern: String, kind: PatternKind) -> Result<Self, CatalogError> {
         if pattern.is_empty()
             || pattern.len() > pooler_core::MAX_IDENTIFIER_LENGTH
             || pattern
                 .chars()
                 .any(|character| character.is_control() || character.is_whitespace())
         {
-            return Err(CatalogError::InvalidExclusion {
-                source: source.clone(),
-                pattern,
-            });
+            return Err(kind.invalid(source.clone(), pattern));
         }
         Ok(Self { pattern })
+    }
+
+    fn as_str(&self) -> &str {
+        &self.pattern
     }
 
     fn matches(&self, model: &str) -> bool {
         wildcard_matches(&self.pattern, model)
     }
+}
+
+#[derive(Clone, Copy)]
+enum PatternKind {
+    Inclusion,
+    Exclusion,
+}
+
+impl PatternKind {
+    fn invalid(self, source_id: SourceId, pattern: String) -> CatalogError {
+        match self {
+            Self::Inclusion => CatalogError::InvalidInclusion { source_id, pattern },
+            Self::Exclusion => CatalogError::InvalidExclusion { source_id, pattern },
+        }
+    }
+
+    fn duplicate(self, source_id: SourceId, pattern: String) -> CatalogError {
+        match self {
+            Self::Inclusion => CatalogError::DuplicateInclusion { source_id, pattern },
+            Self::Exclusion => CatalogError::DuplicateExclusion { source_id, pattern },
+        }
+    }
+}
+
+fn compile_patterns(
+    source: &SourceId,
+    patterns: Vec<String>,
+    kind: PatternKind,
+) -> Result<Vec<ModelPattern>, CatalogError> {
+    let mut patterns = patterns
+        .into_iter()
+        .map(|pattern| ModelPattern::new(source, pattern, kind))
+        .collect::<Result<Vec<_>, _>>()?;
+    patterns.sort_by(|left, right| left.pattern.cmp(&right.pattern));
+    for pair in patterns.windows(2) {
+        if pair[0].pattern == pair[1].pattern {
+            return Err(kind.duplicate(source.clone(), pair[0].pattern.clone()));
+        }
+    }
+    Ok(patterns)
 }
 
 /// Provider-returned metadata for one upstream model.
@@ -691,6 +801,7 @@ pub struct CatalogSourceState {
     revision: Option<String>,
     observed_at_unix_ms: u64,
     discovered_models: usize,
+    not_included_models: usize,
     excluded_models: usize,
     published_exposures: usize,
 }
@@ -718,6 +829,12 @@ impl CatalogSourceState {
     #[must_use]
     pub const fn discovered_models(&self) -> usize {
         self.discovered_models
+    }
+
+    /// Models omitted because they did not match the source allow-list.
+    #[must_use]
+    pub const fn not_included_models(&self) -> usize {
+        self.not_included_models
     }
 
     /// Models removed by exclusion policy.
@@ -808,15 +925,16 @@ pub fn merge_discoveries(
     inputs.sort_by(|left, right| source_order(&left.source, &right.source));
     let mut seen_sources = BTreeSet::new();
     let mut total_models = 0usize;
+    let mut merge_operations = 0usize;
     for input in &inputs {
         if !seen_sources.insert(input.source.id.clone()) {
             return Err(CatalogError::DuplicateSource {
-                source: input.source.id.clone(),
+                source_id: input.source.id.clone(),
             });
         }
         if input.response.models.len() > limits.max_models_per_source {
             return Err(CatalogError::SourceModelLimitExceeded {
-                source: input.source.id.clone(),
+                source_id: input.source.id.clone(),
                 actual: input.response.models.len(),
                 maximum: limits.max_models_per_source,
             });
@@ -826,6 +944,21 @@ pub fn merge_discoveries(
             return Err(CatalogError::TotalModelLimitExceeded {
                 actual: total_models,
                 maximum: limits.max_total_models,
+            });
+        }
+        let rules_per_model = input
+            .source
+            .aliases
+            .len()
+            .saturating_add(input.source.inclusions.len())
+            .saturating_add(input.source.exclusions.len())
+            .saturating_add(1);
+        merge_operations = merge_operations
+            .saturating_add(input.response.models.len().saturating_mul(rules_per_model));
+        if merge_operations > limits.max_merge_operations {
+            return Err(CatalogError::MergeWorkLimitExceeded {
+                actual: merge_operations,
+                maximum: limits.max_merge_operations,
             });
         }
     }
@@ -839,16 +972,27 @@ pub fn merge_discoveries(
         for pair in discovered.windows(2) {
             if pair[0].id == pair[1].id {
                 return Err(CatalogError::DuplicateDiscoveredModel {
-                    source: input.source.id.clone(),
+                    source_id: input.source.id.clone(),
                     model: pair[0].id.clone(),
                 });
             }
         }
 
         let discovered_count = discovered.len();
+        let mut not_included_count = 0usize;
         let mut excluded_count = 0usize;
         let mut exposure_count = 0usize;
         for model in discovered {
+            if !input.source.inclusions.is_empty()
+                && !input
+                    .source
+                    .inclusions
+                    .iter()
+                    .any(|pattern| pattern.matches(model.id.as_str()))
+            {
+                not_included_count += 1;
+                continue;
+            }
             if input
                 .source
                 .exclusions
@@ -927,6 +1071,7 @@ pub fn merge_discoveries(
                 revision: input.response.revision,
                 observed_at_unix_ms: refreshed_at_unix_ms,
                 discovered_models: discovered_count,
+                not_included_models: not_included_count,
                 excluded_models: excluded_count,
                 published_exposures: exposure_count,
             },
@@ -1007,12 +1152,14 @@ fn compile_public_model(
         if let Some((upstream, first_source)) = provider_mappings.get(&candidate.provider) {
             if upstream != &candidate.upstream_model {
                 return Err(CatalogError::ConflictingPublicMapping {
-                    public_model: public_id,
-                    provider: candidate.provider,
-                    first_upstream: upstream.clone(),
-                    first_source: first_source.clone(),
-                    second_upstream: candidate.upstream_model,
-                    second_source: candidate.provenance.source,
+                    conflict: Box::new(PublicMappingConflict {
+                        public_model: public_id,
+                        provider: candidate.provider,
+                        first_upstream: upstream.clone(),
+                        first_source: first_source.clone(),
+                        second_upstream: candidate.upstream_model,
+                        second_source: candidate.provenance.source,
+                    }),
                 });
             }
         } else {
@@ -1062,38 +1209,74 @@ fn prefixed_model_id(source: &CatalogSource, public_id: &ModelId) -> Result<Mode
     };
     ModelId::new(format!("{prefix}/{public_id}")).map_err(|error| {
         CatalogError::PrefixedModelInvalid {
-            source: source.id.clone(),
+            source_id: source.id.clone(),
             model: public_id.clone(),
             message: error.to_string(),
         }
     })
 }
 
-/// A sanitized provider discovery failure.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("{message}")]
+/// Stable, non-secret failure categories accepted at the discovery boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryFailureKind {
+    /// The provider could not be reached or did not complete in time.
+    Transport,
+    /// Configured authentication was unavailable or rejected.
+    Authentication,
+    /// The provider returned an unsuccessful response.
+    Provider,
+    /// The provider response did not match the selected bounded parser.
+    InvalidResponse,
+    /// A response or parser resource bound was exceeded.
+    LimitExceeded,
+    /// Runtime shutdown cancelled the discovery attempt.
+    Cancelled,
+    /// An internal integration invariant failed.
+    Internal,
+}
+
+impl Display for DiscoveryFailureKind {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Transport => "transport",
+            Self::Authentication => "authentication",
+            Self::Provider => "provider",
+            Self::InvalidResponse => "invalid_response",
+            Self::LimitExceeded => "limit_exceeded",
+            Self::Cancelled => "cancelled",
+            Self::Internal => "internal",
+        })
+    }
+}
+
+/// A centrally redacted provider discovery failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("model discovery failed ({kind})")]
 pub struct DiscoveryFailure {
-    message: String,
+    kind: DiscoveryFailureKind,
 }
 
 impl DiscoveryFailure {
-    /// Construct a bounded diagnostic. Provider adapters must not include
-    /// credential material in this message.
+    /// Construct a provider failure while discarding caller-supplied text.
+    ///
+    /// This compatibility constructor deliberately ignores `message`; use
+    /// [`Self::from_kind`] when the integration can classify the failure.
     #[must_use]
-    pub fn new(message: impl AsRef<str>) -> Self {
-        let message = message.as_ref();
-        let message = if message.is_empty() {
-            "model discovery failed".to_owned()
-        } else {
-            truncate_utf8(message, MAX_DIAGNOSTIC_BYTES)
-        };
-        Self { message }
+    pub fn new(_message: impl AsRef<str>) -> Self {
+        Self::from_kind(DiscoveryFailureKind::Provider)
     }
 
-    /// Bounded diagnostic text.
+    /// Construct from a stable failure category.
     #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
+    pub const fn from_kind(kind: DiscoveryFailureKind) -> Self {
+        Self { kind }
+    }
+
+    /// Stable failure category.
+    #[must_use]
+    pub const fn kind(self) -> DiscoveryFailureKind {
+        self.kind
     }
 }
 
@@ -1159,10 +1342,11 @@ impl CatalogService {
             });
         }
         sources.sort_by(|left, right| source_order(&left.source, &right.source));
-        for pair in sources.windows(2) {
-            if pair[0].source.id == pair[1].source.id {
+        let mut source_ids = BTreeSet::new();
+        for registered in &sources {
+            if !source_ids.insert(registered.source.id.clone()) {
                 return Err(CatalogError::DuplicateSource {
-                    source: pair[0].source.id.clone(),
+                    source_id: registered.source.id.clone(),
                 });
             }
         }
@@ -1190,6 +1374,7 @@ impl CatalogService {
             .clone()
             .try_acquire_owned()
             .map_err(|_| CatalogError::RefreshInProgress)?;
+        let deadline = tokio::time::Instant::now() + self.limits.timeout;
         let concurrency = self.limits.max_concurrency.min(self.sources.len().max(1));
         let fetches = stream::iter(self.sources.iter().cloned())
             .map(|registered| async move {
@@ -1198,7 +1383,7 @@ impl CatalogService {
             })
             .buffer_unordered(concurrency)
             .collect::<Vec<_>>();
-        let mut responses = tokio::time::timeout(self.limits.timeout, fetches)
+        let mut responses = tokio::time::timeout_at(deadline, fetches)
             .await
             .map_err(|_| CatalogError::RefreshTimedOut {
                 timeout_ms: duration_millis_u64(self.limits.timeout),
@@ -1208,8 +1393,8 @@ impl CatalogService {
         let mut inputs = Vec::with_capacity(responses.len());
         for (source, response) in responses {
             let response = response.map_err(|failure| CatalogError::DiscoveryFailed {
-                source: source.id.clone(),
-                message: failure.message,
+                source_id: source.id.clone(),
+                kind: failure.kind(),
             })?;
             inputs.push(CatalogInput::new(source, response));
         }
@@ -1219,7 +1404,21 @@ impl CatalogService {
             .generation
             .checked_add(1)
             .ok_or(CatalogError::GenerationExhausted)?;
-        let candidate = merge_discoveries(generation, observed_at_unix_ms, inputs, self.limits)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CatalogError::RefreshTimedOut {
+                timeout_ms: duration_millis_u64(self.limits.timeout),
+            });
+        }
+        let limits = self.limits;
+        let merge = tokio::task::spawn_blocking(move || {
+            merge_discoveries(generation, observed_at_unix_ms, inputs, limits)
+        });
+        let candidate = tokio::time::timeout_at(deadline, merge)
+            .await
+            .map_err(|_| CatalogError::RefreshTimedOut {
+                timeout_ms: duration_millis_u64(self.limits.timeout),
+            })?
+            .map_err(|_| CatalogError::MergeWorkerFailed)??;
         let report = RefreshReport {
             generation,
             source_count: candidate.sources.len(),
@@ -1277,6 +1476,58 @@ impl RefreshReport {
     }
 }
 
+/// Deterministic details for an ambiguous public/provider mapping.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error(
+    "public model {public_model} maps provider {provider} to both {first_upstream} ({first_source}) and {second_upstream} ({second_source})"
+)]
+pub struct PublicMappingConflict {
+    public_model: ModelId,
+    provider: ProviderId,
+    first_upstream: ModelId,
+    first_source: SourceId,
+    second_upstream: ModelId,
+    second_source: SourceId,
+}
+
+impl PublicMappingConflict {
+    /// Ambiguous client-visible model ID.
+    #[must_use]
+    pub const fn public_model(&self) -> &ModelId {
+        &self.public_model
+    }
+
+    /// Provider whose upstream mapping is ambiguous.
+    #[must_use]
+    pub const fn provider(&self) -> &ProviderId {
+        &self.provider
+    }
+
+    /// Higher-priority deterministic mapping.
+    #[must_use]
+    pub const fn first_upstream(&self) -> &ModelId {
+        &self.first_upstream
+    }
+
+    /// Source of the higher-priority mapping.
+    #[must_use]
+    pub const fn first_source(&self) -> &SourceId {
+        &self.first_source
+    }
+
+    /// Conflicting lower-priority mapping.
+    #[must_use]
+    pub const fn second_upstream(&self) -> &ModelId {
+        &self.second_upstream
+    }
+
+    /// Source of the conflicting lower-priority mapping.
+    #[must_use]
+    pub const fn second_source(&self) -> &SourceId {
+        &self.second_source
+    }
+}
+
 /// Catalog configuration, merge, or refresh failure.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CatalogError {
@@ -1284,43 +1535,74 @@ pub enum CatalogError {
     #[error("invalid catalog source id: {message}")]
     InvalidSourceId { message: String },
     /// Invalid provider identifier.
-    #[error("catalog source {source} has an invalid provider id: {message}")]
-    InvalidProviderId { source: SourceId, message: String },
+    #[error("catalog source {source_id} has an invalid provider id: {message}")]
+    InvalidProviderId {
+        source_id: SourceId,
+        message: String,
+    },
     /// Invalid source prefix.
-    #[error("catalog source {source} has invalid prefix {prefix:?}")]
-    InvalidPrefix { source: SourceId, prefix: String },
+    #[error("catalog source {source_id} has invalid prefix {prefix:?}")]
+    InvalidPrefix { source_id: SourceId, prefix: String },
     /// Invalid alias declaration.
-    #[error("catalog source {source} has an invalid alias: {message}")]
-    InvalidAlias { source: SourceId, message: String },
+    #[error("catalog source {source_id} has an invalid alias: {message}")]
+    InvalidAlias {
+        source_id: SourceId,
+        message: String,
+    },
     /// Duplicate public alias in one source.
-    #[error("catalog source {source} declares public alias {alias} more than once")]
-    DuplicateAlias { source: SourceId, alias: ModelId },
+    #[error("catalog source {source_id} declares public alias {alias} more than once")]
+    DuplicateAlias { source_id: SourceId, alias: ModelId },
     /// Too many aliases in one source.
-    #[error("catalog source {source} has {actual} aliases; maximum is {maximum}")]
+    #[error("catalog source {source_id} has {actual} aliases; maximum is {maximum}")]
     AliasLimitExceeded {
-        source: SourceId,
+        source_id: SourceId,
+        actual: usize,
+        maximum: usize,
+    },
+    /// Invalid inclusion wildcard.
+    #[error("catalog source {source_id} has invalid inclusion pattern {pattern:?}")]
+    InvalidInclusion {
+        source_id: SourceId,
+        pattern: String,
+    },
+    /// Duplicate inclusion wildcard.
+    #[error("catalog source {source_id} repeats inclusion pattern {pattern:?}")]
+    DuplicateInclusion {
+        source_id: SourceId,
+        pattern: String,
+    },
+    /// Too many inclusions in one source.
+    #[error("catalog source {source_id} has {actual} inclusions; maximum is {maximum}")]
+    InclusionLimitExceeded {
+        source_id: SourceId,
         actual: usize,
         maximum: usize,
     },
     /// Invalid exclusion wildcard.
-    #[error("catalog source {source} has invalid exclusion pattern {pattern:?}")]
-    InvalidExclusion { source: SourceId, pattern: String },
+    #[error("catalog source {source_id} has invalid exclusion pattern {pattern:?}")]
+    InvalidExclusion {
+        source_id: SourceId,
+        pattern: String,
+    },
     /// Duplicate exclusion wildcard.
-    #[error("catalog source {source} repeats exclusion pattern {pattern:?}")]
-    DuplicateExclusion { source: SourceId, pattern: String },
+    #[error("catalog source {source_id} repeats exclusion pattern {pattern:?}")]
+    DuplicateExclusion {
+        source_id: SourceId,
+        pattern: String,
+    },
     /// Too many exclusions in one source.
-    #[error("catalog source {source} has {actual} exclusions; maximum is {maximum}")]
+    #[error("catalog source {source_id} has {actual} exclusions; maximum is {maximum}")]
     ExclusionLimitExceeded {
-        source: SourceId,
+        source_id: SourceId,
         actual: usize,
         maximum: usize,
     },
     /// Invalid display metadata.
-    #[error("catalog source {source} returned an invalid model display name")]
-    InvalidDisplayName { source: SourceId },
+    #[error("catalog source {source_id} returned an invalid model display name")]
+    InvalidDisplayName { source_id: SourceId },
     /// Invalid provider revision metadata.
-    #[error("catalog source {source} returned an invalid catalog revision")]
-    InvalidRevision { source: SourceId },
+    #[error("catalog source {source_id} returned an invalid catalog revision")]
+    InvalidRevision { source_id: SourceId },
     /// Invalid numeric refresh bound.
     #[error("invalid refresh limit {field}={actual}; expected 1..={maximum}")]
     InvalidRefreshLimit {
@@ -1335,39 +1617,36 @@ pub enum CatalogError {
     #[error("catalog has {actual} sources; maximum is {maximum}")]
     SourceLimitExceeded { actual: usize, maximum: usize },
     /// Duplicate source registration or merge input.
-    #[error("catalog source {source} is registered more than once")]
-    DuplicateSource { source: SourceId },
+    #[error("catalog source {source_id} is registered more than once")]
+    DuplicateSource { source_id: SourceId },
     /// Duplicate model ID in one provider response.
-    #[error("catalog source {source} returned model {model} more than once")]
-    DuplicateDiscoveredModel { source: SourceId, model: ModelId },
+    #[error("catalog source {source_id} returned model {model} more than once")]
+    DuplicateDiscoveredModel { source_id: SourceId, model: ModelId },
     /// One provider response exceeded its model bound.
-    #[error("catalog source {source} returned {actual} models; maximum is {maximum}")]
+    #[error("catalog source {source_id} returned {actual} models; maximum is {maximum}")]
     SourceModelLimitExceeded {
-        source: SourceId,
+        source_id: SourceId,
         actual: usize,
         maximum: usize,
     },
     /// The aggregate response exceeded its model bound.
     #[error("catalog refresh returned {actual} models; maximum is {maximum}")]
     TotalModelLimitExceeded { actual: usize, maximum: usize },
+    /// Alias/filter evaluation exceeded the configured deterministic work budget.
+    #[error("catalog merge requires {actual} operations; maximum is {maximum}")]
+    MergeWorkLimitExceeded { actual: usize, maximum: usize },
     /// Prefixing produced an invalid public model ID.
-    #[error("catalog source {source} cannot prefix model {model}: {message}")]
+    #[error("catalog source {source_id} cannot prefix model {model}: {message}")]
     PrefixedModelInvalid {
-        source: SourceId,
+        source_id: SourceId,
         model: ModelId,
         message: String,
     },
     /// One public/provider pair mapped to multiple upstream names.
-    #[error(
-        "public model {public_model} maps provider {provider} to both {first_upstream} ({first_source}) and {second_upstream} ({second_source})"
-    )]
+    #[error("{conflict}")]
     ConflictingPublicMapping {
-        public_model: ModelId,
-        provider: ProviderId,
-        first_upstream: ModelId,
-        first_source: SourceId,
-        second_upstream: ModelId,
-        second_source: SourceId,
+        /// Structured conflict details.
+        conflict: Box<PublicMappingConflict>,
     },
     /// A refresh is already active.
     #[error("model catalog refresh is already in progress")]
@@ -1376,8 +1655,14 @@ pub enum CatalogError {
     #[error("model catalog refresh exceeded {timeout_ms}ms")]
     RefreshTimedOut { timeout_ms: u64 },
     /// Provider discovery failed.
-    #[error("model discovery from {source} failed: {message}")]
-    DiscoveryFailed { source: SourceId, message: String },
+    #[error("model discovery from {source_id} failed ({kind})")]
+    DiscoveryFailed {
+        source_id: SourceId,
+        kind: DiscoveryFailureKind,
+    },
+    /// The isolated merge worker failed without publishing a candidate.
+    #[error("model catalog merge worker failed")]
+    MergeWorkerFailed,
     /// The successful-refresh generation cannot advance.
     #[error("model catalog generation is exhausted")]
     GenerationExhausted,
@@ -1445,7 +1730,7 @@ fn validate_prefix(source: &SourceId, prefix: String) -> Result<String, CatalogE
             .any(|character| character.is_control() || character.is_whitespace());
     if invalid {
         Err(CatalogError::InvalidPrefix {
-            source: source.clone(),
+            source_id: source.clone(),
             prefix,
         })
     } else {
@@ -1459,7 +1744,7 @@ fn validate_display_name(source: &SourceId, display_name: &str) -> Result<(), Ca
         || display_name.chars().any(char::is_control)
     {
         Err(CatalogError::InvalidDisplayName {
-            source: source.clone(),
+            source_id: source.clone(),
         })
     } else {
         Ok(())
@@ -1473,7 +1758,7 @@ fn validate_revision(source: &SourceId, revision: Option<&str>) -> Result<(), Ca
             || revision.chars().any(char::is_control)
     }) {
         Err(CatalogError::InvalidRevision {
-            source: source.clone(),
+            source_id: source.clone(),
         })
     } else {
         Ok(())
@@ -1506,17 +1791,6 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
         pattern_index += 1;
     }
     pattern_index == pattern.len()
-}
-
-fn truncate_utf8(value: &str, maximum_bytes: usize) -> String {
-    if value.len() <= maximum_bytes {
-        return value.to_owned();
-    }
-    let mut end = maximum_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {

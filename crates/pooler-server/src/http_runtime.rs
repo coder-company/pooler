@@ -11,8 +11,13 @@ use std::{
     time::Duration,
 };
 
+use adapter_anthropic::AnthropicSemanticAdapter;
 use adapter_devin::DevinSemanticAdapter;
+use adapter_droid::DroidOpenAiSemanticAdapter;
 use adapter_factory::FactorySemanticAdapter;
+use adapter_fx::FxSemanticAdapter;
+use adapter_gemini::GeminiSemanticAdapter;
+use adapter_xai::XaiSemanticAdapter;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
@@ -27,9 +32,10 @@ use pooler_extension::{
     ExtensionCapabilities, ExtensionLimits, ExtensionRegistry, ExtensionSpec, WasmExtension,
 };
 use pooler_http::{
-    BoxError, DrainError, HttpProxy, NativeRuntime, PoolingCoordinator, ProxyBody, ProxyError,
-    RuntimeResourceGuard, RuntimeResourceSnapshot, RuntimeResources, SelectionContext,
-    SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
+    BoxError, DrainError, HttpProxy, MediaSemanticAdapter, NativeRuntime, PoolingCoordinator,
+    ProxyBody, ProxyError, RuntimeResourceGuard, RuntimeResourceSnapshot, RuntimeResources,
+    SelectionContext, SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
+    SemanticResponseHint, SemanticWebSocketTransport,
 };
 use pooler_observe::MetricsRegistry;
 use thiserror::Error;
@@ -43,7 +49,8 @@ use tracing::debug;
 
 use crate::tls::{PreparedTls, TlsError};
 use crate::{
-    ActiveCounts, ActiveGuard, ManagementApi, ManagementHttpServer, ManagementServerError,
+    ActiveCounts, ActiveGuard, CatalogRuntime, CatalogRuntimeError, ManagementApi,
+    ManagementHttpServer, ManagementServerError,
 };
 
 const FORCE_CANCEL_GRACE: Duration = Duration::from_secs(1);
@@ -60,7 +67,14 @@ struct RuntimeSemanticAdapter;
 
 impl SemanticAdapter for RuntimeSemanticAdapter {
     fn supports(&self, route: &pooler_config::RoutePlan) -> bool {
-        FactorySemanticAdapter.supports(route) || DevinSemanticAdapter.supports(route)
+        DroidOpenAiSemanticAdapter.supports(route)
+            || XaiSemanticAdapter.supports(route)
+            || MediaSemanticAdapter::default().supports(route)
+            || AnthropicSemanticAdapter.supports(route)
+            || GeminiSemanticAdapter.supports(route)
+            || FxSemanticAdapter.supports(route)
+            || FactorySemanticAdapter.supports(route)
+            || DevinSemanticAdapter.supports(route)
     }
 
     fn encode_request(
@@ -69,12 +83,38 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         headers: &http::HeaderMap,
         body: &[u8],
     ) -> Result<SemanticRequestBody, BoxError> {
-        if FactorySemanticAdapter.supports(route) {
+        if DroidOpenAiSemanticAdapter.supports(route) {
+            DroidOpenAiSemanticAdapter.encode_request(route, headers, body)
+        } else if XaiSemanticAdapter.supports(route) {
+            XaiSemanticAdapter.encode_request(route, headers, body)
+        } else if MediaSemanticAdapter::default().supports(route) {
+            MediaSemanticAdapter::default().encode_request(route, headers, body)
+        } else if AnthropicSemanticAdapter.supports(route) {
+            AnthropicSemanticAdapter.encode_request(route, headers, body)
+        } else if GeminiSemanticAdapter.supports(route) {
+            GeminiSemanticAdapter.encode_request(route, headers, body)
+        } else if FxSemanticAdapter.supports(route) {
+            FxSemanticAdapter.encode_request(route, headers, body)
+        } else if FactorySemanticAdapter.supports(route) {
             FactorySemanticAdapter.encode_request(route, headers, body)
         } else if DevinSemanticAdapter.supports(route) {
             DevinSemanticAdapter.encode_request(route, headers, body)
         } else {
             Err(unsupported_semantic_route(route))
+        }
+    }
+
+    fn encode_request_with_uri(
+        &self,
+        route: &pooler_config::RoutePlan,
+        uri: &http::Uri,
+        headers: &http::HeaderMap,
+        body: &[u8],
+    ) -> Result<SemanticRequestBody, BoxError> {
+        if GeminiSemanticAdapter.supports(route) {
+            GeminiSemanticAdapter.encode_request_with_uri(route, uri, headers, body)
+        } else {
+            self.encode_request(route, headers, body)
         }
     }
 
@@ -84,7 +124,19 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         headers: &http::HeaderMap,
         body: &[u8],
     ) -> Result<SelectionContext, BoxError> {
-        if FactorySemanticAdapter.supports(route) {
+        if DroidOpenAiSemanticAdapter.supports(route) {
+            DroidOpenAiSemanticAdapter.selection_context(route, headers, body)
+        } else if XaiSemanticAdapter.supports(route) {
+            XaiSemanticAdapter.selection_context(route, headers, body)
+        } else if MediaSemanticAdapter::default().supports(route) {
+            MediaSemanticAdapter::default().selection_context(route, headers, body)
+        } else if AnthropicSemanticAdapter.supports(route) {
+            AnthropicSemanticAdapter.selection_context(route, headers, body)
+        } else if GeminiSemanticAdapter.supports(route) {
+            GeminiSemanticAdapter.selection_context(route, headers, body)
+        } else if FxSemanticAdapter.supports(route) {
+            FxSemanticAdapter.selection_context(route, headers, body)
+        } else if FactorySemanticAdapter.supports(route) {
             FactorySemanticAdapter.selection_context(route, headers, body)
         } else if DevinSemanticAdapter.supports(route) {
             DevinSemanticAdapter.selection_context(route, headers, body)
@@ -93,7 +145,61 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         }
     }
 
+    fn selection_context_with_uri(
+        &self,
+        route: &pooler_config::RoutePlan,
+        uri: &http::Uri,
+        headers: &http::HeaderMap,
+        body: &[u8],
+    ) -> Result<SelectionContext, BoxError> {
+        if GeminiSemanticAdapter.supports(route) {
+            GeminiSemanticAdapter.selection_context_with_uri(route, uri, headers, body)
+        } else {
+            self.selection_context(route, headers, body)
+        }
+    }
+
+    fn model_in_request_body(&self, route: &pooler_config::RoutePlan) -> bool {
+        !GeminiSemanticAdapter.supports(route)
+    }
+
+    fn websocket_transport(
+        &self,
+        route: &pooler_config::RoutePlan,
+    ) -> Option<SemanticWebSocketTransport> {
+        if DroidOpenAiSemanticAdapter.supports(route) {
+            DroidOpenAiSemanticAdapter.websocket_transport(route)
+        } else {
+            None
+        }
+    }
+
+    fn rewrite_upstream_uri(
+        &self,
+        route: &pooler_config::RoutePlan,
+        downstream_uri: &http::Uri,
+        upstream_model: Option<&str>,
+        upstream_uri: http::Uri,
+    ) -> Result<http::Uri, BoxError> {
+        if GeminiSemanticAdapter.supports(route) {
+            GeminiSemanticAdapter.rewrite_upstream_uri(
+                route,
+                downstream_uri,
+                upstream_model,
+                upstream_uri,
+            )
+        } else {
+            Ok(upstream_uri)
+        }
+    }
+
     fn sanitize_request_headers(&self, headers: &mut http::HeaderMap) {
+        DroidOpenAiSemanticAdapter.sanitize_request_headers(headers);
+        XaiSemanticAdapter.sanitize_request_headers(headers);
+        MediaSemanticAdapter::default().sanitize_request_headers(headers);
+        AnthropicSemanticAdapter.sanitize_request_headers(headers);
+        GeminiSemanticAdapter.sanitize_request_headers(headers);
+        FxSemanticAdapter.sanitize_request_headers(headers);
         FactorySemanticAdapter.sanitize_request_headers(headers);
         DevinSemanticAdapter.sanitize_request_headers(headers);
     }
@@ -104,7 +210,17 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         body: ProxyBody,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
-        if FactorySemanticAdapter.supports(route) {
+        if DroidOpenAiSemanticAdapter.supports(route) {
+            DroidOpenAiSemanticAdapter.decode_response(route, body, cancellation)
+        } else if XaiSemanticAdapter.supports(route) {
+            XaiSemanticAdapter.decode_response(route, body, cancellation)
+        } else if AnthropicSemanticAdapter.supports(route) {
+            AnthropicSemanticAdapter.decode_response(route, body, cancellation)
+        } else if GeminiSemanticAdapter.supports(route) {
+            GeminiSemanticAdapter.decode_response(route, body, cancellation)
+        } else if FxSemanticAdapter.supports(route) {
+            FxSemanticAdapter.decode_response(route, body, cancellation)
+        } else if FactorySemanticAdapter.supports(route) {
             FactorySemanticAdapter.decode_response(route, body, cancellation)
         } else if DevinSemanticAdapter.supports(route) {
             DevinSemanticAdapter.decode_response(route, body, cancellation)
@@ -120,7 +236,42 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         request_headers: &http::HeaderMap,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
-        if FactorySemanticAdapter.supports(route) {
+        if DroidOpenAiSemanticAdapter.supports(route) {
+            DroidOpenAiSemanticAdapter.decode_response_with_request_headers(
+                route,
+                body,
+                request_headers,
+                cancellation,
+            )
+        } else if XaiSemanticAdapter.supports(route) {
+            XaiSemanticAdapter.decode_response_with_request_headers(
+                route,
+                body,
+                request_headers,
+                cancellation,
+            )
+        } else if AnthropicSemanticAdapter.supports(route) {
+            AnthropicSemanticAdapter.decode_response_with_request_headers(
+                route,
+                body,
+                request_headers,
+                cancellation,
+            )
+        } else if GeminiSemanticAdapter.supports(route) {
+            GeminiSemanticAdapter.decode_response_with_request_headers(
+                route,
+                body,
+                request_headers,
+                cancellation,
+            )
+        } else if FxSemanticAdapter.supports(route) {
+            FxSemanticAdapter.decode_response_with_request_headers(
+                route,
+                body,
+                request_headers,
+                cancellation,
+            )
+        } else if FactorySemanticAdapter.supports(route) {
             FactorySemanticAdapter.decode_response_with_request_headers(
                 route,
                 body,
@@ -132,6 +283,75 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
                 route,
                 body,
                 request_headers,
+                cancellation,
+            )
+        } else {
+            Err(unsupported_semantic_route(route))
+        }
+    }
+
+    fn decode_response_with_hint(
+        &self,
+        route: &pooler_config::RoutePlan,
+        body: ProxyBody,
+        request_headers: &http::HeaderMap,
+        hint: &SemanticResponseHint,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        if DroidOpenAiSemanticAdapter.supports(route) {
+            DroidOpenAiSemanticAdapter.decode_response_with_hint(
+                route,
+                body,
+                request_headers,
+                hint,
+                cancellation,
+            )
+        } else if XaiSemanticAdapter.supports(route) {
+            XaiSemanticAdapter.decode_response_with_hint(
+                route,
+                body,
+                request_headers,
+                hint,
+                cancellation,
+            )
+        } else if AnthropicSemanticAdapter.supports(route) {
+            AnthropicSemanticAdapter.decode_response_with_hint(
+                route,
+                body,
+                request_headers,
+                hint,
+                cancellation,
+            )
+        } else if GeminiSemanticAdapter.supports(route) {
+            GeminiSemanticAdapter.decode_response_with_hint(
+                route,
+                body,
+                request_headers,
+                hint,
+                cancellation,
+            )
+        } else if FxSemanticAdapter.supports(route) {
+            FxSemanticAdapter.decode_response_with_hint(
+                route,
+                body,
+                request_headers,
+                hint,
+                cancellation,
+            )
+        } else if FactorySemanticAdapter.supports(route) {
+            FactorySemanticAdapter.decode_response_with_hint(
+                route,
+                body,
+                request_headers,
+                hint,
+                cancellation,
+            )
+        } else if DevinSemanticAdapter.supports(route) {
+            DevinSemanticAdapter.decode_response_with_hint(
+                route,
+                body,
+                request_headers,
+                hint,
                 cancellation,
             )
         } else {
@@ -199,6 +419,12 @@ pub enum HttpProxyServerError {
     /// The configured management listener could not be started.
     #[error(transparent)]
     Management(#[from] ManagementServerError),
+    /// Configured model discovery could not be constructed.
+    #[error(transparent)]
+    CatalogRuntime(#[from] CatalogRuntimeError),
+    /// Configured model discovery could not publish a complete refresh.
+    #[error(transparent)]
+    CatalogRefresh(#[from] pooler_model_catalog::CatalogError),
 }
 
 /// Result of applying a compiled HTTP runtime candidate.
@@ -276,6 +502,7 @@ pub(crate) struct RuntimeGeneration {
     proxies: BTreeMap<Arc<str>, Arc<RuntimeProxy>>,
     tls: BTreeMap<Arc<str>, Option<Arc<PreparedTls>>>,
     pub(crate) pooling: Arc<PoolingCoordinator>,
+    pub(crate) catalog: Option<Arc<CatalogRuntime>>,
 }
 
 /// A concrete HTTP/1 listener set serving every compiled listener.
@@ -349,6 +576,13 @@ impl HttpProxyServer {
         native: Arc<NativeRuntime>,
         pooling: Arc<PoolingCoordinator>,
     ) -> Result<Self, HttpProxyServerError> {
+        let catalog = prepare_catalog(&config, Arc::clone(&native)).await?;
+        let pooling = Arc::new(
+            pooling
+                .as_ref()
+                .clone()
+                .with_optional_catalog(catalog.as_ref().map(|catalog| catalog.service())),
+        );
         let config = Arc::new(config);
         let resources = RuntimeResources::new();
         let dispatch = Arc::new(ArcSwap::from_pointee(RuntimeGeneration {
@@ -356,6 +590,7 @@ impl HttpProxyServer {
             proxies: BTreeMap::new(),
             tls: BTreeMap::new(),
             pooling: Arc::clone(&pooling),
+            catalog: catalog.clone(),
         }));
         let metrics = MetricsRegistry::default();
         let active = ActiveCounts::new();
@@ -465,6 +700,7 @@ impl HttpProxyServer {
             proxies,
             tls: tls_by_listener,
             pooling: Arc::clone(&pooling),
+            catalog,
         }));
 
         Ok(Self {
@@ -556,6 +792,12 @@ impl HttpProxyServer {
         snapshot.pooling.clone()
     }
 
+    /// Current remote model-catalog runtime, when discovery is configured.
+    #[must_use]
+    pub fn catalog(&self) -> Option<Arc<CatalogRuntime>> {
+        self.state.dispatch.load_full().catalog.clone()
+    }
+
     /// Atomically publish a compiled route plan for new requests.
     ///
     /// Candidate proxies are fully constructed before the swap. Existing
@@ -575,20 +817,26 @@ impl HttpProxyServer {
         if current.config.management() != candidate.management() {
             return Err(HttpProxyServerError::ListenerSetChanged);
         }
-
         let tls = prepare_tls_map(&candidate)?;
         if current.config.equivalent(&candidate) && same_tls_map(&current.tls, &tls) {
+            if let Some(catalog) = &current.catalog {
+                catalog.refresh().await?;
+            }
             return Ok(HttpReloadOutcome::Unchanged {
                 generation: current.config.generation(),
             });
         }
+        let catalog = prepare_catalog(&candidate, Arc::clone(&self.state.native)).await?;
 
         let generation = current.config.generation().saturating_add(1);
         let config = Arc::new(candidate.with_generation(generation));
-        let pooling =
-            Arc::new(current.pooling.reconfigure(&config).map_err(|error| {
-                HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string()))
-            })?);
+        let pooling = Arc::new(
+            current
+                .pooling
+                .reconfigure(&config)
+                .map_err(|error| HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string())))?
+                .with_optional_catalog(catalog.as_ref().map(|catalog| catalog.service())),
+        );
         let mut proxies = BTreeMap::new();
         let extensions = extension_registry(&config)?;
         for plan in config.listeners().values() {
@@ -618,6 +866,7 @@ impl HttpProxyServer {
             proxies,
             tls,
             pooling: Arc::clone(&pooling),
+            catalog,
         }));
         Ok(HttpReloadOutcome::Reloaded { generation })
     }
@@ -774,6 +1023,17 @@ impl HttpProxyServer {
         });
         proxies
     }
+}
+
+async fn prepare_catalog(
+    config: &CompiledConfig,
+    native: Arc<NativeRuntime>,
+) -> Result<Option<Arc<CatalogRuntime>>, HttpProxyServerError> {
+    let catalog = CatalogRuntime::from_config(config, native)?;
+    if let Some(catalog) = &catalog {
+        catalog.refresh().await?;
+    }
+    Ok(catalog)
 }
 
 fn same_listener_bindings(current: &CompiledConfig, candidate: &CompiledConfig) -> bool {
@@ -1181,8 +1441,11 @@ mod tests {
 
     use http::Response;
     use http_body_util::{BodyExt as _, Full};
-    use pooler_auth::{OAuthFuture, OAuthRefresher, OAuthTokenStore, OAuthTokens, SecretValue};
-    use pooler_store::{MasterKey, SqliteStore, Store};
+    use pooler_auth::{
+        OAuthCredentialProfile, OAuthFuture, OAuthRefresher, OAuthTokenStore, OAuthTokens,
+        SecretValue,
+    };
+    use pooler_store::{CredentialState, MasterKey, SqliteOAuthTokenStore, SqliteStore, Store};
     use pooler_testkit::{normalize_json_value, Fixture, ScriptedChunk, ScriptedResult};
     use tempfile::tempdir;
     use tokio::{
@@ -1195,6 +1458,15 @@ mod tests {
     use super::*;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn management_headers() -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("localhost"),
+        );
+        headers
+    }
 
     struct TestSecret {
         path: PathBuf,
@@ -1451,6 +1723,18 @@ mod tests {
             line.split_once(':')
                 .is_some_and(|(name, _)| name.eq_ignore_ascii_case(expected))
         })
+    }
+
+    fn request_header<'a>(request: &'a [u8], expected: &str) -> Option<&'a str> {
+        let header_end = header_end(request)?;
+        std::str::from_utf8(&request[..header_end])
+            .ok()?
+            .lines()
+            .skip(1)
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(expected).then_some(value.trim())
+            })
     }
 
     fn listener_address(server: &HttpProxyServer, id: &str) -> SocketAddr {
@@ -2487,7 +2771,7 @@ mod tests {
             .expect("downstream request");
 
         wait_for_active(&server, 1).await;
-        let active = api.handle(&http::Method::GET, "/active", &http::HeaderMap::new());
+        let active = api.handle(&http::Method::GET, "/active", &management_headers());
         assert_eq!(active.status, http::StatusCode::OK);
         assert!(String::from_utf8_lossy(&active.body).contains("\"active\":1"));
 
@@ -2503,8 +2787,7 @@ mod tests {
         .expect("response prefix reads");
         assert!(prefix.ends_with(b"hel"));
         assert_eq!(server.active(), 1);
-        let active_during_stream =
-            api.handle(&http::Method::GET, "/active", &http::HeaderMap::new());
+        let active_during_stream = api.handle(&http::Method::GET, "/active", &management_headers());
         assert!(String::from_utf8_lossy(&active_during_stream.body).contains("\"active\":1"));
 
         release_body.notify_one();
@@ -2520,7 +2803,7 @@ mod tests {
         })
         .await
         .expect("active stream releases");
-        let inactive = api.handle(&http::Method::GET, "/active", &http::HeaderMap::new());
+        let inactive = api.handle(&http::Method::GET, "/active", &management_headers());
         assert!(String::from_utf8_lossy(&inactive.body).contains("\"active\":0"));
 
         upstream.await.expect("upstream task");
@@ -3908,6 +4191,157 @@ mod tests {
             "new-access"
         );
         upstream.await.expect("upstream task");
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn mixed_api_key_and_imported_subscription_failover_isolates_attempt_auth() {
+        let subscription_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("subscription upstream binds");
+        let subscription_address = subscription_listener
+            .local_addr()
+            .expect("subscription upstream address");
+        let subscription_upstream = tokio::spawn(async move {
+            let (mut stream, _) = subscription_listener
+                .accept()
+                .await
+                .expect("subscription upstream accepts");
+            let request = read_request(&mut stream)
+                .await
+                .expect("subscription request bytes");
+            let body = br#"{"error":{"type":"account_quota_exhausted","code":"account_quota_exhausted","message":"subscription quota"}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("subscription response headers");
+            stream
+                .write_all(body)
+                .await
+                .expect("subscription response body");
+            request
+        });
+
+        let api_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("API-key upstream binds");
+        let api_address = api_listener.local_addr().expect("API-key upstream address");
+        let api_upstream = tokio::spawn(async move {
+            let (mut stream, _) = api_listener
+                .accept()
+                .await
+                .expect("API-key upstream accepts");
+            let request = read_request(&mut stream)
+                .await
+                .expect("API-key request bytes");
+            let body = b"api-key-fallback-ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("API-key response headers");
+            stream.write_all(body).await.expect("API-key response body");
+            request
+        });
+
+        let api_secret = TestSecret::new("static-api-secret");
+        let config = pooler_config::compile_yaml(
+            "mixed-openai-auth-e2e.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  subscription:\n    url: http://{subscription_address}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\n  api:\n    url: http://{api_address}\naccounts:\n  a-subscription-account:\n    provider: subscription\n    auth_kind: oauth\n  b-api-account:\n    provider: api\n    auth_kind: api_key\n    secret: {}\naccount_pools:\n  mixed: {{accounts: [a-subscription-account, b-api-account]}}\nmodels:\n  - id: gpt-test\n    targets:\n      - {{provider: subscription, upstream_model: gpt-test}}\n      - {{provider: api, upstream_model: gpt-test}}\npolicies:\n  mixed:\n    selection: {{strategy: ordered_fallback, account_pool: mixed}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, maximum_providers: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}}\nroutes:\n  - id: mixed\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: subscription, model_from: request.model, policy: mixed}}\n    response: {{mode: opaque}}\n",
+                api_secret.reference()
+            ),
+        )
+        .expect("mixed-auth route config");
+
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"mixed-openai-auth-test-key").expect("master key"),
+        )
+        .expect("encrypted credential store");
+        let state = store
+            .upsert_credential_state(CredentialState::new(
+                "a-subscription-account",
+                "subscription",
+                true,
+                1,
+            ))
+            .expect("subscription credential metadata");
+        let token_store = Arc::new(SqliteOAuthTokenStore::new(store));
+        let credential = pooler_auth::CredentialId::new("a-subscription-account")
+            .expect("subscription credential ID");
+        let profile = OAuthCredentialProfile::new(
+            "openai",
+            OAuthTokens::bearer(
+                "subscription-access-token",
+                Some("subscription-refresh-token"),
+                None,
+            ),
+        )
+        .with_account_id("chatgpt-subscription-account");
+        token_store
+            .compare_and_swap_profile(&credential, state.revision, &profile)
+            .expect("imported subscription profile persists");
+        let native = Arc::new(
+            NativeRuntime::new_with_sqlite(&config, token_store)
+                .expect("native runtime loads imported profile"),
+        );
+
+        let server = HttpProxyServer::bind_with_native_runtime(config, native)
+            .await
+            .expect("mixed-auth proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"gpt-test","input":"hello"}"#;
+        let request = format!(
+            "POST /responses HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nIdempotency-Key: mixed-auth-e2e\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response = send_request(address, request.as_bytes()).await;
+        assert_eq!(
+            status(&response),
+            200,
+            "response={}, decisions={:?}",
+            String::from_utf8_lossy(&response),
+            server.pooling().recent_decisions(8)
+        );
+        assert_eq!(response_body(&response), b"api-key-fallback-ok");
+
+        let subscription_request = subscription_upstream
+            .await
+            .expect("subscription upstream task");
+        assert_eq!(
+            request_header(&subscription_request, "authorization"),
+            Some("Bearer subscription-access-token")
+        );
+        assert_eq!(
+            request_header(&subscription_request, "chatgpt-account-id"),
+            Some("chatgpt-subscription-account")
+        );
+        assert!(!String::from_utf8_lossy(&subscription_request).contains("static-api-secret"));
+
+        let api_request = api_upstream.await.expect("API-key upstream task");
+        assert_eq!(
+            request_header(&api_request, "authorization"),
+            Some("Bearer static-api-secret")
+        );
+        assert_eq!(request_header(&api_request, "chatgpt-account-id"), None);
+        assert_eq!(request_header(&api_request, "originator"), None);
+        assert!(!String::from_utf8_lossy(&api_request).contains("subscription-access-token"));
+        assert!(!String::from_utf8_lossy(&response).contains("subscription-access-token"));
+        assert!(!String::from_utf8_lossy(&response).contains("static-api-secret"));
+        assert!(!String::from_utf8_lossy(&response).contains("chatgpt-subscription-account"));
+
         stop_server(&server, runner).await;
     }
 

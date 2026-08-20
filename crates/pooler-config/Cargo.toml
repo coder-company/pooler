@@ -10,6 +10,7 @@ description = "Source-aware YAML configuration parsing and immutable route-plan 
 [dependencies]
 http.workspace = true
 pooler-core = { path = "../pooler-core" }
+pooler-model-catalog = { path = "../pooler-model-catalog" }
 pooler-protocol = { path = "../pooler-protocol" }
 serde.workspace = true
 serde_json.workspace = true

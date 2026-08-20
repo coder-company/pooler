@@ -8,8 +8,10 @@ repository.workspace = true
 
 [dependencies]
 adapter-codex = { path = "../adapter-codex" }
+adapter-providers = { path = "../adapter-providers" }
 base64.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 hyper.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
@@ -20,6 +22,7 @@ pooler-config = { path = "../pooler-config" }
 pooler-extension = { path = "../pooler-extension" }
 pooler-auth = { path = "../pooler-auth" }
 pooler-core = { path = "../pooler-core" }
+pooler-model-catalog = { path = "../pooler-model-catalog" }
 pooler-protocol = { path = "../pooler-protocol" }
 pooler-policy = { path = "../pooler-policy" }
 pooler-store = { path = "../pooler-store" }
@@ -30,13 +33,11 @@ rustls-native-certs.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
-
-[dev-dependencies]
-futures-util.workspace = true
 
 [lints]
 workspace = true

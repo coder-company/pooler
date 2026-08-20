@@ -1361,6 +1361,7 @@ impl SemanticAdapter for FactorySemanticAdapter {
         Ok(SemanticRequestBody {
             body: serde_json::to_vec(&value)?,
             content_type: HeaderValue::from_static("application/json"),
+            response_hint: pooler_http::SemanticResponseHint::default(),
         })
     }
 

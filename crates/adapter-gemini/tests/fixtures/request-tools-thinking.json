@@ -1,0 +1,78 @@
+{
+  "systemInstruction": {
+    "parts": [{"text": "Be concise."}]
+  },
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {"text": "Check Paris weather."},
+        {"inlineData": {"mimeType": "image/png", "data": "AQID"}}
+      ]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "functionCall": {
+            "id": "call-weather",
+            "name": "weather",
+            "args": {"city": "Paris"}
+          },
+          "thoughtSignature": "c2lnLUE="
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "parts": [
+        {
+          "functionResponse": {
+            "id": "call-weather",
+            "name": "weather",
+            "response": {"temperature": 21}
+          }
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "name": "weather",
+          "description": "Read weather",
+          "parametersJsonSchema": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+          }
+        }
+      ],
+      "codeExecution": {}
+    }
+  ],
+  "toolConfig": {
+    "functionCallingConfig": {
+      "mode": "ANY",
+      "allowedFunctionNames": ["weather"]
+    }
+  },
+  "generationConfig": {
+    "temperature": 0.2,
+    "topP": 0.9,
+    "maxOutputTokens": 512,
+    "stopSequences": ["END"],
+    "seed": 7,
+    "responseMimeType": "application/json",
+    "responseJsonSchema": {"type": "object"},
+    "thinkingConfig": {
+      "includeThoughts": true,
+      "thinkingLevel": "HIGH",
+      "thinkingBudget": 2048
+    },
+    "topK": 20
+  },
+  "cachedContent": "cachedContents/example",
+  "safetySettings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}]
+}

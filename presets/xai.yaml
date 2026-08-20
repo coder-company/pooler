@@ -1,0 +1,90 @@
+version: 1
+
+listeners:
+  xai:
+    bind: 127.0.0.1:18476
+
+upstreams:
+  xai-rest:
+    url: https://api.x.ai
+    auth:
+      kind: bearer_secret
+      secret: env:XAI_API_KEY
+  xai-websocket:
+    url: wss://api.x.ai
+    auth:
+      kind: bearer_secret
+      secret: env:XAI_API_KEY
+
+routes:
+  - id: chat-completions
+    listen: xai
+    match:
+      method: POST
+      path: /v1/chat/completions
+      content_types: [application/json]
+      websocket: false
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+      max_event_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 256
+    ingress:
+      mode: semantic
+      decoder: decode.xai.chat
+    target:
+      provider: xai-rest
+      path: /v1/chat/completions
+    response:
+      mode: semantic
+      decoder: decode.xai.chat.events
+      encoder: encode.xai.chat.events
+    loss_policy: reject
+
+  - id: responses-rest
+    listen: xai
+    match:
+      method: POST
+      path: /v1/responses
+      content_types: [application/json]
+      websocket: false
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+      max_event_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 256
+    ingress:
+      mode: semantic
+      decoder: decode.xai.responses
+    target:
+      provider: xai-rest
+      path: /v1/responses
+    response:
+      mode: semantic
+      decoder: decode.xai.responses.events
+      encoder: encode.xai.responses.events
+    loss_policy: reject
+
+  # xAI Responses WebSocket connections can carry multiple turns. Pooler
+  # therefore tunnels their text messages exactly while enforcing the same
+  # 8 MiB message ceiling as adapter-xai's realtime codec.
+  - id: responses-websocket
+    listen: xai
+    match:
+      method: GET
+      path: /v1/responses
+      websocket: true
+    limits:
+      max_frame_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 64
+      request_timeout: null
+    ingress:
+      mode: opaque
+    target:
+      provider: xai-websocket
+      path: /v1/responses
+    response:
+      mode: opaque

@@ -1,0 +1,13 @@
+{
+  "responseId": "response-1",
+  "modelVersion": "gemini-3.1-pro",
+  "candidates": [{"index": 0, "finishReason": "STOP"}],
+  "usageMetadata": {
+    "promptTokenCount": 12,
+    "candidatesTokenCount": 4,
+    "thoughtsTokenCount": 6,
+    "cachedContentTokenCount": 2,
+    "toolUsePromptTokenCount": 3,
+    "totalTokenCount": 22
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "type": "error",
+  "status": 400,
+  "error": {
+    "code": "previous_response_not_found",
+    "message": "Previous response was not found.",
+    "param": "previous_response_id"
+  }
+}

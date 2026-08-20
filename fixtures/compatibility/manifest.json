@@ -141,6 +141,40 @@
       ]
     },
     {
+      "adapter": "fx",
+      "protocol": "ai-language-model-v4",
+      "version": "fx-0.0.3",
+      "fixture": "../fx/fx-0.0.3-cliproxy-tool-loop.json",
+      "equivalence": "event_semantic",
+      "status": "sanitized_local_reference",
+      "source": "Installed Vercel Labs fx/0.0.3 wire and sanitized fx-cliproxy-bridge tool-loop reference",
+      "supported_capabilities": [
+        "prompt_text",
+        "reasoning",
+        "function_tools",
+        "tool_results",
+        "streaming",
+        "usage",
+        "response_metadata",
+        "v4_headers",
+        "model_id_routing",
+        "model_discovery"
+      ],
+      "unsupported_capabilities": [
+        "live_provider",
+        "provider_tools",
+        "images",
+        "audio",
+        "files"
+      ],
+      "notes": [
+        "This fixture distinguishes the Vercel Labs fx terminal agent from Factory Droid and the legacy Factory adapter.",
+        "The installed fx client previously completed a tool loop through the temporary local bridge; the committed replay uses deterministic sanitized OpenAI SSE rather than a live provider.",
+        "The native adapter preserves the reasoning alias delta, emits one completed tool-call event, and preserves the nested tool-result invocation ID on the follow-up request.",
+        "Replay: cargo test -p adapter-fx --test fx_tool_loop replays_streaming_tool_call_and_follow_up --locked."
+      ]
+    },
+    {
       "adapter": "cursor",
       "protocol": "http-json-patch",
       "version": "preset-v1",

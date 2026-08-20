@@ -90,6 +90,7 @@
     }
   },
   "upstream_sse": [
+    "{\"id\":\"chat-fx-tool\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning\":\"Checking the tool contract.\"},\"finish_reason\":null}]}",
     "{\"id\":\"chat-fx-tool\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}",
     "{\"id\":\"chat-fx-tool\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"README.md\\\"}\"}}]},\"finish_reason\":null}]}",
     "{\"id\":\"chat-fx-tool\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
@@ -100,6 +101,19 @@
     {
       "type": "response-metadata",
       "modelId": "gpt-test"
+    },
+    {
+      "type": "reasoning-start",
+      "id": "reasoning"
+    },
+    {
+      "type": "reasoning-delta",
+      "id": "reasoning",
+      "delta": "Checking the tool contract."
+    },
+    {
+      "type": "reasoning-end",
+      "id": "reasoning"
     },
     {
       "type": "tool-call",
@@ -255,6 +269,26 @@
         "id": "gpt-test",
         "object": "model",
         "owned_by": "local"
+      },
+      {
+        "id": "provider-declared",
+        "object": "model",
+        "owned_by": "provider",
+        "type": "language",
+        "tags": [
+          "provider-declared"
+        ],
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "low"
+            ]
+          }
+        ],
+        "provider_metadata": {
+          "trusted": true
+        }
       }
     ]
   }

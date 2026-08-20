@@ -16,7 +16,7 @@ mod oauth;
 mod sqlite;
 
 pub use encrypted::{CredentialPayload, MasterKey, SecretPayload};
-pub use oauth::SqliteOAuthTokenStore;
+pub use oauth::{CredentialProfileMetadata, SqliteOAuthTokenStore};
 pub use sqlite::SqliteStore;
 
 /// Milliseconds since the Unix epoch, supplied by the caller.

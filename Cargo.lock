@@ -72,6 +72,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "adapter-droid"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "pooler-config",
+ "pooler-core",
+ "pooler-http",
+ "pooler-protocol",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "adapter-factory"
 version = "0.1.0"
 dependencies = [
@@ -96,6 +114,58 @@ name = "adapter-fx"
 version = "0.1.0"
 dependencies = [
  "adapter-factory",
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "pooler-config",
+ "pooler-core",
+ "pooler-http",
+ "pooler-protocol",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "adapter-gemini"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "pooler-config",
+ "pooler-core",
+ "pooler-http",
+ "pooler-protocol",
+ "serde_json",
+ "thiserror",
+ "tokio-util",
+]
+
+[[package]]
+name = "adapter-providers"
+version = "0.1.0"
+dependencies = [
+ "http",
+ "pooler-auth",
+ "pooler-core",
+ "pooler-model-catalog",
+ "pooler-policy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "adapter-xai"
+version = "0.1.0"
+dependencies = [
  "bytes",
  "http",
  "http-body",
@@ -1418,6 +1488,7 @@ dependencies = [
 name = "pooler-cli"
 version = "0.1.0"
 dependencies = [
+ "adapter-codex",
  "anyhow",
  "clap",
  "pooler-auth",
@@ -1445,6 +1516,7 @@ version = "0.1.0"
 dependencies = [
  "http",
  "pooler-core",
+ "pooler-model-catalog",
  "pooler-protocol",
  "pretty_assertions",
  "serde",
@@ -1486,6 +1558,7 @@ name = "pooler-http"
 version = "0.1.0"
 dependencies = [
  "adapter-codex",
+ "adapter-providers",
  "base64",
  "bytes",
  "futures-util",
@@ -1499,6 +1572,7 @@ dependencies = [
  "pooler-config",
  "pooler-core",
  "pooler-extension",
+ "pooler-model-catalog",
  "pooler-observe",
  "pooler-policy",
  "pooler-protocol",
@@ -1510,9 +1584,23 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "pooler-model-catalog"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "futures-util",
+ "pooler-core",
+ "serde",
+ "serde_yaml_ng",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1555,8 +1643,14 @@ dependencies = [
 name = "pooler-server"
 version = "0.1.0"
 dependencies = [
+ "adapter-anthropic",
  "adapter-devin",
+ "adapter-droid",
  "adapter-factory",
+ "adapter-fx",
+ "adapter-gemini",
+ "adapter-providers",
+ "adapter-xai",
  "arc-swap",
  "bytes",
  "futures-util",
@@ -1564,6 +1658,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "libc",
  "pooler-auth",
@@ -1571,7 +1666,9 @@ dependencies = [
  "pooler-core",
  "pooler-extension",
  "pooler-http",
+ "pooler-model-catalog",
  "pooler-observe",
+ "pooler-protocol",
  "pooler-store",
  "pooler-testkit",
  "prost",

@@ -1,0 +1,28 @@
+{
+  "responseId": "response-1",
+  "modelVersion": "gemini-3.1-pro",
+  "candidates": [
+    {
+      "index": 0,
+      "content": {
+        "role": "model",
+        "parts": [
+          {"text": "I should check the weather.", "thought": true},
+          {
+            "functionCall": {
+              "id": "call-weather",
+              "name": "weather",
+              "args": {"city": "Paris"}
+            },
+            "thoughtSignature": "c2lnLXN0cmVhbQ=="
+          },
+          {"executableCode": {"language": "PYTHON", "code": "print('weather')"}}
+        ]
+      },
+      "safetyRatings": [
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "probability": "NEGLIGIBLE", "blocked": false}
+      ],
+      "groundingMetadata": {"webSearchQueries": ["Paris weather"]}
+    }
+  ]
+}

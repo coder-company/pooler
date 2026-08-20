@@ -101,6 +101,19 @@ VERIFIERS: dict[EntryKey, Verifier] = {
         test_name="devin_current_tool_follow_up_replays_through_http_proxy_server",
     ),
     (
+        "fx",
+        "ai-language-model-v4",
+        "fx-0.0.3",
+        "../fx/fx-0.0.3-cliproxy-tool-loop.json",
+        "event_semantic",
+        "sanitized_local_reference",
+    ): CargoTest(
+        package="adapter-fx",
+        target="fx_tool_loop",
+        source="crates/adapter-fx/tests/fx_tool_loop.rs",
+        test_name="replays_streaming_tool_call_and_follow_up",
+    ),
+    (
         "cursor",
         "http-json-patch",
         "preset-v1",

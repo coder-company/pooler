@@ -10,6 +10,14 @@
         ]
       },
       "properties": {
+        "auth_kind": {
+          "enum": [
+            "api_key",
+            "oauth",
+            "subscription"
+          ],
+          "type": "string"
+        },
         "enabled": {
           "type": "boolean"
         },
@@ -20,6 +28,10 @@
         },
         "merge": true,
         "provider": {
+          "type": "string"
+        },
+        "quota_project": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
           "type": "string"
         },
         "remove": true,
@@ -86,7 +98,11 @@
         "kind": {
           "enum": [
             "bearer",
-            "bearer_secret"
+            "bearer_secret",
+            "x-api-key",
+            "x_api_key",
+            "x-goog-api-key",
+            "x_goog_api_key"
           ],
           "type": "string"
         },
@@ -165,6 +181,160 @@
           "$ref": "#/$defs/duration"
         }
       },
+      "type": "object"
+    },
+    "catalog": {
+      "additionalProperties": false,
+      "properties": {
+        "refresh": {
+          "$ref": "#/$defs/catalog_refresh"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/catalog_source"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "sources"
+      ],
+      "type": "object"
+    },
+    "catalog_alias": {
+      "additionalProperties": false,
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "force_mapping": {
+          "type": "boolean"
+        },
+        "fork": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "alias"
+      ],
+      "type": "object"
+    },
+    "catalog_refresh": {
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrency": {
+          "maximum": 64,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_merge_operations": {
+          "maximum": 20000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_models_per_source": {
+          "maximum": 50000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_sources": {
+          "maximum": 1024,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_total_models": {
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "maximum": 300000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "catalog_source": {
+      "additionalProperties": false,
+      "properties": {
+        "account": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        },
+        "aliases": {
+          "items": {
+            "$ref": "#/$defs/catalog_alias"
+          },
+          "maxItems": 1024,
+          "minItems": 0,
+          "type": "array"
+        },
+        "excluded_models": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "minItems": 0,
+          "type": "array"
+        },
+        "id": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        },
+        "included_models": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "minItems": 0,
+          "type": "array"
+        },
+        "max_response_bytes": {
+          "maximum": 16777216,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "parser": {
+          "enum": [
+            "openai",
+            "open_ai",
+            "kimi",
+            "vertex",
+            "antigravity"
+          ],
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "priority": {
+          "maximum": 2147483647,
+          "minimum": -2147483648,
+          "type": "integer"
+        },
+        "provider": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "provider",
+        "parser"
+      ],
       "type": "object"
     },
     "cooldown": {
@@ -349,7 +519,9 @@
                 "cursor",
                 "devin",
                 "factory",
-                "fx"
+                "fx",
+                "media",
+                "xai"
               ],
               "type": "string"
             },
@@ -1191,6 +1363,9 @@
         "type": "string"
       },
       "type": "object"
+    },
+    "catalog": {
+      "$ref": "#/$defs/catalog"
     },
     "credentials": {
       "additionalProperties": {

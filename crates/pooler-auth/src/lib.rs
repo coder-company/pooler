@@ -23,9 +23,40 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod keyring_backend;
 mod oauth;
+mod provider_login;
 
 pub use keyring_backend::{KeyringBackend, KeyringProvider, OsKeyringBackend};
 pub use oauth::*;
+pub use provider_login::*;
+
+/// Authentication material selected for one configured account.
+///
+/// API keys remain external [`SecretRef`] values. OAuth credentials are held
+/// in the encrypted token store and may represent subscription access.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AuthKind {
+    /// Usage-based provider API key.
+    ApiKey,
+    /// OAuth bearer credential, including ChatGPT/Codex subscription access.
+    OAuth,
+}
+
+impl AuthKind {
+    /// Stable operator-facing spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::OAuth => "oauth",
+        }
+    }
+}
+
+impl fmt::Display for AuthKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// A secret held in memory and zeroized when dropped.
 ///
@@ -700,6 +731,162 @@ impl fmt::Debug for OAuthTokens {
             )
             .field("expires_at", &self.expires_at)
             .field("token_type", &self.token_type)
+            .finish()
+    }
+}
+
+/// One imported or newly authenticated OAuth account profile.
+///
+/// The profile name is non-secret provider metadata. Token and identity
+/// material remains protected and debug output reports presence only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthCredentialProfile {
+    provider_profile: String,
+    tokens: OAuthTokens,
+    id_token: Option<SecretValue>,
+    account_id: Option<String>,
+    email: Option<String>,
+    name: Option<String>,
+    expired: bool,
+    disabled: bool,
+    last_refresh: Option<SystemTime>,
+}
+
+impl OAuthCredentialProfile {
+    /// Create an active OAuth profile from protected tokens.
+    #[must_use]
+    pub fn new(provider_profile: impl Into<String>, tokens: OAuthTokens) -> Self {
+        Self {
+            provider_profile: provider_profile.into(),
+            tokens,
+            id_token: None,
+            account_id: None,
+            email: None,
+            name: None,
+            expired: false,
+            disabled: false,
+            last_refresh: None,
+        }
+    }
+
+    /// Attach a provider identity returned by a documented identity endpoint.
+    #[must_use]
+    pub fn with_identity(mut self, identity: OAuthIdentity) -> Self {
+        self.account_id = Some(identity.subject);
+        self.email = identity.email;
+        self.name = identity.name;
+        self
+    }
+
+    /// Attach an explicitly verified provider account identifier.
+    #[must_use]
+    pub fn with_account_id(mut self, account_id: impl Into<String>) -> Self {
+        self.account_id = Some(account_id.into());
+        self
+    }
+
+    /// Attach an optional encrypted ID token from an imported profile.
+    #[must_use]
+    pub fn with_id_token(mut self, id_token: Option<SecretValue>) -> Self {
+        self.id_token = id_token;
+        self
+    }
+
+    /// Attach optional non-secret account display metadata.
+    #[must_use]
+    pub fn with_email(mut self, email: Option<String>) -> Self {
+        self.email = email;
+        self
+    }
+
+    /// Retain imported lifecycle metadata.
+    #[must_use]
+    pub const fn with_lifecycle(
+        mut self,
+        expired: bool,
+        disabled: bool,
+        last_refresh: Option<SystemTime>,
+    ) -> Self {
+        self.expired = expired;
+        self.disabled = disabled;
+        self.last_refresh = last_refresh;
+        self
+    }
+
+    /// Canonical provider login profile.
+    #[must_use]
+    pub fn provider_profile(&self) -> &str {
+        &self.provider_profile
+    }
+
+    /// Protected OAuth token set.
+    #[must_use]
+    pub const fn tokens(&self) -> &OAuthTokens {
+        &self.tokens
+    }
+
+    /// Consume the profile and return its token set.
+    #[must_use]
+    pub fn into_tokens(self) -> OAuthTokens {
+        self.tokens
+    }
+
+    /// Optional imported ID token.
+    #[must_use]
+    pub const fn id_token(&self) -> Option<&SecretValue> {
+        self.id_token.as_ref()
+    }
+
+    /// Provider-stable account identifier.
+    #[must_use]
+    pub fn account_id(&self) -> Option<&str> {
+        self.account_id.as_deref()
+    }
+
+    /// Optional provider email metadata.
+    #[must_use]
+    pub fn email(&self) -> Option<&str> {
+        self.email.as_deref()
+    }
+
+    /// Optional provider display name.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Whether the imported source marked the token expired.
+    #[must_use]
+    pub const fn is_expired(&self) -> bool {
+        self.expired
+    }
+
+    /// Whether the imported source marked the account disabled.
+    #[must_use]
+    pub const fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// Imported last-refresh timestamp.
+    #[must_use]
+    pub const fn last_refresh(&self) -> Option<SystemTime> {
+        self.last_refresh
+    }
+}
+
+impl fmt::Debug for OAuthCredentialProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OAuthCredentialProfile")
+            .field("provider_profile", &self.provider_profile)
+            .field("tokens", &self.tokens)
+            .field("has_id_token", &self.id_token.is_some())
+            .field("has_account_id", &self.account_id.is_some())
+            .field("has_email", &self.email.is_some())
+            .field("has_name", &self.name.is_some())
+            .field("expired", &self.expired)
+            .field("disabled", &self.disabled)
+            .field("last_refresh", &self.last_refresh)
             .finish()
     }
 }

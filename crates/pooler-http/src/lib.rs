@@ -12,7 +12,9 @@ mod body;
 mod cache;
 mod drain;
 mod headers;
+mod media;
 mod native;
+mod openai_websocket;
 mod pool;
 mod proxy;
 mod resources;
@@ -36,13 +38,18 @@ pub use headers::{
     remove_hop_by_hop_headers, retry_after_delay, sanitize_headers, strip_hop_by_hop_headers,
     HOP_BY_HOP_HEADERS,
 };
+pub use media::{
+    MediaSemanticAdapter, MediaSemanticAdapterError, MEDIA_BINARY_DECODER, MEDIA_MULTIPART_DECODER,
+};
 pub use native::{NativeAuthorization, NativeRuntime, NativeRuntimeError};
 pub use pool::{
-    PoolError, PoolFailure, PoolSelection, PoolingCoordinator, SelectionContext, SelectionTiming,
+    apply_configured_account_auth, PoolError, PoolFailure, PoolSelection, PoolingCoordinator,
+    SelectionContext, SelectionTiming,
 };
 pub use proxy::{
-    BoxError, HttpProxy, NoSemanticAdapter, ProxyBody, ProxyError, SemanticAdapter,
-    SemanticRequestBody, SemanticResponseBody,
+    apply_configured_upstream_auth, BoxError, HttpProxy, NoSemanticAdapter, ProxyBody, ProxyError,
+    SemanticAdapter, SemanticRequestBody, SemanticResponseBody, SemanticResponseHint,
+    SemanticResponseMode, SemanticWebSocketTransport,
 };
 pub use resources::{RuntimeResourceGuard, RuntimeResourceSnapshot, RuntimeResources};
 pub use sse::{

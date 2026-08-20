@@ -20,10 +20,19 @@ pub use pooler_core::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod quota;
 mod selection;
 
+pub(crate) use quota::QuotaPersistenceIdentity;
+
+pub use quota::{
+    PersistedQuotaSnapshot, ProviderNeutralQuotaClassifier, QuotaClassification, QuotaClassifier,
+    QuotaError, QuotaFailureClassifier, QuotaObservation, QuotaProjectKey, QuotaScope, QuotaSignal,
+    QuotaSnapshot, QuotaState, QuotaSubject, QuotaUnit, QUOTA_STATE_SCHEMA_VERSION,
+};
+
 pub use selection::{
-    AffinityKey, CredentialRegistration, CredentialRegistry, QuotaSnapshot, SelectionError,
+    AffinityKey, CredentialRegistration, CredentialRegistry, QuotaRecovery, SelectionError,
     SelectionLease, SelectionRequest, SelectionReservation, SelectionStrategy,
 };
 
@@ -620,6 +629,22 @@ impl ReplayCheck {
     }
 }
 
+/// Whether the next retry waits for the failed target or rotates away from it.
+///
+/// A recovery hint belongs to the failed scope. It must delay a same-target
+/// retry, but it must not stall an immediately available credential/provider
+/// outside that scope.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RetryTargetChange {
+    /// Retry the same credential and provider after their recovery window.
+    #[default]
+    SameTarget,
+    /// Rotate to another credential that is outside a credential-scoped limit.
+    DifferentCredential,
+    /// Rotate to another provider that is outside a provider-scoped limit.
+    DifferentProvider,
+}
+
 /// Inputs to a retry decision.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RetryContext {
@@ -638,6 +663,8 @@ pub struct RetryContext {
     /// Whether the request carries the idempotency key required by the
     /// provider before replaying a non-idempotent operation.
     pub idempotency_key_present: bool,
+    /// Planned target change for the next attempt.
+    pub target_change: RetryTargetChange,
 }
 
 impl RetryContext {
@@ -654,6 +681,7 @@ impl RetryContext {
             providers_used: 1,
             elapsed_recovery_wait: Duration::ZERO,
             idempotency_key_present: false,
+            target_change: RetryTargetChange::SameTarget,
         }
     }
 
@@ -692,6 +720,13 @@ impl RetryContext {
         self.idempotency_key_present = present;
         self
     }
+
+    /// Describe how the next attempt moves outside the failed quota scope.
+    #[must_use]
+    pub const fn with_target_change(mut self, target_change: RetryTargetChange) -> Self {
+        self.target_change = target_change;
+        self
+    }
 }
 
 /// Why policy refused a retry.
@@ -706,12 +741,18 @@ pub enum RetryStopReason {
     ProvidersExhausted,
     RecoveryWaitExhausted,
     RetryBudgetExhausted,
+    /// Retry was otherwise allowed but every alternate target was filtered.
+    NoAlternateTarget,
 }
 
 /// Why policy allowed a retry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryReason {
     ReplaySafeBeforeCommit,
+    /// A credential-scoped recovery window was bypassed by account rotation.
+    AlternateCredential,
+    /// A provider-scoped recovery window was bypassed by provider rotation.
+    AlternateProvider,
 }
 
 /// The retry decision and its auditable reason.
@@ -889,7 +930,8 @@ impl RetryPolicy {
                 reason: RetryStopReason::ProvidersExhausted,
             };
         }
-        let delay = self.delay_for(failure, context.attempt);
+        let avoids_failed_scope = context.target_change.avoids(failure.classification.scope);
+        let delay = self.delay_for(failure, context.attempt, avoids_failed_scope);
         if self
             .max_elapsed
             .is_some_and(|limit| context.elapsed.saturating_add(delay) > limit)
@@ -898,7 +940,11 @@ impl RetryPolicy {
                 reason: RetryStopReason::RetryBudgetExhausted,
             };
         }
-        if let Some(recovery) = failure.classification.recovery_after {
+        if let Some(recovery) = failure
+            .classification
+            .recovery_after
+            .filter(|_| !avoids_failed_scope)
+        {
             if context.elapsed_recovery_wait.saturating_add(recovery) > self.max_recovery_wait {
                 return RetryDecision::DoNotRetry {
                     reason: RetryStopReason::RecoveryWaitExhausted,
@@ -912,7 +958,11 @@ impl RetryPolicy {
         }
         RetryDecision::Retry {
             delay,
-            reason: RetryReason::ReplaySafeBeforeCommit,
+            reason: match context.target_change {
+                RetryTargetChange::SameTarget => RetryReason::ReplaySafeBeforeCommit,
+                RetryTargetChange::DifferentCredential => RetryReason::AlternateCredential,
+                RetryTargetChange::DifferentProvider => RetryReason::AlternateProvider,
+            },
         }
     }
 
@@ -922,7 +972,15 @@ impl RetryPolicy {
         self.decide(failure, context).is_retry()
     }
 
-    fn delay_for(&self, failure: &FailureClassification, attempt: u32) -> Duration {
+    fn delay_for(
+        &self,
+        failure: &FailureClassification,
+        attempt: u32,
+        avoids_failed_scope: bool,
+    ) -> Duration {
+        if avoids_failed_scope {
+            return Duration::ZERO;
+        }
         let multiplier = 1_u32 << attempt.saturating_sub(1).min(31);
         let exponential = self.base_delay.saturating_mul(multiplier);
         exponential
@@ -933,6 +991,18 @@ impl RetryPolicy {
                     .unwrap_or(Duration::ZERO),
             )
             .min(self.max_delay)
+    }
+}
+
+impl RetryTargetChange {
+    const fn avoids(self, scope: ErrorScope) -> bool {
+        matches!(
+            (self, scope),
+            (
+                Self::DifferentCredential | Self::DifferentProvider,
+                ErrorScope::Credential
+            ) | (Self::DifferentProvider, ErrorScope::Provider)
+        )
     }
 }
 

@@ -6,13 +6,12 @@ mod runtime;
 mod stream;
 
 pub use request::{
-    AnthropicMessagesCodec, AnthropicRequestError, DecodedAnthropicRequest,
-    EncodedAnthropicRequest,
+    AnthropicMessagesCodec, AnthropicRequestError, DecodedAnthropicRequest, EncodedAnthropicRequest,
 };
 pub use runtime::AnthropicSemanticAdapter;
 pub use stream::{
-    AnthropicEventDecoder, AnthropicEventEncoder, AnthropicStreamError,
-    EncodedAnthropicEvents,
+    AnthropicEventDecoder, AnthropicEventEncoder, AnthropicMessageCodec, AnthropicStreamError,
+    DecodedAnthropicMessage, EncodedAnthropicEvents, EncodedAnthropicMessage,
 };
 
 /// Anthropic's Messages HTTP endpoint.

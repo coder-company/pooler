@@ -8,11 +8,18 @@ repository.workspace = true
 description = "Pooler process lifecycle, immutable configuration generations, and listener wiring"
 
 [dependencies]
+adapter-anthropic = { path = "../adapter-anthropic" }
 adapter-devin = { path = "../adapter-devin" }
+adapter-droid = { path = "../adapter-droid" }
 adapter-factory = { path = "../adapter-factory" }
+adapter-fx = { path = "../adapter-fx" }
+adapter-gemini = { path = "../adapter-gemini" }
+adapter-providers = { path = "../adapter-providers" }
+adapter-xai = { path = "../adapter-xai" }
 arc-swap.workspace = true
 bytes.workspace = true
 hyper.workspace = true
+hyper-rustls.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body.workspace = true
@@ -22,6 +29,7 @@ pooler-config = { path = "../pooler-config" }
 pooler-extension = { path = "../pooler-extension" }
 pooler-core = { path = "../pooler-core" }
 pooler-http = { path = "../pooler-http" }
+pooler-model-catalog = { path = "../pooler-model-catalog" }
 pooler-observe = { path = "../pooler-observe" }
 pooler-store = { path = "../pooler-store" }
 ring.workspace = true
@@ -36,6 +44,7 @@ tracing.workspace = true
 [dev-dependencies]
 futures-util.workspace = true
 pooler-testkit = { path = "../pooler-testkit" }
+pooler-protocol = { path = "../pooler-protocol" }
 prost = "0.14"
 serde.workspace = true
 tokio-tungstenite.workspace = true

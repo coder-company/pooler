@@ -1,0 +1,25 @@
+{
+  "model": "grok-4.6",
+  "store": false,
+  "stream": true,
+  "background": false,
+  "previous_response_id": "resp_fixture_previous",
+  "input": [
+    {
+      "type": "function_call_output",
+      "call_id": "call_fixture_weather",
+      "output": "sunny"
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Summarize that result."
+        }
+      ]
+    }
+  ],
+  "tools": []
+}

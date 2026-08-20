@@ -1,0 +1,10 @@
+imports:
+  - preset: xai
+    as: xai
+    with:
+      bind: 127.0.0.1:18476
+      rest_url: https://api.x.ai
+      websocket_url: wss://api.x.ai
+      secret: env:XAI_API_KEY
+
+version: 1

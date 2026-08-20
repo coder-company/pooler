@@ -7,8 +7,8 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use pooler_auth::{
-    CredentialId, OAuthIdentity, OAuthStoreError, OAuthStoreFuture, OAuthTokenStore, OAuthTokens,
-    SecretValue, TokenSnapshot,
+    AuthKind, CredentialId, OAuthCredentialProfile, OAuthIdentity, OAuthStoreError,
+    OAuthStoreFuture, OAuthTokenStore, OAuthTokens, SecretValue, TokenSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -19,6 +19,23 @@ use crate::{CredentialPayload, SqliteStore, Store, StoreError};
 #[derive(Clone)]
 pub struct SqliteOAuthTokenStore {
     store: SqliteStore,
+}
+
+/// Redacted metadata for one encrypted credential profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialProfileMetadata {
+    /// Persisted authentication kind.
+    pub auth_kind: AuthKind,
+    /// Canonical provider login profile, such as `openai`.
+    pub provider_profile: String,
+    /// Whether a provider account ID is available for request headers.
+    pub account_id_present: bool,
+    /// Store revision used as the credential generation.
+    pub generation: u64,
+    /// Imported provider expiry marker.
+    pub expired: bool,
+    /// Imported provider disablement marker.
+    pub disabled: bool,
 }
 
 impl std::fmt::Debug for SqliteOAuthTokenStore {
@@ -41,6 +58,96 @@ impl SqliteOAuthTokenStore {
     #[must_use]
     pub const fn store(&self) -> &SqliteStore {
         &self.store
+    }
+
+    /// Atomically import an OAuth profile into the encrypted payload store.
+    pub fn compare_and_swap_profile(
+        &self,
+        credential: &CredentialId,
+        expected_generation: u64,
+        profile: &OAuthCredentialProfile,
+    ) -> Result<TokenSnapshot, OAuthStoreError> {
+        let provider_profile = profile.provider_profile().trim();
+        if provider_profile.is_empty() || provider_profile.len() > 128 {
+            return Err(OAuthStoreError::Unavailable);
+        }
+        if profile
+            .account_id()
+            .is_some_and(|account_id| account_id.trim().is_empty() || account_id.len() > 512)
+        {
+            return Err(OAuthStoreError::Unavailable);
+        }
+        let persisted = PersistedTokens {
+            access_token: profile.tokens().access_token().expose_secret().to_owned(),
+            refresh_token: profile
+                .tokens()
+                .refresh_token()
+                .map(|value| value.expose_secret().to_owned()),
+            expires_at_seconds: profile.tokens().expires_at().and_then(|value| {
+                value
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs())
+            }),
+            token_type: profile.tokens().token_type().to_owned(),
+            auth_type: AuthKind::OAuth.as_str().to_owned(),
+            provider_profile: Some(provider_profile.to_owned()),
+            id_token: profile
+                .id_token()
+                .map(|value| value.expose_secret().to_owned()),
+            account_id: profile.account_id().map(ToOwned::to_owned),
+            email: profile.email().map(ToOwned::to_owned),
+            name: profile.name().map(ToOwned::to_owned),
+            expired: profile.is_expired(),
+            disabled: profile.is_disabled(),
+            last_refresh: profile.last_refresh().and_then(|value| {
+                value
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs())
+            }),
+        };
+        let payload = encode_persisted(&persisted)?;
+        let state = self
+            .store
+            .compare_and_swap_credential_payload(
+                credential.as_str(),
+                expected_generation,
+                &payload,
+                now_millis(),
+            )
+            .map_err(Self::map_store_error)?;
+        Ok(TokenSnapshot::new(state.revision, profile.tokens().clone()))
+    }
+
+    /// Load redacted encrypted-profile metadata without exposing tokens or IDs.
+    pub fn profile_metadata(
+        &self,
+        credential: &CredentialId,
+    ) -> Result<Option<CredentialProfileMetadata>, OAuthStoreError> {
+        let Some((state, payload)) = self
+            .store
+            .credential_payload_with_state(credential.as_str())
+            .map_err(Self::map_store_error)?
+        else {
+            return Ok(None);
+        };
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let persisted = decode_persisted(payload)?;
+        let auth_kind = match persisted.auth_type.as_str() {
+            "oauth" | "oauth2" | "codex" => AuthKind::OAuth,
+            _ => return Err(OAuthStoreError::Unavailable),
+        };
+        Ok(Some(CredentialProfileMetadata {
+            auth_kind,
+            provider_profile: persisted.provider_profile.unwrap_or_default(),
+            account_id_present: persisted.account_id.is_some(),
+            generation: state.revision,
+            expired: persisted.expired,
+            disabled: persisted.disabled,
+        }))
     }
 
     /// Persist the provider identity associated with one encrypted token set.
@@ -195,6 +302,8 @@ struct PersistedTokens {
     #[serde(rename = "type", default = "default_auth_type")]
     auth_type: String,
     #[serde(default)]
+    provider_profile: Option<String>,
+    #[serde(default)]
     id_token: Option<String>,
     #[serde(default)]
     account_id: Option<String>,
@@ -237,6 +346,7 @@ fn encode_preserving_identity(
             expires_at_seconds: None,
             token_type: String::new(),
             auth_type: "oauth".to_owned(),
+            provider_profile: None,
             id_token: None,
             account_id: None,
             email: None,

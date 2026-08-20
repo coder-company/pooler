@@ -424,9 +424,11 @@ fn expand_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError>
         Some("devin") => expand_devin_preset(import, path),
         Some("factory") => expand_factory_preset(import, path),
         Some("fx") => expand_fx_preset(import, path),
+        Some("media") => expand_media_preset(import, path),
+        Some("xai") => expand_xai_preset(import, path),
         _ => Err(load_error(
             path,
-            "unknown preset; expected cursor, devin, factory, or fx",
+            "unknown preset; expected cursor, devin, factory, fx, media, or xai",
         )),
     }
 }
@@ -475,7 +477,7 @@ fn expand_cursor_preset(import: &ImportSpec, path: &Path) -> Result<Value, Confi
             "listeners",
             alias,
             "bind",
-            string_value(value, path)?,
+            string_value(value, path, "cursor")?,
             path,
         )?;
     }
@@ -485,7 +487,7 @@ fn expand_cursor_preset(import: &ImportSpec, path: &Path) -> Result<Value, Confi
             "upstreams",
             alias,
             "url",
-            string_value(value, path)?,
+            string_value(value, path, "cursor")?,
             path,
         )?;
     }
@@ -497,14 +499,24 @@ fn expand_cursor_preset(import: &ImportSpec, path: &Path) -> Result<Value, Confi
             .ok_or_else(|| load_error(path, "cursor preset auth is invalid"))?;
         auth.insert(
             Value::String("secret".to_owned()),
-            Value::String(string_value(value, path)?),
+            Value::String(string_value(value, path, "cursor")?),
         );
     }
     if let Some(value) = import.parameters.get("reasoning_effort") {
-        set_cursor_transform_parameter(&mut preset, "value", string_value(value, path)?, path)?;
+        set_cursor_transform_parameter(
+            &mut preset,
+            "value",
+            string_value(value, path, "cursor")?,
+            path,
+        )?;
     }
     if let Some(value) = import.parameters.get("model_prefix") {
-        set_cursor_transform_parameter(&mut preset, "prefix", string_value(value, path)?, path)?;
+        set_cursor_transform_parameter(
+            &mut preset,
+            "prefix",
+            string_value(value, path, "cursor")?,
+            path,
+        )?;
     }
     Ok(preset)
 }
@@ -535,7 +547,7 @@ fn expand_factory_preset(import: &ImportSpec, path: &Path) -> Result<Value, Conf
             "listeners",
             alias,
             "bind",
-            string_value(value, path)?,
+            string_value(value, path, "factory")?,
             path,
         )?;
     }
@@ -545,7 +557,7 @@ fn expand_factory_preset(import: &ImportSpec, path: &Path) -> Result<Value, Conf
             "upstreams",
             alias,
             "url",
-            string_value(value, path)?,
+            string_value(value, path, "factory")?,
             path,
         )?;
     }
@@ -558,7 +570,7 @@ fn expand_factory_preset(import: &ImportSpec, path: &Path) -> Result<Value, Conf
             .ok_or_else(|| load_error(path, "factory preset auth is invalid"))?;
         auth.insert(
             Value::String("secret".to_owned()),
-            Value::String(string_value(value, path)?),
+            Value::String(string_value(value, path, "factory")?),
         );
     }
     Ok(preset)
@@ -628,7 +640,7 @@ fn expand_fx_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigErr
             "listeners",
             alias,
             "bind",
-            string_value(value, path)?,
+            string_value(value, path, "fx")?,
             path,
         )?;
     }
@@ -638,7 +650,7 @@ fn expand_fx_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigErr
             "upstreams",
             alias,
             "url",
-            string_value(value, path)?,
+            string_value(value, path, "fx")?,
             path,
         )?;
     }
@@ -651,7 +663,7 @@ fn expand_fx_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigErr
             .ok_or_else(|| load_error(path, "fx preset auth is invalid"))?;
         auth.insert(
             Value::String("secret".to_owned()),
-            Value::String(string_value(value, path)?),
+            Value::String(string_value(value, path, "fx")?),
         );
     }
     Ok(preset)
@@ -691,6 +703,230 @@ fn rewrite_fx_routes(root: &mut Value, alias: &str, path: &Path) -> Result<(), C
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn expand_media_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
+    for key in import.parameters.keys() {
+        if !matches!(key.as_str(), "bind" | "upstream_url" | "secret") {
+            return Err(unknown_preset_parameter(path, key));
+        }
+    }
+    let alias = import.alias.as_deref().unwrap_or("media");
+    if alias.is_empty()
+        || !alias
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(load_error(path, "invalid preset alias"));
+    }
+    let mut preset: Value = serde_yml::from_str(include_str!("../../../presets/media.yaml"))
+        .map_err(|error| load_error(path, &format!("invalid built-in media preset: {error}")))?;
+    rename_named_key(&mut preset, "listeners", "media", alias, path)?;
+    rename_named_key(&mut preset, "upstreams", "media", alias, path)?;
+    rewrite_media_routes(&mut preset, alias, path)?;
+
+    if let Some(value) = import.parameters.get("bind") {
+        set_named_field(
+            &mut preset,
+            "listeners",
+            alias,
+            "bind",
+            string_value(value, path, "media")?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("upstream_url") {
+        set_named_field(
+            &mut preset,
+            "upstreams",
+            alias,
+            "url",
+            string_value(value, path, "media")?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("secret") {
+        let upstream = named_declaration_mut(&mut preset, "upstreams", alias, path)?;
+        let auth = upstream
+            .entry(Value::String("auth".to_owned()))
+            .or_insert_with(|| Value::Mapping(Mapping::new()))
+            .as_mapping_mut()
+            .ok_or_else(|| load_error(path, "media preset auth is invalid"))?;
+        auth.insert(
+            Value::String("secret".to_owned()),
+            Value::String(string_value(value, path, "media")?),
+        );
+    }
+    Ok(preset)
+}
+
+fn rewrite_media_routes(root: &mut Value, alias: &str, path: &Path) -> Result<(), ConfigError> {
+    let routes = root
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(Value::String("routes".to_owned())))
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| load_error(path, "media preset routes are invalid"))?;
+    for route in routes {
+        let route = route
+            .as_mapping_mut()
+            .ok_or_else(|| load_error(path, "media preset route is invalid"))?;
+        let route_id = route
+            .get(Value::String("id".to_owned()))
+            .and_then(Value::as_str)
+            .ok_or_else(|| load_error(path, "media preset route ID is missing"))?;
+        route.insert(
+            Value::String("id".to_owned()),
+            Value::String(format!("{alias}-{route_id}")),
+        );
+        route.insert(
+            Value::String("listen".to_owned()),
+            Value::String(alias.to_owned()),
+        );
+        let target = route
+            .get_mut(Value::String("target".to_owned()))
+            .and_then(Value::as_mapping_mut)
+            .ok_or_else(|| load_error(path, "media preset target is invalid"))?;
+        if target
+            .get(Value::String("provider".to_owned()))
+            .and_then(Value::as_str)
+            != Some("media")
+        {
+            return Err(load_error(path, "media preset target provider is invalid"));
+        }
+        target.insert(
+            Value::String("provider".to_owned()),
+            Value::String(alias.to_owned()),
+        );
+    }
+    Ok(())
+}
+
+fn expand_xai_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
+    for key in import.parameters.keys() {
+        if !matches!(
+            key.as_str(),
+            "bind" | "rest_url" | "websocket_url" | "secret"
+        ) {
+            return Err(unknown_preset_parameter(path, key));
+        }
+    }
+    let alias = import.alias.as_deref().unwrap_or("xai");
+    if alias.is_empty()
+        || !alias
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(load_error(path, "invalid preset alias"));
+    }
+    let mut preset: Value = serde_yml::from_str(include_str!("../../../presets/xai.yaml"))
+        .map_err(|error| load_error(path, &format!("invalid built-in xai preset: {error}")))?;
+    let rest_alias = format!("{alias}-rest");
+    let websocket_alias = format!("{alias}-websocket");
+    rename_named_key(&mut preset, "listeners", "xai", alias, path)?;
+    rename_named_key(&mut preset, "upstreams", "xai-rest", &rest_alias, path)?;
+    rename_named_key(
+        &mut preset,
+        "upstreams",
+        "xai-websocket",
+        &websocket_alias,
+        path,
+    )?;
+    rewrite_xai_routes(&mut preset, alias, &rest_alias, &websocket_alias, path)?;
+
+    if let Some(value) = import.parameters.get("bind") {
+        set_named_field(
+            &mut preset,
+            "listeners",
+            alias,
+            "bind",
+            string_value(value, path, "xai")?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("rest_url") {
+        set_named_field(
+            &mut preset,
+            "upstreams",
+            &rest_alias,
+            "url",
+            string_value(value, path, "xai")?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("websocket_url") {
+        set_named_field(
+            &mut preset,
+            "upstreams",
+            &websocket_alias,
+            "url",
+            string_value(value, path, "xai")?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("secret") {
+        let secret = string_value(value, path, "xai")?;
+        for upstream_id in [&rest_alias, &websocket_alias] {
+            let upstream = named_declaration_mut(&mut preset, "upstreams", upstream_id, path)?;
+            let auth = upstream
+                .get_mut(Value::String("auth".to_owned()))
+                .and_then(Value::as_mapping_mut)
+                .ok_or_else(|| load_error(path, "xai preset auth is invalid"))?;
+            auth.insert(
+                Value::String("secret".to_owned()),
+                Value::String(secret.clone()),
+            );
+        }
+    }
+    Ok(preset)
+}
+
+fn rewrite_xai_routes(
+    root: &mut Value,
+    alias: &str,
+    rest_alias: &str,
+    websocket_alias: &str,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    let routes = root
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(Value::String("routes".to_owned())))
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| load_error(path, "xai preset routes are invalid"))?;
+    for route in routes {
+        let route = route
+            .as_mapping_mut()
+            .ok_or_else(|| load_error(path, "xai preset route is invalid"))?;
+        let route_id = route
+            .get(Value::String("id".to_owned()))
+            .and_then(Value::as_str)
+            .ok_or_else(|| load_error(path, "xai preset route ID is missing"))?;
+        route.insert(
+            Value::String("id".to_owned()),
+            Value::String(format!("{alias}-{route_id}")),
+        );
+        route.insert(
+            Value::String("listen".to_owned()),
+            Value::String(alias.to_owned()),
+        );
+        let target = route
+            .get_mut(Value::String("target".to_owned()))
+            .and_then(Value::as_mapping_mut)
+            .ok_or_else(|| load_error(path, "xai preset target is invalid"))?;
+        let provider = target
+            .get(Value::String("provider".to_owned()))
+            .and_then(Value::as_str)
+            .ok_or_else(|| load_error(path, "xai preset target provider is missing"))?;
+        let provider = match provider {
+            "xai-rest" => rest_alias,
+            "xai-websocket" => websocket_alias,
+            _ => return Err(load_error(path, "xai preset target provider is invalid")),
+        };
+        target.insert(
+            Value::String("provider".to_owned()),
+            Value::String(provider.to_owned()),
+        );
     }
     Ok(())
 }
@@ -739,7 +975,7 @@ fn expand_devin_preset(import: &ImportSpec, path: &Path) -> Result<Value, Config
             "listeners",
             alias,
             "bind",
-            string_value(value, path)?,
+            string_value(value, path, "devin")?,
             path,
         )?;
     }
@@ -749,7 +985,7 @@ fn expand_devin_preset(import: &ImportSpec, path: &Path) -> Result<Value, Config
             "upstreams",
             alias,
             "url",
-            string_value(value, path)?,
+            string_value(value, path, "devin")?,
             path,
         )?;
     }
@@ -761,7 +997,7 @@ fn expand_devin_preset(import: &ImportSpec, path: &Path) -> Result<Value, Config
             .ok_or_else(|| load_error(path, "devin preset auth is invalid"))?;
         auth.insert(
             Value::String("secret".to_owned()),
-            Value::String(string_value(value, path)?),
+            Value::String(string_value(value, path, "devin")?),
         );
     }
     Ok(preset)
@@ -895,11 +1131,11 @@ fn set_cursor_transform_parameter(
     Ok(())
 }
 
-fn string_value(value: &Value, path: &Path) -> Result<String, ConfigError> {
+fn string_value(value: &Value, path: &Path, preset: &str) -> Result<String, ConfigError> {
     value
         .as_str()
         .map(ToOwned::to_owned)
-        .ok_or_else(|| load_error(path, "cursor preset parameters must be strings"))
+        .ok_or_else(|| load_error(path, &format!("{preset} preset parameters must be strings")))
 }
 
 fn normalize_provider_alias(document: &mut Value, path: &Path) -> Result<(), ConfigError> {
@@ -925,6 +1161,9 @@ fn collect_origins(document: &Value, path: &Path) -> BTreeMap<String, Arc<str>> 
     let source: Arc<str> = Arc::from(path.display().to_string());
     if root.contains_key(Value::String("management".to_owned())) {
         origins.insert("management".to_owned(), Arc::clone(&source));
+    }
+    if root.contains_key(Value::String("catalog".to_owned())) {
+        origins.insert("catalog".to_owned(), Arc::clone(&source));
     }
     for section in [
         "listeners",
@@ -989,6 +1228,11 @@ fn apply_origin_changes(
     if root.contains_key(Value::String("management".to_owned())) {
         if let Some(origin) = incoming_origins.get("management") {
             base.insert("management".to_owned(), Arc::clone(origin));
+        }
+    }
+    if root.contains_key(Value::String("catalog".to_owned())) {
+        if let Some(origin) = incoming_origins.get("catalog") {
+            base.insert("catalog".to_owned(), Arc::clone(origin));
         }
     }
     for section in [
@@ -1541,6 +1785,92 @@ version: 1
         assert!(rendered.contains("encode.fx.events"));
         assert!(rendered.contains("decode.fx.models.request"));
         assert!(rendered.contains("encode.fx.models"));
+        assert!(!rendered.contains("preset:"));
+    }
+
+    #[test]
+    fn fx_parameter_type_errors_name_the_fx_preset() {
+        let dir = TestDir::new();
+        let root = dir.write(
+            "fx-invalid.yaml",
+            "imports: [{preset: fx, with: {bind: 9333}}]\nversion: 1\n",
+        );
+        let error = load_path(root).expect_err("numeric fx parameter");
+        assert!(error
+            .to_string()
+            .contains("fx preset parameters must be strings"));
+        assert!(!error.to_string().contains("cursor preset parameters"));
+    }
+
+    #[test]
+    fn expands_xai_preset_with_semantic_rest_and_bounded_raw_websocket() {
+        let dir = TestDir::new();
+        let root = dir.write(
+            "xai.yaml",
+            r#"
+imports:
+  - preset: xai
+    as: grok-local
+    with:
+      bind: 127.0.0.1:9334
+      rest_url: http://127.0.0.1:9319
+      websocket_url: ws://127.0.0.1:9320
+      secret: env:XAI_TEST_KEY
+version: 1
+"#,
+        );
+        let config = load_path(&root)
+            .expect("xai preset")
+            .compile()
+            .expect("compiled");
+        assert_eq!(config.listeners()["grok-local"].bind(), "127.0.0.1:9334");
+
+        let chat = config
+            .route("grok-local-chat-completions")
+            .expect("xai Chat route");
+        assert_eq!(chat.ingress().decoder(), Some("decode.xai.chat"));
+        assert_eq!(chat.response().decoder(), Some("decode.xai.chat.events"));
+        assert_eq!(chat.response().encoder(), Some("encode.xai.chat.events"));
+        assert_eq!(chat.target().upstream(), "grok-local-rest");
+
+        let responses = config
+            .route("grok-local-responses-rest")
+            .expect("xai Responses REST route");
+        assert_eq!(responses.ingress().decoder(), Some("decode.xai.responses"));
+        assert_eq!(
+            responses.response().decoder(),
+            Some("decode.xai.responses.events")
+        );
+        assert_eq!(
+            responses.response().encoder(),
+            Some("encode.xai.responses.events")
+        );
+
+        let websocket = config
+            .route("grok-local-responses-websocket")
+            .expect("xai Responses WebSocket route");
+        assert_eq!(websocket.matcher().websocket(), Some(true));
+        assert!(!websocket.ingress().mode().is_semantic());
+        assert!(!websocket.response().mode().is_semantic());
+        assert_eq!(websocket.target().upstream(), "grok-local-websocket");
+        assert_eq!(websocket.limits().max_frame_bytes, 8 * 1024 * 1024);
+        assert_eq!(websocket.limits().max_queue_bytes, 8 * 1024 * 1024);
+        assert_eq!(websocket.limits().max_queue_items, 64);
+        assert_eq!(websocket.limits().request_timeout, None);
+
+        for upstream_id in ["grok-local-rest", "grok-local-websocket"] {
+            assert_eq!(
+                config.upstreams()[upstream_id]
+                    .auth()
+                    .expect("xai auth")
+                    .secret()
+                    .redacted(),
+                "env:XAI_TEST_KEY"
+            );
+        }
+        let rendered = render_path(root).expect("rendered xai preset");
+        assert!(rendered.contains("decode.xai.responses"));
+        assert!(rendered.contains("websocket: true"));
         assert!(!rendered.contains("preset:"));
     }
 

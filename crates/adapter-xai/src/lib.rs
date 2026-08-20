@@ -10,15 +10,24 @@
 mod chat;
 mod realtime;
 mod rest;
+mod runtime;
 
-pub use chat::XaiChatEventDecoder;
+pub use chat::{
+    XaiChatEventDecoder, XaiChatEventEncoder, XAI_CHAT_CITATIONS_MEDIA_TYPE,
+    XAI_CHAT_OUTPUT_FILES_MEDIA_TYPE,
+};
 pub use realtime::{
-    DecodedXaiRealtimeEvent, EncodedXaiRealtimeRequest, XaiRealtimeEventDecoder,
+    DecodedXaiRealtimeEvent, EncodedXaiRealtimeRequest, XaiRealtimeError, XaiRealtimeEventDecoder,
     XaiRealtimeEventKind, XaiRealtimeLimits, XaiRealtimeRequestCodec,
 };
 pub use rest::{
     DecodedXaiChatRequest, PreparedXaiRestRequest, XaiRestAdapter, XaiRestEndpoint, XaiRestError,
     XaiRestLimits, XaiRestTransport,
+};
+pub use runtime::{
+    XaiSemanticAdapter, XAI_CHAT_EVENT_DECODER, XAI_CHAT_EVENT_ENCODER, XAI_CHAT_REQUEST_DECODER,
+    XAI_CHAT_REQUEST_ENCODER, XAI_RESPONSES_EVENT_DECODER, XAI_RESPONSES_EVENT_ENCODER,
+    XAI_RESPONSES_REQUEST_DECODER, XAI_RESPONSES_REQUEST_ENCODER,
 };
 
 /// xAI inference API origin.

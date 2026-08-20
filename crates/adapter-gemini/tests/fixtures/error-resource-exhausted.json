@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": 429,
+    "message": "Quota exhausted for this model.",
+    "status": "RESOURCE_EXHAUSTED",
+    "details": [{"reason": "RATE_LIMIT_EXCEEDED"}]
+  }
+}

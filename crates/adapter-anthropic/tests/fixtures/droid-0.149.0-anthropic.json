@@ -1,0 +1,189 @@
+{
+  "metadata": {
+    "client": "Factory Droid",
+    "client_version": "0.149.0",
+    "captured_at": "2026-08-20",
+    "provenance": "sanitized deterministic loopback capture",
+    "notes": "Prompt text, system text, tool descriptions, tool output, API key, and transport-only values are synthetic. The installed client wire-shape capture is recorded separately under .omo/evidence."
+  },
+  "request": {
+    "model": "droid-anthropic-fixture",
+    "max_tokens": 4096,
+    "stream": true,
+    "system": [
+      {
+        "type": "text",
+        "text": "Synthetic system instruction.",
+        "cache_control": {"type": "ephemeral"}
+      }
+    ],
+    "thinking": {"type": "enabled", "budget_tokens": 1024},
+    "tools": [
+      {
+        "name": "read_fixture",
+        "description": "Reads synthetic fixture data.",
+        "input_schema": {
+          "type": "object",
+          "properties": {"path": {"type": "string"}},
+          "required": ["path"],
+          "additionalProperties": false
+        },
+        "cache_control": {"type": "ephemeral"}
+      }
+    ],
+    "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
+    "messages": [
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "Use the fixture tool.",
+            "signature": "synthetic-signature"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_fixture",
+            "name": "read_fixture",
+            "input": {"path": "fixture.txt"}
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_fixture",
+            "content": "synthetic tool result",
+            "is_error": false
+          }
+        ]
+      }
+    ]
+  },
+  "cache_warmup_request": {
+    "model": "droid-anthropic-fixture",
+    "max_tokens": 0,
+    "stream": false,
+    "system": [
+      {
+        "type": "text",
+        "text": "Synthetic cached instruction.",
+        "cache_control": {"type": "ephemeral"}
+      }
+    ],
+    "messages": [{"role": "user", "content": "Populate the prompt cache."}]
+  },
+  "sse": [
+    {
+      "event": "message_start",
+      "data": {
+        "type": "message_start",
+        "message": {
+          "id": "msg_fixture",
+          "type": "message",
+          "role": "assistant",
+          "content": [],
+          "model": "droid-anthropic-fixture",
+          "stop_reason": null,
+          "stop_sequence": null,
+          "usage": {
+            "input_tokens": 21,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 5,
+            "cache_creation_input_tokens": 3
+          }
+        }
+      }
+    },
+    {
+      "event": "content_block_start",
+      "data": {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+      }
+    },
+    {
+      "event": "content_block_delta",
+      "data": {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "thinking_delta", "thinking": "Read it."}
+      }
+    },
+    {
+      "event": "content_block_delta",
+      "data": {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "signature_delta", "signature": "synthetic-signature"}
+      }
+    },
+    {
+      "event": "content_block_stop",
+      "data": {"type": "content_block_stop", "index": 0}
+    },
+    {
+      "event": "content_block_start",
+      "data": {
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {
+          "type": "tool_use",
+          "id": "toolu_fixture",
+          "name": "read_fixture",
+          "input": {}
+        }
+      }
+    },
+    {
+      "event": "content_block_delta",
+      "data": {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"fixture.txt\"}"}
+      }
+    },
+    {
+      "event": "content_block_stop",
+      "data": {"type": "content_block_stop", "index": 1}
+    },
+    {
+      "event": "message_delta",
+      "data": {
+        "type": "message_delta",
+        "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+        "usage": {"output_tokens": 12}
+      }
+    },
+    {"event": "message_stop", "data": {"type": "message_stop"}}
+  ],
+  "unary_response": {
+    "id": "msg_warm_fixture",
+    "type": "message",
+    "role": "assistant",
+    "model": "droid-anthropic-fixture",
+    "content": [],
+    "stop_reason": "max_tokens",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 20,
+      "output_tokens": 0,
+      "cache_creation_input_tokens": 20
+    },
+    "service_tier": "standard"
+  },
+  "error_sse": {
+    "event": "error",
+    "data": {
+      "type": "error",
+      "error": {
+        "type": "overloaded_error",
+        "message": "synthetic overload",
+        "request_id": "req_fixture"
+      }
+    }
+  }
+}

@@ -50,7 +50,8 @@ impl Default for XaiRestLimits {
 /// A validated xAI JSON request and its explicit compatibility accounting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedXaiRestRequest {
-    /// Upstream JSON bytes.
+    /// Upstream JSON bytes. Unchanged HTTP requests retain their exact input
+    /// representation; only applied compatibility transforms reserialize.
     pub body: Vec<u8>,
     /// xAI compatibility rules and losses applied to the request.
     pub report: ConversionReport,
@@ -133,6 +134,7 @@ impl XaiRestAdapter {
         policy: LossPolicy,
     ) -> Result<PreparedXaiRestRequest, XaiRestError> {
         let mut object = self.parse_object(body)?;
+        let original = object.clone();
         let mut report = ConversionReport::default();
         match endpoint {
             XaiRestEndpoint::ChatCompletions => {
@@ -158,10 +160,12 @@ impl XaiRestAdapter {
             }
         }
         report.validate(policy)?;
-        Ok(PreparedXaiRestRequest {
-            body: serde_json::to_vec(&Value::Object(object))?,
-            report,
-        })
+        let body = if object == original {
+            body.to_vec()
+        } else {
+            serde_json::to_vec(&Value::Object(object))?
+        };
+        Ok(PreparedXaiRestRequest { body, report })
     }
 
     /// Decodes xAI Chat JSON through the shared OpenAI-compatible semantic
@@ -254,13 +258,7 @@ impl XaiRestAdapter {
         if deferred {
             report.preserve_capability("xai.deferred_chat");
         }
-        degrade_ignored_field(
-            object,
-            "logit_bias",
-            "xAI documents logit_bias as unsupported",
-            policy,
-            report,
-        );
+        degrade_logit_bias(object, policy, report)?;
         Ok(())
     }
 
@@ -277,23 +275,25 @@ impl XaiRestAdapter {
         validate_top_logprobs(object)?;
         validate_service_tier(object)?;
         validate_optional_nonempty_string(object, "prompt_cache_key")?;
+        validate_optional_nonempty_string(object, "previous_response_id")?;
+        validate_optional_nonempty_string(object, "user")?;
         validate_search_parameters(object)?;
         validate_responses_reasoning(object, policy, report)?;
         validate_background(object, report)?;
-        degrade_ignored_field(
+        degrade_ignored_number_field(
             object,
             "frequency_penalty",
             "xAI Responses does not apply frequency_penalty",
             policy,
             report,
-        );
-        degrade_ignored_field(
+        )?;
+        degrade_ignored_number_field(
             object,
             "presence_penalty",
             "xAI Responses does not apply presence_penalty",
             policy,
             report,
-        );
+        )?;
         degrade_metadata(object, policy, report)?;
         degrade_truncation(object, policy, report)?;
         account_search_override(object, report);
@@ -317,10 +317,7 @@ fn invalid_field(field: impl Into<String>, reason: &'static str) -> XaiRestError
     }
 }
 
-fn require_nonempty_string(
-    object: &Map<String, Value>,
-    field: &str,
-) -> Result<(), XaiRestError> {
+fn require_nonempty_string(object: &Map<String, Value>, field: &str) -> Result<(), XaiRestError> {
     let value = object
         .get(field)
         .ok_or_else(|| XaiRestError::MissingField(field.to_owned()))?;
@@ -364,10 +361,7 @@ fn require_input(object: &Map<String, Value>) -> Result<(), XaiRestError> {
     }
 }
 
-fn optional_bool(
-    object: &Map<String, Value>,
-    field: &str,
-) -> Result<Option<bool>, XaiRestError> {
+fn optional_bool(object: &Map<String, Value>, field: &str) -> Result<Option<bool>, XaiRestError> {
     match object.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
@@ -402,10 +396,7 @@ fn validate_stop(object: &Map<String, Value>, limit: usize) -> Result<(), XaiRes
         .as_array()
         .ok_or_else(|| invalid_field("stop", "must be an array or null"))?;
     if stop.len() > limit {
-        return Err(invalid_field(
-            "stop",
-            "exceeds xAI's four-sequence limit",
-        ));
+        return Err(invalid_field("stop", "exceeds xAI's four-sequence limit"));
     }
     if stop.iter().all(Value::is_string) {
         Ok(())
@@ -450,10 +441,7 @@ fn validate_service_tier(object: &Map<String, Value>) -> Result<(), XaiRestError
     }
 }
 
-fn validate_reasoning_effort(
-    object: &Map<String, Value>,
-    field: &str,
-) -> Result<(), XaiRestError> {
+fn validate_reasoning_effort(object: &Map<String, Value>, field: &str) -> Result<(), XaiRestError> {
     match object.get(field) {
         None | Some(Value::Null) => Ok(()),
         Some(Value::String(value))
@@ -490,11 +478,7 @@ fn validate_search_parameters(object: &Map<String, Value>) -> Result<(), XaiRest
     }
     for field in ["from_date", "to_date"] {
         if let Some(value) = search.get(field) {
-            if !value.is_null()
-                && !value
-                    .as_str()
-                    .is_some_and(looks_like_iso_date)
-            {
+            if !value.is_null() && !value.as_str().is_some_and(looks_like_iso_date) {
                 return Err(invalid_field(
                     format!("search_parameters.{field}"),
                     "must use YYYY-MM-DD",
@@ -549,10 +533,7 @@ fn looks_like_iso_date(value: &str) -> bool {
             .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
 }
 
-fn validate_optional_object(
-    object: &Map<String, Value>,
-    field: &str,
-) -> Result<(), XaiRestError> {
+fn validate_optional_object(object: &Map<String, Value>, field: &str) -> Result<(), XaiRestError> {
     match object.get(field) {
         None | Some(Value::Null | Value::Object(_)) => Ok(()),
         Some(_) => Err(invalid_field(field, "must be an object or null")),
@@ -566,7 +547,9 @@ fn validate_responses_reasoning(
 ) -> Result<(), XaiRestError> {
     validate_optional_object(object, "reasoning")?;
     validate_reasoning_effort(object, "reasoning_effort")?;
-    let has_reasoning = object.get("reasoning").is_some_and(|value| !value.is_null());
+    let has_reasoning = object
+        .get("reasoning")
+        .is_some_and(|value| !value.is_null());
     let has_alternative = object
         .get("reasoning_effort")
         .is_some_and(|value| !value.is_null());
@@ -595,19 +578,56 @@ fn validate_background(
     Ok(())
 }
 
-fn degrade_ignored_field(
+fn degrade_logit_bias(
+    object: &mut Map<String, Value>,
+    policy: LossPolicy,
+    report: &mut ConversionReport,
+) -> Result<(), XaiRestError> {
+    let Some(value) = object.get("logit_bias") else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let bias = value
+        .as_object()
+        .ok_or_else(|| invalid_field("logit_bias", "must be an object or null"))?;
+    if bias.is_empty() {
+        report.apply_rule("xai.chat.empty_logit_bias_is_noop");
+    } else {
+        report.degrade_field("logit_bias", "xAI documents logit_bias as unsupported");
+        if policy == LossPolicy::Degrade {
+            object.remove("logit_bias");
+        }
+    }
+    Ok(())
+}
+
+fn degrade_ignored_number_field(
     object: &mut Map<String, Value>,
     field: &'static str,
     reason: &'static str,
     policy: LossPolicy,
     report: &mut ConversionReport,
-) {
-    if object.get(field).is_some_and(|value| !value.is_null()) {
+) -> Result<(), XaiRestError> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let value = value
+        .as_f64()
+        .ok_or_else(|| invalid_field(field, "must be a number or null"))?;
+    if value == 0.0 {
+        report.apply_rule(format!("xai.responses.{field}_zero_is_noop"));
+    } else {
         report.degrade_field(field, reason);
         if policy == LossPolicy::Degrade {
             object.remove(field);
         }
     }
+    Ok(())
 }
 
 fn degrade_metadata(
@@ -618,6 +638,9 @@ fn degrade_metadata(
     let Some(value) = object.get("metadata") else {
         return Ok(());
     };
+    if value.is_null() {
+        return Ok(());
+    }
     let metadata = value
         .as_object()
         .ok_or_else(|| invalid_field("metadata", "must be an object"))?;
@@ -669,9 +692,9 @@ fn account_search_override(object: &Map<String, Value>, report: &mut ConversionR
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|tools| {
-            tools.iter().any(|tool| {
-                tool.get("type").and_then(Value::as_str) == Some("web_search_preview")
-            })
+            tools
+                .iter()
+                .any(|tool| tool.get("type").and_then(Value::as_str) == Some("web_search_preview"))
         });
     if has_preview_tool {
         report.apply_rule("xai.search_parameters_overrides_web_search_preview");
@@ -724,9 +747,7 @@ mod tests {
     use pooler_protocol::{LossPolicy, Role};
     use serde_json::{json, Value};
 
-    use super::{
-        XaiRestAdapter, XaiRestEndpoint, XaiRestError, XaiRestLimits, XaiRestTransport,
-    };
+    use super::{XaiRestAdapter, XaiRestEndpoint, XaiRestError, XaiRestLimits, XaiRestTransport};
 
     #[test]
     fn rejects_unsupported_chat_field_under_strict_policy() {
@@ -791,6 +812,26 @@ mod tests {
     }
 
     #[test]
+    fn zero_responses_penalties_are_accepted_as_noops() {
+        let body = br#"{
+          "model":"grok",
+          "input":"hello",
+          "frequency_penalty":0,
+          "presence_penalty":0.0
+        }"#;
+        let prepared = XaiRestAdapter::default()
+            .prepare_request(
+                XaiRestEndpoint::Responses,
+                XaiRestTransport::Http,
+                body,
+                LossPolicy::Reject,
+            )
+            .expect("zero penalties have no semantic effect");
+        assert!(prepared.report.is_lossless());
+        assert_eq!(prepared.report.rules_applied.len(), 2);
+    }
+
+    #[test]
     fn validates_xai_tool_limit_before_forwarding() {
         let tools = (0..129)
             .map(|index| json!({"type":"function","name":format!("tool-{index}")}))
@@ -827,7 +868,10 @@ mod tests {
             .decode_chat_request(body, LossPolicy::Reject)
             .expect("xAI Chat request");
         assert_eq!(decoded.request.model, "grok-4.6");
-        assert_eq!(decoded.request.messages().next().expect("message").role, Role::User);
+        assert_eq!(
+            decoded.request.messages().next().expect("message").role,
+            Role::User
+        );
         let value: Value = serde_json::from_slice(&decoded.body).expect("JSON");
         assert_eq!(value["search_parameters"]["mode"], "auto");
         assert!(decoded
@@ -835,6 +879,20 @@ mod tests {
             .preserved_capabilities
             .iter()
             .any(|capability| capability == "xai.search_parameters"));
+    }
+
+    #[test]
+    fn unchanged_http_request_keeps_exact_json_bytes() {
+        let body = b"{ \n  \"model\": \"grok\", \"input\": \"hello\" \n}";
+        let prepared = XaiRestAdapter::default()
+            .prepare_request(
+                XaiRestEndpoint::Responses,
+                XaiRestTransport::Http,
+                body,
+                LossPolicy::Reject,
+            )
+            .expect("valid request");
+        assert_eq!(prepared.body, body);
     }
 
     #[test]

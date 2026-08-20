@@ -215,6 +215,7 @@ for target in $targets; do
     cp "$root_directory/schema/pooler.schema.json" "$stage/schema/pooler.schema.json"
     cp "$root_directory/config/pooler.example.yaml" "$stage/config/pooler.example.yaml"
     cp "$root_directory/config/cursor.example.yaml" "$stage/config/cursor.example.yaml"
+    cp "$root_directory/config/media.example.yaml" "$stage/config/media.example.yaml"
     cp "$report" "$stage/compatibility/MATRIX.md"
     cp "$root_directory/fixtures/compatibility/manifest.json" "$stage/compatibility/manifest.json"
     cp "$cdx" "$stage/sbom/pooler.cdx.json"

@@ -1745,7 +1745,11 @@ impl OpenAiChatEventDecoder {
                 });
             }
         }
-        if let Some(reasoning) = delta.get("reasoning_content") {
+        if let Some(reasoning) = delta
+            .get("reasoning_content")
+            .filter(|reasoning| !reasoning.is_null())
+            .or_else(|| delta.get("reasoning"))
+        {
             let reasoning = reasoning
                 .as_str()
                 .ok_or_else(|| OpenAiChatError::InvalidShape {
@@ -2377,6 +2381,23 @@ mod tests {
             }
         )));
         assert!(decoder.decode_data(b"[DONE]").expect("done").is_empty());
+    }
+
+    #[test]
+    fn decoder_accepts_reasoning_alias_delta() {
+        let mut decoder = OpenAiChatEventDecoder::new();
+        let events = decoder
+            .decode_chunk(
+                br#"{"id":"chat-1","model":"gpt-test","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":null,"reasoning":"checking"},"finish_reason":null}]}"#,
+            )
+            .expect("reasoning alias");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.kind, StreamEventKind::ReasoningStart)));
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            StreamEventKind::ReasoningDelta { ref text } if text == "checking"
+        )));
     }
 
     #[test]

@@ -1,0 +1,138 @@
+version: 1
+
+listeners:
+  media:
+    bind: 127.0.0.1:18476
+
+upstreams:
+  media:
+    url: http://127.0.0.1:8319
+
+routes:
+  # Broad provider-native surfaces stay opaque. This preserves endpoint-
+  # specific fields and streams upload bytes only once, so they are not
+  # replayed by Pooler's retry policy.
+  - id: images
+    listen: media
+    match:
+      methods: [GET, POST, DELETE]
+      path_prefix: /v1/images
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: opaque
+    target:
+      provider: media
+      capabilities: [images]
+    response:
+      mode: opaque
+
+  - id: audio
+    listen: media
+    match:
+      methods: [GET, POST, DELETE]
+      path_prefix: /v1/audio
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: opaque
+    target:
+      provider: media
+      capabilities: [audio]
+    response:
+      mode: opaque
+
+  - id: files
+    listen: media
+    match:
+      methods: [GET, POST, DELETE]
+      path_prefix: /v1/files
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: opaque
+    target:
+      provider: media
+      capabilities: [files]
+    response:
+      mode: opaque
+
+  - id: batches
+    listen: media
+    match:
+      methods: [GET, POST, DELETE]
+      path_prefix: /v1/batches
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+    ingress:
+      mode: opaque
+    target:
+      provider: media
+      capabilities: [batch]
+    response:
+      mode: opaque
+
+  # Known multipart upload endpoints are decoded only for strict validation
+  # and capability-aware selection. The original boundary, headers, order,
+  # and body bytes are forwarded unchanged; responses remain opaque.
+  - id: image-edits
+    listen: media
+    match:
+      methods: [POST]
+      path: /v1/images/edits
+      content_types: [multipart/form-data]
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.media.multipart
+    target:
+      provider: media
+      capabilities: [text, images, files]
+      codecs: [decode.media.multipart]
+    response:
+      mode: opaque
+
+  - id: audio-transcriptions
+    listen: media
+    match:
+      methods: [POST]
+      path: /v1/audio/transcriptions
+      content_types: [multipart/form-data]
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.media.multipart
+    target:
+      provider: media
+      capabilities: [text, audio, input_audio, files]
+      codecs: [decode.media.multipart]
+    response:
+      mode: opaque
+
+  - id: file-uploads
+    listen: media
+    match:
+      methods: [POST]
+      path: /v1/files
+      content_types: [multipart/form-data]
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.media.multipart
+    target:
+      provider: media
+      capabilities: [text, files]
+      codecs: [decode.media.multipart]
+    response:
+      mode: opaque
+

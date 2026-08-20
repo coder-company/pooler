@@ -17,11 +17,19 @@ Render a fully expanded configuration, including imports and presets, with:
 cargo run -p pooler-cli -- --config config/cursor.example.yaml config render
 ```
 
+Run the native Vercel Labs fx adapter, including model discovery, streaming,
+and tool-result continuation, with the [`fx` preset](docs/fx.md). Factory Droid
+is a separate client and does not use this adapter.
+
 Run the opaque proxy with:
 
 ```sh
 POOLER_UPSTREAM_KEY=... cargo run -p pooler-cli -- serve --config config/pooler.example.yaml
 ```
+
+Inspect provider login support, aliases, and API-key guidance with `pooler auth
+providers`; the secure profile, OAuth override, device-flow, and status UX is
+documented in [provider login](docs/provider-login.md).
 
 Verify every declared compatibility fixture through its adapter or runtime
 boundary:

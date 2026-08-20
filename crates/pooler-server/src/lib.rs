@@ -6,6 +6,7 @@
 //! current when it was admitted.  This keeps a reload from changing the
 //! configuration observed by an in-flight request.
 
+mod catalog_runtime;
 mod config_store;
 mod http_runtime;
 mod lifecycle;
@@ -15,6 +16,10 @@ mod management_ui;
 mod server;
 mod tls;
 
+pub use catalog_runtime::{
+    merged_model_catalog_value, merged_model_ids, CatalogFetchFuture, CatalogFetcherRegistration,
+    CatalogRuntime, CatalogRuntimeError, FetchedCatalog, ProviderCatalogFetcher,
+};
 pub use config_store::{ConfigSnapshot, ConfigStore, ConfigStoreError};
 pub use http_runtime::{HttpProxyServer, HttpProxyServerError, HttpReloadOutcome, ListenerAddress};
 pub use lifecycle::{Lifecycle, LifecycleError, LifecycleState};

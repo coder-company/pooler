@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use pooler_protocol::{
     CacheHints, ContentPart, ConversionError, ConversionReport, ExtensionError, Extensions,
@@ -127,12 +125,7 @@ fn decode_request(input: &[u8]) -> Result<DecodedAnthropicRequest, AnthropicRequ
 
     if let Some(system) = object.remove("system") {
         let mut message = Message::new(Role::System);
-        message.content = parse_content(
-            &system,
-            "system",
-            &mut message.extensions,
-            &mut report,
-        )?;
+        message.content = parse_content(&system, "system", &mut message.extensions, &mut report)?;
         request.push_message(message);
     }
 
@@ -155,9 +148,11 @@ fn decode_request(input: &[u8]) -> Result<DecodedAnthropicRequest, AnthropicRequ
         .ok_or_else(|| missing("max_tokens"))?
         .as_u64()
         .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value > 0)
-        .ok_or_else(|| invalid_value("max_tokens", "must be a positive 32-bit integer"))?;
+        .ok_or_else(|| invalid_value("max_tokens", "must be a 32-bit unsigned integer"))?;
     request.sampling.max_output_tokens = Some(max_tokens);
+    if max_tokens == 0 {
+        report.preserve_capability("anthropic.messages.cache_warmup");
+    }
     request.sampling.temperature = take_optional_f32(object, "temperature")?;
     request.sampling.top_p = take_optional_f32(object, "top_p")?;
     if let Some(stop) = object.remove("stop_sequences") {
@@ -169,26 +164,27 @@ fn decode_request(input: &[u8]) -> Result<DecodedAnthropicRequest, AnthropicRequ
     }
     if let Some(choice) = object.remove("tool_choice") {
         request.tool_choice = Some(parse_tool_choice(&choice)?);
-        preserve_json(
-            &mut request.extensions,
-            TOOL_CHOICE,
-            &choice,
-            &mut report,
-        )?;
+        preserve_json(&mut request.extensions, TOOL_CHOICE, &choice, &mut report)?;
     }
     if let Some(thinking) = object.remove("thinking") {
+        if max_tokens == 0
+            && thinking
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "disabled")
+        {
+            return Err(invalid_value(
+                "thinking",
+                "cache warmup with max_tokens 0 cannot enable thinking",
+            ));
+        }
         request.reasoning = Some(parse_thinking(&thinking, &mut report)?);
     }
     if let Some(stream) = object.remove("stream") {
         if !stream.is_boolean() {
             return Err(invalid_shape("stream", "a boolean"));
         }
-        preserve_json(
-            &mut request.extensions,
-            STREAM,
-            &stream,
-            &mut report,
-        )?;
+        preserve_json(&mut request.extensions, STREAM, &stream, &mut report)?;
     }
     if let Some(metadata) = object.remove("metadata") {
         parse_metadata(&metadata, &mut request, &mut report)?;
@@ -270,12 +266,7 @@ fn parse_content(
         parts.push(part);
     }
     if has_extras {
-        preserve_json(
-            extensions,
-            CONTENT_EXTRAS,
-            &Value::Array(extras),
-            report,
-        )?;
+        preserve_json(extensions, CONTENT_EXTRAS, &Value::Array(extras), report)?;
     }
     Ok(parts)
 }
@@ -416,11 +407,8 @@ fn parse_image(
     let kind = required_string(source, "type", &format!("{field}.source.type"))?;
     match kind {
         "base64" => {
-            let media_type = required_string(
-                source,
-                "media_type",
-                &format!("{field}.source.media_type"),
-            )?;
+            let media_type =
+                required_string(source, "media_type", &format!("{field}.source.media_type"))?;
             let data = required_string(source, "data", &format!("{field}.source.data"))?;
             let bytes = BASE64.decode(data).map_err(|_| {
                 invalid_value(format!("{field}.source.data"), "must be valid base64")
@@ -454,16 +442,17 @@ fn parse_document(
     let name = optional_string(object, "title", &format!("{field}.title"))?;
     match kind {
         "base64" => {
-            let media_type = required_string(
-                source,
-                "media_type",
-                &format!("{field}.source.media_type"),
-            )?;
+            let media_type =
+                required_string(source, "media_type", &format!("{field}.source.media_type"))?;
             let data = required_string(source, "data", &format!("{field}.source.data"))?;
             let bytes = BASE64.decode(data).map_err(|_| {
                 invalid_value(format!("{field}.source.data"), "must be valid base64")
             })?;
-            Ok(ContentPart::file(name, media_type, MediaSource::inline(bytes)))
+            Ok(ContentPart::file(
+                name,
+                media_type,
+                MediaSource::inline(bytes),
+            ))
         }
         "url" => Ok(ContentPart::file(
             name,
@@ -511,11 +500,8 @@ fn parse_tools(
                 .map(|value| PreservedJson::from_value(value.clone()))
                 .transpose()?;
             let mut tool = ToolDefinition::new(name, parameters);
-            tool.description = optional_string(
-                object,
-                "description",
-                &format!("{field}.description"),
-            )?;
+            tool.description =
+                optional_string(object, "description", &format!("{field}.description"))?;
             let extras = unknown_fields(object, &["name", "description", "input_schema"]);
             if !extras.is_empty() {
                 preserve_json(
@@ -692,11 +678,25 @@ fn encode_request(
         preserve_known_extension(&request.extensions, TOOL_CHOICE, &mut report);
     }
     if let Some(reasoning) = request.reasoning.as_ref() {
-        object.insert("thinking".to_owned(), encode_thinking(reasoning, &mut report)?);
+        if max_tokens == 0
+            && !matches!(
+                reasoning.effort.as_ref(),
+                Some(ReasoningEffort::Custom(value)) if value == "disabled"
+            )
+        {
+            return Err(invalid_value(
+                "reasoning",
+                "cache warmup with max_tokens 0 cannot enable thinking",
+            ));
+        }
+        object.insert(
+            "thinking".to_owned(),
+            encode_thinking(reasoning, &mut report)?,
+        );
     }
     object.insert(
         "stream".to_owned(),
-        extension_value(&request.extensions, STREAM)?.unwrap_or(Value::Bool(true)),
+        extension_value(&request.extensions, STREAM)?.unwrap_or(Value::Bool(false)),
     );
     preserve_known_extension(&request.extensions, STREAM, &mut report);
 
@@ -709,7 +709,11 @@ fn encode_request(
             )])),
         );
     }
-    for key in request.metadata.keys().filter(|key| key.as_str() != "user_id") {
+    for key in request
+        .metadata
+        .keys()
+        .filter(|key| key.as_str() != "user_id")
+    {
         report.drop_optional(
             format!("metadata.{key}"),
             "Anthropic Messages only supports metadata.user_id",
@@ -813,7 +817,10 @@ fn encode_message(
         encode_message_content(message, report)?
     };
     if message.id.is_some() {
-        report.drop_optional("message.id", "Anthropic Messages has no message ID input field");
+        report.drop_optional(
+            "message.id",
+            "Anthropic Messages has no message ID input field",
+        );
     }
     if message.name.is_some() {
         report.drop_optional(
@@ -999,15 +1006,13 @@ fn encode_tool(
     object.insert("name".to_owned(), Value::String(tool.name.clone()));
     object.insert(
         "input_schema".to_owned(),
-        tool.parameters
-            .as_ref()
-            .map_or_else(|| serde_json::json!({"type":"object"}), |value| value.value().clone()),
+        tool.parameters.as_ref().map_or_else(
+            || serde_json::json!({"type":"object"}),
+            |value| value.value().clone(),
+        ),
     );
     if let Some(description) = tool.description.as_ref() {
-        object.insert(
-            "description".to_owned(),
-            Value::String(description.clone()),
-        );
+        object.insert("description".to_owned(), Value::String(description.clone()));
     }
     if tool.strict.is_some() {
         report.drop_optional(
@@ -1142,11 +1147,7 @@ fn preserve_json(
     Ok(())
 }
 
-fn preserve_known_extension(
-    extensions: &Extensions,
-    name: &str,
-    report: &mut ConversionReport,
-) {
+fn preserve_known_extension(extensions: &Extensions, name: &str, report: &mut ConversionReport) {
     let key = format!("{NAMESPACE}.{name}");
     if let Some(extension) = extensions.get_str(&key) {
         report.preserve_extension(&extension.key());
@@ -1159,8 +1160,7 @@ fn report_unknown_extensions(
     report: &mut ConversionReport,
 ) {
     for (key, _) in extensions {
-        let known = key.namespace.as_str() == NAMESPACE
-            && known_names.contains(&key.name.as_str());
+        let known = key.namespace.as_str() == NAMESPACE && known_names.contains(&key.name.as_str());
         if !known {
             report.drop_optional(
                 format!("extensions.{key}"),
@@ -1318,9 +1318,10 @@ fn string_array(value: &Value, field: &str) -> Result<Vec<String>, AnthropicRequ
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            value.as_str().map(str::to_owned).ok_or_else(|| {
-                invalid_shape(&format!("{field}[{index}]"), "a string")
-            })
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid_shape(&format!("{field}[{index}]"), "a string"))
         })
         .collect()
 }
@@ -1342,10 +1343,7 @@ fn invalid_shape(field: &str, expected: &'static str) -> AnthropicRequestError {
     }
 }
 
-fn invalid_value(
-    field: impl Into<String>,
-    message: impl Into<String>,
-) -> AnthropicRequestError {
+fn invalid_value(field: impl Into<String>, message: impl Into<String>) -> AnthropicRequestError {
     AnthropicRequestError::InvalidValue {
         field: field.into(),
         message: message.into(),
@@ -1386,7 +1384,10 @@ mod tests {
             decoded.request.reasoning.as_ref().and_then(|value| value.effort.as_ref()),
             Some(ReasoningEffort::Custom(value)) if value == "enabled"
         ));
-        assert!(matches!(decoded.request.tool_choice, Some(ToolChoice::Auto)));
+        assert!(matches!(
+            decoded.request.tool_choice,
+            Some(ToolChoice::Auto)
+        ));
         assert!(matches!(
             &decoded.request.input[0],
             InputItem::Message(message) if message.role == Role::System
@@ -1412,18 +1413,9 @@ mod tests {
         assert_eq!(value["thinking"]["budget_tokens"], 1024);
         assert_eq!(value["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(value["tools"][0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(
-            value["tool_choice"]["disable_parallel_tool_use"],
-            true
-        );
-        assert_eq!(
-            value["messages"][0]["content"][0]["signature"],
-            "sig-local"
-        );
-        assert_eq!(
-            value["messages"][1]["content"][0]["tool_use_id"],
-            "toolu_1"
-        );
+        assert_eq!(value["tool_choice"]["disable_parallel_tool_use"], true);
+        assert_eq!(value["messages"][0]["content"][0]["signature"], "sig-local");
+        assert_eq!(value["messages"][1]["content"][0]["tool_use_id"], "toolu_1");
     }
 
     #[test]
@@ -1433,5 +1425,41 @@ mod tests {
         )
         .expect_err("max_tokens is required");
         assert!(error.to_string().contains("max_tokens"));
+    }
+
+    #[test]
+    fn zero_max_tokens_preserves_cache_warmup_without_thinking() {
+        let body = br#"{
+          "model":"claude-test",
+          "max_tokens":0,
+          "stream":false,
+          "system":[{"type":"text","text":"cache me","cache_control":{"type":"ephemeral"}}],
+          "messages":[{"role":"user","content":"warm cache"}]
+        }"#;
+        let decoded = AnthropicMessagesCodec::decode_request_with_report(body).expect("decode");
+        assert_eq!(decoded.request.sampling.max_output_tokens, Some(0));
+        assert!(decoded
+            .report
+            .preserved_capabilities
+            .contains(&"anthropic.messages.cache_warmup".to_owned()));
+        let encoded = AnthropicMessagesCodec::encode_request(&decoded.request, LossPolicy::Reject)
+            .expect("encode");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("json");
+        assert_eq!(value["max_tokens"], 0);
+        assert_eq!(value["stream"], false);
+    }
+
+    #[test]
+    fn zero_max_tokens_rejects_enabled_thinking() {
+        let error = AnthropicMessagesCodec::decode_request(
+            br#"{
+          "model":"claude-test",
+          "max_tokens":0,
+          "thinking":{"type":"enabled","budget_tokens":1024},
+          "messages":[{"role":"user","content":"warm cache"}]
+        }"#,
+        )
+        .expect_err("thinking and cache warmup conflict");
+        assert!(error.to_string().contains("cannot enable thinking"));
     }
 }

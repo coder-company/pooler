@@ -19,7 +19,8 @@ use http_body_util::BodyExt;
 use pooler_config::RoutePlan;
 use pooler_http::{
     BoxError, ProxyBody, SelectionContext, SemanticAdapter, SemanticRequestBody,
-    SemanticResponseBody, SseEncoder, SseError, SseEvent, SseLimits, SseParser,
+    SemanticResponseBody, SemanticResponseHint, SseEncoder, SseError, SseEvent, SseLimits,
+    SseParser,
 };
 use pooler_protocol::{
     ContentPart, ConversionError, ConversionReport, Extensions, FinishReason, InputItem,
@@ -74,6 +75,7 @@ impl SemanticAdapter for FxSemanticAdapter {
             return Ok(SemanticRequestBody {
                 body: Vec::new(),
                 content_type: HeaderValue::from_static("application/json"),
+                response_hint: pooler_http::SemanticResponseHint::default(),
             });
         }
         if !is_language_model_route(route) {
@@ -81,6 +83,7 @@ impl SemanticAdapter for FxSemanticAdapter {
         }
 
         let decoded = decode_language_model_request(route, headers, body)?;
+        let requested_model = decoded.request.model.clone();
         let encoded =
             pooler_protocol::OpenAiChatCodec::encode_request(&decoded.request, route.loss_policy())
                 .map_err(|error| Box::new(error) as BoxError)?;
@@ -97,6 +100,10 @@ impl SemanticAdapter for FxSemanticAdapter {
         Ok(SemanticRequestBody {
             body: serde_json::to_vec(&value).map_err(|error| Box::new(error) as BoxError)?,
             content_type: HeaderValue::from_static("application/json"),
+            response_hint: SemanticResponseHint {
+                requested_model: Some(requested_model),
+                ..SemanticResponseHint::default()
+            },
         })
     }
 
@@ -143,14 +150,33 @@ impl SemanticAdapter for FxSemanticAdapter {
         request_headers: &HeaderMap,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
-        let requested_model = request_headers
-            .get(MODEL_ID_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
+        let requested_model = requested_model_header(request_headers);
         decode_response(route, body, requested_model, cancellation)
     }
+
+    fn decode_response_with_hint(
+        &self,
+        route: &RoutePlan,
+        body: ProxyBody,
+        request_headers: &HeaderMap,
+        hint: &SemanticResponseHint,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        let requested_model = hint
+            .requested_model
+            .clone()
+            .or_else(|| requested_model_header(request_headers));
+        decode_response(route, body, requested_model, cancellation)
+    }
+}
+
+fn requested_model_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(MODEL_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn is_language_model_route(route: &RoutePlan) -> bool {
@@ -191,8 +217,9 @@ fn decode_language_model_request(
         },
         ..FactoryDecodeOptions::default()
     });
+    let normalized_body = normalize_fx_wire_body(body)?;
     let mut decoded = decoder
-        .decode(body, model)
+        .decode(&normalized_body, model)
         .map_err(|error| Box::new(error) as BoxError)?;
     normalize_fx_request(&mut decoded.request, &mut decoded.report)
         .map_err(|error| Box::new(error) as BoxError)?;
@@ -203,26 +230,33 @@ fn decode_language_model_request(
     Ok(decoded)
 }
 
+fn normalize_fx_wire_body(body: &[u8]) -> Result<Vec<u8>, BoxError> {
+    let mut value: Value =
+        serde_json::from_slice(body).map_err(|error| Box::new(error) as BoxError)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| Box::new(FxAdapterError::RequestNotObject) as BoxError)?;
+    if let Some(Value::String(effort)) = object.get("reasoning") {
+        object.insert(
+            "reasoning".to_owned(),
+            serde_json::json!({"effort": effort}),
+        );
+    }
+    serde_json::to_vec(&value).map_err(|error| Box::new(error) as BoxError)
+}
+
 fn normalize_fx_request(
     request: &mut pooler_protocol::SemanticRequest,
     report: &mut ConversionReport,
 ) -> Result<(), FxAdapterError> {
-    drop_extensions(
-        "request.extensions",
-        &mut request.extensions,
-        report,
-    );
+    drop_extensions("request.extensions", &mut request.extensions, report);
     drop_extensions(
         "sampling.extensions",
         &mut request.sampling.extensions,
         report,
     );
     if let Some(reasoning) = &mut request.reasoning {
-        drop_extensions(
-            "reasoning.extensions",
-            &mut reasoning.extensions,
-            report,
-        );
+        drop_extensions("reasoning.extensions", &mut reasoning.extensions, report);
     }
     for tool in &mut request.tools {
         drop_extensions("tools[].extensions", &mut tool.extensions, report);
@@ -234,11 +268,7 @@ fn normalize_fx_request(
             normalized.push(item);
             continue;
         };
-        drop_extensions(
-            "prompt[].providerOptions",
-            &mut message.extensions,
-            report,
-        );
+        drop_extensions("prompt[].providerOptions", &mut message.extensions, report);
         if message.role != Role::Tool {
             for part in &mut message.content {
                 if let ContentPart::ToolCall(call) = part {
@@ -404,6 +434,8 @@ enum FxAdapterError {
     InvalidModelHeader,
     #[error("invalid fx request JSON: {0}")]
     InvalidRequestJson(serde_json::Error),
+    #[error("fx request JSON must be an object")]
+    RequestNotObject,
     #[error("encoded OpenAI request is not an object")]
     EncodedRequestNotObject,
     #[error("fx specification version must be 3 or 4")]
@@ -597,7 +629,12 @@ impl FxEventEncoder {
         }
         let mut values = Vec::with_capacity(self.tool_calls.len().saturating_add(1));
         for call in self.tool_calls.drain(..) {
-            let input = serde_json::from_str(&call.arguments)
+            let arguments = if call.arguments.is_empty() {
+                "{}"
+            } else {
+                &call.arguments
+            };
+            let input = serde_json::from_str(arguments)
                 .unwrap_or_else(|_| Value::String(call.arguments.clone()));
             values.push(serde_json::json!({
                 "type": "tool-call",
@@ -721,10 +758,6 @@ fn event_name(event: &StreamEventKind) -> &'static str {
 
 #[derive(Debug, Error)]
 enum FxEncodeError {
-    #[error("cannot encode fx event JSON: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("cannot frame fx event as SSE: {0}")]
-    Sse(#[from] SseError),
     #[error("fx event conversion rejected: {0}")]
     Conversion(#[from] ConversionError),
     #[error("fx {0} event requires a block identifier")]
@@ -1024,18 +1057,9 @@ impl FxModelsBody {
             let model = model
                 .as_object_mut()
                 .ok_or_else(|| Box::new(FxModelsError::InvalidModel) as BoxError)?;
-            model.insert("type".to_owned(), Value::String("language".to_owned()));
-            model.insert(
-                "tags".to_owned(),
-                serde_json::json!(["tool-use", "reasoning", "vision"]),
-            );
-            model.insert(
-                "reasoning_options".to_owned(),
-                serde_json::json!([{
-                    "type": "effort",
-                    "values": ["low", "medium", "high", "xhigh", "max", "ultra"]
-                }]),
-            );
+            model
+                .entry("type".to_owned())
+                .or_insert_with(|| Value::String("language".to_owned()));
         }
         Ok(Bytes::from(serde_json::to_vec(&value)?))
     }
@@ -1110,6 +1134,14 @@ fn usize_limit(value: u64) -> usize {
 mod tests {
     use super::*;
     use pooler_protocol::StreamEvent;
+
+    #[test]
+    fn current_fx_reasoning_effort_string_normalizes_to_v4_shape() {
+        let body = br#"{"prompt":[],"reasoning":"low"}"#;
+        let normalized = normalize_fx_wire_body(body).expect("normalized request");
+        let value: Value = serde_json::from_slice(&normalized).expect("normalized JSON");
+        assert_eq!(value["reasoning"], serde_json::json!({"effort": "low"}));
+    }
 
     #[test]
     fn completed_tool_call_is_emitted_before_finish() {

@@ -15,7 +15,8 @@ use std::{
 };
 
 use adapter_codex::CodexFailureClassifier;
-use http::{header, HeaderMap};
+use adapter_providers::AuthPlacement;
+use http::HeaderMap;
 use pooler_auth::SecretRef as AuthSecretRef;
 use pooler_config::{
     AccountPlan, CompiledConfig, PolicyPlan, RoutePlan, SecretRef,
@@ -25,18 +26,22 @@ use pooler_core::{
     Capability, CapabilitySet, ConfigGeneration, CredentialId, ErrorClass, ModelId, ProviderId,
     RouteId,
 };
+use pooler_model_catalog::{CatalogService, CatalogSnapshot};
 use pooler_policy::{
     AffinityKey, CommitmentState, CooldownScope, CredentialRegistration, CredentialRegistry,
     FailureClassification, FailureClassifier, HealthMutation, HealthSubject, HttpFailureClassifier,
-    ObservedFailure, ReplayCheck, RetryContext, RetryDecision, RetryPolicy, SelectionError,
-    SelectionExplanation, SelectionLease, SelectionRequest,
+    ObservedFailure, PersistedQuotaSnapshot, ProviderNeutralQuotaClassifier, QuotaClassification,
+    QuotaClassifier, QuotaObservation, QuotaProjectKey, QuotaScope, QuotaSignal, QuotaUnit,
+    ReplayCheck, RetryContext, RetryDecision, RetryPolicy, SelectionError, SelectionExplanation,
+    SelectionLease, SelectionRequest,
 };
 use pooler_store::{
     CooldownState, CredentialHealthState, CredentialHealthStatus, CredentialState,
     DecisionCandidate, DecisionRecord, MemoryStore, SessionAffinity, Store,
 };
 use thiserror::Error;
-use zeroize::Zeroizing;
+
+const TYPED_QUOTA_STORE_SCOPE: &str = "typed_quota_v1";
 
 /// Request-local semantic information needed by account selection.
 ///
@@ -206,6 +211,7 @@ pub struct PoolSelection {
     credential: Option<CredentialId>,
     affinity_key: Option<AffinityKey>,
     registry_key: Option<Arc<str>>,
+    selection_request: Option<SelectionRequest>,
 }
 
 impl std::fmt::Debug for PoolSelection {
@@ -240,7 +246,7 @@ impl PoolSelection {
     /// authentication was selected.
     #[must_use]
     pub fn account_secret(&self) -> Option<&SecretRef> {
-        self.account.as_ref().map(AccountPlan::secret)
+        self.account.as_ref().and_then(AccountPlan::secret)
     }
 
     /// Whether this selection can participate in a retry policy.
@@ -292,24 +298,34 @@ impl PoolSelection {
 }
 
 /// A failure classification plus the retry decision made for one attempt.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PoolFailure {
     pub classification: FailureClassification,
     pub mutation: HealthMutation,
     pub decision: RetryDecision,
+    replacement: Option<PoolSelection>,
+}
+
+impl PoolFailure {
+    /// Take the atomically reserved alternate selected for a quota retry.
+    pub(crate) fn take_replacement(&mut self) -> Option<PoolSelection> {
+        self.replacement.take()
+    }
 }
 
 /// Inputs for one pre-commit failure decision.
 pub(crate) struct FailureInput<'a> {
     pub config: &'a CompiledConfig,
     pub route: &'a RoutePlan,
-    pub selection: &'a PoolSelection,
+    pub selection: &'a mut PoolSelection,
     pub status: Option<u16>,
     pub provider_code: Option<String>,
     pub message: Option<String>,
     pub native_codex: bool,
+    pub quota_observations: &'a [QuotaObservation],
     pub retry_after: Option<Duration>,
     pub replay: ReplayCheck,
+    pub commitment: CommitmentState,
     pub idempotency_key_present: bool,
     pub attempt: u32,
     pub credentials_used: u32,
@@ -346,6 +362,7 @@ pub struct PoolingCoordinator {
     accounts: Arc<BTreeMap<String, AccountPlan>>,
     store: Arc<dyn Store>,
     request_sequence: Arc<AtomicU64>,
+    catalog: Option<Arc<CatalogService>>,
 }
 
 impl std::fmt::Debug for PoolingCoordinator {
@@ -402,6 +419,7 @@ impl PoolingCoordinator {
             accounts: Arc::new(accounts),
             store,
             request_sequence: Arc::new(AtomicU64::new(0)),
+            catalog: None,
         };
         coordinator.restore_account_state(config)?;
         Ok(coordinator)
@@ -414,7 +432,22 @@ impl PoolingCoordinator {
     pub fn reconfigure(&self, config: &CompiledConfig) -> Result<Self, PoolError> {
         let mut coordinator = Self::with_store(config, Arc::clone(&self.store))?;
         coordinator.request_sequence = Arc::clone(&self.request_sequence);
+        coordinator.catalog.clone_from(&self.catalog);
         Ok(coordinator)
+    }
+
+    /// Attach the atomically refreshed catalog used by request model selection.
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: Arc<CatalogService>) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
+    /// Replace or clear the catalog attached to this coordinator.
+    #[must_use]
+    pub fn with_optional_catalog(mut self, catalog: Option<Arc<CatalogService>>) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     /// Return the mutable state store shared by this coordinator.
@@ -513,22 +546,24 @@ impl PoolingCoordinator {
 
         let requested_model =
             model.or_else(|| route.target().model_source().and_then(|_| context.model()));
+        let catalog = self.catalog.as_ref().map(|catalog| catalog.snapshot());
         let (logical_model, static_upstream, static_model) =
-            resolve_static_target(config, route, requested_model)?;
+            resolve_static_target(config, route, requested_model, catalog.as_deref())?;
         let Some(policy) = policy else {
             if selection_contract_is_declared(route, requested_model)
                 && !target_satisfies_context(
                     config,
                     route,
                     requested_model,
-                    static_upstream,
+                    &static_upstream,
                     context,
+                    catalog.as_deref(),
                 )
             {
                 return Err(PoolError::Selection);
             }
-            let provider = ProviderId::new(static_upstream.to_owned())
-                .map_err(|_| PoolError::InvalidProvider)?;
+            let provider =
+                ProviderId::new(static_upstream.clone()).map_err(|_| PoolError::InvalidProvider)?;
             let model_id =
                 ModelId::new(logical_model.to_owned()).map_err(|_| PoolError::InvalidModel)?;
             return Ok(PoolSelection {
@@ -543,6 +578,7 @@ impl PoolingCoordinator {
                 credential: None,
                 affinity_key: None,
                 registry_key: None,
+                selection_request: None,
             });
         };
 
@@ -602,6 +638,7 @@ impl PoolingCoordinator {
             }
         }
 
+        let selection_request = request.clone();
         let lease = match registry.select(request) {
             Ok(lease) => lease,
             Err(SelectionError::NoEligible { explanation, .. }) => {
@@ -633,7 +670,7 @@ impl PoolingCoordinator {
                     .find(|target| target.provider() == provider.as_str())
             })
             .map(|target| target.upstream_model().to_owned())
-            .or_else(|| static_model.map(str::to_owned));
+            .or(static_model);
         self.record_selection(
             route,
             &logical_model,
@@ -654,6 +691,7 @@ impl PoolingCoordinator {
             credential: Some(account_id),
             affinity_key,
             registry_key: Some(Arc::from(registry_key)),
+            selection_request: Some(selection_request),
         })
     }
 
@@ -668,8 +706,10 @@ impl PoolingCoordinator {
             provider_code,
             message,
             native_codex,
+            quota_observations,
             retry_after,
             replay,
+            commitment,
             idempotency_key_present,
             attempt,
             credentials_used,
@@ -678,6 +718,7 @@ impl PoolingCoordinator {
             elapsed_recovery_wait,
             started,
         } = input;
+        let quota_provider_code = provider_code.clone();
         let observed = ObservedFailure {
             source: if status.is_some() {
                 pooler_policy::FailureSource::Upstream
@@ -706,47 +747,105 @@ impl PoolingCoordinator {
             route: RouteId::new(route.id()).ok(),
         };
         let registry = self.registry_for(route, selection.model());
-        let mutation = registry
-            .map(|registry| registry.apply_failure(&classification, &subject, Instant::now()))
-            .transpose()
-            .ok()
-            .flatten()
-            .unwrap_or(HealthMutation::NoChange {
-                reason: pooler_policy::HealthMutationReason::MissingCooldownTarget,
-            });
-        self.persist_failure(&classification, &subject, &mutation);
+        let policy = selection.policy().cloned();
+        let retry_policy = policy.as_ref().map(configured_retry_policy);
+        let retry_context = RetryContext::new(attempt, commitment, replay)
+            .with_elapsed(started.elapsed())
+            .with_used_targets(credentials_used, providers_used)
+            .with_elapsed_retry_delay(elapsed_retry_delay)
+            .with_elapsed_recovery_wait(elapsed_recovery_wait)
+            .with_idempotency_key(idempotency_key_present);
+        let status_allows_retry = policy
+            .as_ref()
+            .is_some_and(|policy| status.is_none_or(|status| policy.retry().allows_status(status)));
+        let now = Instant::now();
+        let quotas = quota_classifications_for_failure(
+            &classification,
+            selection,
+            quota_provider_code.as_deref(),
+            retry_after,
+            quota_observations,
+            now,
+        );
+        let quota = quotas
+            .iter()
+            .filter(|quota| quota.exhausted(now))
+            .max_by_key(|quota| quota.snapshot.reset_at);
+        if let Some(typed) = quota.and_then(QuotaClassification::failure) {
+            classification = typed.clone();
+        }
 
-        let retry = selection.policy().map(|policy| {
-            let retry_plan = policy.retry();
-            let mut retry_policy = RetryPolicy::with_bounds(
-                retry_plan.maximum_attempts(),
-                retry_plan.maximum_credentials(),
-                retry_plan.maximum_providers(),
-                retry_plan.base_delay(),
-                retry_plan.maximum_delay(),
-                retry_plan.maximum_total_delay(),
-                retry_plan
-                    .maximum_recovery_wait()
-                    .unwrap_or(retry_plan.maximum_total_delay()),
-            )
-            .unwrap_or_default();
-            retry_policy = retry_policy.with_max_elapsed(retry_plan.maximum_elapsed());
-            if status.is_some_and(|status| !retry_plan.allows_status(status)) {
-                return RetryDecision::DoNotRetry {
-                    reason: pooler_policy::RetryStopReason::ClassificationNotRetryable,
-                };
+        let mut replacement = None;
+        let mut recovered = None;
+        if status_allows_retry {
+            if let (Some(registry), Some(quota), Some(retry_policy), Some(mut request)) = (
+                registry.as_ref(),
+                quota.as_ref(),
+                retry_policy.as_ref(),
+                selection.selection_request.clone(),
+            ) {
+                request.attempt = attempt.saturating_add(1);
+                request.now = now;
+                if let Some(credential) = selection.credential().cloned() {
+                    request.excluded_credentials.insert(credential);
+                }
+                if let Some(lease) = selection.take_lease() {
+                    if let Ok(recovery) = registry.recover_quota(
+                        lease,
+                        quota,
+                        request.clone(),
+                        retry_policy,
+                        retry_context,
+                    ) {
+                        let mutation = recovery.health_mutation().clone();
+                        let decision = recovery.retry_decision();
+                        for observed in &quotas {
+                            if let Some(credential) = selection.credential() {
+                                let _ = registry.apply_quota_classification(credential, observed);
+                            }
+                            self.persist_quota_classification(selection, observed, registry, now);
+                        }
+                        replacement = recovery.into_selection().map(|lease| {
+                            self.selection_from_recovery(config, route, selection, request, lease)
+                        });
+                        recovered = Some((mutation, decision));
+                    }
+                }
             }
-            let context = RetryContext::new(attempt, CommitmentState::Uncommitted, replay)
-                .with_elapsed(started.elapsed())
-                .with_used_targets(credentials_used, providers_used)
-                .with_elapsed_retry_delay(elapsed_retry_delay)
-                .with_elapsed_recovery_wait(elapsed_recovery_wait)
-                .with_idempotency_key(idempotency_key_present);
-            retry_policy.decide(&classification, context)
+        }
+
+        let (mutation, decision) = recovered.unwrap_or_else(|| {
+            if let (Some(registry), Some(credential)) = (registry.as_ref(), selection.credential())
+            {
+                for quota in &quotas {
+                    let _ = registry.apply_quota_classification(credential, quota);
+                    self.persist_quota_classification(selection, quota, registry, now);
+                }
+            }
+            let mutation = registry
+                .as_ref()
+                .map(|registry| registry.apply_failure(&classification, &subject, now))
+                .transpose()
+                .ok()
+                .flatten()
+                .unwrap_or(HealthMutation::NoChange {
+                    reason: pooler_policy::HealthMutationReason::MissingCooldownTarget,
+                });
+            let decision = if !status_allows_retry {
+                RetryDecision::DoNotRetry {
+                    reason: pooler_policy::RetryStopReason::ClassificationNotRetryable,
+                }
+            } else {
+                retry_policy.as_ref().map_or(
+                    RetryDecision::DoNotRetry {
+                        reason: pooler_policy::RetryStopReason::ClassificationNotRetryable,
+                    },
+                    |retry_policy| retry_policy.decide(&classification, retry_context),
+                )
+            };
+            (mutation, decision)
         });
-        let decision = retry.unwrap_or(RetryDecision::DoNotRetry {
-            reason: pooler_policy::RetryStopReason::ClassificationNotRetryable,
-        });
+        self.persist_failure(&classification, &subject, &mutation);
         self.record_failure(
             route,
             selection,
@@ -759,6 +858,128 @@ impl PoolingCoordinator {
             classification,
             mutation,
             decision,
+            replacement,
+        }
+    }
+
+    fn selection_from_recovery(
+        &self,
+        config: &CompiledConfig,
+        route: &RoutePlan,
+        failed: &PoolSelection,
+        request: SelectionRequest,
+        lease: SelectionLease,
+    ) -> PoolSelection {
+        let registration = lease.registration().clone();
+        let explanation = lease.explanation().clone();
+        let provider = registration.provider().clone();
+        let credential = registration.credential().clone();
+        let upstream_model = config
+            .models()
+            .get(registration.model().as_str())
+            .and_then(|model| {
+                model
+                    .targets()
+                    .iter()
+                    .find(|target| target.provider() == provider.as_str())
+            })
+            .map(|target| Arc::from(target.upstream_model()))
+            .or_else(|| {
+                (&provider == failed.provider())
+                    .then(|| failed.upstream_model().map(Arc::from))
+                    .flatten()
+            });
+        self.record_selection(
+            route,
+            registration.model().as_str(),
+            request.attempt,
+            config.generation(),
+            &lease,
+            upstream_model.as_deref(),
+        );
+        PoolSelection {
+            upstream_id: Arc::from(provider.as_str()),
+            upstream_model,
+            account: self.accounts.get(credential.as_str()).cloned(),
+            lease: Some(lease),
+            policy: failed.policy.clone(),
+            explanation: Some(explanation),
+            model: registration.model().clone(),
+            provider,
+            credential: Some(credential),
+            affinity_key: failed.affinity_key.clone(),
+            registry_key: failed.registry_key.clone(),
+            selection_request: Some(request),
+        }
+    }
+
+    fn persist_quota_classification(
+        &self,
+        failed: &PoolSelection,
+        classification: &QuotaClassification,
+        current: &Arc<CredentialRegistry>,
+        now: Instant,
+    ) {
+        self.propagate_shared_quota(failed, classification, current);
+        let now_wall = timestamp_now();
+        for registry in self.registries.values() {
+            let Ok(records) = registry.quota_state_records(now, now_wall) else {
+                continue;
+            };
+            for record in records {
+                let Some(until) = record.reset_at_unix_ms() else {
+                    continue;
+                };
+                let Ok(reason) = serde_json::to_string(&record) else {
+                    continue;
+                };
+                let Ok(key) = quota_store_key(&record) else {
+                    continue;
+                };
+                let mut cooldown =
+                    CooldownState::new(TYPED_QUOTA_STORE_SCOPE, key, until, now_wall);
+                cooldown.reason = Some(reason);
+                let _ = self.store.upsert_cooldown(cooldown);
+            }
+        }
+    }
+
+    fn propagate_shared_quota(
+        &self,
+        failed: &PoolSelection,
+        classification: &QuotaClassification,
+        current: &Arc<CredentialRegistry>,
+    ) {
+        if !matches!(
+            classification.snapshot.scope,
+            QuotaScope::Credential | QuotaScope::Project | QuotaScope::Provider
+        ) {
+            return;
+        }
+        let quota_project = failed
+            .account
+            .as_ref()
+            .and_then(|account| account.quota_project())
+            .and_then(|project| QuotaProjectKey::new(project).ok());
+        for registry in self.registries.values() {
+            if Arc::ptr_eq(registry, current) {
+                continue;
+            }
+            let Ok(registrations) = registry.registrations() else {
+                continue;
+            };
+            let matching = registrations.into_iter().find(|registration| {
+                quota_registration_matches(
+                    registration,
+                    failed,
+                    classification.snapshot.scope,
+                    quota_project.as_ref(),
+                )
+            });
+            if let Some(registration) = matching {
+                let _ =
+                    registry.set_quota_snapshot(registration.credential(), classification.snapshot);
+            }
         }
     }
 
@@ -832,6 +1053,7 @@ impl PoolingCoordinator {
             }
         }
         self.restore_cooldowns()?;
+        self.restore_quota_states()?;
         self.restore_affinities()?;
         Ok(())
     }
@@ -864,6 +1086,31 @@ impl PoolingCoordinator {
                 }
                 registry
                     .restore_cooldown(scope.clone(), until)
+                    .map_err(|_| PoolError::Selection)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_quota_states(&self) -> Result<(), PoolError> {
+        let now_wall = timestamp_now();
+        let now = Instant::now();
+        for cooldown in self
+            .store
+            .cooldowns(now_wall)
+            .map_err(|_| PoolError::Store)?
+            .into_iter()
+            .filter(|cooldown| cooldown.scope == TYPED_QUOTA_STORE_SCOPE)
+        {
+            let reason = cooldown.reason.as_deref().ok_or(PoolError::Store)?;
+            let record: PersistedQuotaSnapshot =
+                serde_json::from_str(reason).map_err(|_| PoolError::Store)?;
+            if record.reset_at_unix_ms() != Some(cooldown.until) {
+                return Err(PoolError::Store);
+            }
+            for registry in self.registries.values() {
+                registry
+                    .restore_quota_state(&record, now, now_wall)
                     .map_err(|_| PoolError::Selection)?;
             }
         }
@@ -1081,6 +1328,130 @@ impl PoolingCoordinator {
     }
 }
 
+fn configured_retry_policy(policy: &PolicyPlan) -> RetryPolicy {
+    let retry = policy.retry();
+    RetryPolicy::with_bounds(
+        retry.maximum_attempts(),
+        retry.maximum_credentials(),
+        retry.maximum_providers(),
+        retry.base_delay(),
+        retry.maximum_delay(),
+        retry.maximum_total_delay(),
+        retry
+            .maximum_recovery_wait()
+            .unwrap_or(retry.maximum_total_delay()),
+    )
+    .unwrap_or_default()
+    .with_max_elapsed(retry.maximum_elapsed())
+}
+
+fn quota_classifications_for_failure(
+    failure: &FailureClassification,
+    selection: &PoolSelection,
+    provider_code: Option<&str>,
+    retry_after: Option<Duration>,
+    observations: &[QuotaObservation],
+    now: Instant,
+) -> Vec<QuotaClassification> {
+    if selection.credential().is_none() {
+        return Vec::new();
+    }
+    let classifier = ProviderNeutralQuotaClassifier::default();
+    if !observations.is_empty() {
+        return observations
+            .iter()
+            .cloned()
+            .map(|mut observation| {
+                if observation.scope == QuotaScope::Project
+                    && selection
+                        .account
+                        .as_ref()
+                        .and_then(AccountPlan::quota_project)
+                        .is_none()
+                    && selection.credential().is_some()
+                {
+                    observation.scope = QuotaScope::Credential;
+                }
+                classifier.classify(&observation, now)
+            })
+            .collect();
+    }
+    let project_scope = selection
+        .account
+        .as_ref()
+        .and_then(AccountPlan::quota_project)
+        .is_some()
+        && provider_code.is_some_and(project_quota_marker);
+    let (signal, scope) = match failure.classification.class {
+        ErrorClass::CredentialQuotaExhausted => (
+            QuotaSignal::Exhausted,
+            if project_scope {
+                QuotaScope::Project
+            } else {
+                QuotaScope::Credential
+            },
+        ),
+        ErrorClass::ModelQuotaExhausted => (
+            QuotaSignal::Exhausted,
+            if project_scope {
+                QuotaScope::ProjectModel
+            } else {
+                QuotaScope::CredentialModel
+            },
+        ),
+        ErrorClass::ProviderRateLimited => (QuotaSignal::RateLimited, QuotaScope::Provider),
+        _ => return Vec::new(),
+    };
+    let recovery = [failure.classification.recovery_after, retry_after]
+        .into_iter()
+        .flatten()
+        .max();
+    let mut observation =
+        QuotaObservation::new(signal, scope, QuotaUnit::Requests).with_window(None, Some(0));
+    if let Some(recovery) = recovery {
+        observation = observation.with_reset_after(recovery);
+    }
+    if let Some(code) = provider_code {
+        observation = observation.with_provider_code(code);
+    }
+    vec![classifier.classify(&observation, now)]
+}
+
+fn project_quota_marker(code: &str) -> bool {
+    let code = code.to_ascii_lowercase();
+    matches!(
+        code.as_str(),
+        "project_quota_exhausted"
+            | "project_quota_exceeded"
+            | "billing_project_quota_exhausted"
+            | "billing_quota_exhausted"
+            | "organization_quota_exhausted"
+            | "tenant_quota_exhausted"
+    )
+}
+
+fn quota_registration_matches(
+    registration: &CredentialRegistration,
+    failed: &PoolSelection,
+    scope: QuotaScope,
+    project: Option<&QuotaProjectKey>,
+) -> bool {
+    match scope {
+        QuotaScope::Credential => failed
+            .credential()
+            .is_some_and(|credential| credential == registration.credential()),
+        QuotaScope::Project => {
+            registration.provider() == failed.provider() && registration.quota_project() == project
+        }
+        QuotaScope::Provider => registration.provider() == failed.provider(),
+        QuotaScope::CredentialModel | QuotaScope::ProjectModel | QuotaScope::ProviderModel => false,
+    }
+}
+
+fn quota_store_key(record: &PersistedQuotaSnapshot) -> Result<String, serde_json::Error> {
+    serde_json::to_string(record)
+}
+
 fn register_model_accounts(
     registry: &CredentialRegistry,
     model: &str,
@@ -1107,6 +1478,7 @@ fn register_model_accounts(
         let registration = registration
             .with_codecs(target.codecs().iter().map(AsRef::as_ref))
             .map_err(|_| PoolError::Selection)?;
+        let registration = with_account_quota_project(registration, account)?;
         let registration = match account.max_concurrency() {
             Some(max) => registration
                 .with_max_in_flight(max)
@@ -1144,6 +1516,7 @@ fn register_route_accounts(
         let registration = registration
             .with_codecs(target.codecs().iter().map(AsRef::as_ref))
             .map_err(|_| PoolError::Selection)?;
+        let registration = with_account_quota_project(registration, account)?;
         let registration = match account.max_concurrency() {
             Some(max) => registration
                 .with_max_in_flight(max)
@@ -1157,32 +1530,53 @@ fn register_route_accounts(
     Ok(())
 }
 
-fn resolve_static_target<'a>(
-    config: &'a CompiledConfig,
-    route: &'a RoutePlan,
-    model: Option<&'a str>,
-) -> Result<(String, &'a str, Option<&'a str>), PoolError> {
-    if let Some(source) = route.target().model_source() {
+fn with_account_quota_project(
+    registration: CredentialRegistration,
+    account: &AccountPlan,
+) -> Result<CredentialRegistration, PoolError> {
+    let Some(project) = account.quota_project() else {
+        return Ok(registration);
+    };
+    QuotaProjectKey::new(project)
+        .map(|project| registration.with_quota_project(project))
+        .map_err(|_| PoolError::Selection)
+}
+
+fn resolve_static_target(
+    config: &CompiledConfig,
+    route: &RoutePlan,
+    model: Option<&str>,
+    catalog: Option<&CatalogSnapshot>,
+) -> Result<(String, String, Option<String>), PoolError> {
+    if route.target().model_source().is_some() {
         let model = model.ok_or(PoolError::InvalidModel)?;
-        let plan = config
-            .models()
-            .get(model)
-            .ok_or_else(|| PoolError::UnknownModel {
+        if let Some(plan) = config.models().get(model) {
+            let target = plan.targets().first().ok_or(PoolError::UnknownModel {
                 model: model.to_owned(),
             })?;
-        let target = plan.targets().first().ok_or(PoolError::UnknownModel {
+            return Ok((
+                model.to_owned(),
+                target.provider().to_owned(),
+                Some(target.upstream_model().to_owned()),
+            ));
+        }
+        if let Some(target) = catalog
+            .and_then(|catalog| catalog.get(model))
+            .and_then(|model| model.targets().first())
+        {
+            return Ok((
+                model.to_owned(),
+                target.provider().to_string(),
+                Some(target.upstream_model().to_string()),
+            ));
+        }
+        return Err(PoolError::UnknownModel {
             model: model.to_owned(),
-        })?;
-        let _ = source;
-        return Ok((
-            model.to_owned(),
-            target.provider(),
-            Some(target.upstream_model()),
-        ));
+        });
     }
     Ok((
         model.unwrap_or(route.id()).to_owned(),
-        route.target().upstream(),
+        route.target().upstream().to_owned(),
         None,
     ))
 }
@@ -1225,20 +1619,34 @@ fn target_satisfies_context(
     model: Option<&str>,
     static_upstream: &str,
     context: &SelectionContext,
+    catalog: Option<&CatalogSnapshot>,
 ) -> bool {
     let (capabilities, codecs) = if let Some(model) = model {
-        let Some(plan) = config.models().get(model) else {
-            return false;
-        };
-        let Some(target) = plan
-            .targets()
-            .iter()
-            .find(|target| target.provider() == static_upstream)
-            .or_else(|| plan.targets().first())
-        else {
-            return false;
-        };
-        (target.capabilities(), target.codecs())
+        if let Some(plan) = config.models().get(model) {
+            let Some(target) = plan
+                .targets()
+                .iter()
+                .find(|target| target.provider() == static_upstream)
+                .or_else(|| plan.targets().first())
+            else {
+                return false;
+            };
+            (target.capabilities(), target.codecs())
+        } else {
+            let Some(target) = catalog
+                .and_then(|catalog| catalog.get(model))
+                .and_then(|model| {
+                    model
+                        .targets()
+                        .iter()
+                        .find(|target| target.provider().as_str() == static_upstream)
+                        .or_else(|| model.targets().first())
+                })
+            else {
+                return false;
+            };
+            (target.capabilities(), &[][..])
+        }
     } else {
         (route.target().capabilities(), route.target().codecs())
     };
@@ -1403,10 +1811,11 @@ fn unix_millis_from_instant(now: Instant, instant: Instant) -> Timestamp {
     timestamp_now().saturating_add(instant.saturating_duration_since(now).as_millis() as u64)
 }
 
-/// Apply one account secret to an outbound request.
-pub(crate) fn apply_account_auth(
+/// Apply one configured account secret using the upstream provider's auth kind.
+pub fn apply_configured_account_auth(
     headers: &mut HeaderMap,
     secret: Option<&SecretRef>,
+    configured_kind: Option<&str>,
 ) -> Result<bool, PoolError> {
     let Some(secret) = secret else {
         return Ok(false);
@@ -1423,16 +1832,22 @@ pub(crate) fn apply_account_auth(
     if value.expose_secret().chars().any(char::is_whitespace) {
         return Err(PoolError::Store);
     }
-    let mut bytes = Zeroizing::new(Vec::with_capacity(7 + value.expose_bytes().len()));
-    bytes.extend_from_slice(b"Bearer ");
-    bytes.extend_from_slice(value.expose_bytes());
-    let header = http::HeaderValue::from_bytes(&bytes).map_err(|_| PoolError::Store)?;
-    headers.insert(header::AUTHORIZATION, header);
+    let placement = AuthPlacement::from_configured_kind(configured_kind.unwrap_or("bearer_secret"))
+        .map_err(|_| PoolError::Store)?;
+    let authorization = placement
+        .materialize(&value)
+        .map_err(|_| PoolError::Store)?;
+    authorization.apply_to(headers);
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{mpsc, Barrier},
+        thread,
+    };
+
     use super::*;
     use http::HeaderValue;
     use pooler_config::compile_yaml;
@@ -1458,6 +1873,61 @@ mod tests {
             headers.insert("x-session", HeaderValue::from_str(session).expect("header"));
         }
         headers
+    }
+
+    fn project_quota_config() -> CompiledConfig {
+        compile_yaml(
+            "project-quota-test.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+accounts:
+  first: {provider: local, secret: env:POOLER_FIRST, quota_project: shared-billing}
+  second: {provider: local, secret: env:POOLER_SECOND, quota_project: shared-billing}
+  third: {provider: local, secret: env:POOLER_THIRD, quota_project: alternate-billing}
+account_pools:
+  pool: {accounts: [first, second, third]}
+policies:
+  pooled:
+    selection: {strategy: ordered_fallback, account_pool: pool}
+    retry: {maximum_attempts: 3, maximum_credentials: 3, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}
+routes:
+  - id: pooled
+    listen: local
+    target: {provider: local, policy: pooled}
+"#,
+        )
+        .expect("project quota config")
+    }
+
+    fn classify_quota_failure(
+        coordinator: &PoolingCoordinator,
+        config: &CompiledConfig,
+        selection: &mut PoolSelection,
+        commitment: CommitmentState,
+        replay: ReplayCheck,
+    ) -> PoolFailure {
+        coordinator.classify_failure(FailureInput {
+            config,
+            route: config.route("pooled").expect("route"),
+            selection,
+            status: Some(429),
+            provider_code: Some("project_quota_exhausted".to_owned()),
+            message: None,
+            native_codex: false,
+            quota_observations: &[],
+            retry_after: Some(Duration::from_secs(30)),
+            replay,
+            commitment,
+            idempotency_key_present: true,
+            attempt: 1,
+            credentials_used: 1,
+            providers_used: 1,
+            elapsed_retry_delay: Duration::ZERO,
+            elapsed_recovery_wait: Duration::ZERO,
+            started: Instant::now(),
+        })
     }
 
     #[test]
@@ -1574,7 +2044,7 @@ routes:
         let config = pooled_config(false);
         let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
         let route = config.route("pooled").expect("route");
-        let selection = coordinator
+        let mut selection = coordinator
             .select(
                 &config,
                 route,
@@ -1587,13 +2057,15 @@ routes:
         let failure = coordinator.classify_failure(FailureInput {
             config: &config,
             route,
-            selection: &selection,
+            selection: &mut selection,
             status: Some(400),
             provider_code: None,
             message: None,
             native_codex: false,
+            quota_observations: &[],
             retry_after: None,
             replay: ReplayCheck::for_http_method("POST", false),
+            commitment: CommitmentState::Uncommitted,
             idempotency_key_present: false,
             attempt: 1,
             credentials_used: 1,
@@ -1617,7 +2089,7 @@ routes:
         let config = pooled_config(false);
         let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
         let route = config.route("pooled").expect("route");
-        let first = coordinator
+        let mut first = coordinator
             .select(
                 &config,
                 route,
@@ -1630,13 +2102,15 @@ routes:
         let failure = coordinator.classify_failure(FailureInput {
             config: &config,
             route,
-            selection: &first,
+            selection: &mut first,
             status: Some(429),
             provider_code: Some("rate_limit".to_owned()),
             message: None,
             native_codex: false,
+            quota_observations: &[],
             retry_after: Some(Duration::from_secs(30)),
             replay: ReplayCheck::for_http_method("POST", true),
+            commitment: CommitmentState::Uncommitted,
             idempotency_key_present: true,
             attempt: 1,
             credentials_used: 1,
@@ -1676,20 +2150,22 @@ routes:
         let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
         let route = config.route("pooled").expect("route");
         let headers = request_headers(Some("session-1"));
-        let first = coordinator
+        let mut first = coordinator
             .select(&config, route, None, &headers, 1, Instant::now())
             .expect("first selection");
         let first_credential = first.credential().expect("first credential").clone();
-        let failure = coordinator.classify_failure(FailureInput {
+        let mut failure = coordinator.classify_failure(FailureInput {
             config: &config,
             route,
-            selection: &first,
+            selection: &mut first,
             status: Some(429),
             provider_code: Some("insufficient_quota".to_owned()),
             message: None,
             native_codex: false,
+            quota_observations: &[],
             retry_after: Some(Duration::from_secs(30)),
             replay: ReplayCheck::for_http_method("POST", true),
+            commitment: CommitmentState::Uncommitted,
             idempotency_key_present: true,
             attempt: 1,
             credentials_used: 1,
@@ -1699,10 +2175,9 @@ routes:
             started: Instant::now(),
         });
         assert!(failure.mutation.applied());
-        drop(first);
-        let second = coordinator
-            .select(&config, route, None, &headers, 2, Instant::now())
-            .expect("rebound selection");
+        let second = failure
+            .take_replacement()
+            .expect("quota recovery reserves the rebound selection");
         assert_ne!(second.credential(), Some(&first_credential));
         assert!(matches!(
             second
@@ -1726,7 +2201,7 @@ routes:
             PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
         let route = config.route("pooled").expect("route");
         let headers = request_headers(Some("session-restart"));
-        let first = coordinator
+        let mut first = coordinator
             .select(&config, route, None, &headers, 1, Instant::now())
             .expect("first selection");
         let first_credential = first.credential().expect("credential").clone();
@@ -1734,13 +2209,15 @@ routes:
         let failure = coordinator.classify_failure(FailureInput {
             config: &config,
             route,
-            selection: &first,
+            selection: &mut first,
             status: Some(429),
             provider_code: Some("insufficient_quota".to_owned()),
             message: None,
             native_codex: false,
+            quota_observations: &[],
             retry_after: Some(Duration::from_secs(30)),
             replay: ReplayCheck::for_http_method("POST", true),
+            commitment: CommitmentState::Uncommitted,
             idempotency_key_present: true,
             attempt: 1,
             credentials_used: 1,
@@ -1777,6 +2254,239 @@ routes:
                 .map(|explanation| &explanation.affinity),
             Some(pooler_policy::AffinityDecision::Rebound { .. })
         ));
+    }
+
+    #[test]
+    fn project_quota_uses_exact_config_group_and_restores_without_a_migration() {
+        let config = project_quota_config();
+        let store = Arc::new(MemoryStore::new());
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        let route = config.route("pooled").expect("route");
+        let mut failed = coordinator
+            .select(&config, route, None, &HeaderMap::new(), 1, Instant::now())
+            .expect("first project account");
+        assert_eq!(failed.credential().map(CredentialId::as_str), Some("first"));
+
+        let mut failure = classify_quota_failure(
+            &coordinator,
+            &config,
+            &mut failed,
+            CommitmentState::Uncommitted,
+            ReplayCheck::safe(),
+        );
+        let replacement = failure
+            .take_replacement()
+            .expect("alternate project is reserved");
+        assert_eq!(
+            replacement.credential().map(CredentialId::as_str),
+            Some("third")
+        );
+        drop(replacement);
+
+        let persisted = store
+            .cooldowns(timestamp_now())
+            .expect("quota persistence")
+            .into_iter()
+            .filter(|state| state.scope == TYPED_QUOTA_STORE_SCOPE)
+            .collect::<Vec<_>>();
+        assert!(!persisted.is_empty());
+        for state in &persisted {
+            let record = state.reason.as_deref().expect("serialized quota record");
+            assert!(!record.contains("shared-billing"));
+            assert!(!record.contains("\"credential\":\"first\""));
+        }
+
+        let restarted =
+            PoolingCoordinator::with_store(&config, store).expect("quota state restores");
+        let selected = restarted
+            .select(&config, route, None, &HeaderMap::new(), 2, Instant::now())
+            .expect("restored project quota permits alternate project");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("third")
+        );
+    }
+
+    #[test]
+    fn remaining_high_regression_runtime_keeps_mixed_quota_dimensions() {
+        let config = project_quota_config();
+        let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
+        let route = config.route("pooled").expect("route");
+        let mut failed = coordinator
+            .select(&config, route, None, &HeaderMap::new(), 1, Instant::now())
+            .expect("first project account");
+        let failed_credential = failed.credential().expect("credential").clone();
+        let observations = [
+            QuotaObservation::new(
+                QuotaSignal::Snapshot,
+                QuotaScope::Project,
+                QuotaUnit::Requests,
+            )
+            .with_window(Some(100), Some(7))
+            .with_reset_after(Duration::from_secs(2)),
+            QuotaObservation::new(
+                QuotaSignal::Exhausted,
+                QuotaScope::Project,
+                QuotaUnit::Tokens,
+            )
+            .with_window(Some(10_000), Some(0))
+            .with_reset_after(Duration::from_secs(30)),
+        ];
+        let mut failure = coordinator.classify_failure(FailureInput {
+            config: &config,
+            route,
+            selection: &mut failed,
+            status: Some(429),
+            provider_code: Some("project_quota_exhausted".to_owned()),
+            message: None,
+            native_codex: false,
+            quota_observations: &observations,
+            retry_after: None,
+            replay: ReplayCheck::safe(),
+            commitment: CommitmentState::Uncommitted,
+            idempotency_key_present: true,
+            attempt: 1,
+            credentials_used: 1,
+            providers_used: 1,
+            elapsed_retry_delay: Duration::ZERO,
+            elapsed_recovery_wait: Duration::ZERO,
+            started: Instant::now(),
+        });
+        assert_eq!(
+            failure
+                .take_replacement()
+                .expect("token exhaustion rotates projects")
+                .credential()
+                .map(CredentialId::as_str),
+            Some("third")
+        );
+        let registry = coordinator
+            .registry_for(route, failed.model())
+            .expect("route registry");
+        let mut snapshots = registry
+            .quota_snapshots(&failed_credential, Instant::now())
+            .expect("typed quota snapshots");
+        snapshots.sort_by_key(|snapshot| snapshot.unit);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].unit, QuotaUnit::Requests);
+        assert_eq!(snapshots[0].remaining, Some(7));
+        assert_eq!(snapshots[1].unit, QuotaUnit::Tokens);
+        assert_eq!(snapshots[1].remaining, Some(0));
+    }
+
+    #[test]
+    fn quota_rotation_stays_inside_commit_and_replay_boundaries() {
+        let config = project_quota_config();
+        let route = config.route("pooled").expect("route");
+
+        let committed = PoolingCoordinator::new(&config).expect("coordinator");
+        let mut failed = committed
+            .select(&config, route, None, &HeaderMap::new(), 1, Instant::now())
+            .expect("selection");
+        let mut failure = classify_quota_failure(
+            &committed,
+            &config,
+            &mut failed,
+            CommitmentState::Committed,
+            ReplayCheck::safe(),
+        );
+        assert_eq!(
+            failure.decision,
+            RetryDecision::DoNotRetry {
+                reason: pooler_policy::RetryStopReason::DownstreamCommitted,
+            }
+        );
+        assert!(failure.take_replacement().is_none());
+
+        let unsafe_replay = PoolingCoordinator::new(&config).expect("coordinator");
+        let mut failed = unsafe_replay
+            .select(&config, route, None, &HeaderMap::new(), 1, Instant::now())
+            .expect("selection");
+        let mut failure = classify_quota_failure(
+            &unsafe_replay,
+            &config,
+            &mut failed,
+            CommitmentState::Uncommitted,
+            ReplayCheck::for_http_method("POST", false),
+        );
+        assert_eq!(
+            failure.decision,
+            RetryDecision::DoNotRetry {
+                reason: pooler_policy::RetryStopReason::NotReplaySafe,
+            }
+        );
+        assert!(failure.take_replacement().is_none());
+    }
+
+    #[test]
+    fn concurrent_runtime_quota_failures_reserve_only_the_alternate_project() {
+        const WORKERS: usize = 24;
+
+        let config = Arc::new(project_quota_config());
+        let coordinator = Arc::new(PoolingCoordinator::new(&config).expect("coordinator"));
+        let ready = Arc::new(Barrier::new(WORKERS + 1));
+        let (sender, receiver) = mpsc::channel();
+        let mut workers = Vec::with_capacity(WORKERS);
+        for _ in 0..WORKERS {
+            let config = Arc::clone(&config);
+            let coordinator = Arc::clone(&coordinator);
+            let ready = Arc::clone(&ready);
+            let sender = sender.clone();
+            workers.push(thread::spawn(move || {
+                let route = config.route("pooled").expect("route");
+                let mut failed = coordinator
+                    .select(&config, route, None, &HeaderMap::new(), 1, Instant::now())
+                    .expect("initial account");
+                assert_eq!(failed.credential().map(CredentialId::as_str), Some("first"));
+                ready.wait();
+                let mut failure = classify_quota_failure(
+                    &coordinator,
+                    &config,
+                    &mut failed,
+                    CommitmentState::Uncommitted,
+                    ReplayCheck::safe(),
+                );
+                assert!(failure.decision.is_retry());
+                let replacement = failure.take_replacement().unwrap_or_else(|| {
+                    coordinator
+                        .select(&config, route, None, &HeaderMap::new(), 2, Instant::now())
+                        .expect("stale observation sees the installed project quota")
+                });
+                sender
+                    .send(
+                        replacement
+                            .credential()
+                            .expect("credential")
+                            .as_str()
+                            .to_owned(),
+                    )
+                    .expect("send result");
+            }));
+        }
+        drop(sender);
+        ready.wait();
+        let selected = receiver.iter().take(WORKERS).collect::<Vec<_>>();
+        assert_eq!(selected.len(), WORKERS);
+        assert!(selected.iter().all(|credential| credential == "third"));
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+
+        let final_selection = coordinator
+            .select(
+                &config,
+                config.route("pooled").expect("route"),
+                None,
+                &HeaderMap::new(),
+                2,
+                Instant::now(),
+            )
+            .expect("post-recovery selection");
+        assert_eq!(
+            final_selection.credential().map(CredentialId::as_str),
+            Some("third")
+        );
     }
 
     #[test]

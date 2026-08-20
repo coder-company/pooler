@@ -125,6 +125,7 @@ impl SemanticAdapter for DevinSemanticAdapter {
         Ok(SemanticRequestBody {
             body: serde_json::to_vec(&value).map_err(boxed)?,
             content_type: HeaderValue::from_static("application/json"),
+            response_hint: pooler_http::SemanticResponseHint::default(),
         })
     }
 

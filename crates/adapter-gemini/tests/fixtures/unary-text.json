@@ -1,0 +1,16 @@
+{
+  "responseId": "response-text",
+  "modelVersion": "gemini-2.5-flash",
+  "candidates": [
+    {
+      "index": 0,
+      "content": {"role": "model", "parts": [{"text": "hello "}, {"text": "world"}]},
+      "finishReason": "STOP"
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 3,
+    "candidatesTokenCount": 2,
+    "totalTokenCount": 5
+  }
+}

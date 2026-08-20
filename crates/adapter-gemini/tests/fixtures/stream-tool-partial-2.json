@@ -1,0 +1,23 @@
+{
+  "responseId": "response-partial-tool",
+  "modelVersion": "gemini-3.1-pro",
+  "candidates": [
+    {
+      "index": 0,
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {
+              "id": "call-partial",
+              "name": "weather",
+              "args": {"units": "metric"}
+            },
+            "thoughtSignature": "c2lnLXBhcnRpYWw="
+          }
+        ]
+      },
+      "finishReason": "STOP"
+    }
+  ]
+}

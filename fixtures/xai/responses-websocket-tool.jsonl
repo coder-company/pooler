@@ -1,0 +1,7 @@
+{"type":"response.created","sequence_number":0,"response":{"id":"resp_fixture_tool","model":"grok-4.6","status":"in_progress","output":[]}}
+{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"fc_fixture_weather","type":"function_call","call_id":"call_fixture_weather","name":"weather","arguments":"","status":"in_progress"}}
+{"type":"response.function_call_arguments.delta","sequence_number":2,"item_id":"fc_fixture_weather","output_index":0,"delta":"{\"city\":"}
+{"type":"response.function_call_arguments.delta","sequence_number":3,"item_id":"fc_fixture_weather","output_index":0,"delta":"\"Paris\"}"}
+{"type":"response.function_call_arguments.done","sequence_number":4,"item_id":"fc_fixture_weather","output_index":0,"name":"weather","arguments":"{\"city\":\"Paris\"}"}
+{"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"id":"fc_fixture_weather","type":"function_call","call_id":"call_fixture_weather","name":"weather","arguments":"{\"city\":\"Paris\"}","status":"completed"}}
+{"type":"response.completed","sequence_number":6,"response":{"id":"resp_fixture_tool","model":"grok-4.6","status":"completed","usage":{"input_tokens":8,"output_tokens":5,"total_tokens":13}}}
