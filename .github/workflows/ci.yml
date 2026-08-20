@@ -113,6 +113,21 @@ jobs:
       - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-audit,cargo-deny
-      - run: cargo audit --deny warnings
-      - run: cargo audit --deny warnings --file fuzz/Cargo.lock
-      - run: cargo deny check
+      - name: Record dependency and license evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          evidence="$RUNNER_TEMP/supply-chain-evidence"
+          mkdir -p "$evidence"
+          cargo audit --deny warnings 2>&1 | tee "$evidence/root-audit.log"
+          cargo audit --deny warnings --file fuzz/Cargo.lock 2>&1 | tee "$evidence/fuzz-audit.log"
+          cargo deny check 2>&1 | tee "$evidence/deny.log"
+          git rev-parse HEAD > "$evidence/commit.txt"
+          rustc --version --verbose > "$evidence/rustc.txt"
+      - name: Upload dependency and license evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: supply-chain-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/supply-chain-evidence
+          if-no-files-found: error
