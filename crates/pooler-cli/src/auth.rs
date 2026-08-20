@@ -311,12 +311,27 @@ fn login(request: LoginRequest<'_>) -> Result<()> {
     let account = resolve_oauth_account(&config, &configured_provider, request.account)?;
     let credential_id = CredentialId::new(account.id().to_owned())
         .map_err(|_| anyhow::anyhow!("account ID is invalid"))?;
-    let oauth = configured_oauth(&config, &configured_provider)?;
+    let oauth = config
+        .upstreams()
+        .get(configured_provider.as_str())
+        .and_then(|upstream| upstream.oauth());
     let callback = validate_loopback_callback(request.callback)?;
-    if callback != *oauth.callback() {
-        bail!("oauth callback does not match the provider configuration");
+    if let Some(oauth) = oauth {
+        if callback != *oauth.callback() {
+            bail!("oauth callback does not match the provider configuration");
+        }
     }
-    let resolved = ResolvedOAuthSettings::new(oauth, callback.clone(), request.oauth, profile)?;
+    let resolved = match oauth {
+        Some(oauth) => ResolvedOAuthSettings::new(oauth, callback.clone(), request.oauth, profile)?,
+        None => {
+            if profile.is_none() {
+                bail!(
+                    "provider `{configured_provider}` is not configured for OAuth; use a built-in profile such as openai"
+                );
+            }
+            ResolvedOAuthSettings::from_cli_overrides(callback.clone(), request.oauth)?
+        }
+    };
     let provider_client =
         build_login_provider(&configured_provider, profile, request.method, &resolved)?;
     let store_path = credential_store_path(request.explicit_store_path)?;
@@ -442,7 +457,17 @@ fn persist_login(
         }
     };
     let token_store = SqliteOAuthTokenStore::new(store.clone());
-    let mut profile = OAuthCredentialProfile::new(provider_profile, tokens);
+    let id_token = tokens.id_token().cloned();
+    let mut profile =
+        OAuthCredentialProfile::new(provider_profile, tokens).with_id_token(id_token.clone());
+    if provider_profile == "openai" {
+        let id_token = id_token
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenAI login response did not include an ID token"))?;
+        let account_id = CodexCredential::account_id_from_id_token(id_token)
+            .context("OpenAI login response did not identify a ChatGPT account")?;
+        profile = profile.with_account_id(account_id);
+    }
     if let Some(identity) = identity {
         profile = profile.with_identity(identity);
     }
@@ -931,7 +956,8 @@ mod tests {
         assert!(anthropic.contains("code.claude.com"));
 
         let openai = render_provider_support(registry.require("codex").expect("OpenAI"));
-        assert!(openai.contains("support=requires_explicit_configuration"));
+        assert!(openai.contains("method=authorization_code_pkce support=supported"));
+        assert!(openai.contains("method=device_code support=supported"));
         assert!(
             api_key_guidance(Some(registry.require("grok").expect("xAI")))
                 .contains("env:XAI_API_KEY")

@@ -1218,6 +1218,10 @@ where
                     .map_err(|_| ProxyError::RequestBodyTooLarge)?;
                 headers.insert(header::CONTENT_TYPE, prepared.content_type);
                 self.semantic.sanitize_request_headers(&mut headers);
+                headers.insert(
+                    header::ACCEPT_ENCODING,
+                    HeaderValue::from_static("identity"),
+                );
                 headers.remove(header::CONTENT_LENGTH);
                 let response_hint = prepared.response_hint;
                 (
@@ -2051,6 +2055,7 @@ where
                     ProxyError::SemanticResponse(error.to_string())
                 })?;
             response_headers.remove(header::CONTENT_LENGTH);
+            response_headers.remove(header::CONTENT_ENCODING);
             response_headers.insert(header::CONTENT_TYPE, transformed.content_type);
             transformed.body
         } else {

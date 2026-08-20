@@ -41,6 +41,7 @@ const PART_METADATA_EXTENSION: &str = "part-metadata";
 const CANDIDATE_FIELDS_EXTENSION: &str = "candidate-fields";
 const TOOL_FIELDS_EXTENSION: &str = "tool-fields";
 const FUNCTION_NAME_EXTENSION: &str = "function-name";
+const FUNCTION_ID_ABSENT_EXTENSION: &str = "function-id-absent";
 const THOUGHT_SIGNATURE_EXTENSION: &str = "thought-signature";
 const THINKING_BUDGET_EXTENSION: &str = "thinking-budget";
 
@@ -542,7 +543,9 @@ fn decode_function_call(
         .as_object()
         .cloned()
         .ok_or_else(|| invalid_shape(field, "an object"))?;
-    let id = take_string(&mut object, "id", &format!("{field}.id"))?.unwrap_or_else(|| {
+    let id = take_string(&mut object, "id", &format!("{field}.id"))?;
+    let id_was_absent = id.is_none();
+    let id = id.unwrap_or_else(|| {
         report.apply_rule("gemini.generated_function_call_id");
         format!("gemini-call-{content_index}-{part_index}")
     });
@@ -554,6 +557,14 @@ fn decode_function_call(
         return Err(invalid_shape(&format!("{field}.args"), "an object"));
     }
     let mut call = ToolCall::new(id, name, PreservedJson::from_value(args)?);
+    if id_was_absent {
+        preserve_text_extension(
+            &mut call.extensions,
+            FUNCTION_ID_ABSENT_EXTENSION,
+            "true",
+            report,
+        )?;
+    }
     if let Some(signature) = signature {
         preserve_bytes_extension(
             &mut call.extensions,
@@ -584,7 +595,9 @@ fn decode_function_response(
         .as_object()
         .cloned()
         .ok_or_else(|| invalid_shape(field, "an object"))?;
-    let id = take_string(&mut object, "id", &format!("{field}.id"))?.unwrap_or_else(|| {
+    let id = take_string(&mut object, "id", &format!("{field}.id"))?;
+    let id_was_absent = id.is_none();
+    let id = id.unwrap_or_else(|| {
         report.apply_rule("gemini.generated_function_response_id");
         format!("gemini-response-{content_index}-{part_index}")
     });
@@ -609,6 +622,14 @@ fn decode_function_response(
         &name,
         report,
     )?;
+    if id_was_absent {
+        preserve_text_extension(
+            &mut result.extensions,
+            FUNCTION_ID_ABSENT_EXTENSION,
+            "true",
+            report,
+        )?;
+    }
     if !object.is_empty() {
         preserve_json_extension(
             &mut result.extensions,
@@ -1206,7 +1227,9 @@ fn encode_tool_call(call: &ToolCall, report: &mut ConversionReport) -> Result<Va
         .map(|value| into_object(value, "tool_call.extensions.tool-fields"))
         .transpose()?
         .unwrap_or_default();
-    function.insert("id".to_owned(), Value::String(call.id.clone()));
+    if extension_text(&call.extensions, FUNCTION_ID_ABSENT_EXTENSION)?.is_none() {
+        function.insert("id".to_owned(), Value::String(call.id.clone()));
+    }
     function.insert("name".to_owned(), Value::String(call.name.clone()));
     function.insert("args".to_owned(), call.arguments.value().clone());
     let mut part = Map::from_iter([("functionCall".to_owned(), Value::Object(function))]);
@@ -1226,7 +1249,11 @@ fn encode_tool_call(call: &ToolCall, report: &mut ConversionReport) -> Result<Va
     report_unhandled_extensions(
         "tool_call.extensions",
         &call.extensions,
-        &[TOOL_FIELDS_EXTENSION, THOUGHT_SIGNATURE_EXTENSION],
+        &[
+            TOOL_FIELDS_EXTENSION,
+            FUNCTION_ID_ABSENT_EXTENSION,
+            THOUGHT_SIGNATURE_EXTENSION,
+        ],
         report,
     );
     Ok(Value::Object(part))
@@ -1261,13 +1288,19 @@ fn encode_tool_result(
         .map(|value| into_object(value, "tool_result.extensions.tool-fields"))
         .transpose()?
         .unwrap_or_default();
-    function.insert("id".to_owned(), Value::String(result.tool_call_id.clone()));
+    if extension_text(&result.extensions, FUNCTION_ID_ABSENT_EXTENSION)?.is_none() {
+        function.insert("id".to_owned(), Value::String(result.tool_call_id.clone()));
+    }
     function.insert("name".to_owned(), Value::String(name));
     function.insert("response".to_owned(), response);
     report_unhandled_extensions(
         "tool_result.extensions",
         &result.extensions,
-        &[FUNCTION_NAME_EXTENSION, TOOL_FIELDS_EXTENSION],
+        &[
+            FUNCTION_NAME_EXTENSION,
+            FUNCTION_ID_ABSENT_EXTENSION,
+            TOOL_FIELDS_EXTENSION,
+        ],
         report,
     );
     Ok(serde_json::json!({"functionResponse":function}))
@@ -1381,16 +1414,18 @@ fn encode_tool_config(
         .map(|value| into_object(value, "request.extensions.tool-config"))
         .transpose()?
         .unwrap_or_default();
-    if let Some(choice) = &request.tool_choice {
-        let function = match choice {
-            ToolChoice::Auto => serde_json::json!({"mode":"AUTO"}),
-            ToolChoice::None => serde_json::json!({"mode":"NONE"}),
-            ToolChoice::Required => serde_json::json!({"mode":"ANY"}),
-            ToolChoice::Tool { name } => {
-                serde_json::json!({"mode":"ANY","allowedFunctionNames":[name]})
-            }
-        };
-        config.insert("functionCallingConfig".to_owned(), function);
+    if !config.contains_key("functionCallingConfig") {
+        if let Some(choice) = &request.tool_choice {
+            let function = match choice {
+                ToolChoice::Auto => serde_json::json!({"mode":"AUTO"}),
+                ToolChoice::None => serde_json::json!({"mode":"NONE"}),
+                ToolChoice::Required => serde_json::json!({"mode":"ANY"}),
+                ToolChoice::Tool { name } => {
+                    serde_json::json!({"mode":"ANY","allowedFunctionNames":[name]})
+                }
+            };
+            config.insert("functionCallingConfig".to_owned(), function);
+        }
     }
     if !config.is_empty() {
         object.insert("toolConfig".to_owned(), Value::Object(config));

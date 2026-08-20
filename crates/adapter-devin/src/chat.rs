@@ -1072,17 +1072,7 @@ fn decode_prompt(
     let role = match source {
         ChatMessageSource::User => Role::User,
         ChatMessageSource::Tool => Role::Tool,
-        ChatMessageSource::System => {
-            if !prompt.thinking.is_empty()
-                || !prompt.signature.is_empty()
-                || !prompt.tool_calls.is_empty()
-                || prompt.message_id.starts_with("bot-")
-            {
-                Role::Assistant
-            } else {
-                Role::System
-            }
-        }
+        ChatMessageSource::System => Role::Assistant,
         ChatMessageSource::Unknown | ChatMessageSource::SystemPrompt => Role::System,
         ChatMessageSource::Unspecified => {
             return Err(DevinChatCodecError::InvalidField {
@@ -1389,7 +1379,8 @@ fn encode_source(role: Role) -> ChatMessageSource {
     match role {
         Role::User => ChatMessageSource::User,
         Role::Tool => ChatMessageSource::Tool,
-        Role::System | Role::Developer | Role::Assistant => ChatMessageSource::System,
+        Role::Assistant => ChatMessageSource::System,
+        Role::System | Role::Developer => ChatMessageSource::SystemPrompt,
     }
 }
 
@@ -1733,6 +1724,44 @@ routes:
             .expect("OpenAI request");
         let actual: serde_json::Value = serde_json::from_slice(&encoded.body).expect("OpenAI JSON");
         assert_eq!(actual, fixture["expected_openai_request"]);
+    }
+
+    #[test]
+    fn message_sources_round_trip_assistant_and_system_roles() {
+        let mut report = pooler_protocol::ConversionReport::default();
+        let assistant_wire = ChatMessagePrompt {
+            message_id: "assistant-1".into(),
+            source: ChatMessageSource::System as i32,
+            prompt: "previous answer".into(),
+            ..Default::default()
+        };
+        let (assistant, _) =
+            super::decode_prompt(&assistant_wire, 0, &mut report, DevinChatLimits::default())
+                .expect("decode assistant");
+        assert_eq!(assistant.role, Role::Assistant);
+        let assistant_encoded =
+            super::encode_message(&assistant, "cascade", 0, &mut report).expect("encode assistant");
+        assert_eq!(
+            ChatMessageSource::try_from(assistant_encoded.source).expect("assistant source"),
+            ChatMessageSource::System
+        );
+
+        let system_wire = ChatMessagePrompt {
+            message_id: "system-1".into(),
+            source: ChatMessageSource::SystemPrompt as i32,
+            prompt: "follow policy".into(),
+            ..Default::default()
+        };
+        let (system, _) =
+            super::decode_prompt(&system_wire, 1, &mut report, DevinChatLimits::default())
+                .expect("decode system");
+        assert_eq!(system.role, Role::System);
+        let system_encoded =
+            super::encode_message(&system, "cascade", 1, &mut report).expect("encode system");
+        assert_eq!(
+            ChatMessageSource::try_from(system_encoded.source).expect("system source"),
+            ChatMessageSource::SystemPrompt
+        );
     }
 
     #[test]

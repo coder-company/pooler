@@ -3717,7 +3717,7 @@ mod tests {
             let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
             let request = read_request(&mut stream).await.expect("upstream request");
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n")
                 .await
                 .expect("upstream headers");
             for fragment in [
@@ -3751,7 +3751,7 @@ mod tests {
         };
         let body = br#"{"prompt":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}"#;
         let mut request = format!(
-            "POST /v3/ai/language-model HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nai-language-model-id: gpt-test\r\nai-language-model-specification-version: 3\r\nContent-Length: {}\r\n\r\n",
+            "POST /v3/ai/language-model HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nAccept-Encoding: gzip, br\r\nai-language-model-id: gpt-test\r\nai-language-model-specification-version: 3\r\nContent-Length: {}\r\n\r\n",
             body.len()
         )
         .into_bytes();
@@ -3763,10 +3763,13 @@ mod tests {
         assert!(response_text.contains("\"type\":\"text-delta\""));
         assert!(response_text.contains("hello"));
         assert!(response_text.contains("data: [DONE]\n\n"));
-        assert!(!response_text
-            .to_ascii_lowercase()
-            .contains("content-length:"));
+        let response_headers = response_text.to_ascii_lowercase();
+        assert!(!response_headers.contains("content-length:"));
+        assert!(!response_headers.contains("content-encoding:"));
         let upstream_request = upstream.await.expect("upstream task");
+        assert!(String::from_utf8_lossy(&upstream_request)
+            .to_ascii_lowercase()
+            .contains("accept-encoding: identity\r\n"));
         let upstream_body: serde_json::Value =
             serde_json::from_slice(response_body(&upstream_request)).expect("OpenAI JSON");
         assert_eq!(upstream_body["model"], "gpt-test");

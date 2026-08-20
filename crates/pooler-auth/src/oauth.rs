@@ -34,6 +34,9 @@ use super::{
     constant_time_eq, CredentialId, OAuthTokens, RefreshCoordinator, RefreshError, SecretValue,
 };
 
+const DEVICE_POLL_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const DEVICE_POLL_MAX_INTERVAL: Duration = Duration::from_secs(60);
+
 /// A boxed asynchronous OAuth operation.
 pub type OAuthFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, OAuthError>> + Send + 'a>>;
 
@@ -762,6 +765,21 @@ pub enum OAuthRequestEncoding {
     Json,
 }
 
+/// Device authorization dialect.
+///
+/// Codex does not implement RFC 8628. Its CLI issues a user code through
+/// `/api/accounts/deviceauth/usercode`, polls `/api/accounts/deviceauth/token`
+/// until an authorization code appears, then exchanges that code at the
+/// ordinary token endpoint with `redirect_uri` set to `/deviceauth/callback`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DeviceAuthorizationGrant {
+    /// RFC 8628 device authorization grant.
+    #[default]
+    Rfc8628,
+    /// Official Codex CLI accounts-API device login.
+    CodexAccounts,
+}
+
 /// Immutable endpoint and client settings for a standard OAuth provider.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OAuthClientConfig {
@@ -785,6 +803,11 @@ pub struct OAuthClientConfig {
     pub client_auth: OAuthClientAuth,
     /// Token and revocation request encoding.
     pub request_encoding: OAuthRequestEncoding,
+    /// Extra authorization-query parameters required by a provider.
+    pub authorization_parameters: Vec<(String, String)>,
+    /// Device authorization dialect. Codex uses a custom accounts API rather
+    /// than RFC 8628.
+    pub device_grant: DeviceAuthorizationGrant,
 }
 
 impl OAuthClientConfig {
@@ -806,6 +829,8 @@ impl OAuthClientConfig {
             scopes: Vec::new(),
             client_auth: OAuthClientAuth::None,
             request_encoding: OAuthRequestEncoding::Form,
+            authorization_parameters: Vec::new(),
+            device_grant: DeviceAuthorizationGrant::Rfc8628,
         };
         config.validate()
     }
@@ -850,6 +875,25 @@ impl OAuthClientConfig {
     #[must_use]
     pub const fn with_json_requests(mut self) -> Self {
         self.request_encoding = OAuthRequestEncoding::Json;
+        self
+    }
+
+    /// Append an authorization-query parameter the provider requires.
+    #[must_use]
+    pub fn with_authorization_parameter(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.authorization_parameters
+            .push((name.into(), value.into()));
+        self
+    }
+
+    /// Select the device-authorization dialect.
+    #[must_use]
+    pub const fn with_device_grant(mut self, grant: DeviceAuthorizationGrant) -> Self {
+        self.device_grant = grant;
         self
     }
 
@@ -1175,6 +1219,31 @@ impl StandardOAuthProvider {
         })
     }
 
+    async fn send_before_deadline(
+        &self,
+        request: OAuthHttpRequest,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<OAuthHttpResponse, OAuthError> {
+        let request_cancellation = cancellation.child_token();
+        tokio::select! {
+            () = cancellation.cancelled() => {
+                request_cancellation.cancel();
+                Err(OAuthError::Cancelled)
+            }
+            result = time::timeout_at(
+                deadline,
+                self.send(request, request_cancellation.clone()),
+            ) => match result {
+                Ok(response) => response,
+                Err(_) => {
+                    request_cancellation.cancel();
+                    Err(expired_device_code())
+                }
+            }
+        }
+    }
+
     fn authorization_url(
         &self,
         state: OAuthState,
@@ -1192,12 +1261,270 @@ impl StandardOAuthProvider {
             if !self.config.scopes.is_empty() {
                 query.append_pair("scope", &self.config.scopes.join(" "));
             }
+            for (name, value) in &self.config.authorization_parameters {
+                query.append_pair(name, value);
+            }
         }
         Ok(AuthorizationAttempt {
             authorization_url: url,
             state,
             pkce,
             redirect_uri: self.config.redirect_uri.clone(),
+        })
+    }
+
+    fn start_rfc8628_device_authorization(
+        &self,
+        cancellation: CancellationToken,
+    ) -> OAuthFuture<'_, DeviceAuthorization> {
+        let Some(endpoint) = self.config.device_authorization_endpoint.clone() else {
+            return Box::pin(async { Err(OAuthError::Unsupported) });
+        };
+        let mut form = vec![(
+            "client_id".to_owned(),
+            SecretValue::new(self.config.client_id.clone()),
+        )];
+        if !self.config.scopes.is_empty() {
+            form.push((
+                "scope".to_owned(),
+                SecretValue::new(self.config.scopes.join(" ")),
+            ));
+        }
+        let request = self.apply_client_auth(OAuthHttpRequest::post_form(endpoint, form));
+        Box::pin(async move {
+            let response = self.send(request, cancellation).await?;
+            Self::parse_device_response(&response)
+        })
+    }
+
+    fn poll_rfc8628_device<'a>(
+        &'a self,
+        authorization: &'a DeviceAuthorization,
+        cancellation: CancellationToken,
+    ) -> OAuthFuture<'a, OAuthTokens> {
+        Box::pin(async move {
+            let started = Instant::now();
+            let deadline = started + authorization.expires_in();
+            let mut interval = bounded_device_poll_interval(authorization.interval());
+            loop {
+                if cancellation.is_cancelled() {
+                    return Err(OAuthError::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    return Err(OAuthError::Provider {
+                        status: 400,
+                        code: OAuthProviderErrorCode::ExpiredToken,
+                    });
+                }
+                let request = self.token_request(vec![
+                    (
+                        "grant_type".to_owned(),
+                        SecretValue::new("urn:ietf:params:oauth:grant-type:device_code"),
+                    ),
+                    (
+                        "device_code".to_owned(),
+                        authorization.device_code().clone(),
+                    ),
+                ]);
+                let response = self
+                    .send_before_deadline(request, &cancellation, deadline)
+                    .await?;
+                match Self::classify_device_response(&response) {
+                    Ok(tokens) => return Ok(tokens),
+                    Err(DevicePollError::Pending) => {}
+                    Err(DevicePollError::SlowDown) => {
+                        interval = bounded_device_poll_interval(
+                            interval.saturating_add(Duration::from_secs(5)),
+                        );
+                    }
+                    Err(DevicePollError::OAuth(error)) => return Err(error),
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(OAuthError::Provider {
+                        status: 400,
+                        code: OAuthProviderErrorCode::ExpiredToken,
+                    });
+                }
+                tokio::select! {
+                    () = cancellation.cancelled() => return Err(OAuthError::Cancelled),
+                    () = time::sleep(interval.min(remaining)) => {}
+                }
+            }
+        })
+    }
+
+    fn start_codex_device_authorization(
+        &self,
+        cancellation: CancellationToken,
+    ) -> OAuthFuture<'_, DeviceAuthorization> {
+        let Some(endpoints) = self.codex_device_endpoints() else {
+            return Box::pin(async { Err(OAuthError::Unsupported) });
+        };
+        let request = OAuthHttpRequest::post_json(
+            endpoints.usercode,
+            SecretValue::new(serde_json::json!({ "client_id": self.config.client_id }).to_string()),
+        );
+        let verification = endpoints.verification;
+        Box::pin(async move {
+            let response = self.send(request, cancellation).await?;
+            Self::parse_codex_usercode_response(&response, verification)
+        })
+    }
+
+    fn poll_codex_device<'a>(
+        &'a self,
+        authorization: &'a DeviceAuthorization,
+        cancellation: CancellationToken,
+    ) -> OAuthFuture<'a, OAuthTokens> {
+        let Some(endpoints) = self.codex_device_endpoints() else {
+            return Box::pin(async { Err(OAuthError::Unsupported) });
+        };
+        Box::pin(async move {
+            let started = Instant::now();
+            let deadline = started + authorization.expires_in();
+            let mut interval = bounded_device_poll_interval(authorization.interval());
+            loop {
+                if cancellation.is_cancelled() {
+                    return Err(OAuthError::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    return Err(OAuthError::Provider {
+                        status: 400,
+                        code: OAuthProviderErrorCode::ExpiredToken,
+                    });
+                }
+                let request = OAuthHttpRequest::post_json(
+                    endpoints.poll.clone(),
+                    SecretValue::new(
+                        serde_json::json!({
+                            "device_auth_id": authorization.device_code().expose_secret(),
+                            "user_code": authorization.user_code(),
+                        })
+                        .to_string(),
+                    ),
+                );
+                let response = self
+                    .send_before_deadline(request, &cancellation, deadline)
+                    .await?;
+                match Self::classify_codex_device_poll(&response) {
+                    Ok(issued) => {
+                        let token_request = self.token_request(vec![
+                            (
+                                "grant_type".to_owned(),
+                                SecretValue::new("authorization_code"),
+                            ),
+                            (
+                                "code".to_owned(),
+                                SecretValue::new(issued.authorization_code),
+                            ),
+                            (
+                                "redirect_uri".to_owned(),
+                                SecretValue::new(endpoints.callback.as_str().to_owned()),
+                            ),
+                            (
+                                "code_verifier".to_owned(),
+                                SecretValue::new(issued.code_verifier),
+                            ),
+                        ]);
+                        let token_response = self
+                            .send_before_deadline(token_request, &cancellation, deadline)
+                            .await?;
+                        return Self::parse_token_response(&token_response)
+                            .map_err(TokenEndpointError::into_oauth);
+                    }
+                    Err(DevicePollError::Pending) => {}
+                    Err(DevicePollError::SlowDown) => {
+                        interval = bounded_device_poll_interval(
+                            interval.saturating_add(Duration::from_secs(5)),
+                        );
+                    }
+                    Err(DevicePollError::OAuth(error)) => return Err(error),
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(OAuthError::Provider {
+                        status: 400,
+                        code: OAuthProviderErrorCode::ExpiredToken,
+                    });
+                }
+                tokio::select! {
+                    () = cancellation.cancelled() => return Err(OAuthError::Cancelled),
+                    () = time::sleep(interval.min(remaining)) => {}
+                }
+            }
+        })
+    }
+
+    fn codex_device_endpoints(&self) -> Option<CodexDeviceEndpoints> {
+        if self.config.device_grant != DeviceAuthorizationGrant::CodexAccounts {
+            return None;
+        }
+        let usercode = self.config.device_authorization_endpoint.as_ref()?;
+        derive_codex_device_endpoints(usercode).ok()
+    }
+
+    fn parse_codex_usercode_response(
+        response: &OAuthHttpResponse,
+        verification: Url,
+    ) -> Result<DeviceAuthorization, OAuthError> {
+        let value = parse_json(response)?;
+        if !(200..300).contains(&response.status()) {
+            return Err(classify_provider_error(response.status(), &value));
+        }
+        let object = value.as_object().ok_or(OAuthError::InvalidResponse)?;
+        let device_auth_id = object
+            .get("device_auth_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(OAuthError::InvalidResponse)?;
+        let user_code = object
+            .get("user_code")
+            .or_else(|| object.get("usercode"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(OAuthError::InvalidResponse)?;
+        let interval = bounded_device_poll_interval(
+            json_duration_secs(object.get("interval")).unwrap_or(Duration::from_secs(5)),
+        );
+        DeviceAuthorization::new(
+            device_auth_id,
+            user_code,
+            verification,
+            Duration::from_secs(15 * 60),
+            interval,
+        )
+    }
+
+    fn classify_codex_device_poll(
+        response: &OAuthHttpResponse,
+    ) -> Result<CodexIssuedAuthorization, DevicePollError> {
+        if matches!(response.status(), 403 | 404) {
+            return Err(DevicePollError::Pending);
+        }
+        let value = parse_json(response).map_err(DevicePollError::OAuth)?;
+        if !(200..300).contains(&response.status()) {
+            return Err(DevicePollError::OAuth(classify_provider_error(
+                response.status(),
+                &value,
+            )));
+        }
+        let object = value
+            .as_object()
+            .ok_or(DevicePollError::OAuth(OAuthError::InvalidResponse))?;
+        let authorization_code = object
+            .get("authorization_code")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(DevicePollError::OAuth(OAuthError::InvalidResponse))?;
+        let code_verifier = object
+            .get("code_verifier")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(DevicePollError::OAuth(OAuthError::InvalidResponse))?;
+        Ok(CodexIssuedAuthorization {
+            authorization_code: authorization_code.to_owned(),
+            code_verifier: code_verifier.to_owned(),
         })
     }
 
@@ -1220,6 +1547,10 @@ impl StandardOAuthProvider {
             .get("refresh_token")
             .and_then(Value::as_str)
             .filter(|token| !token.is_empty());
+        let id_token = object
+            .get("id_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty());
         let token_type = object
             .get("token_type")
             .and_then(Value::as_str)
@@ -1234,7 +1565,8 @@ impl StandardOAuthProvider {
             refresh_token.map(|token| SecretValue::new(token.to_owned())),
             expires_at,
             token_type.to_owned(),
-        ))
+        )
+        .with_id_token(id_token.map(|token| SecretValue::new(token.to_owned()))))
     }
 
     fn parse_device_response(
@@ -1268,11 +1600,13 @@ impl StandardOAuthProvider {
             .map(Duration::from_secs)
             .filter(|value| !value.is_zero())
             .ok_or(OAuthError::InvalidResponse)?;
-        let interval = object
-            .get("interval")
-            .and_then(Value::as_u64)
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(5));
+        let interval = bounded_device_poll_interval(
+            object
+                .get("interval")
+                .and_then(Value::as_u64)
+                .map(Duration::from_secs)
+                .unwrap_or_else(|| Duration::from_secs(5)),
+        );
         let mut authorization =
             DeviceAuthorization::new(device_code, user_code, verification, expires_in, interval)?;
         authorization.verification_uri_complete = object
@@ -1354,10 +1688,23 @@ impl OAuthRefresher for StandardOAuthProvider {
         refresh_token: &'a SecretValue,
         cancellation: CancellationToken,
     ) -> OAuthFuture<'a, OAuthTokens> {
-        let request = self.token_request(vec![
+        let fields = vec![
             ("grant_type".to_owned(), SecretValue::new("refresh_token")),
             ("refresh_token".to_owned(), refresh_token.clone()),
-        ]);
+        ];
+        let request = if self.config.device_grant == DeviceAuthorizationGrant::CodexAccounts {
+            let mut fields = fields;
+            fields.push((
+                "client_id".to_owned(),
+                SecretValue::new(self.config.client_id.clone()),
+            ));
+            OAuthHttpRequest::post_json(
+                self.config.token_endpoint.clone(),
+                SecretValue::new(json_form(&fields)),
+            )
+        } else {
+            self.token_request(fields)
+        };
         Box::pin(async move {
             let response = self.send(request, cancellation).await?;
             let tokens =
@@ -1370,7 +1717,8 @@ impl OAuthRefresher for StandardOAuthProvider {
                 Some(refresh_token.clone()),
                 tokens.expires_at(),
                 tokens.token_type().to_owned(),
-            ))
+            )
+            .with_id_token(tokens.id_token().cloned()))
         })
     }
 }
@@ -1464,24 +1812,14 @@ impl OAuthDeviceFlow for StandardOAuthProvider {
         &self,
         cancellation: CancellationToken,
     ) -> OAuthFuture<'_, DeviceAuthorization> {
-        let Some(endpoint) = self.config.device_authorization_endpoint.clone() else {
-            return Box::pin(async { Err(OAuthError::Unsupported) });
-        };
-        let mut form = vec![(
-            "client_id".to_owned(),
-            SecretValue::new(self.config.client_id.clone()),
-        )];
-        if !self.config.scopes.is_empty() {
-            form.push((
-                "scope".to_owned(),
-                SecretValue::new(self.config.scopes.join(" ")),
-            ));
+        match self.config.device_grant {
+            DeviceAuthorizationGrant::Rfc8628 => {
+                self.start_rfc8628_device_authorization(cancellation)
+            }
+            DeviceAuthorizationGrant::CodexAccounts => {
+                self.start_codex_device_authorization(cancellation)
+            }
         }
-        let request = self.apply_client_auth(OAuthHttpRequest::post_form(endpoint, form));
-        Box::pin(async move {
-            let response = self.send(request, cancellation).await?;
-            Self::parse_device_response(&response)
-        })
     }
 
     fn poll_device<'a>(
@@ -1489,52 +1827,14 @@ impl OAuthDeviceFlow for StandardOAuthProvider {
         authorization: &'a DeviceAuthorization,
         cancellation: CancellationToken,
     ) -> OAuthFuture<'a, OAuthTokens> {
-        Box::pin(async move {
-            let started = Instant::now();
-            let deadline = started + authorization.expires_in();
-            let mut interval = authorization.interval();
-            loop {
-                if cancellation.is_cancelled() {
-                    return Err(OAuthError::Cancelled);
-                }
-                if Instant::now() >= deadline {
-                    return Err(OAuthError::Provider {
-                        status: 400,
-                        code: OAuthProviderErrorCode::ExpiredToken,
-                    });
-                }
-                let request = self.token_request(vec![
-                    (
-                        "grant_type".to_owned(),
-                        SecretValue::new("urn:ietf:params:oauth:grant-type:device_code"),
-                    ),
-                    (
-                        "device_code".to_owned(),
-                        authorization.device_code().clone(),
-                    ),
-                ]);
-                let response = self.send(request, cancellation.clone()).await?;
-                match Self::classify_device_response(&response) {
-                    Ok(tokens) => return Ok(tokens),
-                    Err(DevicePollError::Pending) => {}
-                    Err(DevicePollError::SlowDown) => {
-                        interval = interval.saturating_add(Duration::from_secs(5));
-                    }
-                    Err(DevicePollError::OAuth(error)) => return Err(error),
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(OAuthError::Provider {
-                        status: 400,
-                        code: OAuthProviderErrorCode::ExpiredToken,
-                    });
-                }
-                tokio::select! {
-                    () = cancellation.cancelled() => return Err(OAuthError::Cancelled),
-                    () = time::sleep(interval.min(remaining)) => {}
-                }
+        match self.config.device_grant {
+            DeviceAuthorizationGrant::Rfc8628 => {
+                self.poll_rfc8628_device(authorization, cancellation)
             }
-        })
+            DeviceAuthorizationGrant::CodexAccounts => {
+                self.poll_codex_device(authorization, cancellation)
+            }
+        }
     }
 }
 
@@ -1542,6 +1842,65 @@ enum DevicePollError {
     Pending,
     SlowDown,
     OAuth(OAuthError),
+}
+
+struct CodexDeviceEndpoints {
+    usercode: Url,
+    poll: Url,
+    verification: Url,
+    callback: Url,
+}
+
+struct CodexIssuedAuthorization {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+fn derive_codex_device_endpoints(usercode: &Url) -> Result<CodexDeviceEndpoints, OAuthError> {
+    let path = usercode.path();
+    let poll_path = path
+        .strip_suffix("usercode")
+        .ok_or(OAuthError::InvalidConfiguration)?;
+    let mut poll = usercode.clone();
+    poll.set_path(&format!("{poll_path}token"));
+    let mut origin = usercode.clone();
+    origin.set_path("/");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    let verification = origin
+        .join("codex/device")
+        .map_err(|_| OAuthError::InvalidConfiguration)?;
+    let callback = origin
+        .join("deviceauth/callback")
+        .map_err(|_| OAuthError::InvalidConfiguration)?;
+    if !valid_endpoint(&poll) || !valid_endpoint(&verification) || !valid_endpoint(&callback) {
+        return Err(OAuthError::InvalidConfiguration);
+    }
+    Ok(CodexDeviceEndpoints {
+        usercode: usercode.clone(),
+        poll,
+        verification,
+        callback,
+    })
+}
+
+fn json_duration_secs(value: Option<&Value>) -> Option<Duration> {
+    let value = value?;
+    let seconds = value
+        .as_u64()
+        .or_else(|| value.as_str()?.trim().parse().ok())?;
+    Some(Duration::from_secs(seconds))
+}
+
+fn bounded_device_poll_interval(interval: Duration) -> Duration {
+    interval.clamp(DEVICE_POLL_MIN_INTERVAL, DEVICE_POLL_MAX_INTERVAL)
+}
+
+fn expired_device_code() -> OAuthError {
+    OAuthError::Provider {
+        status: 400,
+        code: OAuthProviderErrorCode::ExpiredToken,
+    }
 }
 
 enum TokenEndpointError {
@@ -2161,6 +2520,84 @@ mod tests {
             "device-secret"
         );
         assert!(!format!("{authorization:?}").contains("device-secret"));
+    }
+
+    #[tokio::test]
+    async fn codex_device_login_polls_accounts_api_then_exchanges_the_code() {
+        let transport = Arc::new(MockTransport::new([
+            OAuthHttpResponse::new(
+                200,
+                br#"{"device_auth_id":"device-auth-123","user_code":"CODE-12345","interval":"0"}"#,
+            ),
+            OAuthHttpResponse::new(404, br#"{}"#),
+            OAuthHttpResponse::new(
+                200,
+                br#"{"authorization_code":"poll-code-321","code_challenge":"ignored","code_verifier":"code-verifier-321"}"#,
+            ),
+            OAuthHttpResponse::new(
+                200,
+                br#"{"access_token":"codex-access","refresh_token":"codex-refresh","id_token":"codex-id"}"#,
+            ),
+        ]));
+        let config = OAuthClientConfig::new(
+            "app_EMoamEEZ73f0CkXaXp7hrann",
+            "http://localhost:1455/auth/callback".parse().unwrap(),
+            "https://auth.openai.com/oauth/authorize".parse().unwrap(),
+            "https://auth.openai.com/oauth/token".parse().unwrap(),
+        )
+        .unwrap()
+        .with_device_authorization_endpoint(
+            "https://auth.openai.com/api/accounts/deviceauth/usercode"
+                .parse()
+                .unwrap(),
+        )
+        .with_device_grant(DeviceAuthorizationGrant::CodexAccounts);
+        let provider =
+            StandardOAuthProvider::new("openai", config, Arc::clone(&transport) as Arc<_>).unwrap();
+        let authorization = provider
+            .start_device_authorization(CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(authorization.user_code(), "CODE-12345");
+        assert_eq!(
+            authorization.verification_uri().as_str(),
+            "https://auth.openai.com/codex/device"
+        );
+        let tokens = provider
+            .poll_device(&authorization, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(tokens.access_token().expose_secret(), "codex-access");
+        assert_eq!(
+            transport.request(0).url().as_str(),
+            "https://auth.openai.com/api/accounts/deviceauth/usercode"
+        );
+        assert!(transport.request(0).json_body().is_some());
+        assert_eq!(
+            transport.request(1).url().as_str(),
+            "https://auth.openai.com/api/accounts/deviceauth/token"
+        );
+        assert_eq!(
+            transport.request(3).url().as_str(),
+            "https://auth.openai.com/oauth/token"
+        );
+        assert_eq!(
+            transport
+                .request(3)
+                .form_field("redirect_uri")
+                .unwrap()
+                .expose_secret(),
+            "https://auth.openai.com/deviceauth/callback"
+        );
+        assert_eq!(
+            transport
+                .request(3)
+                .form_field("code_verifier")
+                .unwrap()
+                .expose_secret(),
+            "code-verifier-321"
+        );
+        assert!(!format!("{authorization:?}").contains("device-auth-123"));
     }
 
     #[tokio::test]

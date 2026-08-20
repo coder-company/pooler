@@ -1571,6 +1571,11 @@ impl OpenAiResponsesEventDecoder {
         let item = item_object(object)?;
         let item_id = required_string(item, "id", "event.item.id")?.to_owned();
         let kind = required_string(item, "type", "event.item.type")?;
+        if !matches!(kind, "message" | "reasoning" | "function_call") {
+            return Err(OpenAiResponsesError::InvalidStream {
+                message: format!("unsupported Responses output item `{kind}`"),
+            });
+        }
         let mut events = self.ensure_response_start();
         match kind {
             "message" => {
@@ -1608,7 +1613,7 @@ impl OpenAiResponsesEventDecoder {
                     Some(&call_id),
                 ));
             }
-            _ => {}
+            _ => unreachable!("output item kind was validated"),
         }
         Ok(events)
     }
@@ -1621,11 +1626,16 @@ impl OpenAiResponsesEventDecoder {
             .get("part")
             .and_then(Value::as_object)
             .ok_or_else(|| invalid_shape("event.part", "an object"))?;
-        if required_string(part, "type", "event.part.type")? != "output_text" {
-            return Ok(Vec::new());
+        match required_string(part, "type", "event.part.type")? {
+            "output_text" => {
+                let item_id = required_string(object, "item_id", "event.item_id")?.to_owned();
+                self.open_text(&item_id)
+            }
+            "refusal" => Ok(Vec::new()),
+            kind => Err(OpenAiResponsesError::InvalidStream {
+                message: format!("unsupported Responses content part `{kind}`"),
+            }),
         }
-        let item_id = required_string(object, "item_id", "event.item_id")?.to_owned();
-        self.open_text(&item_id)
     }
 
     fn open_text(&mut self, item_id: &str) -> Result<Vec<StreamEvent>, OpenAiResponsesError> {
@@ -1674,7 +1684,9 @@ impl OpenAiResponsesEventDecoder {
                 .collect());
         }
         if kind != "output_text" {
-            return Ok(Vec::new());
+            return Err(OpenAiResponsesError::InvalidStream {
+                message: format!("unsupported Responses content part `{kind}`"),
+            });
         }
         let item_id = required_string(object, "item_id", "event.item_id")?.to_owned();
         self.close_text(&item_id)
@@ -1821,7 +1833,9 @@ impl OpenAiResponsesEventDecoder {
             }
             "reasoning" => self.close_reasoning(&item_id, item),
             "function_call" => self.close_function(&item_id, item),
-            _ => Ok(Vec::new()),
+            kind => Err(OpenAiResponsesError::InvalidStream {
+                message: format!("unsupported Responses output item `{kind}`"),
+            }),
         }
     }
 
@@ -1932,7 +1946,28 @@ impl OpenAiResponsesEventDecoder {
             .map(parse_responses_usage)
             .transpose()?;
         let finish_reason = if incomplete {
-            FinishReason::Length
+            let reason = response
+                .get("incomplete_details")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_object()
+                        .ok_or_else(|| invalid_shape("response.incomplete_details", "an object"))
+                })
+                .transpose()?
+                .and_then(|details| details.get("reason"))
+                .map(|value| {
+                    value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                        invalid_shape("response.incomplete_details.reason", "a string")
+                    })
+                })
+                .transpose()?;
+            match reason.as_deref() {
+                Some("max_output_tokens") => FinishReason::Length,
+                Some("content_filter") => FinishReason::ContentFilter,
+                Some(reason) => FinishReason::Other(reason.to_owned()),
+                None => FinishReason::Other("incomplete".to_owned()),
+            }
         } else if self.saw_tool_call {
             FinishReason::ToolCall
         } else {
@@ -2343,6 +2378,18 @@ impl OpenAiResponsesEventEncoder {
                         Some(serde_json::json!({"reason":"max_output_tokens"})),
                         None,
                     ),
+                    FinishReason::ContentFilter => (
+                        "response.incomplete",
+                        "incomplete",
+                        Some(serde_json::json!({"reason":"content_filter"})),
+                        None,
+                    ),
+                    FinishReason::Other(reason) => (
+                        "response.incomplete",
+                        "incomplete",
+                        Some(serde_json::json!({"reason":reason})),
+                        None,
+                    ),
                     FinishReason::Error => (
                         "response.failed",
                         "failed",
@@ -2352,7 +2399,9 @@ impl OpenAiResponsesEventEncoder {
                             "message":"the semantic stream ended with an error"
                         })),
                     ),
-                    _ => ("response.completed", "completed", None, None),
+                    FinishReason::Stop | FinishReason::ToolCall => {
+                        ("response.completed", "completed", None, None)
+                    }
                 };
                 values.push((
                     event_name,
@@ -3190,6 +3239,94 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn incomplete_reasons_round_trip_without_becoming_success() {
+        for (wire_reason, semantic_reason) in [
+            ("content_filter", FinishReason::ContentFilter),
+            (
+                "provider_safety_limit",
+                FinishReason::Other("provider_safety_limit".to_owned()),
+            ),
+        ] {
+            let wire = json!({
+                "type":"response.incomplete",
+                "response":{
+                    "id":"resp_incomplete",
+                    "model":"model-a",
+                    "status":"incomplete",
+                    "incomplete_details":{"reason":wire_reason},
+                    "usage":null
+                }
+            });
+            let mut decoder = OpenAiResponsesEventDecoder::new();
+            let decoded = decoder
+                .decode_event(None, &serde_json::to_vec(&wire).expect("event JSON"))
+                .expect("decode incomplete response");
+            assert!(matches!(
+                decoded.last().map(|event| &event.kind),
+                Some(StreamEventKind::Completion { finish_reason, .. })
+                    if finish_reason == &semantic_reason
+            ));
+
+            let mut encoder = OpenAiResponsesEventEncoder::new();
+            encoder
+                .encode_event(
+                    &StreamEvent::new(
+                        0,
+                        StreamEventKind::response_start(
+                            Some("resp_incomplete".to_owned()),
+                            Some("model-a".to_owned()),
+                        ),
+                    ),
+                    LossPolicy::Reject,
+                )
+                .expect("encode response start");
+            let encoded = encoder
+                .encode_event(
+                    &StreamEvent::new(1, StreamEventKind::completion(semantic_reason, None)),
+                    LossPolicy::Reject,
+                )
+                .expect("encode incomplete response");
+            assert_eq!(encoded.len(), 1);
+            assert_eq!(encoded[0].event, "response.incomplete");
+            let value: Value = serde_json::from_slice(&encoded[0].body).expect("encoded JSON");
+            assert_eq!(
+                value["response"]["incomplete_details"]["reason"],
+                wire_reason
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_unsupported_output_items_and_content_parts() {
+        let events = [
+            json!({
+                "type":"response.output_item.added",
+                "item":{"id":"search_1","type":"web_search_call"}
+            }),
+            json!({
+                "type":"response.output_item.done",
+                "item":{"id":"computer_1","type":"computer_call"}
+            }),
+            json!({
+                "type":"response.content_part.added",
+                "item_id":"message_1",
+                "part":{"type":"output_image"}
+            }),
+        ];
+
+        for event in events {
+            let mut decoder = OpenAiResponsesEventDecoder::new();
+            let error = decoder
+                .decode_event(None, &serde_json::to_vec(&event).expect("event JSON"))
+                .expect_err("unsupported output must not be discarded");
+            assert!(
+                error.to_string().contains("unsupported Responses"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]

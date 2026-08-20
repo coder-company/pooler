@@ -1,10 +1,11 @@
 //! Provider-specific login profiles over Pooler's generic OAuth contracts.
 //!
-//! This module intentionally separates verified provider facts from OAuth
-//! mechanics. It only supplies defaults that providers publish for third-party
-//! clients. First-party subscription endpoints and client identifiers are not
-//! copied from installed tools or guessed: those flows remain unsupported or
-//! require a complete, explicit configuration.
+//! This module separates verified provider facts from OAuth mechanics. Browser
+//! login is offered only when a public installed-app client identifier and
+//! HTTPS endpoints are known. Codex uses the official Codex CLI installed-app
+//! client ID so `pooler auth login openai` does not import another proxy's
+//! tokens or require an operator-owned OAuth app. First-party client secrets
+//! and undocumented subscription grants remain unsupported.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -15,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use super::oauth::{
-    AuthorizationAttempt, AuthorizationCode, DeviceAuthorization, OAuthClientConfig,
-    OAuthCodeExchange, OAuthDeviceFlow, OAuthError, OAuthFuture, OAuthIdentity,
+    AuthorizationAttempt, AuthorizationCode, DeviceAuthorization, DeviceAuthorizationGrant,
+    OAuthClientConfig, OAuthCodeExchange, OAuthDeviceFlow, OAuthError, OAuthFuture, OAuthIdentity,
     OAuthIdentityProvider, OAuthProvider, OAuthRefresher, OAuthRequestEncoding, OAuthRevoker,
     OAuthState, OAuthTransport, PkcePair, StandardOAuthProvider,
 };
@@ -105,6 +106,9 @@ pub struct ProviderOAuthDefaults {
     device_authorization_endpoint: Option<&'static str>,
     revocation_endpoint: Option<&'static str>,
     identity_endpoint: Option<&'static str>,
+    client_id: Option<&'static str>,
+    authorization_parameters: &'static [(&'static str, &'static str)],
+    device_grant: DeviceAuthorizationGrant,
 }
 
 impl ProviderOAuthDefaults {
@@ -117,7 +121,34 @@ impl ProviderOAuthDefaults {
             device_authorization_endpoint: None,
             revocation_endpoint: None,
             identity_endpoint: None,
+            client_id: None,
+            authorization_parameters: &[],
+            device_grant: DeviceAuthorizationGrant::Rfc8628,
         }
+    }
+
+    /// Select the device-authorization dialect.
+    #[must_use]
+    pub const fn with_device_grant(mut self, grant: DeviceAuthorizationGrant) -> Self {
+        self.device_grant = grant;
+        self
+    }
+
+    /// Set the public installed-app client identifier.
+    #[must_use]
+    pub const fn with_client_id(mut self, client_id: &'static str) -> Self {
+        self.client_id = Some(client_id);
+        self
+    }
+
+    /// Set extra authorization-query parameters the provider requires.
+    #[must_use]
+    pub const fn with_authorization_parameters(
+        mut self,
+        parameters: &'static [(&'static str, &'static str)],
+    ) -> Self {
+        self.authorization_parameters = parameters;
+        self
     }
 
     /// Set the published authorization endpoint.
@@ -183,6 +214,24 @@ impl ProviderOAuthDefaults {
     #[must_use]
     pub const fn identity_endpoint(&self) -> Option<&'static str> {
         self.identity_endpoint
+    }
+
+    /// Public installed-app client identifier, when the provider publishes one.
+    #[must_use]
+    pub const fn client_id(&self) -> Option<&'static str> {
+        self.client_id
+    }
+
+    /// Extra authorization-query parameters required by the provider.
+    #[must_use]
+    pub const fn authorization_parameters(&self) -> &'static [(&'static str, &'static str)] {
+        self.authorization_parameters
+    }
+
+    /// Device-authorization dialect.
+    #[must_use]
+    pub const fn device_grant(&self) -> DeviceAuthorizationGrant {
+        self.device_grant
     }
 }
 
@@ -380,6 +429,23 @@ impl ProviderLoginDefinition {
             | ProviderLoginSupport::RequiresExplicitConfiguration => {}
         }
 
+        let mut settings = settings;
+        if settings.client_id.is_empty() {
+            if let Some(client_id) = self.oauth_defaults.client_id {
+                settings.client_id = client_id.to_owned();
+            }
+        }
+        if settings.scopes.is_empty()
+            && self.oauth_defaults.client_id.is_some()
+            && !self.suggested_scopes.is_empty()
+        {
+            settings.scopes = self
+                .suggested_scopes
+                .iter()
+                .map(|scope| (*scope).to_owned())
+                .collect();
+        }
+
         validate_oauth_settings(&settings)?;
         let dangerous_custom_endpoint_hosts = settings.dangerous_custom_endpoint_hosts;
         validate_loopback_redirect(&settings.redirect_uri)?;
@@ -445,6 +511,12 @@ impl ProviderLoginDefinition {
         }
         if settings.request_encoding == OAuthRequestEncoding::Json {
             config = config.with_json_requests();
+        }
+        for (name, value) in self.oauth_defaults.authorization_parameters {
+            config = config.with_authorization_parameter(*name, *value);
+        }
+        if self.oauth_defaults.device_grant != DeviceAuthorizationGrant::Rfc8628 {
+            config = config.with_device_grant(self.oauth_defaults.device_grant);
         }
         config.validate().map_err(Into::into)
     }
@@ -1157,6 +1229,40 @@ fn validate_loopback_redirect(redirect: &Url) -> Result<(), ProviderLoginError> 
     Ok(())
 }
 
+/// Official Codex CLI installed-app client ID. This is a public native-app
+/// identifier, not a secret. Pooler ships it so login talks to OpenAI
+/// directly instead of importing another proxy's tokens.
+pub const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+/// Codex authorization endpoint used by the official CLI.
+pub const CODEX_OAUTH_AUTHORIZATION_ENDPOINT: &str = "https://auth.openai.com/oauth/authorize";
+/// Codex token endpoint used by the official CLI.
+pub const CODEX_OAUTH_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
+/// Codex revocation endpoint used by the official CLI.
+pub const CODEX_OAUTH_REVOCATION_ENDPOINT: &str = "https://auth.openai.com/oauth/revoke";
+/// Codex device user-code endpoint used by the official CLI.
+pub const CODEX_OAUTH_DEVICE_USERCODE_ENDPOINT: &str =
+    "https://auth.openai.com/api/accounts/deviceauth/usercode";
+/// Codex CLI originator query value required for the ChatGPT consent screen.
+pub const CODEX_OAUTH_ORIGINATOR: &str = "codex_cli_rs";
+/// Space-joined Codex CLI scopes, for authorize-query assertions.
+pub const CODEX_OAUTH_SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+
+const CODEX_OAUTH_SCOPE_LIST: &[&str] = &[
+    "openid",
+    "profile",
+    "email",
+    "offline_access",
+    "api.connectors.read",
+    "api.connectors.invoke",
+];
+
+const CODEX_OAUTH_AUTHORIZE_PARAMETERS: &[(&str, &str)] = &[
+    ("id_token_add_organizations", "true"),
+    ("codex_cli_simplified_flow", "true"),
+    ("originator", CODEX_OAUTH_ORIGINATOR),
+];
+
 const OPENAI_CAPABILITIES: &[ProviderLoginCapability] = &[
     ProviderLoginCapability::new(
         ProviderLoginMethod::ApiKey,
@@ -1165,13 +1271,13 @@ const OPENAI_CAPABILITIES: &[ProviderLoginCapability] = &[
     ),
     ProviderLoginCapability::new(
         ProviderLoginMethod::AuthorizationCodePkce,
-        ProviderLoginSupport::RequiresExplicitConfiguration,
-        "Codex documents browser sign-in, but reusable OAuth endpoints and a Pooler client registration are not published.",
+        ProviderLoginSupport::Supported,
+        "Pooler ships the official Codex CLI installed-app client and browser PKCE flow.",
     ),
     ProviderLoginCapability::new(
         ProviderLoginMethod::DeviceCode,
-        ProviderLoginSupport::Unsupported,
-        "No provider-documented Codex device authorization grant is configured.",
+        ProviderLoginSupport::Supported,
+        "Pooler ships the official Codex CLI device-code flow for headless sign-in.",
     ),
 ];
 
@@ -1252,6 +1358,15 @@ const GOOGLE_OAUTH_DEFAULTS: ProviderOAuthDefaults = ProviderOAuthDefaults::none
     .with_token_endpoint("https://oauth2.googleapis.com/token")
     .with_revocation_endpoint("https://oauth2.googleapis.com/revoke");
 
+const OPENAI_OAUTH_DEFAULTS: ProviderOAuthDefaults = ProviderOAuthDefaults::none()
+    .with_client_id(CODEX_OAUTH_CLIENT_ID)
+    .with_authorization_endpoint(CODEX_OAUTH_AUTHORIZATION_ENDPOINT)
+    .with_token_endpoint(CODEX_OAUTH_TOKEN_ENDPOINT)
+    .with_revocation_endpoint(CODEX_OAUTH_REVOCATION_ENDPOINT)
+    .with_device_authorization_endpoint(CODEX_OAUTH_DEVICE_USERCODE_ENDPOINT)
+    .with_authorization_parameters(CODEX_OAUTH_AUTHORIZE_PARAMETERS)
+    .with_device_grant(DeviceAuthorizationGrant::CodexAccounts);
+
 /// Verified provider login definitions. Declaration order is stable for CLI
 /// and management presentation.
 pub static BUILTIN_PROVIDER_LOGIN_DEFINITIONS: [ProviderLoginDefinition; 5] = [
@@ -1263,6 +1378,8 @@ pub static BUILTIN_PROVIDER_LOGIN_DEFINITIONS: [ProviderLoginDefinition; 5] = [
     .with_aliases(&["codex"])
     .with_api_key_environment_variables(&["OPENAI_API_KEY"])
     .with_oauth_host_suffixes(&["openai.com"])
+    .with_oauth_defaults(OPENAI_OAUTH_DEFAULTS)
+    .with_suggested_scopes(CODEX_OAUTH_SCOPE_LIST)
     .with_capabilities(OPENAI_CAPABILITIES),
     ProviderLoginDefinition::new(
         "anthropic",
@@ -1368,16 +1485,103 @@ mod tests {
     }
 
     #[test]
+    fn openai_profile_builds_codex_login_from_first_party_defaults() {
+        let openai = ProviderLoginRegistry::builtin()
+            .require("codex")
+            .expect("Codex");
+        assert_eq!(
+            openai.support(ProviderLoginMethod::AuthorizationCodePkce),
+            ProviderLoginSupport::Supported
+        );
+        let provider = openai
+            .build_oauth_provider(
+                ProviderLoginMethod::AuthorizationCodePkce,
+                ProviderOAuthSettings::new(String::new(), loopback_redirect()),
+                Arc::new(NoopTransport),
+            )
+            .expect("Codex login should not need an operator-owned client");
+        let attempt = provider
+            .begin_authorization_with(
+                OAuthState::new("state-value").expect("state"),
+                PkcePair::from_verifier(
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~",
+                )
+                .expect("PKCE"),
+            )
+            .expect("authorization attempt");
+        let query = attempt
+            .authorization_url()
+            .query_pairs()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            attempt.authorization_url().as_str().split('?').next(),
+            Some(CODEX_OAUTH_AUTHORIZATION_ENDPOINT)
+        );
+        assert_eq!(
+            query.get("client_id").map(AsRef::as_ref),
+            Some(CODEX_OAUTH_CLIENT_ID)
+        );
+        assert_eq!(
+            query.get("redirect_uri").map(AsRef::as_ref),
+            Some("http://127.0.0.1:1455/oauth/callback")
+        );
+        assert_eq!(
+            query.get("scope").map(AsRef::as_ref),
+            Some(CODEX_OAUTH_SCOPES)
+        );
+        assert_eq!(
+            query.get("id_token_add_organizations").map(AsRef::as_ref),
+            Some("true")
+        );
+        assert_eq!(
+            query.get("codex_cli_simplified_flow").map(AsRef::as_ref),
+            Some("true")
+        );
+        assert_eq!(
+            query.get("originator").map(AsRef::as_ref),
+            Some(CODEX_OAUTH_ORIGINATOR)
+        );
+        assert!(!query.contains_key("client_secret"));
+    }
+
+    #[test]
+    fn openai_profile_enables_codex_device_code_login() {
+        let openai = ProviderLoginRegistry::builtin()
+            .require("codex")
+            .expect("Codex");
+        assert_eq!(
+            openai.support(ProviderLoginMethod::DeviceCode),
+            ProviderLoginSupport::Supported
+        );
+        let config = openai
+            .build_oauth_config(
+                ProviderLoginMethod::DeviceCode,
+                ProviderOAuthSettings::new(String::new(), loopback_redirect()),
+            )
+            .expect("Codex device login should not need an operator-owned client");
+        assert_eq!(config.device_grant, DeviceAuthorizationGrant::CodexAccounts);
+        assert_eq!(
+            config
+                .device_authorization_endpoint
+                .as_ref()
+                .map(Url::as_str),
+            Some(CODEX_OAUTH_DEVICE_USERCODE_ENDPOINT)
+        );
+        assert_eq!(config.client_id, CODEX_OAUTH_CLIENT_ID);
+        assert_eq!(config.token_endpoint.as_str(), CODEX_OAUTH_TOKEN_ENDPOINT);
+    }
+
+    #[test]
     fn support_matrix_does_not_claim_undocumented_subscription_flows() {
         let registry = ProviderLoginRegistry::builtin();
         let openai = registry.require("openai").expect("OpenAI");
         assert_eq!(
             openai.support(ProviderLoginMethod::AuthorizationCodePkce),
-            ProviderLoginSupport::RequiresExplicitConfiguration
+            ProviderLoginSupport::Supported
         );
         assert_eq!(
             openai.support(ProviderLoginMethod::DeviceCode),
-            ProviderLoginSupport::Unsupported
+            ProviderLoginSupport::Supported
         );
 
         let anthropic = registry.require("anthropic").expect("Anthropic");
@@ -1456,21 +1660,6 @@ mod tests {
     #[test]
     fn proprietary_flows_require_complete_explicit_configuration() {
         let registry = ProviderLoginRegistry::builtin();
-        let openai = registry.require("codex").expect("Codex");
-        assert_eq!(
-            openai
-                .build_oauth_config(
-                    ProviderLoginMethod::AuthorizationCodePkce,
-                    ProviderOAuthSettings::new("registered-client", loopback_redirect())
-                        .with_scopes(["explicit-scope"]),
-                )
-                .expect_err("explicit endpoints"),
-            ProviderLoginError::ExplicitConfigurationRequired {
-                provider: "openai",
-                method: ProviderLoginMethod::AuthorizationCodePkce,
-            }
-        );
-
         let kimi = registry.require("kimi").expect("Kimi");
         assert_eq!(
             kimi.build_oauth_config(

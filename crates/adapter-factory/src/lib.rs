@@ -18,7 +18,7 @@ use pooler_http::{
 use pooler_protocol::OpenAiChatEventDecoder;
 use pooler_protocol::{
     ContentPart, ConversionError, ConversionReport, ExtensionKey, Extensions, FinishReason,
-    LossPolicy, MediaSource, Message, OpaqueExtension, PreservedJson, ReasoningBlock,
+    InputItem, LossPolicy, MediaSource, Message, OpaqueExtension, PreservedJson, ReasoningBlock,
     ReasoningConfig, ReasoningEffort, RequestValidationError, ResponseFormat, Role,
     SemanticRequest, StreamError, StreamEvent, StreamEventKind, ToolCall, ToolChoice,
     ToolDefinition, ToolResult, Usage,
@@ -1305,6 +1305,37 @@ pub enum FactoryEncodeError {
     ExtensionCollision(String),
 }
 
+fn normalize_tool_results(
+    request: &mut SemanticRequest,
+    report: &mut ConversionReport,
+) -> Result<(), FactoryAdapterError> {
+    let mut normalized = Vec::with_capacity(request.input.len());
+    for item in std::mem::take(&mut request.input) {
+        let InputItem::Message(message) = item else {
+            normalized.push(item);
+            continue;
+        };
+        if message.role != Role::Tool {
+            normalized.push(InputItem::Message(message));
+            continue;
+        }
+        for extension in message.extensions {
+            report.drop_optional(
+                format!("prompt[].{}", extension.key().as_str()),
+                "OpenAI Chat tool-result messages have no message-level provider options",
+            );
+        }
+        for part in message.content {
+            let ContentPart::ToolResult(result) = part else {
+                return Err(FactoryAdapterError::InvalidToolMessageContent);
+            };
+            normalized.push(InputItem::ToolResult(result));
+        }
+    }
+    request.input = normalized;
+    Ok(())
+}
+
 impl SemanticAdapter for FactorySemanticAdapter {
     fn supports(&self, route: &RoutePlan) -> bool {
         route.ingress().mode() == pooler_core::BodyMode::Semantic
@@ -1338,8 +1369,10 @@ impl SemanticAdapter for FactorySemanticAdapter {
             },
             ..FactoryDecodeOptions::default()
         });
-        let decoded = decoder
+        let mut decoded = decoder
             .decode(body, model)
+            .map_err(|error| Box::new(error) as BoxError)?;
+        normalize_tool_results(&mut decoded.request, &mut decoded.report)
             .map_err(|error| Box::new(error) as BoxError)?;
         decoded
             .report
@@ -1469,6 +1502,8 @@ enum FactoryAdapterError {
     InvalidModelHeader,
     #[error("encoded OpenAI request is not an object")]
     EncodedRequestNotObject,
+    #[error("Factory tool messages may contain only tool-result parts")]
+    InvalidToolMessageContent,
     #[error("Factory specification version must be 3 or 4")]
     InvalidSpecificationVersion,
     #[error("Factory Gateway protocol version must be {GATEWAY_PROTOCOL_VERSION}")]
@@ -2613,6 +2648,51 @@ routes:
             .expect("valid Factory V4 headers");
         adapter.sanitize_request_headers(&mut headers);
         assert!(headers.get(GATEWAY_PROTOCOL_VERSION_HEADER).is_none());
+    }
+
+    #[test]
+    fn adapter_flattens_factory_tool_result_for_openai_chat() {
+        let route = pooler_config::compile_yaml(
+            "factory-tool-result.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+routes:
+  - id: factory
+    listen: local
+    ingress: {mode: semantic, decoder: decode.factory.language_model}
+    target: local
+    response: {mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}
+    loss_policy: reject
+"#,
+        )
+        .expect("factory route")
+        .routes()[0]
+            .clone();
+        let body = br#"{
+          "prompt":[{"role":"tool","content":[{
+            "type":"tool-result",
+            "toolCallId":"call-1",
+            "output":{"type":"text","value":"sunny"}
+          }]}]
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(MODEL_ID_HEADER, HeaderValue::from_static("gpt-test"));
+        headers.insert(
+            SPECIFICATION_VERSION_HEADER,
+            HeaderValue::from_static(SPECIFICATION_VERSION_V3),
+        );
+        headers.insert(STREAMING_HEADER, HeaderValue::from_static("true"));
+
+        let encoded = FactorySemanticAdapter
+            .encode_request(&route, &headers, body)
+            .expect("encode tool result");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("OpenAI JSON");
+
+        assert_eq!(value["messages"][0]["role"], "tool");
+        assert_eq!(value["messages"][0]["tool_call_id"], "call-1");
+        assert_eq!(value["messages"][0]["content"], "sunny");
     }
 
     #[test]

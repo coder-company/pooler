@@ -257,7 +257,7 @@ fn rewrite_gemini_uri(
         GeminiMethod::GenerateContent => crate::GENERATE_CONTENT_ACTION,
         GeminiMethod::StreamGenerateContent => crate::STREAM_GENERATE_CONTENT_ACTION,
     };
-    let mut query = downstream_uri
+    let mut query = upstream_uri
         .query()
         .unwrap_or_default()
         .split('&')
@@ -530,4 +530,40 @@ enum GeminiRuntimeError {
 
 fn usize_limit(value: u64) -> usize {
     value.min(usize::MAX as u64) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_preserves_merged_query_and_normalizes_streaming_alt() {
+        let downstream: Uri =
+            "/v1beta/models/client-model:streamGenerateContent?trace=abc&alt=json"
+                .parse()
+                .expect("downstream URI");
+        let upstream: Uri =
+            "https://generativelanguage.googleapis.com/v1beta/models/client-model:streamGenerateContent?trace=abc&alt=json&key=server-key"
+                .parse()
+                .expect("upstream URI");
+
+        let rewritten = rewrite_gemini_uri(&downstream, Some("upstream-model"), upstream)
+            .expect("rewritten URI");
+
+        assert_eq!(rewritten.host(), Some("generativelanguage.googleapis.com"));
+        assert_eq!(
+            rewritten.path(),
+            "/v1beta/models/upstream-model:streamGenerateContent"
+        );
+        let query = rewritten.query().expect("query");
+        assert!(query.split('&').any(|part| part == "trace=abc"));
+        assert!(query.split('&').any(|part| part == "key=server-key"));
+        assert_eq!(
+            query
+                .split('&')
+                .filter(|part| part.split('=').next() == Some("alt"))
+                .collect::<Vec<_>>(),
+            vec![GEMINI_SSE_QUERY]
+        );
+    }
 }

@@ -31,7 +31,15 @@ loopback callback, state validation, and S256 PKCE:
 pooler --credential-key-ref env:POOLER_STORE_KEY auth login google
 ```
 
-Device authorization is explicit:
+Device authorization is explicit. Codex uses the official CLI device flow
+and does not need extra endpoint flags:
+
+```console
+pooler --credential-key-ref env:POOLER_STORE_KEY auth login openai \
+  --method device-code
+```
+
+Kimi still needs an operator-owned registration:
 
 ```console
 pooler --credential-key-ref env:POOLER_STORE_KEY auth login kimi \
@@ -39,11 +47,11 @@ pooler --credential-key-ref env:POOLER_STORE_KEY auth login kimi \
   --device-authorization-endpoint https://auth.kimi.com/device
 ```
 
-Kimi device login and OpenAI browser login require a complete operator-owned
-client registration. Pooler does not copy private client identifiers or
-undocumented endpoints from installed applications. The required client ID,
-scopes, authorization endpoint, and token endpoint can come from the upstream
-`oauth` configuration. A login invocation may replace them with `--client-id`,
+Codex browser and device login use the official Codex CLI installed-app client
+and endpoints, so `pooler auth login openai` and
+`pooler auth login openai --method device-code` talk to OpenAI directly. Kimi
+device login still requires a complete operator-owned client registration.
+A login invocation may replace Codex defaults with `--client-id`,
 repeated `--scope`, `--authorization-endpoint`, `--token-endpoint`,
 `--device-authorization-endpoint`, `--revocation-endpoint`, and
 `--identity-endpoint`. `--request-encoding json` is available only when the

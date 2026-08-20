@@ -292,7 +292,7 @@ async fn gemini_path_template_rewrites_model_alias_and_normalizes_stream_query()
         .expect("upstream task");
     assert_request_line(
         &upstream_request,
-        "/v1beta/models/private-gemini:streamGenerateContent?trace=alias&alt=sse",
+        "/v1beta/models/private-gemini:streamGenerateContent?trace=alias&key=server-key&alt=sse",
     );
     let forwarded: Value =
         serde_json::from_slice(http_body(&upstream_request)).expect("forwarded Gemini alias JSON");
@@ -322,7 +322,7 @@ fn gemini_alias_config(upstream_address: SocketAddr) -> pooler_config::CompiledC
     compile_yaml(
         "gemini-alias-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{provider: local, upstream_model: private-gemini, capabilities: [text, streaming], codecs: [decode.gemini.generate_content]}}\nroutes:\n  - id: gemini-alias\n    listen: local\n    match: {{method: POST, path_template: '/v1beta/models/{{model_action}}', content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model}}\n    response: {{mode: semantic, decoder: decode.gemini.generate_content.response, encoder: encode.gemini.generate_content.response}}\n    loss_policy: reject\n"
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}, query: {{key: server-key}}}}}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{provider: local, upstream_model: private-gemini, capabilities: [text, streaming], codecs: [decode.gemini.generate_content]}}\nroutes:\n  - id: gemini-alias\n    listen: local\n    match: {{method: POST, path_template: '/v1beta/models/{{model_action}}', content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model}}\n    response: {{mode: semantic, decoder: decode.gemini.generate_content.response, encoder: encode.gemini.generate_content.response}}\n    loss_policy: reject\n"
         ),
     )
     .expect("Gemini alias runtime config")

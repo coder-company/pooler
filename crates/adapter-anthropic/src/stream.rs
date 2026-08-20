@@ -259,7 +259,7 @@ fn decode_unary_content(
                 Some(&id),
             );
         }
-        "tool_use" | "server_tool_use" => {
+        "tool_use" => {
             let id =
                 required_string(object, "id", &format!("message.content[{index}].id"))?.to_owned();
             let name = required_string(object, "name", &format!("message.content[{index}].name"))?
@@ -855,7 +855,7 @@ impl AnthropicEventDecoder {
                 }
                 Ok(events)
             }
-            "tool_use" | "server_tool_use" => {
+            "tool_use" => {
                 let id = required_string(block, "id", "content_block_start.content_block.id")?
                     .to_owned();
                 let name =
@@ -987,7 +987,10 @@ impl AnthropicEventDecoder {
                 )])
             }
             DecodedBlock::Tool { id } => Ok(vec![self.event(StreamEventKind::ToolCallEnd { id })]),
-            DecodedBlock::Opaque => Ok(Vec::new()),
+            DecodedBlock::Opaque => Ok(vec![self.event(StreamEventKind::Opaque {
+                media_type: ANTHROPIC_EVENT_MEDIA_TYPE.to_owned(),
+                data: serde_json::to_vec(&Value::Object(object.clone()))?,
+            })]),
         }
     }
 
@@ -1798,6 +1801,121 @@ mod tests {
             events.last().and_then(|event| event.event.as_deref()),
             Some("message_stop")
         );
+    }
+
+    #[test]
+    fn streamed_server_tool_use_stays_opaque_through_stop() {
+        let wire = [
+            event(
+                "message_start",
+                serde_json::json!({
+                    "type":"message_start",
+                    "message":{"id":"msg_server_tool","model":"claude-test","usage":{"input_tokens":2,"output_tokens":0}}
+                }),
+            ),
+            event(
+                "content_block_start",
+                serde_json::json!({
+                    "type":"content_block_start","index":0,
+                    "content_block":{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}
+                }),
+            ),
+            event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type":"content_block_delta","index":0,
+                    "delta":{"type":"input_json_delta","partial_json":"{\"query\":\"pooler\"}"}
+                }),
+            ),
+            event(
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop","index":0}),
+            ),
+            event(
+                "message_delta",
+                serde_json::json!({
+                    "type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},
+                    "usage":{"output_tokens":3}
+                }),
+            ),
+            event("message_stop", serde_json::json!({"type":"message_stop"})),
+        ];
+        let mut decoder = AnthropicEventDecoder::new();
+        let semantic = wire
+            .iter()
+            .flat_map(|event| decoder.decode_sse_event(event).expect("decode"))
+            .collect::<Vec<_>>();
+
+        assert!(!semantic.iter().any(|event| matches!(
+            event.kind,
+            StreamEventKind::ToolCallStart { .. }
+                | StreamEventKind::ToolCallDelta { .. }
+                | StreamEventKind::ToolCallEnd { .. }
+        )));
+        assert_eq!(
+            semantic
+                .iter()
+                .filter(|event| matches!(event.kind, StreamEventKind::Opaque { .. }))
+                .count(),
+            3,
+            "start, delta, and stop must all survive"
+        );
+
+        let mut encoder = AnthropicEventEncoder::new();
+        let body = semantic
+            .iter()
+            .flat_map(|event| {
+                encoder
+                    .encode_event(event, LossPolicy::Reject)
+                    .expect("encode")
+                    .body
+            })
+            .collect::<Vec<_>>();
+        let mut parser = SseParser::new();
+        let encoded = parser.feed(&body).expect("parse encoded stream");
+        parser.finish().expect("complete stream");
+        let values = encoded
+            .iter()
+            .map(|event| {
+                serde_json::from_str::<serde_json::Value>(&event.data).expect("event JSON")
+            })
+            .collect::<Vec<_>>();
+        assert!(values
+            .iter()
+            .any(|value| value["content_block"]["type"] == "server_tool_use"));
+        assert!(values
+            .iter()
+            .any(|value| value["type"] == "content_block_stop"));
+        assert!(!values
+            .iter()
+            .any(|value| value["content_block"]["type"] == "tool_use"));
+    }
+
+    #[test]
+    fn unary_server_tool_use_is_not_promoted_to_client_tool_call() {
+        let body = br#"{
+          "id":"msg_server_tool","type":"message","role":"assistant","model":"claude-test",
+          "content":[{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{"query":"pooler"}}],
+          "stop_reason":"end_turn","stop_sequence":null,
+          "usage":{"input_tokens":2,"output_tokens":3}
+        }"#;
+        let decoded = AnthropicMessageCodec::decode_response(body).expect("decode unary");
+        assert!(!decoded.events.iter().any(|event| matches!(
+            event.kind,
+            StreamEventKind::ToolCallStart { .. }
+                | StreamEventKind::ToolCallDelta { .. }
+                | StreamEventKind::ToolCallEnd { .. }
+        )));
+        assert!(decoded
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, StreamEventKind::Opaque { .. })));
+
+        let encoded = AnthropicMessageCodec::encode_response(&decoded.events, LossPolicy::Reject)
+            .expect("encode unary");
+        let value: serde_json::Value = serde_json::from_slice(&encoded.body).expect("JSON");
+        assert_eq!(value["content"][0]["type"], "server_tool_use");
+        assert_eq!(value["content"][0]["input"]["query"], "pooler");
     }
 
     #[test]

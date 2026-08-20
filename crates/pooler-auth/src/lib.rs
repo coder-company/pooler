@@ -659,6 +659,7 @@ pub fn bearer_authorization_matches(header: &str, expected: &SecretValue) -> boo
 pub struct OAuthTokens {
     access_token: SecretValue,
     refresh_token: Option<SecretValue>,
+    id_token: Option<SecretValue>,
     expires_at: Option<SystemTime>,
     token_type: String,
 }
@@ -674,6 +675,7 @@ impl OAuthTokens {
         Self {
             access_token: SecretValue::new(access_token),
             refresh_token: refresh_token.map(|value| SecretValue::new(value.into())),
+            id_token: None,
             expires_at,
             token_type: "Bearer".to_owned(),
         }
@@ -690,9 +692,23 @@ impl OAuthTokens {
         Self {
             access_token,
             refresh_token,
+            id_token: None,
             expires_at,
             token_type: token_type.into(),
         }
+    }
+
+    /// Attach an optional OpenID Connect ID token returned with the token set.
+    #[must_use]
+    pub fn with_id_token(mut self, id_token: Option<SecretValue>) -> Self {
+        self.id_token = id_token;
+        self
+    }
+
+    /// Optional OpenID Connect ID token.
+    #[must_use]
+    pub const fn id_token(&self) -> Option<&SecretValue> {
+        self.id_token.as_ref()
     }
 
     /// Access token for one outbound request.
@@ -729,6 +745,7 @@ impl fmt::Debug for OAuthTokens {
                 "refresh_token",
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
             .field("expires_at", &self.expires_at)
             .field("token_type", &self.token_type)
             .finish()

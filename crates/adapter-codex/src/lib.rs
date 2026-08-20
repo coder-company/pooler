@@ -413,6 +413,14 @@ impl CodexCredential {
         self.id_token.as_ref()
     }
 
+    /// Extract the ChatGPT account identifier carried by a Codex ID token.
+    pub fn account_id_from_id_token(
+        id_token: &SecretValue,
+    ) -> Result<String, CodexCredentialError> {
+        account_id_from_id_token(id_token.expose_secret())
+            .ok_or(CodexCredentialError::MissingAccountId)
+    }
+
     /// Optional identity email from the local bridge record.
     #[must_use]
     pub fn email(&self) -> Option<&str> {

@@ -11,10 +11,11 @@ use adapter_codex::{CodexAuthorization, CodexCredential, CodexQuotaParser, Codex
 use http::HeaderMap;
 use pooler_auth::{
     refresh_with_store_if_generation, CredentialId, HyperOAuthTransport, MemoryOAuthTokenStore,
-    OAuthClientConfig, OAuthError, OAuthRefresher, OAuthTokenStore, RefreshCoordinator,
+    OAuthClientConfig, OAuthError, OAuthRefresher, OAuthTokenStore, ProviderLoginMethod,
+    ProviderLoginRegistry, ProviderOAuthSettings, RefreshCoordinator, StandardOAuthProvider,
     TokenSnapshot,
 };
-use pooler_config::{CompiledConfig, OAuthPlan, UpstreamPlan};
+use pooler_config::{CompiledConfig, OAuthPlan, UpstreamPlan, DEFAULT_OAUTH_CALLBACK};
 use pooler_store::SqliteOAuthTokenStore;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -114,12 +115,9 @@ impl NativeRuntime {
             if !native.kind().eq_ignore_ascii_case("codex") {
                 continue;
             }
-            let oauth = upstream.oauth().ok_or(NativeRuntimeError::Configuration)?;
-            let provider = build_codex_provider(upstream.id(), oauth, Arc::clone(&transport))?;
-            codex.insert(
-                upstream.id().to_owned(),
-                Arc::new(provider) as Arc<dyn OAuthRefresher>,
-            );
+            let provider =
+                build_codex_provider(upstream.id(), upstream.oauth(), Arc::clone(&transport))?;
+            codex.insert(upstream.id().to_owned(), provider);
         }
         Ok(Self {
             token_store,
@@ -307,29 +305,43 @@ impl NativeRuntime {
 
 fn build_codex_provider(
     id: &str,
-    oauth: &OAuthPlan,
+    oauth: Option<&OAuthPlan>,
     transport: Arc<HyperOAuthTransport>,
-) -> Result<pooler_auth::StandardOAuthProvider, NativeRuntimeError> {
-    let config = OAuthClientConfig::new(
-        oauth.client_id().to_owned(),
-        oauth.callback().clone(),
-        oauth.authorization_endpoint().clone(),
-        oauth.token_endpoint().clone(),
-    )
-    .map_err(|_| NativeRuntimeError::Configuration)?
-    .with_scopes(oauth.scopes().iter().map(ToString::to_string));
-    let config = if let Some(endpoint) = oauth.revocation_endpoint() {
-        config.with_revocation_endpoint(endpoint.clone())
-    } else {
-        config
-    };
-    let config = if let Some(endpoint) = oauth.identity_endpoint() {
-        config.with_identity_endpoint(endpoint.clone())
-    } else {
-        config
-    };
-    pooler_auth::StandardOAuthProvider::new(id.to_owned(), config, transport)
-        .map_err(|_| NativeRuntimeError::Configuration)
+) -> Result<Arc<dyn OAuthRefresher>, NativeRuntimeError> {
+    if let Some(oauth) = oauth {
+        let mut config = OAuthClientConfig::new(
+            oauth.client_id().to_owned(),
+            oauth.callback().clone(),
+            oauth.authorization_endpoint().clone(),
+            oauth.token_endpoint().clone(),
+        )
+        .map_err(|_| NativeRuntimeError::Configuration)?
+        .with_scopes(oauth.scopes().iter().map(ToString::to_string));
+        if let Some(endpoint) = oauth.revocation_endpoint() {
+            config = config.with_revocation_endpoint(endpoint.clone());
+        }
+        if let Some(endpoint) = oauth.identity_endpoint() {
+            config = config.with_identity_endpoint(endpoint.clone());
+        }
+        let provider = StandardOAuthProvider::new(id, config, transport)
+            .map_err(|_| NativeRuntimeError::Configuration)?;
+        return Ok(Arc::new(provider));
+    }
+
+    let definition = ProviderLoginRegistry::builtin()
+        .require("openai")
+        .map_err(|_| NativeRuntimeError::Configuration)?;
+    let callback = DEFAULT_OAUTH_CALLBACK
+        .parse()
+        .map_err(|_| NativeRuntimeError::Configuration)?;
+    let provider = definition
+        .build_oauth_provider(
+            ProviderLoginMethod::AuthorizationCodePkce,
+            ProviderOAuthSettings::new(String::new(), callback),
+            transport,
+        )
+        .map_err(|_| NativeRuntimeError::Configuration)?;
+    Ok(Arc::new(provider))
 }
 
 fn map_refresh_error(error: OAuthError) -> NativeRuntimeError {

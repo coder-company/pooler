@@ -3186,7 +3186,10 @@ fn compile_accounts(
                 });
             }
             let upstream = &upstreams[provider];
-            let inferred_oauth = upstream.native().is_some() && upstream.oauth().is_some();
+            let inferred_oauth = upstream.oauth().is_some()
+                || upstream
+                    .native()
+                    .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"));
             let auth_kind = declaration.auth_kind.unwrap_or(if inferred_oauth {
                 AccountAuthKind::OAuth
             } else {
@@ -3207,7 +3210,12 @@ fn compile_accounts(
             }) {
                 return Err(invalid(&label, "account secret reference is unsupported"));
             }
-            if auth_kind == AccountAuthKind::OAuth && upstream.oauth().is_none() {
+            if auth_kind == AccountAuthKind::OAuth
+                && upstream.oauth().is_none()
+                && upstream
+                    .native()
+                    .is_none_or(|native| !native.kind().eq_ignore_ascii_case("codex"))
+            {
                 return Err(invalid(
                     &label,
                     "OAuth account requires explicit upstream oauth configuration",
@@ -3684,10 +3692,18 @@ fn compile_upstream(
 ) -> Result<CompiledTransport, ConfigError> {
     let transport = declaration.transport.as_ref();
     let known = compile_known_provider(declaration, label)?;
-    let raw_url = transport
+    let explicit_url = transport
         .and_then(|value| value.base_url.as_deref())
         .or(declaration.base_url.as_deref())
-        .or(declaration.url.as_deref())
+        .or(declaration.url.as_deref());
+    let native_codex_default = declaration
+        .native
+        .as_ref()
+        .and_then(|native| native.kind.as_deref())
+        .filter(|kind| kind.trim().eq_ignore_ascii_case("codex"))
+        .map(|_| "https://chatgpt.com");
+    let raw_url = explicit_url
+        .or(native_codex_default)
         .or(known)
         .ok_or_else(|| {
             invalid(
@@ -3778,18 +3794,6 @@ fn compile_provider_auth(
             })
         })
         .transpose()?;
-    if native
-        .as_ref()
-        .is_some_and(|provider| provider.kind.as_ref() == "codex")
-        && oauth
-            .as_ref()
-            .is_some_and(|provider| provider.identity_endpoint.is_none())
-    {
-        return Err(invalid(
-            label,
-            "native codex OAuth providers require oauth.identity_endpoint",
-        ));
-    }
     Ok((oauth, native))
 }
 
@@ -6748,23 +6752,45 @@ upstreams:
     }
 
     #[test]
-    fn native_codex_oauth_requires_identity_endpoint() {
+    fn native_codex_oauth_compiles_without_identity_endpoint() {
         let text = r#"
 version: 1
 upstreams:
   provider:
-    url: https://api.example.test
-    oauth:
-      authorization_endpoint: https://auth.example.test/authorize
-      token_endpoint: https://auth.example.test/token
-      client_id: pooler-cli
-      scopes: [openid]
-      callback: http://127.0.0.1:8765/callback
+    known_provider: openai
     native: {kind: codex}
+accounts:
+  personal:
+    provider: provider
+    auth_kind: oauth
 "#;
-        let error = compile_yaml("oauth-native-missing-identity.yaml", text)
-            .expect_err("native Codex identity is required");
-        assert!(error.to_string().contains("identity_endpoint"));
+        let config = compile_yaml("oauth-native-codex.yaml", text).expect("native Codex login");
+        assert!(config.upstreams()["provider"].oauth().is_none());
+        assert_eq!(
+            config.upstreams()["provider"].url().as_str(),
+            "https://chatgpt.com/"
+        );
+        assert_eq!(
+            config.accounts()["personal"].auth_kind(),
+            AccountAuthKind::OAuth
+        );
+
+        let explicit = compile_yaml(
+            "oauth-native-codex-gateway.yaml",
+            r#"
+version: 1
+upstreams:
+  provider:
+    url: https://gateway.example.test/openai
+    known_provider: openai
+    native: {kind: codex}
+"#,
+        )
+        .expect("explicit Codex gateway");
+        assert_eq!(
+            explicit.upstreams()["provider"].url().as_str(),
+            "https://gateway.example.test/openai"
+        );
     }
 
     #[test]

@@ -120,8 +120,8 @@ pub(super) struct ResolvedOAuthSettings {
     client_id: String,
     callback: Url,
     scopes: Vec<String>,
-    authorization_endpoint: Url,
-    token_endpoint: Url,
+    authorization_endpoint: Option<Url>,
+    token_endpoint: Option<Url>,
     device_authorization_endpoint: Option<Url>,
     revocation_endpoint: Option<Url>,
     identity_endpoint: Option<Url>,
@@ -186,16 +186,16 @@ impl ResolvedOAuthSettings {
             client_id,
             callback,
             scopes,
-            authorization_endpoint: endpoint_override(
+            authorization_endpoint: Some(endpoint_override(
                 overrides.authorization_endpoint.as_deref(),
                 oauth.authorization_endpoint(),
                 "authorization",
-            )?,
-            token_endpoint: endpoint_override(
+            )?),
+            token_endpoint: Some(endpoint_override(
                 overrides.token_endpoint.as_deref(),
                 oauth.token_endpoint(),
                 "token",
-            )?,
+            )?),
             device_authorization_endpoint: optional_endpoint_override(
                 overrides.device_authorization_endpoint.as_deref(),
                 None,
@@ -215,15 +215,61 @@ impl ResolvedOAuthSettings {
         })
     }
 
+    pub(super) fn from_cli_overrides(callback: Url, overrides: &OAuthOverrideArgs) -> Result<Self> {
+        validate_override_budget(overrides)?;
+        if overrides.dangerously_allow_custom_oauth_endpoints {
+            bail!("the custom-provider endpoint override cannot bypass a built-in profile");
+        }
+        Ok(Self {
+            client_id: overrides.client_id.clone().unwrap_or_default(),
+            callback,
+            scopes: overrides.scopes.clone(),
+            authorization_endpoint: optional_endpoint_override(
+                overrides.authorization_endpoint.as_deref(),
+                None,
+                "authorization",
+            )?,
+            token_endpoint: optional_endpoint_override(
+                overrides.token_endpoint.as_deref(),
+                None,
+                "token",
+            )?,
+            device_authorization_endpoint: optional_endpoint_override(
+                overrides.device_authorization_endpoint.as_deref(),
+                None,
+                "device authorization",
+            )?,
+            revocation_endpoint: optional_endpoint_override(
+                overrides.revocation_endpoint.as_deref(),
+                None,
+                "revocation",
+            )?,
+            identity_endpoint: optional_endpoint_override(
+                overrides.identity_endpoint.as_deref(),
+                None,
+                "identity",
+            )?,
+            request_encoding: overrides.request_encoding,
+        })
+    }
+
     fn standard_config(&self, method: AuthLoginMethod) -> Result<OAuthClientConfig> {
         if method == AuthLoginMethod::DeviceCode && self.device_authorization_endpoint.is_none() {
             bail!("OAuth device authorization endpoint is required");
         }
+        let authorization = self
+            .authorization_endpoint
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OAuth authorization endpoint is required"))?;
+        let token = self
+            .token_endpoint
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OAuth token endpoint is required"))?;
         let mut config = OAuthClientConfig::new(
             self.client_id.clone(),
             self.callback.clone(),
-            self.authorization_endpoint.clone(),
-            self.token_endpoint.clone(),
+            authorization.clone(),
+            token.clone(),
         )?
         .with_scopes(self.scopes.clone());
         if let Some(endpoint) = &self.device_authorization_endpoint {
@@ -244,9 +290,13 @@ impl ResolvedOAuthSettings {
     fn provider_settings(&self) -> ProviderOAuthSettings {
         let mut settings =
             ProviderOAuthSettings::new(self.client_id.clone(), self.callback.clone())
-                .with_scopes(self.scopes.clone())
-                .with_authorization_endpoint(self.authorization_endpoint.clone())
-                .with_token_endpoint(self.token_endpoint.clone());
+                .with_scopes(self.scopes.clone());
+        if let Some(endpoint) = &self.authorization_endpoint {
+            settings = settings.with_authorization_endpoint(endpoint.clone());
+        }
+        if let Some(endpoint) = &self.token_endpoint {
+            settings = settings.with_token_endpoint(endpoint.clone());
+        }
         if let Some(endpoint) = &self.device_authorization_endpoint {
             settings = settings.with_device_authorization_endpoint(endpoint.clone());
         }

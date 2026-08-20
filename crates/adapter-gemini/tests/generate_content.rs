@@ -311,3 +311,71 @@ fn multiple_candidates_are_rejected_instead_of_silently_dropping_one() {
         .expect_err("multiple candidates");
     assert!(error.to_string().contains("one Gemini candidate"));
 }
+
+#[test]
+fn multi_name_function_calling_config_round_trips_exactly() {
+    let input = br#"{
+      "contents":[{"role":"user","parts":[{"text":"Find it"}]}],
+      "tools":[{"functionDeclarations":[
+        {"name":"read","parametersJsonSchema":{"type":"object"}},
+        {"name":"search","parametersJsonSchema":{"type":"object"}}
+      ]}],
+      "toolConfig":{"functionCallingConfig":{
+        "mode":"ANY",
+        "allowedFunctionNames":["read","search"]
+      }}
+    }"#;
+
+    let decoded = GeminiGenerateContentCodec::decode_request_with_report(input, "gemini-test")
+        .expect("decode request");
+    decoded
+        .report
+        .validate(LossPolicy::Reject)
+        .expect("lossless decode");
+    let encoded = GeminiGenerateContentCodec::encode_request(&decoded.request, LossPolicy::Reject)
+        .expect("lossless encode");
+    let value: Value = serde_json::from_slice(&encoded.body).expect("encoded JSON");
+
+    assert_eq!(
+        value["toolConfig"]["functionCallingConfig"],
+        serde_json::json!({
+            "mode":"ANY",
+            "allowedFunctionNames":["read","search"]
+        })
+    );
+}
+
+#[test]
+fn idless_function_history_does_not_gain_mismatched_wire_ids() {
+    let input = br#"{
+      "contents":[
+        {"role":"model","parts":[{"functionCall":{
+          "name":"lookup","args":{"query":"pooler"}
+        }}]},
+        {"role":"user","parts":[{"functionResponse":{
+          "name":"lookup","response":{"result":"found"}
+        }}]}
+      ]
+    }"#;
+
+    let decoded = GeminiGenerateContentCodec::decode_request_with_report(input, "gemini-test")
+        .expect("decode ID-less history");
+    let encoded = GeminiGenerateContentCodec::encode_request(&decoded.request, LossPolicy::Reject)
+        .expect("encode ID-less history");
+    let value: Value = serde_json::from_slice(&encoded.body).expect("encoded JSON");
+
+    assert!(value["contents"][0]["parts"][0]["functionCall"]
+        .get("id")
+        .is_none());
+    assert!(value["contents"][1]["parts"][0]["functionResponse"]
+        .get("id")
+        .is_none());
+    assert_eq!(
+        value["contents"][0]["parts"][0]["functionCall"]["name"],
+        "lookup"
+    );
+    assert_eq!(
+        value["contents"][1]["parts"][0]["functionResponse"]["response"]["result"],
+        "found"
+    );
+}
