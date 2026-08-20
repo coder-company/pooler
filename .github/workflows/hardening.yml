@@ -1,16 +1,12 @@
 name: Hardening
 
 on:
-  pull_request:
-  push:
   workflow_call:
     inputs:
       checkout-ref:
         description: Git ref or commit to verify
         required: false
         type: string
-  schedule:
-    - cron: "17 3 * * 1"
   workflow_dispatch:
 
 permissions:

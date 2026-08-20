@@ -9,7 +9,7 @@ jobs target the organization's custom self-hosted pool with the exact labels
 lanes target `[self-hosted, macOS, X64, palantir-actions]` or
 `[self-hosted, macOS, ARM64, palantir-actions]`. No macOS self-hosted runner is
 configured; a queued or unavailable macOS lane is not a passing result. Normal
-push and pull-request CI omits `include-macos`, so the gated lane is skipped;
+manual CI dispatch omits `include-macos`, so the gated lane is skipped;
 reusable callers default it to false. Release CI sets it to true and remains
 blocked until macOS capacity exists.
 

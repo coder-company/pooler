@@ -67,9 +67,11 @@ release targets remain explicit platform requirements, using
 `[self-hosted, macOS, ARM64, palantir-actions]` for arm64. The configured custom
 capacity is currently Linux-only, so matching macOS lanes remain
 queued/unavailable and their platform evidence must not be reported as passing.
-Ordinary push and pull-request events do not supply `include-macos`, so the
-gated job is skipped; reusable callers default the boolean to `false`. The
-release workflow passes `include-macos: true`; release acceptance is therefore
+The custom-runner workflows run only by explicit dispatch or as reusable
+release gates, so ordinary pushes do not consume the shared runners. Manual CI
+dispatch omits `include-macos`, so the gated job is skipped; reusable callers
+default the boolean to `false`. The release workflow passes
+`include-macos: true`; release acceptance is therefore
 still blocked until the required macOS runners are online.
 
 The workflow uploads the archives, generates aggregate checksums, signs the
