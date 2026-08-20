@@ -7,16 +7,23 @@
 //!
 //! Request-shaping facts that provider list endpoints never report, such as a
 //! model that rejects `temperature`, come from the vendored [`ModelFacts`]
-//! snapshot rather than from adapter code.
+//! snapshot rather than from adapter code. Where a provider can be reached at
+//! all comes from [`ProviderCatalog`], a table of base URLs this crate owns.
 
 #![forbid(unsafe_code)]
 
 mod model_facts;
+mod provider_catalog;
 
 pub use model_facts::{
     ModelFacts, ModelFactsError, MAX_MODEL_FACTS_BYTES, MAX_MODEL_FACT_ENTRIES,
     MAX_MODEL_FACT_KEY_BYTES, MAX_UPSTREAM_CATALOG_BYTES, MODELS_DEV_CATALOG_URL,
     MODEL_FACTS_SCHEMA_VERSION,
+};
+pub use provider_catalog::{
+    KnownProvider, ProviderCatalog, ProviderCatalogError, MAX_PROVIDER_CATALOG_BYTES,
+    MAX_PROVIDER_CATALOG_ENTRIES, MAX_PROVIDER_CATALOG_FIELD_BYTES,
+    PROVIDER_CATALOG_SCHEMA_VERSION,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -866,6 +866,7 @@ fn upstream_schema() -> Value {
             ("oauth", optional(reference("oauth"))),
             ("native", optional(reference("native"))),
             ("query", optional(string_map_schema())),
+            ("known_provider", optional(id_schema())),
         ]),
         &[],
         true,

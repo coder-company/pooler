@@ -34,7 +34,8 @@ mod watch;
 
 pub use loader::{load_path, render_path, ConfigLoader, LoadedConfig, DEFAULT_MAX_IMPORT_DEPTH};
 pub use pooler_model_catalog::{
-    AliasConfig as CatalogAliasConfig, RefreshConfig as CatalogRefreshConfig,
+    AliasConfig as CatalogAliasConfig, KnownProvider, ProviderCatalog,
+    RefreshConfig as CatalogRefreshConfig,
 };
 use route_match::{prefix_matches, template_matches};
 pub use route_match::{RouteMatchError, RouteRequest};
@@ -409,6 +410,9 @@ pub struct UpstreamConfig {
     /// OpenAI's `api-version`. A parameter the caller already sent is left
     /// alone, so these act as defaults rather than overrides.
     pub query: BTreeMap<String, String>,
+    /// Known provider whose base URL addresses this upstream, such as `groq`.
+    /// An explicit `url` or `transport.base_url` takes precedence.
+    pub known_provider: Option<String>,
 }
 
 /// Supervised external extension declaration.
@@ -3633,16 +3637,51 @@ fn compile_cooldown(
     Ok(Some(CooldownPlan { scope, duration }))
 }
 
+/// Resolve the base URL a named known provider supplies.
+///
+/// An unrecognized ID fails compilation rather than falling through to a
+/// missing-URL error, because the operator named a provider they expect Pooler
+/// to know and a generic message would not say why it did not work.
+fn compile_known_provider<'a>(
+    declaration: &UpstreamConfig,
+    label: &SourceLabel,
+) -> Result<Option<&'a str>, ConfigError> {
+    let Some(id) = declaration
+        .known_provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    ProviderCatalog::builtin()
+        .get(id)
+        .map(|provider| Some(provider.base_url.as_str()))
+        .ok_or_else(|| {
+            invalid(
+                label,
+                &format!("known_provider `{id}` is not a provider Pooler ships an endpoint for"),
+            )
+        })
+}
+
 fn compile_upstream(
     declaration: &UpstreamConfig,
     label: &SourceLabel,
 ) -> Result<CompiledTransport, ConfigError> {
     let transport = declaration.transport.as_ref();
+    let known = compile_known_provider(declaration, label)?;
     let raw_url = transport
         .and_then(|value| value.base_url.as_deref())
         .or(declaration.base_url.as_deref())
         .or(declaration.url.as_deref())
-        .ok_or_else(|| invalid(label, "upstream requires url or transport.base_url"))?;
+        .or(known)
+        .ok_or_else(|| {
+            invalid(
+                label,
+                "upstream requires url, transport.base_url, or known_provider",
+            )
+        })?;
     let url = Url::parse(raw_url).map_err(|_| invalid(label, "upstream URL is invalid"))?;
     if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") || url.host_str().is_none() {
         return Err(invalid(
@@ -5523,6 +5562,55 @@ routes:
         let compiled = compile_yaml("alias.yaml", text).expect("alias");
         assert_eq!(compiled.routes()[0].ingress().mode(), BodyMode::Semantic);
         assert_eq!(compiled.routes()[0].loss_policy(), LossPolicy::Degrade);
+    }
+
+    #[test]
+    fn a_known_provider_supplies_a_base_url_the_operator_did_not_write() {
+        let upstream = |body: &str| {
+            format!(
+                "version: 1\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{{body}}}}}\n"
+            )
+        };
+
+        let compiled = compile_yaml("known-provider.yaml", &upstream("known_provider: groq"))
+            .expect("a known provider is addressable without a URL");
+        assert_eq!(
+            compiled.upstreams()["u"].url().as_str(),
+            "https://api.groq.com/openai/v1"
+        );
+
+        let overridden = compile_yaml(
+            "known-provider-override.yaml",
+            &upstream("known_provider: groq, url: https://gateway.internal/v1"),
+        )
+        .expect("an explicit URL compiles");
+        assert_eq!(
+            overridden.upstreams()["u"].url().as_str(),
+            "https://gateway.internal/v1",
+            "an operator's own endpoint must win over the shipped one"
+        );
+
+        let unknown = compile_yaml(
+            "known-provider-unknown.yaml",
+            &upstream("known_provider: not-a-provider"),
+        )
+        .expect_err("an unrecognized provider must not fall through");
+        assert!(
+            unknown.to_string().contains(
+                "known_provider `not-a-provider` is not a provider Pooler ships an endpoint for"
+            ),
+            "{unknown}"
+        );
+
+        let azure = compile_yaml(
+            "known-provider-azure.yaml",
+            &upstream("known_provider: azure"),
+        )
+        .expect_err("azure needs a resource name no table can supply");
+        assert!(
+            azure.to_string().contains("known_provider `azure`"),
+            "{azure}"
+        );
     }
 
     #[test]
