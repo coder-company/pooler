@@ -99,12 +99,13 @@ trap 'rm -rf "$work_directory"' EXIT HUP INT TERM
 # Disable incremental metadata and remap the checkout path before rustc sees it.
 # CARGO_ENCODED_RUSTFLAGS also preserves caller-provided flags without shell
 # quoting assumptions.
-path_flag="--remap-path-prefix=$root_directory=/usr/src/pooler"
+source_path_flag="--remap-path-prefix=$root_directory=/usr/src/pooler"
+build_path_flag="--remap-path-prefix=$work_directory=/usr/src/pooler-build"
 separator=$(printf '\037')
 if [ -n "${CARGO_ENCODED_RUSTFLAGS-}" ]; then
-    export CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS$separator$path_flag"
+    export CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS$separator$source_path_flag$separator$build_path_flag"
 else
-    export CARGO_ENCODED_RUSTFLAGS=$path_flag
+    export CARGO_ENCODED_RUSTFLAGS="$source_path_flag$separator$build_path_flag"
 fi
 export CARGO_INCREMENTAL=0
 export SOURCE_DATE_EPOCH=$epoch
@@ -180,8 +181,10 @@ for target in $targets; do
     elif [ "$reproducibility_check" -eq 1 ]; then
         first_binary="$work_directory/pooler-$target_safe.first"
         second_binary="$work_directory/pooler-$target_safe.second"
-        build_binary "$target" "$work_directory/build-$target_safe-first" "$first_binary"
-        build_binary "$target" "$work_directory/build-$target_safe-second" "$second_binary"
+        build_directory="$work_directory/build-$target_safe"
+        build_binary "$target" "$build_directory" "$first_binary"
+        rm -rf "$build_directory"
+        build_binary "$target" "$build_directory" "$second_binary"
         first_hash=$(hash_file "$first_binary")
         second_hash=$(hash_file "$second_binary")
         if [ "$first_hash" != "$second_hash" ]; then
