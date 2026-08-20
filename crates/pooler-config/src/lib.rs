@@ -5614,6 +5614,31 @@ routes:
     }
 
     #[test]
+    fn every_shipped_provider_compiles_into_a_usable_upstream() {
+        // The provider table is advertised by `pooler providers`, so an entry
+        // that does not compile would be a documented endpoint that cannot be
+        // used. Compiling all of them keeps the table and this resolver honest
+        // about each other.
+        for (id, provider) in ProviderCatalog::builtin().iter() {
+            let text = format!(
+                "version: 1\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{known_provider: {id}}}}}\n"
+            );
+            let compiled = compile_yaml("shipped-providers.yaml", &text)
+                .unwrap_or_else(|error| panic!("`{id}` must compile: {error}"));
+            let url = compiled.upstreams()["u"].url();
+            assert_eq!(
+                url.as_str().trim_end_matches('/'),
+                provider.base_url,
+                "`{id}` must resolve to its shipped base URL"
+            );
+            assert!(
+                matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+                "`{id}` must resolve to an addressable URL"
+            );
+        }
+    }
+
+    #[test]
     fn a_credential_header_and_prefix_belong_only_to_the_header_auth_kind() {
         let upstream = |auth: &str| {
             format!(

@@ -70,6 +70,15 @@ pub enum Command {
         #[command(subcommand)]
         command: CatalogCommand,
     },
+    /// List providers this build ships an endpoint for.
+    Providers {
+        /// Restrict output to providers whose ID or name contains this text.
+        #[arg(long)]
+        search: Option<String>,
+        /// Emit the provider table as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect and replay sanitized compatibility fixtures.
     Fixture {
         /// Fixture operation.
@@ -199,6 +208,7 @@ pub fn run(cli: Cli) -> Result<()> {
             json,
         ),
         Command::Catalog { command } => catalog::run(command),
+        Command::Providers { search, json } => catalog::providers(search.as_deref(), json),
         Command::Fixture { command } => fixture_replay::run(command),
         Command::Auth { command } => auth::run(
             command,

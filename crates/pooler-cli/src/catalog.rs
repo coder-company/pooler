@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
-use pooler_model_catalog::{ModelFacts, MODELS_DEV_CATALOG_URL};
+use pooler_model_catalog::{ModelFacts, ProviderCatalog, MODELS_DEV_CATALOG_URL};
 
 /// Default location of the vendored snapshot inside a Pooler checkout.
 pub const VENDORED_MODEL_FACTS_PATH: &str = "crates/pooler-model-catalog/data/model-facts.json";
@@ -109,6 +109,66 @@ fn refresh(url: &str, from: Option<&Path>, output: &Path, check: bool) -> Result
         facts.provider_count(),
         facts.upstream_model_count(),
         facts.source_sha256(),
+    );
+    Ok(())
+}
+
+/// Lists the providers this build can address without an explicit URL.
+///
+/// The environment variables are the ones each provider's own tooling reads,
+/// so they are the names an operator most likely already has exported. They are
+/// printed as a suggestion; configuration still names the secret it uses.
+pub fn providers(search: Option<&str>, json: bool) -> Result<()> {
+    let catalog = ProviderCatalog::builtin();
+    let needle = search.map(str::to_ascii_lowercase);
+    let matched = catalog
+        .iter()
+        .filter(|(id, provider)| match needle.as_deref() {
+            Some(needle) => {
+                id.to_ascii_lowercase().contains(needle)
+                    || provider.name.to_ascii_lowercase().contains(needle)
+            }
+            None => true,
+        })
+        .collect::<Vec<_>>();
+
+    if json {
+        let rendered = matched
+            .iter()
+            .map(|(id, provider)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": provider.name,
+                    "base_url": provider.base_url,
+                    "env": provider.env,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"providers": rendered}))
+                .context("could not render the provider table")?
+        );
+        return Ok(());
+    }
+
+    if matched.is_empty() {
+        println!("no provider matches that search");
+        return Ok(());
+    }
+    let width = matched.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+    for (id, provider) in &matched {
+        let secret = provider
+            .env
+            .first()
+            .map_or_else(String::new, |name| format!("  (env:{name})"));
+        println!("{id:width$}  {}{secret}", provider.base_url);
+    }
+    println!();
+    println!(
+        "{} of {} providers shown. Use one with `known_provider: <id>` on an upstream.",
+        matched.len(),
+        catalog.len()
     );
     Ok(())
 }
