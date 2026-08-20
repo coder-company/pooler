@@ -27,7 +27,7 @@ indexmap = { version = "=2.14.0", features = ["serde"] }
 keyring = { version = "=3.6.3", default-features = false }
 prost = "0.13"
 prost-build = "0.13"
-prost-types = "0.13"
+prost-types = "0.14"
 protoc-bin-vendored = "3"
 ring = "0.17"
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
