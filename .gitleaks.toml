@@ -16,3 +16,6 @@ regexes = [
   '''(?i)Bearer (?:secret|top-secret)''',
   '''(?i)(?:env-secret-value|refresh-live-secret|nested-password|client-secret-value|access-token-value|private-cookie|do-not-log-this|split-secret-token|proof-secret|session-secret-value)''',
 ]
+paths = [
+  '''^crates/pooler-server/tests/fixtures/(?:localhost|mismatch|rotated)-key\.pem$''',
+]
