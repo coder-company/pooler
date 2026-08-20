@@ -489,6 +489,12 @@ pub struct ModelCatalogConfig {
     pub sources: Vec<ModelCatalogSourceConfig>,
     /// Bounds shared by fetch, parse, merge, and publication.
     pub refresh: CatalogRefreshConfig,
+    /// Per-model overrides applied after the merge, keyed by public model ID.
+    ///
+    /// These are the operator's last word: they withhold a discovered model,
+    /// rename it, or restate its capabilities and request-shaping facts
+    /// regardless of what the provider reported.
+    pub overrides: Vec<pooler_model_catalog::ModelOverrideConfig>,
 }
 
 /// Provider response parser selected for one catalog source.
@@ -1883,6 +1889,7 @@ impl ModelPlan {
 pub struct ModelCatalogPlan {
     limits: pooler_model_catalog::RefreshLimits,
     sources: Vec<ModelCatalogSourcePlan>,
+    overrides: pooler_model_catalog::ModelOverrides,
 }
 
 impl ModelCatalogPlan {
@@ -1896,6 +1903,12 @@ impl ModelCatalogPlan {
     #[must_use]
     pub fn sources(&self) -> &[ModelCatalogSourcePlan] {
         &self.sources
+    }
+
+    /// Per-model operator overrides applied after every merge.
+    #[must_use]
+    pub const fn overrides(&self) -> &pooler_model_catalog::ModelOverrides {
+        &self.overrides
     }
 }
 
@@ -4021,6 +4034,7 @@ fn compile_catalog(
             })
             .collect(),
         refresh: declaration.refresh.clone(),
+        overrides: declaration.overrides.clone(),
     }
     .compile()
     .map_err(|error| invalid(&catalog_label, &error.to_string()))?;
@@ -4122,6 +4136,7 @@ fn compile_catalog(
     Ok(Some(ModelCatalogPlan {
         limits: policy.limits(),
         sources,
+        overrides: policy.overrides().clone(),
     }))
 }
 
@@ -5610,6 +5625,76 @@ routes:
         assert!(
             azure.to_string().contains("known_provider `azure`"),
             "{azure}"
+        );
+    }
+
+    #[test]
+    fn an_operator_can_withhold_and_reshape_discovered_models() {
+        let text = "\
+version: 1
+listeners: {l: {bind: 127.0.0.1:1}}
+upstreams: {openai: {known_provider: openai}}
+catalog:
+  sources:
+    - id: openai.primary
+      provider: openai
+      parser: openai
+  overrides:
+    - model: gpt-4o
+      disabled: true
+    - model: o3
+      display_name: Reasoner
+      capabilities: [text, reasoning]
+      dialect:
+        temperature: rejected
+";
+        let config = compile_yaml("overrides.yaml", text).expect("overrides compile");
+        let overrides = config.catalog().expect("catalog is configured").overrides();
+
+        assert_eq!(overrides.len(), 2);
+        let withheld = overrides
+            .get(&pooler_core::ModelId::new("gpt-4o").expect("model id"))
+            .expect("withheld model is overridden");
+        assert!(withheld.disabled());
+
+        let reshaped = overrides
+            .get(&pooler_core::ModelId::new("o3").expect("model id"))
+            .expect("reshaped model is overridden");
+        assert!(!reshaped.disabled());
+        assert_eq!(reshaped.display_name(), Some("Reasoner"));
+        assert_eq!(
+            reshaped.capabilities(),
+            Some(
+                [Capability::Text, Capability::Reasoning]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        assert_eq!(
+            reshaped.dialect().map(|dialect| dialect.temperature),
+            Some(pooler_core::ParamSupport::Rejected)
+        );
+    }
+
+    #[test]
+    fn an_override_that_declares_no_change_is_rejected() {
+        let text = "\
+version: 1
+listeners: {l: {bind: 127.0.0.1:1}}
+upstreams: {openai: {known_provider: openai}}
+catalog:
+  sources:
+    - id: openai.primary
+      provider: openai
+      parser: openai
+  overrides:
+    - model: gpt-4o
+";
+        let error = compile_yaml("empty-override.yaml", text)
+            .expect_err("an override that changes nothing is reported");
+        assert!(
+            error.to_string().contains("declares no change"),
+            "unexpected error: {error}"
         );
     }
 

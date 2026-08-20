@@ -9,16 +9,23 @@
 //! model that rejects `temperature`, come from the vendored [`ModelFacts`]
 //! snapshot rather than from adapter code. Where a provider can be reached at
 //! all comes from [`ProviderCatalog`], a table of base URLs this crate owns.
+//!
+//! What an operator wants exposed is theirs to decide, so [`ModelOverrides`]
+//! are applied last and outrank every discovered and vendored fact.
 
 #![forbid(unsafe_code)]
 
 mod model_facts;
+mod overrides;
 mod provider_catalog;
 
 pub use model_facts::{
     ModelFacts, ModelFactsError, MAX_MODEL_FACTS_BYTES, MAX_MODEL_FACT_ENTRIES,
     MAX_MODEL_FACT_KEY_BYTES, MAX_UPSTREAM_CATALOG_BYTES, MODELS_DEV_CATALOG_URL,
     MODEL_FACTS_SCHEMA_VERSION,
+};
+pub use overrides::{
+    ModelOverride, ModelOverrideConfig, ModelOverrides, OverrideState, MAX_MODEL_OVERRIDES,
 };
 pub use provider_catalog::{
     KnownProvider, ProviderCatalog, ProviderCatalogError, MAX_PROVIDER_CATALOG_BYTES,
@@ -124,6 +131,8 @@ pub struct CatalogConfig {
     pub sources: Vec<CatalogSourceConfig>,
     /// Bounds applied to every refresh.
     pub refresh: RefreshConfig,
+    /// Per-model operator overrides applied after the merge.
+    pub overrides: Vec<ModelOverrideConfig>,
 }
 
 impl CatalogConfig {
@@ -151,7 +160,12 @@ impl CatalogConfig {
                 });
             }
         }
-        Ok(CompiledCatalogConfig { limits, sources })
+        let overrides = ModelOverrides::compile(self.overrides)?;
+        Ok(CompiledCatalogConfig {
+            limits,
+            sources,
+            overrides,
+        })
     }
 }
 
@@ -413,6 +427,7 @@ impl RefreshLimits {
 pub struct CompiledCatalogConfig {
     limits: RefreshLimits,
     sources: Vec<CatalogSource>,
+    overrides: ModelOverrides,
 }
 
 impl CompiledCatalogConfig {
@@ -426,6 +441,12 @@ impl CompiledCatalogConfig {
     #[must_use]
     pub fn sources(&self) -> &[CatalogSource] {
         &self.sources
+    }
+
+    /// Operator overrides applied after every merge.
+    #[must_use]
+    pub const fn overrides(&self) -> &ModelOverrides {
+        &self.overrides
     }
 }
 
@@ -900,6 +921,7 @@ pub struct CatalogSnapshot {
     refreshed_at_unix_ms: u64,
     models: BTreeMap<ModelId, CatalogModel>,
     sources: BTreeMap<SourceId, CatalogSourceState>,
+    overrides: OverrideState,
 }
 
 impl CatalogSnapshot {
@@ -909,6 +931,7 @@ impl CatalogSnapshot {
             refreshed_at_unix_ms: 0,
             models: BTreeMap::new(),
             sources: BTreeMap::new(),
+            overrides: OverrideState::default(),
         }
     }
 
@@ -942,6 +965,12 @@ impl CatalogSnapshot {
         &self.sources
     }
 
+    /// What the declared operator overrides did to this snapshot.
+    #[must_use]
+    pub const fn overrides(&self) -> &OverrideState {
+        &self.overrides
+    }
+
     /// Number of provider/upstream targets across public models.
     #[must_use]
     pub fn target_count(&self) -> usize {
@@ -958,6 +987,7 @@ pub fn merge_discoveries(
     refreshed_at_unix_ms: u64,
     mut inputs: Vec<CatalogInput>,
     limits: RefreshLimits,
+    overrides: &ModelOverrides,
 ) -> Result<CatalogSnapshot, CatalogError> {
     if inputs.len() > limits.max_sources {
         return Err(CatalogError::SourceLimitExceeded {
@@ -1128,11 +1158,13 @@ pub fn merge_discoveries(
             compile_public_model(public_id, public_candidates)?,
         );
     }
+    let (models, overrides) = overrides.apply_all(models);
     Ok(CatalogSnapshot {
         generation,
         refreshed_at_unix_ms,
         models,
         sources: source_states,
+        overrides,
     })
 }
 
@@ -1371,6 +1403,7 @@ impl fmt::Debug for RegisteredSource {
 pub struct CatalogService {
     sources: Vec<RegisteredSource>,
     limits: RefreshLimits,
+    overrides: Arc<ModelOverrides>,
     snapshot: ArcSwap<CatalogSnapshot>,
     refresh_gate: Arc<Semaphore>,
 }
@@ -1399,9 +1432,23 @@ impl CatalogService {
         Ok(Self {
             sources,
             limits,
+            overrides: Arc::new(ModelOverrides::default()),
             snapshot: ArcSwap::from_pointee(CatalogSnapshot::empty()),
             refresh_gate: Arc::new(Semaphore::new(1)),
         })
+    }
+
+    /// Apply operator overrides to every subsequent refresh.
+    #[must_use]
+    pub fn with_overrides(mut self, overrides: ModelOverrides) -> Self {
+        self.overrides = Arc::new(overrides);
+        self
+    }
+
+    /// Overrides applied to every refresh.
+    #[must_use]
+    pub fn overrides(&self) -> &ModelOverrides {
+        &self.overrides
     }
 
     /// Load the immutable current snapshot without blocking refresh work.
@@ -1456,8 +1503,9 @@ impl CatalogService {
             });
         }
         let limits = self.limits;
+        let overrides = Arc::clone(&self.overrides);
         let merge = tokio::task::spawn_blocking(move || {
-            merge_discoveries(generation, observed_at_unix_ms, inputs, limits)
+            merge_discoveries(generation, observed_at_unix_ms, inputs, limits, &overrides)
         });
         let candidate = tokio::time::timeout_at(deadline, merge)
             .await
@@ -1589,6 +1637,21 @@ pub enum CatalogError {
     /// Invalid source prefix.
     #[error("catalog source {source_id} has invalid prefix {prefix:?}")]
     InvalidPrefix { source_id: SourceId, prefix: String },
+    /// Invalid overridden model identifier.
+    #[error("invalid model override id: {message}")]
+    InvalidOverrideModel { message: String },
+    /// Overridden display name is empty, too long, or has control characters.
+    #[error("model override {model} has an invalid display name")]
+    InvalidOverrideDisplayName { model: ModelId },
+    /// Override declaring no change.
+    #[error("model override {model} declares no change")]
+    EmptyOverride { model: ModelId },
+    /// Duplicate override for one public model.
+    #[error("model {model} is overridden more than once")]
+    DuplicateOverride { model: ModelId },
+    /// Too many overrides in one catalog.
+    #[error("catalog has {actual} model overrides; maximum is {maximum}")]
+    OverrideLimitExceeded { actual: usize, maximum: usize },
     /// Invalid alias declaration.
     #[error("catalog source {source_id} has an invalid alias: {message}")]
     InvalidAlias {

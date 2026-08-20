@@ -30,6 +30,11 @@ pub fn config_schema() -> Value {
     definitions.insert("catalog_alias".to_owned(), catalog_alias_schema());
     definitions.insert("catalog_refresh".to_owned(), catalog_refresh_schema());
     definitions.insert("catalog_source".to_owned(), catalog_source_schema());
+    definitions.insert(
+        "catalog_model_override".to_owned(),
+        catalog_model_override_schema(),
+    );
+    definitions.insert("model_dialect".to_owned(), model_dialect_schema());
     definitions.insert("cooldown".to_owned(), cooldown_schema());
     definitions.insert("duration".to_owned(), duration_schema());
     definitions.insert("extension".to_owned(), extension_schema());
@@ -148,8 +153,48 @@ fn catalog_schema() -> Value {
                 ),
             ),
             ("refresh", optional(reference("catalog_refresh"))),
+            (
+                "overrides",
+                array_schema(
+                    reference("catalog_model_override"),
+                    Some(0),
+                    Some(pooler_model_catalog::MAX_MODEL_OVERRIDES as u64),
+                ),
+            ),
         ]),
         &["sources"],
+        false,
+    )
+}
+
+fn catalog_model_override_schema() -> Value {
+    object_schema(
+        properties([
+            ("model", string_schema()),
+            ("disabled", optional(boolean_schema())),
+            ("display_name", optional(string_schema())),
+            (
+                "capabilities",
+                optional(array_schema(
+                    string_enum(Capability::ALL.map(Capability::as_str)),
+                    Some(0),
+                    None,
+                )),
+            ),
+            ("dialect", optional(reference("model_dialect"))),
+        ]),
+        &["model"],
+        false,
+    )
+}
+
+fn model_dialect_schema() -> Value {
+    object_schema(
+        properties([(
+            "temperature",
+            optional(string_enum(["accepted", "rejected"])),
+        )]),
+        &[],
         false,
     )
 }

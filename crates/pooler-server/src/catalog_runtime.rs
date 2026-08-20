@@ -203,7 +203,8 @@ impl CatalogRuntime {
             ));
             sources.push(RegisteredSource::new(source.source().clone(), discovery));
         }
-        let service = CatalogService::new(sources, plan.limits())?;
+        let service =
+            CatalogService::new(sources, plan.limits())?.with_overrides(plan.overrides().clone());
         Ok(Self {
             plan,
             service: Arc::new(service),
@@ -634,6 +635,10 @@ pub fn merged_model_catalog_value(
             .map_or(0, CatalogSnapshot::refreshed_at_unix_ms),
         "models": models.into_values().collect::<Vec<_>>(),
         "catalog_sources": catalog_sources,
+        "model_overrides": snapshot.as_deref().map_or_else(
+            || json!({"disabled_models": [], "unmatched_models": []}),
+            |snapshot| json!(snapshot.overrides()),
+        ),
     })
 }
 

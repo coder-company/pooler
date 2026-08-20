@@ -193,6 +193,14 @@
     "catalog": {
       "additionalProperties": false,
       "properties": {
+        "overrides": {
+          "items": {
+            "$ref": "#/$defs/catalog_model_override"
+          },
+          "maxItems": 1024,
+          "minItems": 0,
+          "type": "array"
+        },
         "refresh": {
           "$ref": "#/$defs/catalog_refresh"
         },
@@ -232,6 +240,64 @@
       "required": [
         "name",
         "alias"
+      ],
+      "type": "object"
+    },
+    "catalog_model_override": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "items": {
+            "enum": [
+              "text",
+              "images",
+              "audio",
+              "files",
+              "tools",
+              "reasoning",
+              "streaming",
+              "usage",
+              "structured_output",
+              "json_schema",
+              "function_calling",
+              "tool_choice",
+              "cache_hints",
+              "continuation",
+              "response_metadata",
+              "encrypted_reasoning",
+              "refusal",
+              "error_events",
+              "input_audio",
+              "output_audio",
+              "code_execution",
+              "computer_use",
+              "batch",
+              "embeddings",
+              "sse",
+              "web_socket",
+              "connect_rpc",
+              "protobuf"
+            ],
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "dialect": {
+          "$ref": "#/$defs/model_dialect"
+        },
+        "disabled": {
+          "type": "boolean"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "model"
       ],
       "type": "object"
     },
@@ -753,6 +819,19 @@
       "required": [
         "id"
       ],
+      "type": "object"
+    },
+    "model_dialect": {
+      "additionalProperties": false,
+      "properties": {
+        "temperature": {
+          "enum": [
+            "accepted",
+            "rejected"
+          ],
+          "type": "string"
+        }
+      },
       "type": "object"
     },
     "model_target": {

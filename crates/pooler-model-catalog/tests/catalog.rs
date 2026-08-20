@@ -1,7 +1,7 @@
 use pooler_core::{Capability, CapabilitySet, ModelDialect, ModelId};
 use pooler_model_catalog::{
     merge_discoveries, AliasConfig, CatalogConfig, CatalogError, CatalogInput, CatalogSourceConfig,
-    DiscoveredModel, DiscoveryResponse, RefreshConfig,
+    DiscoveredModel, DiscoveryResponse, ModelOverrideConfig, ModelOverrides, RefreshConfig,
 };
 
 fn model(id: &str, capabilities: &[Capability]) -> DiscoveredModel {
@@ -19,6 +19,14 @@ fn limits() -> pooler_model_catalog::RefreshLimits {
     RefreshConfig::default()
         .compile()
         .expect("default limits compile")
+}
+
+fn no_overrides() -> ModelOverrides {
+    ModelOverrides::default()
+}
+
+fn overrides(declarations: Vec<ModelOverrideConfig>) -> ModelOverrides {
+    ModelOverrides::compile(declarations).expect("valid test overrides")
 }
 
 #[test]
@@ -100,6 +108,7 @@ fn merge_applies_exclusions_aliases_forks_prefixes_and_provenance() {
             openai_input.clone(),
         ],
         limits(),
+        &no_overrides(),
     )
     .expect("catalog merges");
     let reverse = merge_discoveries(
@@ -107,6 +116,7 @@ fn merge_applies_exclusions_aliases_forks_prefixes_and_provenance() {
         1_700_000_000_123,
         vec![openai_input, anthropic_input, xai_input],
         limits(),
+        &no_overrides(),
     )
     .expect("catalog merge is input-order independent");
     assert_eq!(forward, reverse);
@@ -147,6 +157,92 @@ fn merge_applies_exclusions_aliases_forks_prefixes_and_provenance() {
 }
 
 #[test]
+fn an_operator_override_outranks_every_discovered_fact() {
+    let discovered = source(CatalogSourceConfig {
+        id: "openai.primary".to_owned(),
+        provider: "openai".to_owned(),
+        ..CatalogSourceConfig::default()
+    });
+    let input = CatalogInput::new(
+        discovered,
+        DiscoveryResponse::new(vec![
+            model("keep-me", &[Capability::Text]),
+            model("hide-me", &[Capability::Text]),
+            model("reshape-me", &[Capability::Text]),
+        ]),
+    );
+
+    let snapshot = merge_discoveries(
+        1,
+        1,
+        vec![input],
+        limits(),
+        &overrides(vec![
+            ModelOverrideConfig {
+                model: "hide-me".to_owned(),
+                disabled: true,
+                ..ModelOverrideConfig::default()
+            },
+            ModelOverrideConfig {
+                model: "reshape-me".to_owned(),
+                display_name: Some("Reshaped".to_owned()),
+                capabilities: Some(
+                    [Capability::Text, Capability::Reasoning]
+                        .into_iter()
+                        .collect(),
+                ),
+                dialect: Some(ModelDialect::new().rejecting_temperature()),
+                ..ModelOverrideConfig::default()
+            },
+            ModelOverrideConfig {
+                model: "never-served".to_owned(),
+                disabled: true,
+                ..ModelOverrideConfig::default()
+            },
+        ]),
+    )
+    .expect("merge succeeds");
+
+    // A disabled model leaves the catalog entirely, so nothing can route to it.
+    assert!(snapshot.get("hide-me").is_none());
+    assert_eq!(
+        snapshot.overrides().disabled_models(),
+        &[ModelId::new("hide-me").expect("model id")]
+    );
+
+    // An untouched model is unaffected by its neighbours being overridden.
+    let kept = snapshot
+        .get("keep-me")
+        .expect("unoverridden model survives");
+    assert_eq!(
+        kept.targets()[0].capabilities(),
+        [Capability::Text].into_iter().collect::<CapabilitySet>()
+    );
+
+    // The operator adds a capability no provider reported, which the merge's
+    // intersection rule could never have produced on its own.
+    let reshaped = snapshot.get("reshape-me").expect("overridden model");
+    assert_eq!(reshaped.display_name(), Some("Reshaped"));
+    assert_eq!(
+        reshaped.targets()[0].capabilities(),
+        [Capability::Text, Capability::Reasoning]
+            .into_iter()
+            .collect::<CapabilitySet>()
+    );
+    assert_eq!(
+        reshaped.targets()[0].dialect(),
+        ModelDialect::new().rejecting_temperature()
+    );
+
+    // An override for a model no provider serves is reported rather than
+    // failing the refresh, since a model can vanish upstream at any time.
+    assert_eq!(
+        snapshot.overrides().unmatched_models(),
+        &[ModelId::new("never-served").expect("model id")]
+    );
+}
+
+#[test]
 fn merged_target_intersects_capabilities_but_adopts_one_source_dialect() {
     let strict = source(CatalogSourceConfig {
         id: "openai.strict".to_owned(),
@@ -174,7 +270,8 @@ fn merged_target_intersects_capabilities_but_adopts_one_source_dialect() {
         vec![strict.clone(), permissive.clone()],
         vec![permissive, strict],
     ] {
-        let snapshot = merge_discoveries(1, 1, inputs, limits()).expect("merge succeeds");
+        let snapshot =
+            merge_discoveries(1, 1, inputs, limits(), &no_overrides()).expect("merge succeeds");
         let merged = snapshot.get("gpt-x").expect("merged model");
         let target = &merged.targets()[0];
 
@@ -226,9 +323,15 @@ fn same_provider_public_mapping_conflict_is_deterministic() {
         pooler_model_catalog::DiscoveryResponse::new(vec![model("gpt-old", &[Capability::Text])]),
     );
 
-    let first = merge_discoveries(1, 1, vec![lower.clone(), higher.clone()], limits())
-        .expect_err("ambiguous provider mapping is rejected");
-    let second = merge_discoveries(1, 1, vec![higher, lower], limits())
+    let first = merge_discoveries(
+        1,
+        1,
+        vec![lower.clone(), higher.clone()],
+        limits(),
+        &no_overrides(),
+    )
+    .expect_err("ambiguous provider mapping is rejected");
+    let second = merge_discoveries(1, 1, vec![higher, lower], limits(), &no_overrides())
         .expect_err("input order cannot change the conflict");
     assert_eq!(first, second);
     match first {
@@ -331,6 +434,7 @@ fn response_model_count_is_bounded_before_publication() {
             ]),
         )],
         limits,
+        &no_overrides(),
     )
     .expect_err("oversized response must fail");
     assert!(matches!(
@@ -364,6 +468,7 @@ fn inclusion_policy_runs_before_exclusions_and_is_auditable() {
             ]),
         )],
         limits(),
+        &no_overrides(),
     )
     .expect("catalog merges");
 
@@ -406,6 +511,7 @@ fn merge_work_is_rejected_before_rule_evaluation() {
             )]),
         )],
         limits,
+        &no_overrides(),
     )
     .expect_err("rule work over budget must fail before publication");
     assert!(matches!(

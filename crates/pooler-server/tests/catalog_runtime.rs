@@ -232,6 +232,99 @@ catalog:
 }
 
 #[tokio::test]
+async fn operator_overrides_withhold_and_reshape_published_models() {
+    let config = pooler_config::compile_yaml(
+        "catalog-overrides.yaml",
+        r#"
+version: 1
+management: {bind: 127.0.0.1:0}
+upstreams:
+  openai: {url: http://127.0.0.1:1}
+catalog:
+  sources:
+    - {id: openai.primary, provider: openai, parser: open_ai}
+  overrides:
+    - {model: gpt-4o, disabled: true}
+    - model: gpt-image-1.5
+      display_name: Image Model
+      capabilities: [text, reasoning]
+      dialect: {temperature: accepted}
+    - {model: never-served, disabled: true}
+"#,
+    )
+    .expect("override config");
+    let body =
+        br#"{"data":[{"id":"gpt-image-1.5"},{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}"#.as_slice();
+    let provider = Arc::new(FakeProvider::new([Ok(FetchedCatalog::new(body, None))]));
+    let runtime = CatalogRuntime::with_fetchers(
+        config.catalog().expect("catalog plan").clone(),
+        vec![CatalogFetcherRegistration::new("openai.primary", provider).expect("registration")],
+    )
+    .expect("runtime");
+    runtime.refresh().await.expect("refresh");
+    let snapshot = runtime.snapshot();
+
+    // A withheld model is absent from the published catalog, so no request can
+    // resolve a target for it.
+    assert!(
+        snapshot.get("gpt-4o").is_none(),
+        "a disabled model must not be published"
+    );
+    assert!(
+        snapshot.get("gpt-4o-mini").is_some(),
+        "disabling one model must not withhold its neighbours"
+    );
+    assert_eq!(
+        snapshot
+            .overrides()
+            .disabled_models()
+            .iter()
+            .map(|model| model.as_str())
+            .collect::<Vec<_>>(),
+        ["gpt-4o"]
+    );
+    assert_eq!(
+        snapshot
+            .overrides()
+            .unmatched_models()
+            .iter()
+            .map(|model| model.as_str())
+            .collect::<Vec<_>>(),
+        ["never-served"],
+        "an override matching nothing is reported instead of failing the refresh"
+    );
+
+    // The operator's dialect outranks the vendored snapshot, which records this
+    // model as rejecting temperature.
+    let reshaped = snapshot.get("gpt-image-1.5").expect("reshaped model");
+    assert_eq!(reshaped.display_name(), Some("Image Model"));
+    assert!(
+        reshaped.targets()[0].dialect().is_default(),
+        "an operator dialect must outrank the vendored request facts"
+    );
+    assert!(reshaped.targets()[0]
+        .capabilities()
+        .contains(pooler_core::Capability::Reasoning));
+
+    let view = pooler_server::merged_model_catalog_value(&config, Some(&runtime));
+    let ids = view["models"]
+        .as_array()
+        .expect("model array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id"))
+        .collect::<Vec<_>>();
+    assert!(
+        !ids.contains(&"gpt-4o"),
+        "the model view must not advertise a withheld model"
+    );
+    assert_eq!(view["model_overrides"]["disabled_models"][0], "gpt-4o");
+    assert_eq!(
+        view["model_overrides"]["unmatched_models"][0],
+        "never-served"
+    );
+}
+
+#[tokio::test]
 async fn injected_fetcher_output_is_rechecked_against_the_source_body_bound() {
     let config = pooler_config::compile_yaml(
         "catalog-bound.yaml",
