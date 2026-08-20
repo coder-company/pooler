@@ -25,7 +25,7 @@ hyper-rustls = { version = "=0.27.9", default-features = false, features = ["htt
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "server-auto", "tokio"] }
 indexmap = { version = "=2.14.0", features = ["serde"] }
 keyring = { version = "=3.6.3", default-features = false }
-prost = "0.13"
+prost = "0.14"
 prost-build = "0.13"
 prost-types = "0.13"
 protoc-bin-vendored = "3"

@@ -36,7 +36,7 @@ tracing.workspace = true
 [dev-dependencies]
 futures-util.workspace = true
 pooler-testkit = { path = "../pooler-testkit" }
-prost = "0.13"
+prost = "0.14"
 serde.workspace = true
 tokio-tungstenite.workspace = true
 wat.workspace = true
