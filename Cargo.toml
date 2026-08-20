@@ -45,7 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.12", features = ["serde", "v4"] }
-wasmtime = { version = "=36.0.13", default-features = false, features = ["cranelift", "runtime", "wat"] }
+wasmtime = { version = "=38.0.4", default-features = false, features = ["cranelift", "runtime", "wat"] }
 wat = "1.226.0"
 zeroize = "=1.8.1"
 
