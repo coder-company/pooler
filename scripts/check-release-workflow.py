@@ -375,14 +375,26 @@ def validate_release(path: Path, workflows: dict[str, dict[str, Any]]) -> None:
         hardening_jobs["sanitizer"], "hardening.yml.jobs.sanitizer"
     ):
         fail("hardening.yml sanitizer job must run scripts/deep-test.sh")
-    gitleaks_step = find_step(
+    install_gitleaks = find_step(
         secret_jobs["gitleaks"],
         lambda step: isinstance(step.get("uses"), str)
-        and step["uses"].startswith("gitleaks/gitleaks-action@"),
+        and step["uses"].startswith("taiki-e/install-action@")
+        and isinstance(step.get("with"), dict)
+        and str(step["with"].get("tool", "")).startswith("gitleaks@"),
         "secret-scan.yml.jobs.gitleaks",
     )
-    if not isinstance(gitleaks_step.get("env"), dict) or "GITLEAKS_CONFIG" not in gitleaks_step["env"]:
-        fail("secret-scan.yml gitleaks job must use the repository configuration")
+    if not install_gitleaks:
+        fail("secret-scan.yml must install a pinned Gitleaks CLI")
+    gitleaks_step = find_step(
+        secret_jobs["gitleaks"],
+        lambda step: isinstance(step.get("run"), str)
+        and "gitleaks git" in step["run"]
+        and ".gitleaks.toml" in step["run"]
+        and "--redact" in step["run"],
+        "secret-scan.yml.jobs.gitleaks",
+    )
+    if not gitleaks_step:
+        fail("secret-scan.yml must scan Git history with the repository config")
 
 
 def parse_args() -> argparse.Namespace:
