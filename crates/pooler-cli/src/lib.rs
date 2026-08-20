@@ -11,9 +11,11 @@ use pooler_http::{NativeRuntime, PoolingCoordinator};
 use pooler_store::{SqliteOAuthTokenStore, SqliteStore};
 
 mod auth;
+mod catalog;
 mod doctor;
 mod fixture_replay;
 pub use auth::{AuthCommand, AuthLoginMethod, OAuthEncodingArgument, OAuthOverrideArgs};
+pub use catalog::{CatalogCommand, VENDORED_MODEL_FACTS_PATH};
 
 /// Top-level command-line arguments.
 #[derive(Debug, Parser)]
@@ -61,6 +63,12 @@ pub enum Command {
         /// Emit merged targets, source policy, and provenance as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Maintain the vendored per-model request-facts snapshot.
+    Catalog {
+        /// Catalog data operation.
+        #[command(subcommand)]
+        command: CatalogCommand,
     },
     /// Inspect and replay sanitized compatibility fixtures.
     Fixture {
@@ -190,6 +198,7 @@ pub fn run(cli: Cli) -> Result<()> {
             cli.credential_key_ref.as_deref(),
             json,
         ),
+        Command::Catalog { command } => catalog::run(command),
         Command::Fixture { command } => fixture_replay::run(command),
         Command::Auth { command } => auth::run(
             command,

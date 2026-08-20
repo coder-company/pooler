@@ -1,0 +1,4364 @@
+{
+  "schema_version": 1,
+  "source_url": "https://models.dev/api.json",
+  "source_sha256": "da57b8e4281fd65d725ef7f2f73f681d052848c07737c4aaa1c707d91ad26e33",
+  "upstream_model_count": 6845,
+  "providers": {
+    "302ai": {
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-chat-latest": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-chat-latest": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini-2026-03-17": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano-2026-03-17": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-pro": {
+        "temperature": "rejected"
+      }
+    },
+    "abacus": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-chat-latest": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex-xhigh": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "moonshotai/Kimi-K2.7-Code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/Kimi-K3": {
+        "temperature": "rejected"
+      },
+      "o3": {
+        "temperature": "rejected"
+      },
+      "o3-mini": {
+        "temperature": "rejected"
+      },
+      "o3-pro": {
+        "temperature": "rejected"
+      },
+      "o4-mini": {
+        "temperature": "rejected"
+      }
+    },
+    "ai-router": {
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      }
+    },
+    "aiand": {
+      "moonshotai/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "motif-technologies/motif-3": {
+        "temperature": "rejected"
+      }
+    },
+    "aihubmix": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7-think": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8-think": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.6": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code-highspeed": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "aki-io": {
+      "kimi-k2.7-code-1100b": {
+        "temperature": "rejected"
+      }
+    },
+    "alibaba": {
+      "qwen3-asr-flash": {
+        "temperature": "rejected"
+      }
+    },
+    "alibaba-cn": {
+      "kimi/kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "qwen3-asr-flash": {
+        "temperature": "rejected"
+      }
+    },
+    "alibaba-token-plan": {
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      }
+    },
+    "alibaba-token-plan-cn": {
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      }
+    },
+    "amazon-bedrock": {
+      "anthropic.claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic.claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "anthropic.claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "anthropic.claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "anthropic.claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "au.anthropic.claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "au.anthropic.claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "au.anthropic.claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "eu.anthropic.claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "eu.anthropic.claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "eu.anthropic.claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "eu.anthropic.claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "eu.anthropic.claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "global.anthropic.claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "global.anthropic.claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "global.anthropic.claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "global.anthropic.claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "global.anthropic.claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "global.openai.gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "global.openai.gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "global.openai.gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "jp.anthropic.claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "jp.anthropic.claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "jp.anthropic.claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "jp.anthropic.claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "openai.gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai.gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai.gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai.gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai.gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "us.anthropic.claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "us.anthropic.claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "us.anthropic.claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "us.anthropic.claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "us.anthropic.claude-sonnet-5": {
+        "temperature": "rejected"
+      }
+    },
+    "anthropic": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      }
+    },
+    "anyapi": {
+      "anthropic/claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      }
+    },
+    "auriko": {
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.5": {
+        "temperature": "rejected"
+      }
+    },
+    "azure": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-mythos-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "codex-mini": {
+        "temperature": "rejected"
+      },
+      "cohere-embed-v-4-0": {
+        "temperature": "rejected"
+      },
+      "cohere-embed-v3-english": {
+        "temperature": "rejected"
+      },
+      "cohere-embed-v3-multilingual": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "gpt-chat-latest": {
+        "temperature": "rejected"
+      },
+      "gpt-image-1": {
+        "temperature": "rejected"
+      },
+      "gpt-image-1.5": {
+        "temperature": "rejected"
+      },
+      "gpt-image-2": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "o1": {
+        "temperature": "rejected"
+      },
+      "o3": {
+        "temperature": "rejected"
+      },
+      "o3-mini": {
+        "temperature": "rejected"
+      },
+      "o4-mini": {
+        "temperature": "rejected"
+      }
+    },
+    "azure-cognitive-services": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-mythos-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "codex-mini": {
+        "temperature": "rejected"
+      },
+      "cohere-embed-v-4-0": {
+        "temperature": "rejected"
+      },
+      "cohere-embed-v3-english": {
+        "temperature": "rejected"
+      },
+      "cohere-embed-v3-multilingual": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "gpt-chat-latest": {
+        "temperature": "rejected"
+      },
+      "o1": {
+        "temperature": "rejected"
+      },
+      "o3": {
+        "temperature": "rejected"
+      },
+      "o3-mini": {
+        "temperature": "rejected"
+      },
+      "o4-mini": {
+        "temperature": "rejected"
+      }
+    },
+    "berget": {
+      "moonshotai/Kimi-K3": {
+        "temperature": "rejected"
+      }
+    },
+    "cline-pass": {
+      "cline-pass/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "cline-pass/kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "cloudflare-ai-gateway": {
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.8": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-chat-latest": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex-spark": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "openai/o1": {
+        "temperature": "rejected"
+      },
+      "openai/o1-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o3-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      }
+    },
+    "coralbricks": {
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "cortecs": {
+      "apertus-70b": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus4-8": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "cosmos3-super-reasoner": {
+        "temperature": "rejected"
+      },
+      "gemma-3-27b-it": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "hermes-4-405b": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      },
+      "llama-3.1-8b-instruct": {
+        "temperature": "rejected"
+      },
+      "llama-3.1-nemotron-ultra-253b-v1": {
+        "temperature": "rejected"
+      },
+      "minicpm-v-4.5": {
+        "temperature": "rejected"
+      },
+      "ministral-14b-2512": {
+        "temperature": "rejected"
+      },
+      "ministral-3b-2512": {
+        "temperature": "rejected"
+      },
+      "ministral-8b-2512": {
+        "temperature": "rejected"
+      },
+      "mistral-7b-instruct-v0.2": {
+        "temperature": "rejected"
+      },
+      "mistral-7b-instruct-v0.3": {
+        "temperature": "rejected"
+      },
+      "mistral-large-2402": {
+        "temperature": "rejected"
+      },
+      "mistral-medium-2508": {
+        "temperature": "rejected"
+      },
+      "mistral-medium-3.5": {
+        "temperature": "rejected"
+      },
+      "mistral-nemo-instruct-2407": {
+        "temperature": "rejected"
+      },
+      "mistral-small-2503": {
+        "temperature": "rejected"
+      },
+      "mistral-small-3.2-24b-instruct-2506": {
+        "temperature": "rejected"
+      },
+      "nemotron-nano-v2-12b": {
+        "temperature": "rejected"
+      },
+      "nova-2-lite": {
+        "temperature": "rejected"
+      },
+      "nova-lite-v1": {
+        "temperature": "rejected"
+      },
+      "nova-micro-v1": {
+        "temperature": "rejected"
+      },
+      "nvidia-nemotron-3-nano-30b-a3b": {
+        "temperature": "rejected"
+      },
+      "nvidia-nemotron-3-nano-omni": {
+        "temperature": "rejected"
+      },
+      "pixtral-12b-2409": {
+        "temperature": "rejected"
+      },
+      "pixtral-large-2502": {
+        "temperature": "rejected"
+      },
+      "qwen2.5-vl-72b-instruct": {
+        "temperature": "rejected"
+      },
+      "qwen3-30b-a3b-instruct-2507": {
+        "temperature": "rejected"
+      },
+      "qwen3-vl-235b-a22b": {
+        "temperature": "rejected"
+      },
+      "qwen3guard-gen-0.6b": {
+        "temperature": "rejected"
+      },
+      "qwen3guard-gen-8b": {
+        "temperature": "rejected"
+      },
+      "voxtral-small-2507": {
+        "temperature": "rejected"
+      }
+    },
+    "crof": {
+      "kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.5-lightning": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      },
+      "kimi-k3-eco": {
+        "temperature": "rejected"
+      }
+    },
+    "crossmodel": {
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "moonshot/kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "moonshot/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "moonshot/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra": {
+        "temperature": "rejected"
+      }
+    },
+    "daoxe": {
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.5": {
+        "temperature": "rejected"
+      }
+    },
+    "databricks": {
+      "databricks-claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-1": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-2": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-4": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-4-mini": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-4-nano": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-5": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-6-luna": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-6-sol": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-6-terra": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "databricks-gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "databricks-kimi-k2-7-code": {
+        "temperature": "rejected"
+      }
+    },
+    "deepinfra": {
+      "moonshotai/Kimi-K2.7-Code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/Kimi-K3": {
+        "temperature": "rejected"
+      }
+    },
+    "digitalocean": {
+      "all-mini-lm-l6-v2": {
+        "temperature": "rejected"
+      },
+      "anthropic-claude-5-sonnet": {
+        "temperature": "rejected"
+      },
+      "anthropic-claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic-claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "anthropic-claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "bge-m3": {
+        "temperature": "rejected"
+      },
+      "bge-reranker-v2-m3": {
+        "temperature": "rejected"
+      },
+      "e5-large-v2": {
+        "temperature": "rejected"
+      },
+      "fal-ai/elevenlabs/tts/multilingual-v2": {
+        "temperature": "rejected"
+      },
+      "fal-ai/fast-sdxl": {
+        "temperature": "rejected"
+      },
+      "fal-ai/flux/schnell": {
+        "temperature": "rejected"
+      },
+      "fal-ai/stable-audio-25/text-to-audio": {
+        "temperature": "rejected"
+      },
+      "gte-large-en-v1.5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.6": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      },
+      "multi-qa-mpnet-base-dot-v1": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.2-pro": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-image-1": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-image-1.5": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-image-2": {
+        "temperature": "rejected"
+      },
+      "openai-o1": {
+        "temperature": "rejected"
+      },
+      "openai-o3": {
+        "temperature": "rejected"
+      },
+      "openai-o3-mini": {
+        "temperature": "rejected"
+      },
+      "qwen3-embedding-0.6b": {
+        "temperature": "rejected"
+      },
+      "qwen3-tts-voicedesign": {
+        "temperature": "rejected"
+      },
+      "stable-diffusion-3.5-large": {
+        "temperature": "rejected"
+      },
+      "wan2-2-t2v-a14b": {
+        "temperature": "rejected"
+      }
+    },
+    "edenai": {
+      "amazon/moonshotai.kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-fable-latest": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-latest": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-latest": {
+        "temperature": "rejected"
+      },
+      "azure/gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "azure/gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "azure/gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "azure/gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "deepinfra/moonshotai/Kimi-K2.5": {
+        "temperature": "rejected"
+      },
+      "moonshot/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "moonshot/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-latest": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-mini-latest": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-pro-latest": {
+        "temperature": "rejected"
+      },
+      "openai/o1": {
+        "temperature": "rejected"
+      },
+      "openai/o1-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o3-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      },
+      "perplexityai/sonar-deep-research": {
+        "temperature": "rejected"
+      },
+      "tensorx/moonshotai/kimi-k2.5": {
+        "temperature": "rejected"
+      }
+    },
+    "empiriolabs": {
+      "fugu-ultra-v1-0": {
+        "temperature": "rejected"
+      },
+      "fugu-ultra-v1-1": {
+        "temperature": "rejected"
+      },
+      "kimi-k2-7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k2-7-code-highspeed": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "fastrouter": {
+      "anthropic/claude-opus-4.8": {
+        "temperature": "rejected"
+      },
+      "bytedance/seedance-2": {
+        "temperature": "rejected"
+      },
+      "google/imagen-4.0-fast": {
+        "temperature": "rejected"
+      },
+      "google/imagen-4.0-ultra": {
+        "temperature": "rejected"
+      },
+      "google/veo3.1": {
+        "temperature": "rejected"
+      },
+      "google/veo3.1-fast": {
+        "temperature": "rejected"
+      },
+      "google/veo3.1-lite": {
+        "temperature": "rejected"
+      },
+      "leonardo-ai/lucid-origin": {
+        "temperature": "rejected"
+      },
+      "leonardo-ai/lucid-realism": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "wanx/wan-v2-6": {
+        "temperature": "rejected"
+      }
+    },
+    "fireworks-ai": {
+      "accounts/fireworks/models/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "accounts/fireworks/routers/kimi-k3-fast": {
+        "temperature": "rejected"
+      }
+    },
+    "freemodel": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      }
+    },
+    "frogbot": {
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "gpt-5-3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5-4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5-5": {
+        "temperature": "rejected"
+      }
+    },
+    "github-copilot": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4.8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "gitlab": {
+      "duo-chat-fable-5": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-1": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-2": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-2-codex": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-3-codex": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-4": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-4-mini": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-4-nano": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-5": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-6-luna": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-6-sol": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-6-terra": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "duo-chat-gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "duo-chat-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "duo-chat-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "duo-chat-opus-5": {
+        "temperature": "rejected"
+      },
+      "duo-chat-sonnet-5": {
+        "temperature": "rejected"
+      }
+    },
+    "gmicloud": {
+      "anthropic/claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.8": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.7-code-highspeed": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      }
+    },
+    "google": {
+      "gemini-embedding-001": {
+        "temperature": "rejected"
+      },
+      "gemini-embedding-2": {
+        "temperature": "rejected"
+      },
+      "veo-3.1-fast-generate-preview": {
+        "temperature": "rejected"
+      },
+      "veo-3.1-generate-preview": {
+        "temperature": "rejected"
+      },
+      "veo-3.1-lite-generate-preview": {
+        "temperature": "rejected"
+      }
+    },
+    "google-vertex": {
+      "claude-opus-4-7@default": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8@default": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5@default": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5@default": {
+        "temperature": "rejected"
+      },
+      "gemini-2.5-flash-tts": {
+        "temperature": "rejected"
+      },
+      "gemini-2.5-pro-tts": {
+        "temperature": "rejected"
+      },
+      "gemini-embedding-001": {
+        "temperature": "rejected"
+      }
+    },
+    "google-vertex-anthropic": {
+      "claude-opus-4-7@default": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8@default": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5@default": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5@default": {
+        "temperature": "rejected"
+      }
+    },
+    "greenpt": {
+      "green-s": {
+        "temperature": "rejected"
+      },
+      "green-s-pro": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "groq": {
+      "canopylabs/orpheus-arabic-saudi": {
+        "temperature": "rejected"
+      },
+      "canopylabs/orpheus-v1-english": {
+        "temperature": "rejected"
+      },
+      "meta-llama/llama-prompt-guard-2-22m": {
+        "temperature": "rejected"
+      },
+      "meta-llama/llama-prompt-guard-2-86m": {
+        "temperature": "rejected"
+      }
+    },
+    "helicone": {
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-chat-latest": {
+        "temperature": "rejected"
+      },
+      "gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-chat-latest": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "o1": {
+        "temperature": "rejected"
+      },
+      "o1-mini": {
+        "temperature": "rejected"
+      },
+      "o3": {
+        "temperature": "rejected"
+      },
+      "o3-mini": {
+        "temperature": "rejected"
+      },
+      "o3-pro": {
+        "temperature": "rejected"
+      },
+      "o4-mini": {
+        "temperature": "rejected"
+      }
+    },
+    "huggingface": {
+      "Qwen/Qwen3-Embedding-4B": {
+        "temperature": "rejected"
+      },
+      "Qwen/Qwen3-Embedding-8B": {
+        "temperature": "rejected"
+      },
+      "moonshotai/Kimi-K2.7-Code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/Kimi-K3": {
+        "temperature": "rejected"
+      }
+    },
+    "hyper": {
+      "kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "impossibl": {
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "openai/o1": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      }
+    },
+    "inference": {
+      "qwen/qwen3-embedding-4b": {
+        "temperature": "rejected"
+      }
+    },
+    "inferx": {
+      "Qwen3-Embedding-8B": {
+        "temperature": "rejected"
+      }
+    },
+    "infomaniak": {
+      "bge_multilingual_gemma2": {
+        "temperature": "rejected"
+      },
+      "mini_lm_l12_v2": {
+        "temperature": "rejected"
+      }
+    },
+    "jalapeno": {
+      "Kimi-K2.5": {
+        "temperature": "rejected"
+      },
+      "Kimi-K2.7-Code": {
+        "temperature": "rejected"
+      },
+      "Kimi-K3": {
+        "temperature": "rejected"
+      }
+    },
+    "kenari": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5-6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5-6-terra": {
+        "temperature": "rejected"
+      },
+      "gpt-image-2": {
+        "temperature": "rejected"
+      },
+      "kimi-k2-7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k2-7-code:free": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "kilo": {
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.7-fast": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.8-fast": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-5-fast": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-chat": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-image-2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-chat-latest": {
+        "temperature": "rejected"
+      },
+      "openai/o1": {
+        "temperature": "rejected"
+      },
+      "openai/o1-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini-high": {
+        "temperature": "rejected"
+      },
+      "openai/o3-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini-high": {
+        "temperature": "rejected"
+      },
+      "openrouter/pareto-code": {
+        "temperature": "rejected"
+      },
+      "relace/relace-apply-3": {
+        "temperature": "rejected"
+      },
+      "sakana/fugu-ultra": {
+        "temperature": "rejected"
+      },
+      "sakana/sakana-namazu": {
+        "temperature": "rejected"
+      },
+      "~anthropic/claude-fable-latest": {
+        "temperature": "rejected"
+      },
+      "~anthropic/claude-sonnet-latest": {
+        "temperature": "rejected"
+      },
+      "~openai/gpt-latest": {
+        "temperature": "rejected"
+      },
+      "~openai/gpt-mini-latest": {
+        "temperature": "rejected"
+      }
+    },
+    "kimi-for-coding": {
+      "k3": {
+        "temperature": "rejected"
+      },
+      "k3-256k": {
+        "temperature": "rejected"
+      },
+      "kimi-for-coding": {
+        "temperature": "rejected"
+      },
+      "kimi-for-coding-highspeed": {
+        "temperature": "rejected"
+      }
+    },
+    "llmgateway": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code-highspeed": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      },
+      "kimi-k3-fast": {
+        "temperature": "rejected"
+      },
+      "o1": {
+        "temperature": "rejected"
+      },
+      "o3": {
+        "temperature": "rejected"
+      },
+      "o3-mini": {
+        "temperature": "rejected"
+      },
+      "o4-mini": {
+        "temperature": "rejected"
+      }
+    },
+    "llmtr": {
+      "perplexity/sonar-deep-research": {
+        "temperature": "rejected"
+      },
+      "sakana/fugu-ultra": {
+        "temperature": "rejected"
+      }
+    },
+    "lucidquery": {
+      "lucidnova-rf1-100b": {
+        "temperature": "rejected"
+      },
+      "lucidquery-nexus-coder": {
+        "temperature": "rejected"
+      }
+    },
+    "merge-gateway": {
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "google/gemini-embedding-001": {
+        "temperature": "rejected"
+      },
+      "moonshot/kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "moonshot/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "moonshot/kimi-k2.7-code-highspeed": {
+        "temperature": "rejected"
+      },
+      "moonshot/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-chat-latest": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-chat-latest": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "openai/o1": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      },
+      "sakana/fugu-ultra": {
+        "temperature": "rejected"
+      }
+    },
+    "mistral": {
+      "mistral-embed": {
+        "temperature": "rejected"
+      },
+      "voxtral-mini-latest": {
+        "temperature": "rejected"
+      },
+      "voxtral-mini-tts-latest": {
+        "temperature": "rejected"
+      }
+    },
+    "modal": {
+      "moonshotai/Kimi-K3": {
+        "temperature": "rejected"
+      }
+    },
+    "model-oracle-ai": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4.8": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "o4-mini": {
+        "temperature": "rejected"
+      }
+    },
+    "modelis": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      }
+    },
+    "moonshotai": {
+      "kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code-highspeed": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "moonshotai-cn": {
+      "kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code-highspeed": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "morph": {
+      "auto": {
+        "temperature": "rejected"
+      },
+      "morph-v3-fast": {
+        "temperature": "rejected"
+      },
+      "morph-v3-large": {
+        "temperature": "rejected"
+      }
+    },
+    "nano-gpt": {
+      "TEE/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "TEE/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.7:thinking": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.8": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.8:thinking": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5:thinking": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.5:thinking": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.7-code-highspeed": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o1": {
+        "temperature": "rejected"
+      },
+      "openai/o1-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-deep-research": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini-deep-research": {
+        "temperature": "rejected"
+      },
+      "sakana/fugu-ultra": {
+        "temperature": "rejected"
+      },
+      "sonar-deep-research": {
+        "temperature": "rejected"
+      }
+    },
+    "nearai": {
+      "Qwen/Qwen3-Embedding-0.6B": {
+        "temperature": "rejected"
+      },
+      "Qwen/Qwen3-Reranker-0.6B": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/whisper-large-v3": {
+        "temperature": "rejected"
+      }
+    },
+    "nebius": {
+      "Qwen/Qwen3-Embedding-8B": {
+        "temperature": "rejected"
+      },
+      "moonshotai/Kimi-K2.7-Code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/Kimi-K3": {
+        "temperature": "rejected"
+      }
+    },
+    "neon": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "gemini-3-6-flash": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5-6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5-6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5-6-terra": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      }
+    },
+    "neuralwatt": {
+      "kimi-k2.7-code-flex": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      },
+      "kimi-k3-fast": {
+        "temperature": "rejected"
+      },
+      "moonshotai/Kimi-K2.7-Code": {
+        "temperature": "rejected"
+      }
+    },
+    "novita-ai": {
+      "moonshotai/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "nvidia": {
+      "baai/bge-m3": {
+        "temperature": "rejected"
+      },
+      "black-forest-labs/flux_1-kontext-dev": {
+        "temperature": "rejected"
+      },
+      "black-forest-labs/flux_1-schnell": {
+        "temperature": "rejected"
+      },
+      "nvidia/active-speaker-detection": {
+        "temperature": "rejected"
+      },
+      "nvidia/cosmos-predict1-5b": {
+        "temperature": "rejected"
+      },
+      "nvidia/cosmos-transfer1-7b": {
+        "temperature": "rejected"
+      },
+      "nvidia/cosmos-transfer2_5-2b": {
+        "temperature": "rejected"
+      },
+      "nvidia/llama-3.1-nemotron-safety-guard-8b-v3": {
+        "temperature": "rejected"
+      },
+      "nvidia/llama-3_2-nemoretriever-300m-embed-v1": {
+        "temperature": "rejected"
+      },
+      "nvidia/llama-nemotron-embed-vl-1b-v2": {
+        "temperature": "rejected"
+      },
+      "nvidia/llama-nemotron-rerank-vl-1b-v2": {
+        "temperature": "rejected"
+      },
+      "nvidia/magpie-tts-zeroshot": {
+        "temperature": "rejected"
+      },
+      "nvidia/nemotron-3-content-safety": {
+        "temperature": "rejected"
+      },
+      "nvidia/nemotron-content-safety-reasoning-4b": {
+        "temperature": "rejected"
+      },
+      "nvidia/nv-embed-v1": {
+        "temperature": "rejected"
+      },
+      "nvidia/nv-embedcode-7b-v1": {
+        "temperature": "rejected"
+      },
+      "nvidia/rerank-qa-mistral-4b": {
+        "temperature": "rejected"
+      },
+      "nvidia/riva-translate-4b-instruct-v1.1": {
+        "temperature": "rejected"
+      },
+      "nvidia/usdvalidate": {
+        "temperature": "rejected"
+      },
+      "openai/whisper-large-v3": {
+        "temperature": "rejected"
+      }
+    },
+    "ofox": {
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.8": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.7-code-highspeed": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra": {
+        "temperature": "rejected"
+      }
+    },
+    "ollama-cloud": {
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "openai": {
+      "chatgpt-image-latest": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-chat-latest": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex-spark": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "gpt-image-1": {
+        "temperature": "rejected"
+      },
+      "gpt-image-1-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-image-1.5": {
+        "temperature": "rejected"
+      },
+      "gpt-image-2": {
+        "temperature": "rejected"
+      },
+      "gpt-realtime-2.1": {
+        "temperature": "rejected"
+      },
+      "o1": {
+        "temperature": "rejected"
+      },
+      "o1-pro": {
+        "temperature": "rejected"
+      },
+      "o3": {
+        "temperature": "rejected"
+      },
+      "o3-mini": {
+        "temperature": "rejected"
+      },
+      "o3-pro": {
+        "temperature": "rejected"
+      },
+      "o4-mini": {
+        "temperature": "rejected"
+      },
+      "text-embedding-3-large": {
+        "temperature": "rejected"
+      },
+      "text-embedding-3-small": {
+        "temperature": "rejected"
+      },
+      "text-embedding-ada-002": {
+        "temperature": "rejected"
+      }
+    },
+    "opencode": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex-spark": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "opencode-go": {
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "openrouter": {
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.7-fast": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.8-fast": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-5-fast": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-chat": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-image-2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-chat-latest": {
+        "temperature": "rejected"
+      },
+      "openai/o1": {
+        "temperature": "rejected"
+      },
+      "openai/o1-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini-high": {
+        "temperature": "rejected"
+      },
+      "openai/o3-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini-high": {
+        "temperature": "rejected"
+      },
+      "openrouter/bodybuilder": {
+        "temperature": "rejected"
+      },
+      "openrouter/fusion": {
+        "temperature": "rejected"
+      },
+      "openrouter/pareto-code": {
+        "temperature": "rejected"
+      },
+      "relace/relace-apply-3": {
+        "temperature": "rejected"
+      },
+      "sakana/fugu-ultra": {
+        "temperature": "rejected"
+      },
+      "sakana/sakana-namazu": {
+        "temperature": "rejected"
+      },
+      "~anthropic/claude-fable-latest": {
+        "temperature": "rejected"
+      },
+      "~anthropic/claude-sonnet-latest": {
+        "temperature": "rejected"
+      },
+      "~openai/gpt-latest": {
+        "temperature": "rejected"
+      },
+      "~openai/gpt-mini-latest": {
+        "temperature": "rejected"
+      }
+    },
+    "orcarouter": {
+      "anthropic/claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "kimi/kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-chat-latest": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-chat-latest": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-pro": {
+        "temperature": "rejected"
+      }
+    },
+    "perplexity": {
+      "sonar-deep-research": {
+        "temperature": "rejected"
+      }
+    },
+    "perplexity-agent": {
+      "anthropic/claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "moonshot-ai/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "moonshot-ai/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      }
+    },
+    "pioneer": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "moonshotai/Kimi-K2.7-Code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/Kimi-K3": {
+        "temperature": "rejected"
+      },
+      "sakana/fugu-ultra": {
+        "temperature": "rejected"
+      }
+    },
+    "poe": {
+      "anthropic/claude-haiku-3": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-haiku-3.5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-haiku-4.5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.1": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.6": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.8": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-3.5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-3.5-june": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-3.7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-4": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-4.5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-4.6": {
+        "temperature": "rejected"
+      },
+      "cerebras/gpt-oss-120b-cs": {
+        "temperature": "rejected"
+      },
+      "cerebras/llama-3.1-8b-cs": {
+        "temperature": "rejected"
+      },
+      "cerebras/llama-3.3-70b-cs": {
+        "temperature": "rejected"
+      },
+      "cerebras/qwen3-235b-2507-cs": {
+        "temperature": "rejected"
+      },
+      "cerebras/qwen3-32b-cs": {
+        "temperature": "rejected"
+      },
+      "elevenlabs/elevenlabs-music": {
+        "temperature": "rejected"
+      },
+      "elevenlabs/elevenlabs-v2.5-turbo": {
+        "temperature": "rejected"
+      },
+      "elevenlabs/elevenlabs-v3": {
+        "temperature": "rejected"
+      },
+      "fireworks-ai/kimi-k2.5-fw": {
+        "temperature": "rejected"
+      },
+      "google/gemini-2.0-flash": {
+        "temperature": "rejected"
+      },
+      "google/gemini-2.0-flash-lite": {
+        "temperature": "rejected"
+      },
+      "google/gemini-2.5-flash": {
+        "temperature": "rejected"
+      },
+      "google/gemini-2.5-flash-lite": {
+        "temperature": "rejected"
+      },
+      "google/gemini-2.5-pro": {
+        "temperature": "rejected"
+      },
+      "google/gemini-3-flash": {
+        "temperature": "rejected"
+      },
+      "google/gemini-3-pro": {
+        "temperature": "rejected"
+      },
+      "google/gemini-3.1-flash-lite": {
+        "temperature": "rejected"
+      },
+      "google/gemini-3.1-pro": {
+        "temperature": "rejected"
+      },
+      "google/gemini-3.5-flash": {
+        "temperature": "rejected"
+      },
+      "google/gemini-deep-research": {
+        "temperature": "rejected"
+      },
+      "google/gemma-4-31b": {
+        "temperature": "rejected"
+      },
+      "google/imagen-3": {
+        "temperature": "rejected"
+      },
+      "google/imagen-3-fast": {
+        "temperature": "rejected"
+      },
+      "google/imagen-4": {
+        "temperature": "rejected"
+      },
+      "google/imagen-4-fast": {
+        "temperature": "rejected"
+      },
+      "google/imagen-4-ultra": {
+        "temperature": "rejected"
+      },
+      "google/lyria": {
+        "temperature": "rejected"
+      },
+      "google/nano-banana": {
+        "temperature": "rejected"
+      },
+      "google/nano-banana-pro": {
+        "temperature": "rejected"
+      },
+      "google/veo-2": {
+        "temperature": "rejected"
+      },
+      "google/veo-3": {
+        "temperature": "rejected"
+      },
+      "google/veo-3-fast": {
+        "temperature": "rejected"
+      },
+      "google/veo-3.1": {
+        "temperature": "rejected"
+      },
+      "google/veo-3.1-fast": {
+        "temperature": "rejected"
+      },
+      "ideogramai/ideogram": {
+        "temperature": "rejected"
+      },
+      "ideogramai/ideogram-v2": {
+        "temperature": "rejected"
+      },
+      "ideogramai/ideogram-v2a": {
+        "temperature": "rejected"
+      },
+      "ideogramai/ideogram-v2a-turbo": {
+        "temperature": "rejected"
+      },
+      "lumalabs/ray2": {
+        "temperature": "rejected"
+      },
+      "novita/glm-4.6": {
+        "temperature": "rejected"
+      },
+      "novita/glm-4.6v": {
+        "temperature": "rejected"
+      },
+      "novita/glm-4.7-flash": {
+        "temperature": "rejected"
+      },
+      "novita/glm-4.7-n": {
+        "temperature": "rejected"
+      },
+      "novita/kimi-k2-thinking": {
+        "temperature": "rejected"
+      },
+      "novita/minimax-m2.1": {
+        "temperature": "rejected"
+      },
+      "openai/chatgpt-4o-latest": {
+        "temperature": "rejected"
+      },
+      "openai/dall-e-3": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-3.5-turbo": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-3.5-turbo-instruct": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-3.5-turbo-raw": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4-classic": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4-classic-0314": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4-turbo": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4.1-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4.1-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4o": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4o-aug": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4o-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4o-mini-search": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-4o-search": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-chat": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-codex-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.1-instant": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-instant": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex-spark": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-instant": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-image-1": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-image-1-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-image-1.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-image-2": {
+        "temperature": "rejected"
+      },
+      "openai/o1": {
+        "temperature": "rejected"
+      },
+      "openai/o1-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-deep-research": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini-high": {
+        "temperature": "rejected"
+      },
+      "openai/o3-pro": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini-deep-research": {
+        "temperature": "rejected"
+      },
+      "openai/sora-2": {
+        "temperature": "rejected"
+      },
+      "openai/sora-2-pro": {
+        "temperature": "rejected"
+      },
+      "poetools/claude-code": {
+        "temperature": "rejected"
+      },
+      "runwayml/runway": {
+        "temperature": "rejected"
+      },
+      "runwayml/runway-gen-4-turbo": {
+        "temperature": "rejected"
+      },
+      "stabilityai/stablediffusionxl": {
+        "temperature": "rejected"
+      },
+      "topazlabs-co/topazlabs": {
+        "temperature": "rejected"
+      },
+      "trytako/tako": {
+        "temperature": "rejected"
+      },
+      "xai/grok-3": {
+        "temperature": "rejected"
+      },
+      "xai/grok-3-mini": {
+        "temperature": "rejected"
+      },
+      "xai/grok-4": {
+        "temperature": "rejected"
+      },
+      "xai/grok-4-fast-non-reasoning": {
+        "temperature": "rejected"
+      },
+      "xai/grok-4-fast-reasoning": {
+        "temperature": "rejected"
+      },
+      "xai/grok-4.1-fast-non-reasoning": {
+        "temperature": "rejected"
+      },
+      "xai/grok-4.1-fast-reasoning": {
+        "temperature": "rejected"
+      },
+      "xai/grok-4.20-multi-agent": {
+        "temperature": "rejected"
+      },
+      "xai/grok-code-fast-1": {
+        "temperature": "rejected"
+      }
+    },
+    "qihang-ai": {
+      "gpt-5.2-codex": {
+        "temperature": "rejected"
+      }
+    },
+    "regolo-ai": {
+      "qwen3-embedding-8b": {
+        "temperature": "rejected"
+      },
+      "qwen3-reranker-4b": {
+        "temperature": "rejected"
+      }
+    },
+    "requesty": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-fable-5@eu": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7@eu": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8@eu": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5@eu": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5@eu": {
+        "temperature": "rejected"
+      },
+      "fugu-ultra": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini@eu": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano@eu": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1@eu": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4@eu": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5@eu": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna@eu": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol@eu": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra@eu": {
+        "temperature": "rejected"
+      },
+      "gpt-5@eu": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code@eu": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      },
+      "kimi-k3@eu": {
+        "temperature": "rejected"
+      },
+      "o4-mini@eu": {
+        "temperature": "rejected"
+      }
+    },
+    "routing-run": {
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k2.7-code-nitro": {
+        "temperature": "rejected"
+      }
+    },
+    "sakana": {
+      "fugu": {
+        "temperature": "rejected"
+      },
+      "fugu-ultra": {
+        "temperature": "rejected"
+      },
+      "fugu-ultra-20260615": {
+        "temperature": "rejected"
+      }
+    },
+    "sap-ai-core": {
+      "amazon--titan-embed-text": {
+        "temperature": "rejected"
+      },
+      "anthropic--claude-4.7-opus": {
+        "temperature": "rejected"
+      },
+      "anthropic--claude-4.8-opus": {
+        "temperature": "rejected"
+      },
+      "gemini-embedding": {
+        "temperature": "rejected"
+      },
+      "gemini-embedding-2": {
+        "temperature": "rejected"
+      },
+      "gpt-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "nvidia--llama-3.2-nv-embedqa-1b": {
+        "temperature": "rejected"
+      },
+      "sonar-deep-research": {
+        "temperature": "rejected"
+      },
+      "text-embedding-3-large": {
+        "temperature": "rejected"
+      },
+      "text-embedding-3-small": {
+        "temperature": "rejected"
+      }
+    },
+    "scaleway": {
+      "bge-multilingual-gemma2": {
+        "temperature": "rejected"
+      },
+      "qwen3-embedding-8b": {
+        "temperature": "rejected"
+      },
+      "whisper-large-v3": {
+        "temperature": "rejected"
+      }
+    },
+    "scnet-token-plan": {
+      "Kimi-K2.5": {
+        "temperature": "rejected"
+      },
+      "Kimi-K2.7-Code": {
+        "temperature": "rejected"
+      },
+      "Kimi-K3": {
+        "temperature": "rejected"
+      }
+    },
+    "snowflake-cortex": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.1": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-5.6-terra": {
+        "temperature": "rejected"
+      }
+    },
+    "stackit": {
+      "Qwen/Qwen3-VL-Embedding-8B": {
+        "temperature": "rejected"
+      },
+      "intfloat/e5-mistral-7b-instruct": {
+        "temperature": "rejected"
+      }
+    },
+    "stepfun": {
+      "step-tts-2": {
+        "temperature": "rejected"
+      },
+      "stepaudio-2.5-asr": {
+        "temperature": "rejected"
+      },
+      "stepaudio-2.5-tts": {
+        "temperature": "rejected"
+      }
+    },
+    "stepfun-ai": {
+      "step-tts-2": {
+        "temperature": "rejected"
+      },
+      "stepaudio-2.5-asr": {
+        "temperature": "rejected"
+      },
+      "stepaudio-2.5-tts": {
+        "temperature": "rejected"
+      }
+    },
+    "synthetic": {
+      "hf:moonshotai/Kimi-K2.7-Code": {
+        "temperature": "rejected"
+      }
+    },
+    "tensorx": {
+      "moonshotai/kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "the-grid-ai": {
+      "agent-max": {
+        "temperature": "rejected"
+      },
+      "code-max": {
+        "temperature": "rejected"
+      },
+      "text-max": {
+        "temperature": "rejected"
+      }
+    },
+    "tinfoil": {
+      "kimi-k3": {
+        "temperature": "rejected"
+      },
+      "nomic-embed-text": {
+        "temperature": "rejected"
+      }
+    },
+    "togetherai": {
+      "moonshotai/Kimi-K3": {
+        "temperature": "rejected"
+      }
+    },
+    "umans-ai": {
+      "umans-coder": {
+        "temperature": "rejected"
+      },
+      "umans-flash": {
+        "temperature": "rejected"
+      },
+      "umans-kimi-k2.7": {
+        "temperature": "rejected"
+      },
+      "umans-kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "umans-ai-coding-plan": {
+      "umans-coder": {
+        "temperature": "rejected"
+      },
+      "umans-flash": {
+        "temperature": "rejected"
+      },
+      "umans-kimi-k2.7": {
+        "temperature": "rejected"
+      },
+      "umans-kimi-k3": {
+        "temperature": "rejected"
+      },
+      "umans-qwen3.6-35b-a3b": {
+        "temperature": "rejected"
+      }
+    },
+    "unorouter": {
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4:free": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5:free": {
+        "temperature": "rejected"
+      }
+    },
+    "venice": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-7": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8-fast": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-5-fast": {
+        "temperature": "rejected"
+      },
+      "claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2-5": {
+        "temperature": "rejected"
+      },
+      "kimi-k2-7-code": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      },
+      "kimi-k3-fast-api": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-52": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-52-codex": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-53-codex": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-54": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-54-mini": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-54-pro": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-55": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-55-pro": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-56-luna": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-56-luna-pro": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-56-sol": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-56-sol-pro": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-56-terra": {
+        "temperature": "rejected"
+      },
+      "openai-gpt-56-terra-pro": {
+        "temperature": "rejected"
+      }
+    },
+    "vercel": {
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-5-fast": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "google/imagen-4.0-ultra-generate-001": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k3-fast": {
+        "temperature": "rejected"
+      },
+      "morph/morph-v3-fast": {
+        "temperature": "rejected"
+      },
+      "morph/morph-v3-large": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-fast": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-mini-fast": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5-nano": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-fast": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.3-codex-fast": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-fast": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.4-mini-fast": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-fast": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna-fast": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol-fast": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra-fast": {
+        "temperature": "rejected"
+      },
+      "openai/o1": {
+        "temperature": "rejected"
+      },
+      "openai/o3": {
+        "temperature": "rejected"
+      },
+      "openai/o3-fast": {
+        "temperature": "rejected"
+      },
+      "openai/o3-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini": {
+        "temperature": "rejected"
+      },
+      "openai/o4-mini-fast": {
+        "temperature": "rejected"
+      },
+      "xai/grok-imagine-image-2.0": {
+        "temperature": "rejected"
+      }
+    },
+    "vivgrid": {
+      "gpt-5-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.1-codex-max": {
+        "temperature": "rejected"
+      },
+      "gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.3-codex": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-nano": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "kimi-k3": {
+        "temperature": "rejected"
+      }
+    },
+    "wafer.ai": {
+      "Kimi-K2.6": {
+        "temperature": "rejected"
+      }
+    },
+    "xai": {
+      "grok-imagine-image": {
+        "temperature": "rejected"
+      },
+      "grok-imagine-image-2.0": {
+        "temperature": "rejected"
+      },
+      "grok-imagine-image-quality": {
+        "temperature": "rejected"
+      },
+      "grok-imagine-video": {
+        "temperature": "rejected"
+      },
+      "grok-imagine-video-1.5": {
+        "temperature": "rejected"
+      }
+    },
+    "xpersona": {
+      "claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "claude-opus-4-8": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4": {
+        "temperature": "rejected"
+      },
+      "gpt-5.4-mini": {
+        "temperature": "rejected"
+      },
+      "gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "gpt-5.6-terra": {
+        "temperature": "rejected"
+      },
+      "xpersona-frieren-coder": {
+        "temperature": "rejected"
+      },
+      "xpersona-gpt-5.5": {
+        "temperature": "rejected"
+      }
+    },
+    "zenmux": {
+      "anthropic/claude-fable-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.7": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-opus-4.8": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5": {
+        "temperature": "rejected"
+      },
+      "anthropic/claude-sonnet-5-free": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.5": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.6": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.7-code": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k2.7-code-free": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k3": {
+        "temperature": "rejected"
+      },
+      "moonshotai/kimi-k3-free": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-codex": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.2-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.5-pro": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-luna": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-sol": {
+        "temperature": "rejected"
+      },
+      "openai/gpt-5.6-terra": {
+        "temperature": "rejected"
+      }
+    }
+  }
+}

@@ -234,6 +234,7 @@ fn catalog_source_schema() -> Value {
                     Some(crate::MAX_CATALOG_RESPONSE_BYTES),
                 )),
             ),
+            ("model_facts_provider", optional(id_schema())),
             ("prefix", optional(string_schema())),
             (
                 "priority",

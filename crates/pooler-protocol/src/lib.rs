@@ -48,9 +48,10 @@ pub use model::{
     SemanticRequest, TargetMetadata, ToolCall, ToolChoice, ToolDefinition, ToolResult,
 };
 pub use openai_chat::{
-    decode_chat_request, decode_chat_request_with_report, encode_chat_request, DecodedChatRequest,
-    EncodedChatChunk, EncodedChatRequest, OpenAiChatCodec, OpenAiChatError, OpenAiChatEventDecoder,
-    OpenAiChatEventEncoder, OPENAI_CHAT_UNKNOWN_FIELDS_EXTENSION,
+    decode_chat_request, decode_chat_request_with_report, encode_chat_request,
+    encode_chat_request_with_dialect, DecodedChatRequest, EncodedChatChunk, EncodedChatRequest,
+    OpenAiChatCodec, OpenAiChatError, OpenAiChatEventDecoder, OpenAiChatEventEncoder,
+    OPENAI_CHAT_UNKNOWN_FIELDS_EXTENSION,
 };
 pub use openai_responses::{
     decode_responses_request, decode_responses_request_with_report, encode_responses_request,
@@ -58,7 +59,7 @@ pub use openai_responses::{
     OpenAiResponsesError, OpenAiResponsesEventDecoder, OpenAiResponsesEventEncoder,
     OPENAI_RESPONSES_UNKNOWN_FIELDS_EXTENSION,
 };
-pub use pooler_core::LossPolicy;
+pub use pooler_core::{LossPolicy, ModelDialect, ParamSupport};
 
 /// Request body representations used by route plans.
 // Keep semantic bodies inline: boxing would add an allocation to every decoded

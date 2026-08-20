@@ -1,7 +1,7 @@
-use pooler_core::{Capability, CapabilitySet, ModelId};
+use pooler_core::{Capability, CapabilitySet, ModelDialect, ModelId};
 use pooler_model_catalog::{
     merge_discoveries, AliasConfig, CatalogConfig, CatalogError, CatalogInput, CatalogSourceConfig,
-    DiscoveredModel, RefreshConfig,
+    DiscoveredModel, DiscoveryResponse, RefreshConfig,
 };
 
 fn model(id: &str, capabilities: &[Capability]) -> DiscoveredModel {
@@ -144,6 +144,53 @@ fn merge_applies_exclusions_aliases_forks_prefixes_and_provenance() {
     assert_eq!(openai_state.discovered_models(), 3);
     assert_eq!(openai_state.excluded_models(), 2);
     assert_eq!(openai_state.published_exposures(), 2);
+}
+
+#[test]
+fn merged_target_intersects_capabilities_but_adopts_one_source_dialect() {
+    let strict = source(CatalogSourceConfig {
+        id: "openai.strict".to_owned(),
+        provider: "openai".to_owned(),
+        priority: 20,
+        ..CatalogSourceConfig::default()
+    });
+    let permissive = source(CatalogSourceConfig {
+        id: "openai.permissive".to_owned(),
+        provider: "openai".to_owned(),
+        priority: 10,
+        ..CatalogSourceConfig::default()
+    });
+    let strict = CatalogInput::new(
+        strict,
+        DiscoveryResponse::new(vec![model("gpt-x", &[Capability::Text, Capability::Tools])
+            .with_dialect(ModelDialect::new().rejecting_temperature())]),
+    );
+    let permissive = CatalogInput::new(
+        permissive,
+        DiscoveryResponse::new(vec![model("gpt-x", &[Capability::Text])]),
+    );
+
+    for inputs in [
+        vec![strict.clone(), permissive.clone()],
+        vec![permissive, strict],
+    ] {
+        let snapshot = merge_discoveries(1, 1, inputs, limits()).expect("merge succeeds");
+        let merged = snapshot.get("gpt-x").expect("merged model");
+        let target = &merged.targets()[0];
+
+        // Capabilities intersect: only the higher-priority source reported tools.
+        assert_eq!(
+            target.capabilities(),
+            [Capability::Text].into_iter().collect::<CapabilitySet>()
+        );
+        // The dialect is adopted whole from the highest-priority source rather
+        // than combined field by field, so it still describes a request shape
+        // that some provider actually implements.
+        assert_eq!(
+            target.dialect(),
+            ModelDialect::new().rejecting_temperature()
+        );
+    }
 }
 
 #[test]

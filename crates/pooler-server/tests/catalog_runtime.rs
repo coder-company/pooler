@@ -158,6 +158,80 @@ async fn fake_provider_snapshot_drives_cli_management_shape_and_retains_last_goo
 }
 
 #[tokio::test]
+async fn vendored_request_facts_reach_discovered_targets_and_the_model_view() {
+    let config = pooler_config::compile_yaml(
+        "catalog-model-facts.yaml",
+        r#"
+version: 1
+management: {bind: 127.0.0.1:0}
+upstreams:
+  openai: {url: http://127.0.0.1:1}
+  gateway: {url: http://127.0.0.1:2}
+  private: {url: http://127.0.0.1:3}
+catalog:
+  sources:
+    - {id: openai.primary, provider: openai, parser: open_ai, prefix: direct}
+    - {id: gateway.primary, provider: gateway, parser: open_ai, prefix: gateway, model_facts_provider: openai}
+    - {id: private.primary, provider: private, parser: open_ai, prefix: private}
+"#,
+    )
+    .expect("model facts config");
+    let body = br#"{"data":[{"id":"gpt-image-1.5"},{"id":"gpt-4o"}]}"#.as_slice();
+    let registrations = ["openai.primary", "gateway.primary", "private.primary"]
+        .into_iter()
+        .map(|source| {
+            let provider = Arc::new(FakeProvider::new([Ok(FetchedCatalog::new(body, None))]));
+            CatalogFetcherRegistration::new(source, provider).expect("registration")
+        })
+        .collect();
+    let runtime = CatalogRuntime::with_fetchers(
+        config.catalog().expect("catalog plan").clone(),
+        registrations,
+    )
+    .expect("runtime");
+    runtime.refresh().await.expect("refresh");
+    let snapshot = runtime.snapshot();
+
+    let dialect = |public_id: &str| {
+        snapshot
+            .get(public_id)
+            .unwrap_or_else(|| panic!("{public_id} is discovered"))
+            .targets()[0]
+            .dialect()
+    };
+    assert_eq!(
+        dialect("direct/gpt-image-1.5").temperature,
+        pooler_core::ParamSupport::Rejected,
+        "a provider named like the upstream catalog resolves vendored facts"
+    );
+    assert_eq!(
+        dialect("gateway/gpt-image-1.5").temperature,
+        pooler_core::ParamSupport::Rejected,
+        "model_facts_provider maps a locally named provider onto vendored facts"
+    );
+    assert!(
+        dialect("private/gpt-image-1.5").is_default(),
+        "a provider absent from the vendored snapshot keeps the protocol default"
+    );
+    assert!(
+        dialect("direct/gpt-4o").is_default(),
+        "models with no recorded deviation keep the protocol default"
+    );
+
+    let view = pooler_server::merged_model_catalog_value(&config, Some(&runtime));
+    let rejected = view["models"]
+        .as_array()
+        .expect("model array")
+        .iter()
+        .find(|model| model["id"] == "direct/gpt-image-1.5")
+        .expect("deviating model in the view");
+    assert_eq!(
+        rejected["targets"][0]["dialect"]["temperature"], "rejected",
+        "the model view exposes the dialect that will shape upstream requests"
+    );
+}
+
+#[tokio::test]
 async fn injected_fetcher_output_is_rechecked_against_the_source_body_bound() {
     let config = pooler_config::compile_yaml(
         "catalog-bound.yaml",

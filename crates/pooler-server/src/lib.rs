@@ -13,6 +13,7 @@ mod lifecycle;
 mod listener;
 mod management;
 mod management_ui;
+mod model_facts_refresh;
 mod server;
 mod tls;
 
@@ -28,6 +29,7 @@ pub use management::{
     ActiveCounts, ActiveGuard, ManagementApi, ManagementHttpServer, ManagementResponse,
     ManagementServerError,
 };
+pub use model_facts_refresh::{fetch_model_facts, project_model_facts, ModelFactsRefreshError};
 pub use pooler_core::ConfigGeneration;
 pub use server::{ReloadError, ReloadOutcome, Server, ServerError};
 

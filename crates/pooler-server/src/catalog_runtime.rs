@@ -36,7 +36,8 @@ use pooler_http::{
 };
 use pooler_model_catalog::{
     CatalogError, CatalogService, CatalogSnapshot, DiscoveryFailure, DiscoveryFailureKind,
-    DiscoveryFuture, DiscoveryResponse, ModelDiscovery, RefreshReport, RegisteredSource, SourceId,
+    DiscoveryFuture, DiscoveryResponse, ModelDiscovery, ModelFacts, RefreshReport,
+    RegisteredSource, SourceId,
 };
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -292,6 +293,7 @@ struct ParsedProviderDiscovery {
     parser_kind: CatalogParserKind,
     parser: ProviderModelParser,
     max_response_bytes: usize,
+    model_facts_provider: String,
     fetcher: Arc<dyn ProviderCatalogFetcher>,
 }
 
@@ -311,6 +313,7 @@ impl ParsedProviderDiscovery {
                 MAX_PROVIDER_STRING_BYTES,
             ),
             max_response_bytes,
+            model_facts_provider: source.model_facts_provider().to_owned(),
             fetcher,
         }
     }
@@ -345,7 +348,25 @@ impl ParsedProviderDiscovery {
                 }),
         }
         .map_err(discovery_parse_failure)?;
-        try_into_catalog_response(models, fetched.revision()).map_err(discovery_parse_failure)
+        let mut response = try_into_catalog_response(models, fetched.revision())
+            .map_err(discovery_parse_failure)?;
+        self.apply_model_facts(&mut response);
+        Ok(response)
+    }
+
+    /// Attach vendored request-shaping facts the provider response cannot carry.
+    ///
+    /// Provider model lists report availability, not request shape. Facts are
+    /// keyed by the upstream model ID so a source that renames or prefixes a
+    /// model for clients still resolves the upstream model's real dialect.
+    fn apply_model_facts(&self, response: &mut DiscoveryResponse) {
+        let facts = ModelFacts::builtin();
+        if !facts.covers_provider(&self.model_facts_provider) {
+            return;
+        }
+        for model in &mut response.models {
+            model.dialect = facts.dialect(&self.model_facts_provider, model.id.as_str());
+        }
     }
 }
 
@@ -643,6 +664,7 @@ fn discovered_model_value(model: &pooler_model_catalog::CatalogModel) -> Value {
                     .iter()
                     .map(|capability| capability.as_str())
                     .collect::<Vec<_>>(),
+                "dialect": target.dialect(),
                 "force_mapping": target.force_mapping(),
                 "priority": target.priority(),
                 "provenance": target.provenance(),

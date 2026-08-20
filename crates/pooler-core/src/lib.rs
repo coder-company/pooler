@@ -1,14 +1,15 @@
 //! Shared, dependency-light contracts for the Pooler protocol runtime.
 //!
 //! This crate owns identifiers, request metadata, explicit representation and
-//! loss policies, capability matching, bounded route limits, and common error
-//! classification. It contains no transport implementation and no credential
-//! values.
+//! loss policies, capability matching, per-model request dialects, bounded
+//! route limits, and common error classification. It contains no transport
+//! implementation and no credential values.
 
 #![forbid(unsafe_code)]
 
 mod capabilities;
 mod context;
+mod dialect;
 mod error;
 mod id;
 mod limits;
@@ -16,6 +17,7 @@ mod mode;
 
 pub use capabilities::{Capability, CapabilitySet};
 pub use context::{DownstreamIdentity, Extensions, IdentityError, RequestContext};
+pub use dialect::{ModelDialect, ParamSupport};
 pub use error::{
     ErrorClass, ErrorClassification, ErrorScope, PoolerError, PoolerResult, ReplaySafety,
     Retryability,

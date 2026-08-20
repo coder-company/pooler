@@ -12,6 +12,7 @@ arc-swap.workspace = true
 futures-util.workspace = true
 pooler-core = { path = "../pooler-core" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

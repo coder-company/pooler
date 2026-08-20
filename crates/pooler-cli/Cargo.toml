@@ -16,6 +16,7 @@ serde_json.workspace = true
 pooler-auth = { path = "../pooler-auth" }
 pooler-config = { path = "../pooler-config" }
 pooler-http = { path = "../pooler-http" }
+pooler-model-catalog = { path = "../pooler-model-catalog" }
 pooler-extension = { path = "../pooler-extension" }
 pooler-observe = { path = "../pooler-observe" }
 pooler-store = { path = "../pooler-store" }

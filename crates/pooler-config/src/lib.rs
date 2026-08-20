@@ -535,6 +535,10 @@ pub struct ModelCatalogSourceConfig {
     pub path: Option<String>,
     /// Maximum response bytes for this source.
     pub max_response_bytes: Option<u64>,
+    /// Provider key used to look up vendored request-shaping facts. Omitted
+    /// means the source `provider` ID, which matches the upstream catalog for
+    /// conventionally named providers such as `openai` or `anthropic`.
+    pub model_facts_provider: Option<String>,
     /// Optional client-visible namespace, emitted as `prefix/model`.
     pub prefix: Option<String>,
     /// Higher-priority targets are listed first.
@@ -1880,6 +1884,7 @@ pub struct ModelCatalogSourcePlan {
     account: Option<Arc<str>>,
     path: Arc<str>,
     max_response_bytes: u64,
+    model_facts_provider: Arc<str>,
     source_label: SourceLabel,
 }
 
@@ -1912,6 +1917,12 @@ impl ModelCatalogSourcePlan {
     #[must_use]
     pub const fn max_response_bytes(&self) -> u64 {
         self.max_response_bytes
+    }
+
+    /// Provider key used against the vendored model-facts snapshot.
+    #[must_use]
+    pub fn model_facts_provider(&self) -> &str {
+        &self.model_facts_provider
     }
 
     /// Source declaration label.
@@ -3869,6 +3880,15 @@ fn compile_models(
     Ok(models)
 }
 
+struct CatalogSourceRuntime {
+    parser: CatalogParserKind,
+    account: Option<Arc<str>>,
+    path: Arc<str>,
+    max_response_bytes: u64,
+    model_facts_provider: Arc<str>,
+    label: SourceLabel,
+}
+
 fn compile_catalog(
     declaration: Option<&ModelCatalogConfig>,
     source: &Source,
@@ -3962,15 +3982,22 @@ fn compile_catalog(
                 &format!("catalog max_response_bytes must be 1..={MAX_CATALOG_RESPONSE_BYTES}"),
             ));
         }
+        let model_facts_provider = source_declaration
+            .model_facts_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or(source_declaration.provider.as_str());
         runtime.insert(
             source_declaration.id.clone(),
-            (
+            CatalogSourceRuntime {
                 parser,
-                account.map(Arc::<str>::from),
-                Arc::<str>::from(path.as_str()),
+                account: account.map(Arc::<str>::from),
+                path: Arc::<str>::from(path.as_str()),
                 max_response_bytes,
+                model_facts_provider: Arc::<str>::from(model_facts_provider),
                 label,
-            ),
+            },
         );
     }
 
@@ -3978,16 +4005,17 @@ fn compile_catalog(
         .sources()
         .iter()
         .map(|source_policy| {
-            let (parser, account, path, max_response_bytes, source_label) = runtime
+            let runtime = runtime
                 .remove(source_policy.id().as_str())
                 .expect("compiled catalog sources retain declaration IDs");
             ModelCatalogSourcePlan {
                 source: source_policy.clone(),
-                parser,
-                account,
-                path,
-                max_response_bytes,
-                source_label,
+                parser: runtime.parser,
+                account: runtime.account,
+                path: runtime.path,
+                max_response_bytes: runtime.max_response_bytes,
+                model_facts_provider: runtime.model_facts_provider,
+                source_label: runtime.label,
             }
         })
         .collect();
@@ -5721,6 +5749,34 @@ catalog:
                 .redacted(),
             "env:POOLER_PROVIDER_KEY"
         );
+    }
+
+    #[test]
+    fn catalog_model_facts_provider_defaults_to_the_source_provider() {
+        let text = r#"
+version: 1
+upstreams:
+  provider-a: {url: https://provider.example/v1}
+  gateway: {url: https://gateway.example/v1}
+catalog:
+  sources:
+    - {id: provider-a.primary, provider: provider-a, parser: open_ai}
+    - {id: gateway.primary, provider: gateway, parser: open_ai, model_facts_provider: openai}
+"#;
+        let config = compile_yaml("catalog-model-facts.yaml", text).expect("catalog compiles");
+        let catalog = config.catalog().expect("catalog plan");
+        let facts_provider = |id: &str| {
+            catalog
+                .sources()
+                .iter()
+                .find(|source| source.source().id().as_str() == id)
+                .expect("compiled source")
+                .model_facts_provider()
+                .to_owned()
+        };
+
+        assert_eq!(facts_provider("provider-a.primary"), "provider-a");
+        assert_eq!(facts_provider("gateway.primary"), "openai");
     }
 
     #[test]

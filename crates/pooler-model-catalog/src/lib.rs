@@ -4,8 +4,20 @@
 //! metadata. This crate applies source-local exclusions, aliases, and prefixes,
 //! then publishes one immutable [`CatalogSnapshot`]. A failed refresh never
 //! replaces the last good snapshot.
+//!
+//! Request-shaping facts that provider list endpoints never report, such as a
+//! model that rejects `temperature`, come from the vendored [`ModelFacts`]
+//! snapshot rather than from adapter code.
 
 #![forbid(unsafe_code)]
+
+mod model_facts;
+
+pub use model_facts::{
+    ModelFacts, ModelFactsError, MAX_MODEL_FACTS_BYTES, MAX_MODEL_FACT_ENTRIES,
+    MAX_MODEL_FACT_KEY_BYTES, MAX_UPSTREAM_CATALOG_BYTES, MODELS_DEV_CATALOG_URL,
+    MODEL_FACTS_SCHEMA_VERSION,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
@@ -16,7 +28,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::{stream, StreamExt};
-use pooler_core::{CapabilitySet, ComponentId, IdentifierError, ModelId, ProviderId};
+use pooler_core::{CapabilitySet, ComponentId, IdentifierError, ModelDialect, ModelId, ProviderId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -585,6 +597,9 @@ pub struct DiscoveredModel {
     /// Capabilities proven by the provider adapter.
     #[serde(default)]
     pub capabilities: CapabilitySet,
+    /// Request-shaping deviations observed for this upstream model.
+    #[serde(default)]
+    pub dialect: ModelDialect,
 }
 
 impl DiscoveredModel {
@@ -595,6 +610,7 @@ impl DiscoveredModel {
             id,
             display_name: None,
             capabilities,
+            dialect: ModelDialect::DEFAULT,
         }
     }
 
@@ -602,6 +618,13 @@ impl DiscoveredModel {
     #[must_use]
     pub fn with_display_name(mut self, display_name: impl Into<String>) -> Self {
         self.display_name = Some(display_name.into());
+        self
+    }
+
+    /// Attach the request-shaping dialect observed for this model.
+    #[must_use]
+    pub const fn with_dialect(mut self, dialect: ModelDialect) -> Self {
+        self.dialect = dialect;
         self
     }
 }
@@ -723,6 +746,7 @@ pub struct CatalogTarget {
     provider: ProviderId,
     upstream_model: ModelId,
     capabilities: CapabilitySet,
+    dialect: ModelDialect,
     force_mapping: bool,
     priority: i32,
     provenance: Vec<ModelProvenance>,
@@ -745,6 +769,18 @@ impl CatalogTarget {
     #[must_use]
     pub const fn capabilities(&self) -> CapabilitySet {
         self.capabilities
+    }
+
+    /// Request-shaping dialect for this target.
+    ///
+    /// Unlike [`Self::capabilities`], which intersects every merged origin,
+    /// the dialect is taken from the first origin in deterministic candidate
+    /// order, matching how the display name is chosen. A dialect describes one
+    /// upstream model, so combining fields reported by different sources would
+    /// describe a request shape that no provider actually implements.
+    #[must_use]
+    pub const fn dialect(&self) -> ModelDialect {
+        self.dialect
     }
 
     /// Whether response model fields must be rewritten to the public ID.
@@ -1099,6 +1135,7 @@ struct Candidate {
     provider: ProviderId,
     upstream_model: ModelId,
     capabilities: CapabilitySet,
+    dialect: ModelDialect,
     force_mapping: bool,
     priority: i32,
     provenance: ModelProvenance,
@@ -1122,6 +1159,7 @@ fn push_candidate(
         provider: source.provider.clone(),
         upstream_model: model.id.clone(),
         capabilities: model.capabilities,
+        dialect: model.dialect,
         force_mapping,
         priority: source.priority,
         provenance: ModelProvenance {
@@ -1185,6 +1223,7 @@ fn compile_public_model(
                 provider: candidate.provider,
                 upstream_model: candidate.upstream_model,
                 capabilities: candidate.capabilities,
+                dialect: candidate.dialect,
                 force_mapping: candidate.force_mapping,
                 priority: candidate.priority,
                 provenance: vec![candidate.provenance],

@@ -12,9 +12,10 @@ use thiserror::Error;
 
 use crate::{
     ContentPart, ConversionError, ConversionReport, Extensions, FinishReason, InputItem,
-    LossPolicy, MediaSource, Message, OpaqueExtension, PreservedJson, ReasoningConfig,
-    ReasoningEffort, RequestValidationError, ResponseFormat, Role, SemanticRequest, StreamError,
-    StreamEvent, StreamEventKind, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    LossPolicy, MediaSource, Message, ModelDialect, OpaqueExtension, PreservedJson,
+    ReasoningConfig, ReasoningEffort, RequestValidationError, ResponseFormat, Role,
+    SemanticRequest, StreamError, StreamEvent, StreamEventKind, ToolCall, ToolChoice,
+    ToolDefinition, ToolResult, Usage,
 };
 
 /// Extension carrying OpenAI Chat fields not represented by the semantic
@@ -23,6 +24,16 @@ pub const OPENAI_CHAT_UNKNOWN_FIELDS_EXTENSION: &str = "openai.chat.unknown_requ
 
 const UNKNOWN_FIELDS_NAMESPACE: &str = "openai.chat";
 const UNKNOWN_FIELDS_NAME: &str = "unknown_request_fields";
+/// Delta fields observed carrying assistant reasoning text, in precedence
+/// order.
+///
+/// OpenAI-compatible providers disagree on this name: OpenAI and xAI use
+/// `reasoning`, DeepSeek and Fireworks use `reasoning_content`, and some
+/// gateways use `reasoning_text`. Every name is accepted so an upstream absent
+/// from the model catalog still streams reasoning. `reasoning_content` keeps
+/// first precedence to preserve the previously observed decode order.
+const REASONING_DELTA_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_text"];
+
 const TEXT_BLOCK_ID: &str = "text";
 const REASONING_BLOCK_ID: &str = "reasoning";
 const DEFAULT_RESPONSE_ID: &str = "pooler-response";
@@ -228,9 +239,28 @@ pub fn decode_chat_request_with_report(
 }
 
 /// Encode a semantic request for OpenAI Chat under `policy`.
+///
+/// The target model is assumed to accept every standard sampling parameter.
+/// Use [`encode_chat_request_with_dialect`] when the catalog records that a
+/// model rejects one.
 pub fn encode_chat_request(
     request: &SemanticRequest,
     policy: LossPolicy,
+) -> Result<EncodedChatRequest, OpenAiChatError> {
+    encode_chat_request_with_dialect(request, policy, ModelDialect::DEFAULT)
+}
+
+/// Encode a semantic request for OpenAI Chat under `policy` and `dialect`.
+///
+/// When `dialect` records that the target model rejects a sampling parameter
+/// the caller supplied, the parameter is reported as a dropped optional field
+/// rather than silently omitted. Under the default [`LossPolicy::Reject`] the
+/// request then fails before upstream execution, naming the field; only
+/// [`LossPolicy::Degrade`] permits the omission, and it records a warning.
+pub fn encode_chat_request_with_dialect(
+    request: &SemanticRequest,
+    policy: LossPolicy,
+    dialect: ModelDialect,
 ) -> Result<EncodedChatRequest, OpenAiChatError> {
     request.validate()?;
     let mut report = ConversionReport::default();
@@ -275,7 +305,7 @@ pub fn encode_chat_request(
     if request.session_id.is_some() {
         report.drop_optional("session_id", "OpenAI Chat has no portable session field");
     }
-    encode_sampling(&request.sampling, &mut object, &mut report);
+    encode_sampling(&request.sampling, dialect, &mut object, &mut report);
     if let Some(format) = request.response_format.as_ref() {
         object.insert("response_format".to_owned(), encode_response_format(format));
     }
@@ -1328,12 +1358,20 @@ fn encode_tool_choice(choice: &ToolChoice) -> Value {
 
 fn encode_sampling(
     sampling: &crate::SamplingParameters,
+    dialect: ModelDialect,
     object: &mut Map<String, Value>,
     report: &mut ConversionReport,
 ) {
     report_unrepresentable_extensions("sampling.extensions", &sampling.extensions, report);
     if let Some(value) = sampling.temperature {
-        object.insert("temperature".to_owned(), serde_json::json!(value));
+        if dialect.temperature.is_accepted() {
+            object.insert("temperature".to_owned(), serde_json::json!(value));
+        } else {
+            report.drop_optional(
+                "sampling.temperature",
+                "the target model rejects the temperature parameter",
+            );
+        }
     }
     if let Some(value) = sampling.top_p {
         object.insert("top_p".to_owned(), serde_json::json!(value));
@@ -1745,16 +1783,20 @@ impl OpenAiChatEventDecoder {
                 });
             }
         }
-        if let Some(reasoning) = delta
-            .get("reasoning_content")
-            .filter(|reasoning| !reasoning.is_null())
-            .or_else(|| delta.get("reasoning"))
-        {
-            let reasoning = reasoning
+        // A null value means this delta carries no reasoning, matching how
+        // `content` is treated below.
+        let reasoning = REASONING_DELTA_FIELDS.iter().find_map(|field| {
+            delta
+                .get(*field)
+                .filter(|value| !value.is_null())
+                .map(|value| (*field, value))
+        });
+        if let Some((field, value)) = reasoning {
+            let reasoning = value
                 .as_str()
                 .ok_or_else(|| OpenAiChatError::InvalidShape {
-                    field: "choices[0].delta.reasoning_content".to_owned(),
-                    expected: "a string",
+                    field: format!("choices[0].delta.{field}"),
+                    expected: "a string or null",
                 })?;
             if !reasoning.is_empty() {
                 if !self.reasoning_open {
@@ -2247,11 +2289,12 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        decode_chat_request, decode_chat_request_with_report, encode_chat_request, OpenAiChatError,
-        OpenAiChatEventDecoder, OpenAiChatEventEncoder,
+        decode_chat_request, decode_chat_request_with_report, encode_chat_request,
+        encode_chat_request_with_dialect, OpenAiChatError, OpenAiChatEventDecoder,
+        OpenAiChatEventEncoder,
     };
     use crate::{
-        ContentPart, FinishReason, InputItem, LossPolicy, Message, OpaqueExtension,
+        ContentPart, FinishReason, InputItem, LossPolicy, Message, ModelDialect, OpaqueExtension,
         ReasoningConfig, ReasoningEffort, Role, SemanticRequest, StreamEvent, StreamEventKind,
         StreamValidator, TargetMetadata, ToolCall, ToolDefinition, ToolResult, Usage,
     };
@@ -2302,6 +2345,127 @@ mod tests {
         let input = br#"{"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"n":2}"#;
         let error = decode_chat_request(input).expect_err("multiple choices");
         assert!(matches!(error, OpenAiChatError::Conversion(_)));
+    }
+
+    fn reasoning_text_from_delta(delta: &str) -> Vec<String> {
+        let chunk = format!(
+            r#"{{"id":"chat-1","model":"gpt-test","choices":[{{"index":0,"delta":{delta},"finish_reason":null}}]}}"#
+        );
+        let mut decoder = OpenAiChatEventDecoder::new();
+        decoder
+            .decode_chunk(chunk.as_bytes())
+            .expect("decode reasoning delta")
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StreamEventKind::ReasoningDelta { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn decoder_accepts_every_observed_reasoning_field_name() {
+        for field in ["reasoning", "reasoning_content", "reasoning_text"] {
+            let delta = format!(r#"{{"role":"assistant","{field}":"thinking"}}"#);
+            assert_eq!(
+                reasoning_text_from_delta(&delta),
+                vec!["thinking".to_owned()],
+                "provider field `{field}` must stream reasoning"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_treats_a_null_reasoning_field_as_absent() {
+        // A bare null previously reached `as_str` and failed as InvalidShape,
+        // because only the `reasoning_content` branch filtered nulls.
+        assert!(reasoning_text_from_delta(r#"{"role":"assistant","reasoning":null}"#).is_empty());
+        assert!(
+            reasoning_text_from_delta(r#"{"role":"assistant","reasoning_text":null}"#).is_empty()
+        );
+    }
+
+    #[test]
+    fn decoder_reports_the_offending_reasoning_field_by_name() {
+        let chunk = br#"{"id":"chat-1","model":"gpt-test","choices":[{"index":0,"delta":{"role":"assistant","reasoning":42},"finish_reason":null}]}"#;
+        let error = OpenAiChatEventDecoder::new()
+            .decode_chunk(chunk)
+            .expect_err("a non-string reasoning value is invalid");
+        let OpenAiChatError::InvalidShape { field, .. } = error else {
+            panic!("expected an invalid-shape error");
+        };
+        assert_eq!(field, "choices[0].delta.reasoning");
+    }
+
+    fn request_with_temperature() -> SemanticRequest {
+        let input =
+            br#"{"model":"o-test","messages":[{"role":"user","content":"hi"}],"temperature":0.25}"#;
+        decode_chat_request_with_report(input)
+            .expect("request")
+            .request
+    }
+
+    #[test]
+    fn default_dialect_forwards_temperature_upstream() {
+        let encoded = encode_chat_request(&request_with_temperature(), LossPolicy::Reject)
+            .expect("default dialect encodes");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("JSON");
+        assert_eq!(value["temperature"], 0.25);
+        assert!(encoded.report.is_lossless());
+    }
+
+    #[test]
+    fn rejecting_dialect_fails_before_upstream_under_the_default_policy() {
+        let error = encode_chat_request_with_dialect(
+            &request_with_temperature(),
+            LossPolicy::Reject,
+            ModelDialect::new().rejecting_temperature(),
+        )
+        .expect_err("temperature must not reach a model that rejects it");
+        let OpenAiChatError::Conversion(conversion) = error else {
+            panic!("expected a conversion error naming the dropped field");
+        };
+        assert_eq!(conversion.policy, LossPolicy::Reject);
+        assert!(conversion
+            .disallowed_losses
+            .iter()
+            .any(|field| field == "sampling.temperature"));
+    }
+
+    #[test]
+    fn rejecting_dialect_omits_temperature_and_records_loss_under_degrade() {
+        let encoded = encode_chat_request_with_dialect(
+            &request_with_temperature(),
+            LossPolicy::Degrade,
+            ModelDialect::new().rejecting_temperature(),
+        )
+        .expect("degrade permits the omission");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("JSON");
+        assert!(
+            value.get("temperature").is_none(),
+            "temperature must be absent for a model that rejects it"
+        );
+        assert!(encoded.report.has_loss());
+        assert!(encoded
+            .report
+            .dropped_optional_fields
+            .iter()
+            .any(|field| field == "sampling.temperature"));
+    }
+
+    #[test]
+    fn rejecting_dialect_is_lossless_when_the_caller_sent_no_temperature() {
+        let input = br#"{"model":"o-test","messages":[{"role":"user","content":"hi"}]}"#;
+        let request = decode_chat_request_with_report(input)
+            .expect("request")
+            .request;
+        let encoded = encode_chat_request_with_dialect(
+            &request,
+            LossPolicy::Reject,
+            ModelDialect::new().rejecting_temperature(),
+        )
+        .expect("no temperature means no loss");
+        assert!(encoded.report.is_lossless());
     }
 
     #[test]
