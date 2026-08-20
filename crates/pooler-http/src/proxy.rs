@@ -639,6 +639,9 @@ where
         self.config.match_route_request(&route_request)
     }
 
+    // Returning the final HTTP response keeps request rejection centralized and
+    // avoids a second error-to-response conversion layer on the hot path.
+    #[allow(clippy::result_large_err)]
     fn validate_request(
         &self,
         route: &RoutePlan,
@@ -1855,8 +1858,7 @@ impl PreparedBody {
         match self {
             Self::Streaming(body) => {
                 body.take()
-                    .ok_or(ProxyError::Upstream(Box::new(io::Error::new(
-                        io::ErrorKind::Other,
+                    .ok_or(ProxyError::Upstream(Box::new(io::Error::other(
                         "streaming request body was already used",
                     ))))
             }
@@ -2237,7 +2239,7 @@ struct WebSocketHandshakeResponse {
 #[derive(Debug)]
 enum UpstreamSocket {
     Plain(TcpStream),
-    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for UpstreamSocket {
@@ -2248,7 +2250,7 @@ impl AsyncRead for UpstreamSocket {
     ) -> Poll<io::Result<()>> {
         match self.as_mut().get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_read(context, buffer),
-            Self::Tls(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(context, buffer),
         }
     }
 }
@@ -2261,21 +2263,21 @@ impl AsyncWrite for UpstreamSocket {
     ) -> Poll<io::Result<usize>> {
         match self.as_mut().get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_write(context, bytes),
-            Self::Tls(stream) => Pin::new(stream).poll_write(context, bytes),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(context, bytes),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.as_mut().get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_flush(context),
-            Self::Tls(stream) => Pin::new(stream).poll_flush(context),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(context),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.as_mut().get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(context),
-            Self::Tls(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(context),
         }
     }
 }
@@ -2321,7 +2323,7 @@ async fn connect_websocket(
             .connect(server_name, stream)
             .await
             .map_err(|error| ProxyError::Upstream(Box::new(error)))?;
-        UpstreamSocket::Tls(stream)
+        UpstreamSocket::Tls(Box::new(stream))
     } else if scheme.eq_ignore_ascii_case("ws") {
         UpstreamSocket::Plain(stream)
     } else {

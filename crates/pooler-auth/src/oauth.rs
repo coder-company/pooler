@@ -710,7 +710,7 @@ fn unique_query_parameter(url: &Url, name: &str) -> Result<Option<String>, OAuth
 fn redacted_url(url: &Url) -> String {
     let mut redacted = url.clone();
     redacted.set_query(None);
-    format!("{}?redacted", redacted)
+    format!("{redacted}?redacted")
 }
 
 fn random_urlsafe(size: usize) -> Result<String, OAuthError> {

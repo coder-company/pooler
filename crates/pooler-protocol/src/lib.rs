@@ -46,6 +46,9 @@ pub use openai_chat::{
 pub use pooler_core::LossPolicy;
 
 /// Request body representations used by route plans.
+// Keep semantic bodies inline: boxing would add an allocation to every decoded
+// request solely to reduce the stack size of this boundary enum.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RequestBody {
     /// Bytes or frames that do not require semantic decoding.
@@ -78,6 +81,9 @@ impl RequestBody {
 }
 
 /// Response body representations used by route plans.
+// Stream events cross this boundary one at a time; keep them inline instead of
+// adding one heap allocation per event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ResponseBody {
     /// Opaque response bytes.

@@ -1945,11 +1945,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, Base64Error> {
     }
     let bytes = value.as_bytes();
     let padding = bytes.iter().rev().take_while(|byte| **byte == b'=').count();
-    if padding > 2
-        || bytes[..bytes.len().saturating_sub(padding)]
-            .iter()
-            .any(|byte| *byte == b'=')
-    {
+    if padding > 2 || bytes[..bytes.len().saturating_sub(padding)].contains(&b'=') {
         return Err(Base64Error::Padding);
     }
 

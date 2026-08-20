@@ -231,12 +231,11 @@ pub fn normalize_models(configs: &[ClientModelConfig], base_url: &str) -> Vec<De
             };
             let model = DevinModel {
                 id: id.to_owned(),
-                name: config
-                    .label
-                    .trim()
-                    .is_empty()
-                    .then(|| id.to_owned())
-                    .unwrap_or_else(|| config.label.trim().to_owned()),
+                name: if config.label.trim().is_empty() {
+                    id.to_owned()
+                } else {
+                    config.label.trim().to_owned()
+                },
                 provider: "devin",
                 base_url: base_url.to_owned(),
                 input: if config.supports_images {

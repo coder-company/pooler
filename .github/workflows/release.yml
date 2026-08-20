@@ -122,7 +122,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
         with:
-          toolchain: 1.86.0
+          toolchain: 1.88.0
           components: clippy,rustfmt
 
       - name: Install dependency policy tools
@@ -217,7 +217,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
         with:
-          toolchain: 1.86.0
+          toolchain: 1.88.0
           target: ${{ matrix.target }}
 
       - name: Install the Linux ARM64 linker
@@ -373,7 +373,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         uses: dtolnay/rust-toolchain@c18ebc01c713fe144ce50311473bf5c1b15b8e08 # pinned action; toolchain below
         with:
-          toolchain: 1.86.0
+          toolchain: 1.88.0
 
       - name: Read the package version
         id: package
