@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 try:
     import yaml
@@ -62,7 +62,7 @@ UniqueLoader.add_constructor(
 )
 
 
-def fail(message: str) -> None:
+def fail(message: str) -> NoReturn:
     raise ValueError(message)
 
 
@@ -281,6 +281,48 @@ def validate_rust_setup(
         fail(f"expected 11 job-local Rust setup steps, found {setup_count}")
 
 
+def validate_sanitizer_runner(root: Path) -> None:
+    path = root / "scripts" / "deep-test.sh"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        fail(f"could not read {path}: {error}")
+
+    try:
+        function_start = next(
+            index for index, line in enumerate(lines) if line.strip() == "run_sanitizer() {"
+        )
+        function_end = next(
+            index
+            for index in range(function_start + 1, len(lines))
+            if lines[index].strip() == "}"
+        )
+        command_start = next(
+            index
+            for index in range(function_start + 1, function_end)
+            if lines[index].strip() == "run env \\"
+        )
+    except StopIteration:
+        fail("deep-test.sh must run the sanitizer test command")
+
+    command: list[str] = []
+    for line in lines[command_start:]:
+        command.append(line.strip())
+        if not line.rstrip().endswith("\\"):
+            break
+    required_prefix = [
+        "run env \\",
+        'RUSTFLAGS="-Zsanitizer=$SANITIZER" \\',
+        'RUSTDOCFLAGS="-Zsanitizer=$SANITIZER" \\',
+        'ASAN_OPTIONS="$sanitizer_options" \\',
+        'cargo +"$toolchain" test \\',
+    ]
+    if command[: len(required_prefix)] != required_prefix:
+        fail(
+            "deep-test.sh must link the sanitizer runtime into rustc and rustdoc test harnesses"
+        )
+
+
 def run_contents(job: dict[str, Any], context: str) -> str:
     steps = sequence(job.get("steps"), f"{context}.steps")
     runs = [step["run"] for step in steps if isinstance(step, dict) and "run" in step]
@@ -407,10 +449,16 @@ def validate_release(path: Path, workflows: dict[str, dict[str, Any]]) -> None:
     # executable checks, rather than merely carrying job labels.
     if "scripts/deep-test.sh" not in run_contents(hardening_jobs["fuzz"], "hardening.yml.jobs.fuzz"):
         fail("hardening.yml fuzz job must run scripts/deep-test.sh")
-    if "scripts/deep-test.sh" not in run_contents(
+    sanitizer_run = run_contents(
         hardening_jobs["sanitizer"], "hardening.yml.jobs.sanitizer"
-    ):
-        fail("hardening.yml sanitizer job must run scripts/deep-test.sh")
+    )
+    required_sanitizer_fragments = (
+        "POOLER_REQUIRE_SANITIZER=1",
+        "POOLER_SANITIZER=address",
+        "scripts/deep-test.sh --sanitize --no-fuzz",
+    )
+    if not all(fragment in sanitizer_run for fragment in required_sanitizer_fragments):
+        fail("hardening.yml sanitizer job must require the address sanitizer gate")
     install_gitleaks = find_step(
         secret_jobs["gitleaks"],
         lambda step: isinstance(step.get("run"), str)
@@ -465,6 +513,7 @@ def main() -> int:
     workflows = {**reusable, "release.yml": release}
     validate_runner_policy(workflows)
     validate_rust_setup(workflows, root)
+    validate_sanitizer_runner(root)
     validate_release(paths["release.yml"], reusable)
     print("release workflow dependency checks passed")
     return 0

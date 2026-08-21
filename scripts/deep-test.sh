@@ -196,6 +196,7 @@ run_sanitizer() {
     sanitizer_options='halt_on_error=1:detect_leaks=1:allocator_may_return_null=0'
     run env \
         RUSTFLAGS="-Zsanitizer=$SANITIZER" \
+        RUSTDOCFLAGS="-Zsanitizer=$SANITIZER" \
         ASAN_OPTIONS="$sanitizer_options" \
         cargo +"$toolchain" test \
         --workspace \
