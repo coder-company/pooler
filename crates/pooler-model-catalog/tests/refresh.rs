@@ -126,8 +126,10 @@ async fn refresh_enforces_discovery_concurrency_bound() {
             )
         })
         .collect();
+    // Generous on purpose: this test asserts the concurrency bound, so the
+    // deadline must never turn machine load into a failure.
     let limits = RefreshConfig {
-        timeout_ms: 1_000,
+        timeout_ms: 60_000,
         max_concurrency: 2,
         ..RefreshConfig::default()
     }

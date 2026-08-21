@@ -52,7 +52,9 @@ models:
   - id: configured-only
     targets: [{provider: provider-a, upstream_model: configured-upstream, capabilities: [text]}]
 catalog:
-  refresh: {timeout_ms: 1000, max_models_per_source: 10, max_total_models: 10}
+  # The timeout is deliberately generous: these tests assert catalog shaping,
+  # not refresh deadlines, and a tight budget only measures machine load.
+  refresh: {timeout_ms: 60000, max_models_per_source: 10, max_total_models: 10}
   sources:
     - id: provider-a.primary
       provider: provider-a
@@ -674,45 +676,88 @@ routes:
     provider.await.expect("fake provider task");
 }
 
-/// Serve one discovery response, then hand back any inference request that
-/// arrives within a short window.
-async fn serve_discovery_then_optional_inference(
-    upstream: TcpListener,
-    models: &'static [u8],
-) -> Option<String> {
-    let (mut discovery, _) = upstream.accept().await.expect("discovery connection");
-    let request = read_http_request(&mut discovery).await;
-    assert!(request.starts_with("GET /v1/models HTTP/1.1"));
-    discovery
-        .write_all(
-            format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                models.len()
-            )
-            .as_bytes(),
-        )
-        .await
-        .expect("catalog headers");
-    discovery.write_all(models).await.expect("catalog body");
+/// A deterministic fake upstream for the catalog dialect tests.
+///
+/// The listener is owned for the whole lifetime of the proxy under test
+/// instead of being dropped by a wall-clock timer. The accept loop is stopped
+/// only after the proxy has finished draining, so every connection the proxy
+/// opened is already queued on the listener by then. An inference request the
+/// proxy really made can therefore never be missed because the machine was
+/// busy, and a request it never made can never be observed.
+struct FakeCatalogUpstream {
+    address: std::net::SocketAddr,
+    shutdown: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<Vec<String>>,
+}
 
-    let accepted = tokio::time::timeout(std::time::Duration::from_millis(500), upstream.accept())
-        .await
-        .ok()?;
-    let (mut inference, _) = accepted.expect("inference connection");
-    let request = read_http_request(&mut inference).await;
-    let response = br#"{"id":"response","model":"gpt-image-1.5"}"#;
-    inference
+impl FakeCatalogUpstream {
+    async fn start(models: &'static [u8]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake provider bind");
+        let address = listener.local_addr().expect("fake provider address");
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(serve_catalog_upstream(
+            listener,
+            models,
+            Arc::clone(&shutdown),
+        ));
+        Self {
+            address,
+            shutdown,
+            task,
+        }
+    }
+
+    /// Stops the accept loop and returns every inference request the proxy
+    /// issued. Call this only once the proxy has fully drained.
+    async fn finish(self) -> Vec<String> {
+        self.shutdown.notify_one();
+        self.task.await.expect("fake provider task")
+    }
+}
+
+/// Answers model discovery for as long as the listener is open and records
+/// every non-discovery request so the test can assert on the shaped body.
+async fn serve_catalog_upstream(
+    listener: TcpListener,
+    models: &'static [u8],
+    shutdown: Arc<tokio::sync::Notify>,
+) -> Vec<String> {
+    let mut inference_requests = Vec::new();
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            accepted = listener.accept() => accepted,
+            () = shutdown.notified() => break,
+        };
+        let (mut stream, _) = accepted.expect("upstream connection");
+        let request = read_http_request(&mut stream).await;
+        if request.starts_with("GET /v1/models ") {
+            write_json_response(&mut stream, models).await;
+            continue;
+        }
+        write_json_response(&mut stream, br#"{"id":"response","model":"gpt-image-1.5"}"#).await;
+        inference_requests.push(request);
+    }
+    inference_requests
+}
+
+async fn write_json_response(stream: &mut TcpStream, body: &[u8]) {
+    stream
         .write_all(
             format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                response.len()
+                body.len()
             )
             .as_bytes(),
         )
         .await
-        .expect("inference headers");
-    inference.write_all(response).await.expect("inference body");
-    Some(request)
+        .expect("upstream response headers");
+    stream
+        .write_all(body)
+        .await
+        .expect("upstream response body");
 }
 
 async fn proxy_a_request_rejecting_temperature(
@@ -731,14 +776,18 @@ async fn proxy_a_request_with_catalog_overrides(
     overrides: &str,
     body: &[u8],
 ) -> (String, Option<String>) {
-    let upstream = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("fake provider bind");
-    let upstream_address = upstream.local_addr().expect("fake provider address");
-    let provider = tokio::spawn(serve_discovery_then_optional_inference(
-        upstream,
-        br#"{"data":[{"id":"gpt-image-1.5"},{"id":"gpt-4o"}]}"#,
-    ));
+    proxy_a_request_after_client_delay(loss_policy, overrides, body, None).await
+}
+
+async fn proxy_a_request_after_client_delay(
+    loss_policy: Option<&str>,
+    overrides: &str,
+    body: &[u8],
+    client_delay: Option<std::time::Duration>,
+) -> (String, Option<String>) {
+    let upstream =
+        FakeCatalogUpstream::start(br#"{"data":[{"id":"gpt-image-1.5"},{"id":"gpt-4o"}]}"#).await;
+    let upstream_address = upstream.address;
 
     let loss_policy =
         loss_policy.map_or_else(String::new, |policy| format!("    loss_policy: {policy}\n"));
@@ -771,6 +820,10 @@ catalog:
         tokio::spawn(async move { server.run().await })
     };
 
+    if let Some(client_delay) = client_delay {
+        tokio::time::sleep(client_delay).await;
+    }
+
     let mut downstream = TcpStream::connect(&proxy_address)
         .await
         .expect("proxy connection");
@@ -793,10 +846,14 @@ catalog:
 
     server.begin_drain();
     runner.await.expect("server task").expect("server shutdown");
-    let upstream_request = provider.await.expect("fake provider task");
+    let mut upstream_requests = upstream.finish().await;
+    assert!(
+        upstream_requests.len() <= 1,
+        "the route issues at most one upstream request: {upstream_requests:?}"
+    );
     (
         String::from_utf8_lossy(&response).to_string(),
-        upstream_request,
+        upstream_requests.pop(),
     )
 }
 
@@ -895,6 +952,34 @@ async fn a_rejecting_loss_policy_fails_the_request_before_any_upstream_call() {
     assert!(
         upstream_request.is_none(),
         "no upstream request may be made: {upstream_request:?}"
+    );
+}
+
+/// Regression for a test-isolation defect, not for product behaviour.
+///
+/// The fake upstream used to stop accepting 500 ms after startup discovery and
+/// drop its listener. Whenever the workspace suite ran in parallel and the
+/// machine was busy, the proxy's inference connection landed after that window
+/// and was refused, so the dialect assertions saw `HTTP/1.1 502 Bad Gateway`
+/// instead of the shaped request. The delay below is far past that old window,
+/// so this test fails against the timer-owned harness and passes against the
+/// listener-owned one.
+#[tokio::test]
+async fn the_upstream_harness_records_a_request_made_long_after_discovery() {
+    let (response, upstream_request) = proxy_a_request_after_client_delay(
+        None,
+        "",
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        Some(std::time::Duration::from_millis(1_200)),
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let upstream_request =
+        upstream_request.expect("a late request still reaches the owned upstream listener");
+    assert!(
+        upstream_request.contains("\"model\":\"gpt-4o\""),
+        "{upstream_request}"
     );
 }
 
