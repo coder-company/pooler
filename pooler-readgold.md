@@ -68,6 +68,20 @@ name or advertised without conformance evidence.
   are wired. The hardened three-run benchmark and 15-minute stress rerun for
   implementation commit `47f68b2` passed every enforced invariant. Native
   cross-platform CI and signed release artifacts remain publication gates.
+- Turnkey gateway preset: implemented and locally verified. The `gateway` preset
+  mounts sixteen routes covering models, chat completions, completions,
+  responses, responses compact, the responses WebSocket, embeddings, messages,
+  message token counting, images, audio, files, batches, and the Gemini models,
+  model-action, and interactions surfaces. Its upstream is declared with
+  `known_provider`, so the shipped provider catalog supplies the base URL,
+  discovery parser, aliases, and exclusions, and Pooler derives a catalog source
+  automatically. Model-bearing JSON routes select through that catalog and
+  reject an unknown model before any upstream call; every other surface
+  forwards opaquely under explicit bounds. Opaque forwarding is recorded as
+  forwarding, not as provider-native semantic compatibility. Evidence is
+  `crates/pooler-config/tests/gateway_preset.rs` and the mounted
+  `HttpProxyServer` coverage in `crates/pooler-server/tests/gateway_preset.rs`.
+  Live-provider conformance for the preset remains a separate gate.
 - First useful release acceptance: pending; the authoritative checklist is
   [`docs/release-acceptance.md`](docs/release-acceptance.md).
 

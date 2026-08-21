@@ -424,11 +424,12 @@ fn expand_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError>
         Some("devin") => expand_devin_preset(import, path),
         Some("factory") => expand_factory_preset(import, path),
         Some("fx") => expand_fx_preset(import, path),
+        Some("gateway") => expand_gateway_preset(import, path),
         Some("media") => expand_media_preset(import, path),
         Some("xai") => expand_xai_preset(import, path),
         _ => Err(load_error(
             path,
-            "unknown preset; expected cursor, devin, factory, fx, media, or xai",
+            "unknown preset; expected cursor, devin, factory, fx, gateway, media, or xai",
         )),
     }
 }
@@ -703,6 +704,155 @@ fn rewrite_fx_routes(root: &mut Value, alias: &str, path: &Path) -> Result<(), C
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// Expand the universal turnkey gateway preset.
+///
+/// The preset declares one REST upstream and one WebSocket upstream because a
+/// WebSocket route requires a `ws`/`wss` transport, exactly like the xAI
+/// preset. Every route it carries is renamed under the alias so several
+/// gateways can coexist on one deployment.
+fn expand_gateway_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
+    for key in import.parameters.keys() {
+        if !matches!(
+            key.as_str(),
+            "bind" | "provider" | "upstream_url" | "websocket_url" | "secret"
+        ) {
+            return Err(unknown_preset_parameter(path, key));
+        }
+    }
+    let alias = import.alias.as_deref().unwrap_or("gateway");
+    if alias.is_empty()
+        || !alias
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(load_error(path, "invalid preset alias"));
+    }
+    let mut preset: Value = serde_yml::from_str(include_str!("../../../presets/gateway.yaml"))
+        .map_err(|error| load_error(path, &format!("invalid built-in gateway preset: {error}")))?;
+    let websocket_alias = format!("{alias}-websocket");
+    rename_named_key(&mut preset, "listeners", "gateway", alias, path)?;
+    rename_named_key(
+        &mut preset,
+        "upstreams",
+        "gateway-websocket",
+        &websocket_alias,
+        path,
+    )?;
+    rename_named_key(&mut preset, "upstreams", "gateway", alias, path)?;
+    rewrite_gateway_routes(&mut preset, alias, &websocket_alias, path)?;
+
+    if let Some(value) = import.parameters.get("bind") {
+        set_named_field(
+            &mut preset,
+            "listeners",
+            alias,
+            "bind",
+            string_value(value, path, "gateway")?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("provider") {
+        set_named_field(
+            &mut preset,
+            "upstreams",
+            alias,
+            "known_provider",
+            string_value(value, path, "gateway")?,
+            path,
+        )?;
+    }
+    // An explicit URL outranks the shipped provider base URL, which is what a
+    // private deployment or a loopback test needs.
+    if let Some(value) = import.parameters.get("upstream_url") {
+        set_named_field(
+            &mut preset,
+            "upstreams",
+            alias,
+            "url",
+            string_value(value, path, "gateway")?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("websocket_url") {
+        set_named_field(
+            &mut preset,
+            "upstreams",
+            &websocket_alias,
+            "url",
+            string_value(value, path, "gateway")?,
+            path,
+        )?;
+    }
+    if let Some(value) = import.parameters.get("secret") {
+        let secret = string_value(value, path, "gateway")?;
+        for upstream_id in [alias, websocket_alias.as_str()] {
+            let upstream = named_declaration_mut(&mut preset, "upstreams", upstream_id, path)?;
+            let auth = upstream
+                .get_mut(Value::String("auth".to_owned()))
+                .and_then(Value::as_mapping_mut)
+                .ok_or_else(|| load_error(path, "gateway preset auth is invalid"))?;
+            auth.insert(
+                Value::String("secret".to_owned()),
+                Value::String(secret.clone()),
+            );
+        }
+    }
+    Ok(preset)
+}
+
+fn rewrite_gateway_routes(
+    root: &mut Value,
+    alias: &str,
+    websocket_alias: &str,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    let routes = root
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(Value::String("routes".to_owned())))
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| load_error(path, "gateway preset routes are invalid"))?;
+    for route in routes {
+        let route = route
+            .as_mapping_mut()
+            .ok_or_else(|| load_error(path, "gateway preset route is invalid"))?;
+        let route_id = route
+            .get(Value::String("id".to_owned()))
+            .and_then(Value::as_str)
+            .ok_or_else(|| load_error(path, "gateway preset route ID is missing"))?;
+        route.insert(
+            Value::String("id".to_owned()),
+            Value::String(format!("{alias}-{route_id}")),
+        );
+        route.insert(
+            Value::String("listen".to_owned()),
+            Value::String(alias.to_owned()),
+        );
+        let target = route
+            .get_mut(Value::String("target".to_owned()))
+            .and_then(Value::as_mapping_mut)
+            .ok_or_else(|| load_error(path, "gateway preset target is invalid"))?;
+        let provider = target
+            .get(Value::String("provider".to_owned()))
+            .and_then(Value::as_str)
+            .ok_or_else(|| load_error(path, "gateway preset target provider is missing"))?;
+        let provider = match provider {
+            "gateway" => alias,
+            "gateway-websocket" => websocket_alias,
+            _ => {
+                return Err(load_error(
+                    path,
+                    "gateway preset target provider is invalid",
+                ))
+            }
+        };
+        target.insert(
+            Value::String("provider".to_owned()),
+            Value::String(provider.to_owned()),
+        );
     }
     Ok(())
 }

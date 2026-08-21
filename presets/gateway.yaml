@@ -1,0 +1,348 @@
+version: 1
+
+# Universal turnkey gateway.
+#
+# This preset mounts the endpoint families a general OpenAI/Anthropic/Gemini
+# client expects, using only route primitives that already exist. It makes one
+# claim and no more: every route below is mounted, bounded, and reachable.
+#
+# Two honest modes are used.
+#
+#   patch   The caller's JSON body is preserved except for the `/model`
+#           pointer, which is rewritten to the selected target's upstream
+#           model. This is what makes catalog aliases, account pooling,
+#           capability filtering, and the vendored request-facts dialect apply
+#           to a request. It requires a JSON body with a top-level `model`,
+#           and it only accepts a model the catalog knows.
+#
+# The upstream is declared with `known_provider`, so its base URL, discovery
+# parser, model aliases, and model exclusions come from the provider catalog
+# this build ships. That is what makes the preset turnkey: Pooler derives a
+# model catalog for the upstream automatically, and the patch routes above
+# select against it. Set `upstream_url` to override the shipped base URL.
+#
+#   opaque  Bytes or frames are forwarded without semantic decoding. Media,
+#           file, and batch surfaces keep provider-specific fields exactly, and
+#           upload bytes are streamed once so Pooler's retry policy cannot
+#           replay them.
+#
+# Opaque forwarding is NOT provider-native semantic compatibility. A route here
+# never claims to translate between protocols; routes that do that are
+# configured explicitly with a decoder and encoder.
+
+listeners:
+  gateway:
+    bind: 127.0.0.1:8400
+
+upstreams:
+  gateway:
+    known_provider: openai
+    auth:
+      kind: bearer_secret
+      secret: env:POOLER_GATEWAY_KEY
+  # A WebSocket route requires an explicit ws/wss transport, so this upstream
+  # cannot be derived from `known_provider`. Set the preset's `websocket_url`
+  # parameter whenever `provider` is not `openai`.
+  gateway-websocket:
+    url: wss://api.openai.com
+    auth:
+      kind: bearer_secret
+      secret: env:POOLER_GATEWAY_KEY
+
+routes:
+  # ---------------------------------------------------------------- discovery
+  - id: models
+    listen: gateway
+    match:
+      methods: [GET]
+      path: /v1/models
+    limits:
+      max_request_body_bytes: 65536
+    ingress:
+      mode: opaque
+    target:
+      provider: gateway
+    response:
+      mode: opaque
+
+  # ------------------------------------------------------- OpenAI text family
+  - id: chat-completions
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/chat/completions
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+      max_event_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 256
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      provider: gateway
+      model_from: request.model
+    response:
+      mode: opaque
+
+  - id: completions
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/completions
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+      max_event_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 256
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      provider: gateway
+      model_from: request.model
+    response:
+      mode: opaque
+
+  - id: responses
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/responses
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+      max_event_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 256
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      provider: gateway
+      model_from: request.model
+    response:
+      mode: opaque
+
+  - id: responses-compact
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/responses/compact
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      provider: gateway
+      model_from: request.model
+    response:
+      mode: opaque
+
+  # A Responses WebSocket carries many turns on one connection. Pooler tunnels
+  # its frames under the same ceiling the REST routes enforce; it does not
+  # interpret them.
+  - id: responses-websocket
+    listen: gateway
+    match:
+      methods: [GET]
+      path: /v1/responses
+      websocket: true
+    limits:
+      max_frame_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 256
+    ingress:
+      mode: opaque
+    target:
+      provider: gateway-websocket
+      capabilities: [web_socket]
+    response:
+      mode: opaque
+
+  - id: embeddings
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/embeddings
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      provider: gateway
+      model_from: request.model
+    response:
+      mode: opaque
+
+  # ---------------------------------------------------- Anthropic text family
+  - id: messages
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/messages
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+      max_event_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 256
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      provider: gateway
+      model_from: request.model
+    response:
+      mode: opaque
+
+  - id: messages-count-tokens
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/messages/count_tokens
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      provider: gateway
+      model_from: request.model
+    response:
+      mode: opaque
+
+  # ------------------------------------------------------------- media family
+  # These surfaces stay opaque so multipart parts, binary payloads, and
+  # provider-specific fields survive byte for byte.
+  - id: images
+    listen: gateway
+    match:
+      methods: [GET, POST, DELETE]
+      path_prefix: /v1/images
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: opaque
+    target:
+      provider: gateway
+      capabilities: [images]
+    response:
+      mode: opaque
+
+  - id: audio
+    listen: gateway
+    match:
+      methods: [GET, POST, DELETE]
+      path_prefix: /v1/audio
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: opaque
+    target:
+      provider: gateway
+      capabilities: [audio]
+    response:
+      mode: opaque
+
+  - id: files
+    listen: gateway
+    match:
+      methods: [GET, POST, DELETE]
+      path_prefix: /v1/files
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: opaque
+    target:
+      provider: gateway
+      capabilities: [files]
+    response:
+      mode: opaque
+
+  - id: batches
+    listen: gateway
+    match:
+      methods: [GET, POST, DELETE]
+      path_prefix: /v1/batches
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: opaque
+    target:
+      provider: gateway
+      capabilities: [batch]
+    response:
+      mode: opaque
+
+  # ------------------------------------------------------------ Gemini family
+  # Gemini carries the model and the action in the request path rather than in
+  # a body field, so these routes forward opaquely instead of pretending a body
+  # inspector can select a target.
+  - id: gemini-models
+    listen: gateway
+    match:
+      methods: [GET]
+      path: /v1beta/models
+    limits:
+      max_request_body_bytes: 65536
+    ingress:
+      mode: opaque
+    target:
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: gemini-model-actions
+    listen: gateway
+    match:
+      methods: [GET, POST]
+      path_prefix: /v1beta/models
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+      max_event_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 256
+    ingress:
+      mode: opaque
+    target:
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: gemini-interactions
+    listen: gateway
+    match:
+      methods: [GET, POST]
+      path_prefix: /v1beta/interactions
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+      max_event_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 256
+    ingress:
+      mode: opaque
+    target:
+      provider: gateway
+    response:
+      mode: opaque

@@ -1,0 +1,10 @@
+imports:
+  - preset: gateway
+    as: gateway
+    with:
+      bind: 127.0.0.1:8400
+      upstream_url: https://api.openai.com
+      websocket_url: wss://api.openai.com
+      secret: env:POOLER_GATEWAY_KEY
+
+version: 1

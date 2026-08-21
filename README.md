@@ -17,6 +17,14 @@ Render a fully expanded configuration, including imports and presets, with:
 cargo run -p pooler-cli -- --config config/cursor.example.yaml config render
 ```
 
+Mount the endpoint families a general OpenAI, Anthropic, or Gemini client
+expects, without hand-authoring a route plan, with the
+[`gateway` preset](docs/gateway.md):
+
+```sh
+POOLER_GATEWAY_KEY=... cargo run -p pooler-cli -- serve --config config/gateway.example.yaml
+```
+
 Run the native Vercel Labs fx adapter, including model discovery, streaming,
 and tool-result continuation, with the [`fx` preset](docs/fx.md). Factory Droid
 is a separate client and does not use this adapter.

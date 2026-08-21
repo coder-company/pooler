@@ -27,6 +27,7 @@ CLIProxyAPI currently has the broader integration product.
 | Management | Remote management API, browser panel ecosystem, account/config/model controls, quota and usage tooling | Authenticated browser/API account and runtime-model controls, safe reload, quota/usage/cost views, traces, audit and redacted export | Remote TLS and durable browser-managed configuration editing |
 | Extensions | Broad trusted plugin ABI for auth, models, scheduling, execution, translation, interception, CLI and management | Capability-limited external/WASM inspection and transformation | Plugin registry, provider plugin catalog and broader extension hooks |
 | Operator UX | TUI, standalone modes and provider login switches | CLI/server workflow | Interactive operational tooling |
+| Turnkey endpoint surface | One ready-to-use gateway mounts the expected endpoints by default | The [`gateway` preset](gateway.md) mounts sixteen routes across the OpenAI, Anthropic and Gemini surfaces from one import, with catalog-driven model selection and explicit bounds | Closed for mounted reachability; per-endpoint semantic translation remains route-by-route and evidence-gated |
 
 Primary CLIProxyAPI evidence:
 
