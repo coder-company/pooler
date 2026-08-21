@@ -120,8 +120,11 @@ run_fuzz_targets() {
         echo "unable to determine the libFuzzer target triple" >&2
         return 1
     fi
-    cargo_fuzz+=(fuzz run --target "$fuzz_target")
     cd "$ROOT/fuzz"
+    # Compile outside the per-target wall-clock budget so a cold nightly cache
+    # cannot turn a successful bounded fuzz run into a false timeout.
+    run "${cargo_fuzz[@]}" fuzz build --target "$fuzz_target"
+    cargo_fuzz+=(fuzz run --target "$fuzz_target")
     while read -r target corpus; do
         echo "+ cargo fuzz run --target $fuzz_target $target $corpus -- -max_total_time=$FUZZ_SECONDS"
         run_bounded "$FUZZ_TIMEOUT" "${cargo_fuzz[@]}" "$target" "$corpus" -- \
