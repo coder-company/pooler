@@ -23,6 +23,14 @@
     pollTimer: null,
     expanded: new Set(),
     filter: "",
+    authState: "anonymous",
+    authPrompted: false,
+    requestGeneration: 0,
+    sessionGeneration: 0,
+    readController: null,
+    endpointMeta: {},
+    lastSuccessfulRefresh: null,
+    pending: new Set(),
   };
 
   /* ---------------- Small helpers ---------------- */
@@ -88,8 +96,8 @@
     return state.token ? { Authorization: `Bearer ${state.token}` } : {};
   }
 
-  async function readJson(path) {
-    const response = await fetch(`${BASE}${path}`, { headers: requestHeaders(), cache: "no-store" });
+  async function readJson(path, signal) {
+    const response = await fetch(`${BASE}${path}`, { headers: requestHeaders(), cache: "no-store", signal });
     if (!response.ok) {
       const detail = await response.json().catch(() => null);
       const message = detail && detail.error ? detail.error : `${response.status} ${response.statusText}`;
@@ -112,13 +120,18 @@
     return detail || {};
   }
 
-  async function downloadExport() {
+  async function downloadExport(sessionGeneration) {
     const response = await fetch(`${BASE}/export`, { headers: requestHeaders(), cache: "no-store" });
+    if (sessionGeneration !== state.sessionGeneration) return false;
     if (!response.ok) {
       const detail = await response.json().catch(() => null);
-      throw new Error(detail && detail.error ? detail.error : `${response.status} ${response.statusText}`);
+      const error = new Error(detail && detail.error ? detail.error : `${response.status} ${response.statusText}`);
+      error.status = response.status;
+      throw error;
     }
-    const url = URL.createObjectURL(await response.blob());
+    const blob = await response.blob();
+    if (sessionGeneration !== state.sessionGeneration) return false;
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
     link.download = `pooler-management-export-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
@@ -127,6 +140,7 @@
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
+    return true;
   }
 
   function modelPath(id) {
@@ -145,6 +159,7 @@
     const area = $("#banner-area");
     const banner = document.createElement("div");
     banner.className = `banner banner-${kind}`;
+    if (options.id) banner.dataset.notice = options.id;
     banner.setAttribute("role", kind === "error" ? "alert" : "status");
     const iconName = { success: "check-circle", error: "cancel", warning: "warning-triangle", info: "info-empty" }[kind] || "info-empty";
     banner.innerHTML = `
@@ -159,8 +174,44 @@
     while (area.children.length > 3) area.firstElementChild.remove();
   }
 
+  function invalidateReads({ clearData = false } = {}) {
+    state.requestGeneration += 1;
+    state.readController?.abort();
+    state.readController = null;
+    state.loading = false;
+    if (clearData) {
+      state.data = {};
+      state.errors = {};
+      state.endpointMeta = {};
+      state.lastSuccessfulRefresh = null;
+    }
+  }
+
+  function renderAuthorizationRequired() {
+    const root = $("#view");
+    const view = views[state.route] || views.overview;
+    root.className = `view view-${state.route}`;
+    root.innerHTML = `
+      ${viewHeader(view.title, view.subtitle)}
+      <div class="panel empty-state" role="status">
+        <p class="empty-title">Authorization required</p>
+        <p class="empty-description">Connect with a valid management bearer token to load this view.</p>
+        <button class="btn btn-primary btn-sm" type="button" data-open-session>Open session</button>
+      </div>`;
+  }
+
   function authRequired() {
-    notify("warning", `This listener requires the management bearer token. <button class="btn btn-outline btn-xs" type="button" data-open-session>Connect</button>`, { sticky: true });
+    const firstPrompt = !state.authPrompted;
+    state.sessionGeneration += 1;
+    state.pending.clear();
+    invalidateReads({ clearData: true });
+    state.authState = "required";
+    state.authPrompted = true;
+    stopPolling();
+    renderAuthorizationRequired();
+    updateHeader();
+    if (!firstPrompt) return;
+    notify("warning", `Authorization is required or the current token was rejected. <button class="btn btn-outline btn-xs" type="button" data-open-session>Open session</button>`, { sticky: true, id: "auth" });
     openSessionDialog();
   }
 
@@ -168,9 +219,15 @@
 
   function openSessionDialog() {
     const dialog = $("#session-dialog");
-    $("#token-input").value = state.token;
+    const input = $("#token-input");
+    const visibility = $("#token-visibility");
+    input.value = state.token;
+    input.type = "password";
+    visibility.innerHTML = ic("eye-empty", 16);
+    visibility.setAttribute("aria-label", "Show bearer token");
+    visibility.title = "Show bearer token";
     if (!dialog.open) dialog.showModal();
-    setTimeout(() => $("#token-input").focus(), 50);
+    setTimeout(() => input.focus(), 50);
   }
 
   function confirmAction({ title, copy, acceptLabel = "Confirm", destructive = false }) {
@@ -208,8 +265,8 @@
 
   function toneForStatus(status) {
     const s = String(status ?? "").toLowerCase();
-    if (["ok", "healthy", "succeeded", "success", "available", "enabled", "accepted"].includes(s)) return "success";
-    if (["cooling_down", "degraded", "stale", "queued", "warning"].includes(s)) return "warning";
+    if (["ok", "healthy", "succeeded", "success", "available", "not_cooling", "enabled", "accepted"].includes(s)) return "success";
+    if (["cooling_down", "degraded", "stale", "queued", "pending", "warning"].includes(s)) return "warning";
     if (["failed", "error", "unauthorized", "exhausted", "rejected_body", "rejected_origin", "not_found", "disabled"].includes(s)) return "error";
     if (["active", "running", "requested", "reload_requested"].includes(s)) return "accent";
     return "muted";
@@ -237,15 +294,16 @@
   }
 
   function tableWrap(columns, rows, options = {}) {
-    const head = columns.map((c) => `<th class="${c.align === "right" ? "cell-right" : ""}">${esc(c.label)}</th>`).join("");
+    const head = columns.map((c) => `<th scope="col" class="${c.align === "right" ? "cell-right" : ""}">${esc(c.label)}</th>`).join("");
+    const totalColumns = columns.length + (options.expandable ? 1 : 0);
     let body;
     if (options.loading) {
       body = Array.from({ length: 4 }, () =>
-        `<tr class="skeleton-row">${columns.map(() => `<td><div class="skeleton-bar"></div></td>`).join("")}</tr>`).join("");
+        `<tr class="skeleton-row">${Array.from({ length: totalColumns }, () => `<td><div class="skeleton-bar"></div></td>`).join("")}</tr>`).join("");
     } else if (options.error) {
-      body = `<tr><td class="error-cell" colspan="${columns.length}">${esc(options.error)}</td></tr>`;
+      body = `<tr><td class="error-cell" colspan="${totalColumns}">${esc(options.error)}</td></tr>`;
     } else if (!rows || rows.length === 0) {
-      body = `<tr><td colspan="${columns.length}">
+      body = `<tr><td colspan="${totalColumns}">
         <div class="empty-state">
           <p class="empty-title">${esc(options.emptyTitle || "Nothing here yet")}</p>
           ${options.emptyDescription ? `<p class="empty-description">${esc(options.emptyDescription)}</p>` : ""}
@@ -256,26 +314,32 @@
           const cls = [c.align === "right" ? "cell-right" : "", c.mono ? "cell-mono" : "", c.nowrap === false ? "" : "cell-nowrap", c.className || ""].filter(Boolean).join(" ");
           return `<td class="${cls}">${c.render(row, i)}</td>`;
         }).join("");
-        const key = options.rowKey ? options.rowKey(row, i) : i;
-        const expandable = options.expandable ? ` data-expand="${esc(key)}" style="cursor:pointer"` : "";
+        const key = String(options.rowKey ? options.rowKey(row, i) : i);
         let detail = "";
-        if (options.expandable && state.expanded.has(String(key))) {
-          detail = `<tr class="detail-row"><td colspan="${columns.length}">${options.expandable(row)}</td></tr>`;
+        let disclosure = "";
+        if (options.expandable) {
+          const expanded = state.expanded.has(key);
+          const detailId = `detail-${state.route}-${i}`;
+          disclosure = `<button class="disclosure-button" type="button" data-expand="${esc(key)}" aria-expanded="${expanded}" aria-controls="${detailId}" aria-label="${expanded ? "Hide" : "Show"} details for ${esc(key)}">${ic("nav-arrow-down", 14)}</button>`;
+          detail = `<tr class="detail-row" id="${detailId}"${expanded ? "" : " hidden"}><td colspan="${totalColumns}">${options.expandable(row)}</td></tr>`;
         }
-        return `<tr${expandable}>${cells}</tr>${detail}`;
+        return `<tr>${disclosure ? `<td class="disclosure-cell">${disclosure}</td>` : ""}${cells}</tr>${detail}`;
       }).join("");
     }
-    return `<div class="table-wrap"><table class="data-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+    const disclosureHead = options.expandable ? `<th scope="col" class="disclosure-cell"><span class="sr-only">Details</span></th>` : "";
+    const caption = options.caption || "Management data";
+    return `<div class="table-wrap"><table class="data-table"><caption class="sr-only">${esc(caption)}</caption><thead><tr>${disclosureHead}${head}</tr></thead><tbody>${body}</tbody></table></div>`;
   }
 
   function section(title, inner, hint = "") {
+    const labelledInner = inner.replace(">Management data</caption>", `>${esc(title)}</caption>`);
     return `
       <section class="section">
         <div class="toolbar">
           <h2 class="section-title">${esc(title)}</h2>
           ${hint ? `<span class="section-hint">${esc(hint)}</span>` : ""}
         </div>
-        ${inner}
+        ${labelledInner}
       </section>`;
   }
 
@@ -291,25 +355,81 @@
   }
 
   function endpointError(key) {
-    return state.errors[key] ? state.errors[key].message : "";
+    return state.errors[key] && !Object.prototype.hasOwnProperty.call(state.data, key)
+      ? state.errors[key].message
+      : "";
+  }
+
+  function renderEndpointState(root, keys) {
+    const failed = keys.filter((key) => state.errors[key]);
+    if (!failed.length) return;
+    const stale = failed.filter((key) => state.endpointMeta[key]?.stale);
+    const unavailable = failed.filter((key) => !state.endpointMeta[key]?.stale);
+    const parts = [];
+    if (stale.length) parts.push(`Showing last known data for ${stale.map((key) => ENDPOINTS[key].path).join(", ")}.`);
+    if (unavailable.length) parts.push(`No data is available for ${unavailable.map((key) => ENDPOINTS[key].path).join(", ")}.`);
+    const banner = document.createElement("div");
+    banner.className = "banner banner-warning endpoint-state";
+    banner.setAttribute("role", "status");
+    const summary = failed.length === keys.length ? "Refresh failed." : "Partial refresh.";
+    banner.innerHTML = `<span class="banner-icon">${ic("warning-triangle", 16)}</span><div class="banner-body"><strong>${summary}</strong> ${esc(parts.join(" "))}</div>`;
+    const header = $(".view-header", root);
+    if (header) header.insertAdjacentElement("afterend", banner);
+    else root.prepend(banner);
   }
 
   /* ---------------- Data loading ---------------- */
 
   async function loadEndpoints(keys) {
+    const generation = ++state.requestGeneration;
+    if (state.readController) state.readController.abort();
+    const controller = new AbortController();
+    state.readController = controller;
     state.loading = true;
+    updateHeader();
+
+    let unauthorized = false;
+    let successful = 0;
     await Promise.all(keys.map(async (key) => {
       const spec = ENDPOINTS[key];
       try {
-        state.data[key] = await readJson(spec.path);
+        const payload = await readJson(spec.path, controller.signal);
+        if (generation !== state.requestGeneration) return undefined;
+        state.data[key] = payload;
         state.errors[key] = null;
+        state.endpointMeta[key] = { stale: false, updatedAt: Date.now() };
+        successful += 1;
       } catch (error) {
+        if (error.name === "AbortError" || generation !== state.requestGeneration) return undefined;
         state.errors[key] = error;
-        if (error.status === 401) authRequired();
+        state.endpointMeta[key] = {
+          stale: Object.prototype.hasOwnProperty.call(state.data, key),
+          updatedAt: state.endpointMeta[key]?.updatedAt || null,
+        };
+        if (error.status === 401) unauthorized = true;
       }
+      return undefined;
     }));
+
+    if (generation !== state.requestGeneration) return false;
     state.loading = false;
+    state.readController = null;
+    if (unauthorized) {
+      authRequired();
+      return false;
+    }
+    if (successful > 0) state.lastSuccessfulRefresh = Date.now();
+    if (state.token && successful > 0) {
+      state.authState = "authenticated";
+      state.authPrompted = false;
+      $("[data-notice=\"auth\"]")?.remove();
+    } else if (state.token) {
+      state.authState = "unavailable";
+    } else if (successful > 0) {
+      state.authState = "anonymous";
+    }
     updateHeader();
+    return true;
   }
 
   const ENDPOINTS = {
@@ -326,6 +446,7 @@
     decisions: { path: "/decisions?limit=50" },
     traces: { path: "/traces" },
     audit: { path: "/audit" },
+    reloads: { path: "/reloads" },
   };
 
   /* ---------------- Header ---------------- */
@@ -336,8 +457,25 @@
       ?? state.data.routes?.configuration_generation
       ?? state.data.models?.configuration_generation;
     $("#generation-badge").textContent = `gen ${text(generation)}`;
-    $("#footer-updated").textContent = state.loading ? "Refreshing…" : `Updated ${fmtTime(Date.now())}`;
-    $("#session-button").textContent = state.token ? "Session" : "Connect";
+    const staleCount = (views[state.route]?.endpoints || []).filter((key) => state.errors[key]).length;
+    if (state.loading) {
+      $("#footer-updated").textContent = state.lastSuccessfulRefresh
+        ? `Refreshing… Last data ${fmtTime(state.lastSuccessfulRefresh)}`
+        : "Refreshing… No data loaded yet";
+    } else if (state.lastSuccessfulRefresh) {
+      $("#footer-updated").textContent = `${staleCount ? `Partial · ${staleCount} endpoint issue${staleCount === 1 ? "" : "s"} · ` : ""}Data refreshed ${fmtTime(state.lastSuccessfulRefresh)}`;
+    } else {
+      $("#footer-updated").textContent = "No successful refresh yet";
+    }
+    const sessionLabels = {
+      anonymous: "Connect",
+      checking: "Verifying…",
+      unavailable: "Not verified",
+      authenticated: "Connected",
+      required: state.token ? "Token rejected" : "Connect",
+    };
+    $("#session-button").textContent = sessionLabels[state.authState];
+    $("#session-button").dataset.authState = state.authState;
   }
 
   function updateThemeIcon() {
@@ -345,6 +483,8 @@
       || (!document.documentElement.classList.contains("light")
         && window.matchMedia("(prefers-color-scheme: dark)").matches);
     $("#theme-toggle").innerHTML = ic(dark ? "sun-light" : "half-moon", 18);
+    $("#theme-toggle").setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+    $("#theme-toggle").title = dark ? "Switch to light theme" : "Switch to dark theme";
   }
 
   /* ---------------- Views ---------------- */
@@ -377,7 +517,7 @@
     operations: {
       title: "Operations",
       subtitle: "Configuration reloads, routing decisions, traces, and the management audit log.",
-      endpoints: ["decisions", "traces", "audit"],
+      endpoints: ["health", "decisions", "traces", "audit", "reloads"],
       render: renderOperations,
     },
     diagnostics: {
@@ -400,7 +540,7 @@
     const routes = state.data.routes?.routes || [];
     const active = state.data.active || {};
 
-    const healthyProviders = providers.filter((p) => p.status === "healthy").length;
+    const availableProviders = providers.filter((p) => p.status === "not_cooling" || p.status === "available").length;
     const enabledAccounts = accounts.filter((a) => a.enabled).length;
     const cooldowns = quota.cooldowns || [];
     const windows = quota.windows || [];
@@ -409,7 +549,7 @@
       statCard("Status", statusBadge(health.status || (endpointError("health") ? "error" : "unknown")),
         endpointError("health") ? esc(endpointError("health")) : `${fmtInt(health.credential_health_entries)} health entries`),
       statCard("Active requests", `<span class="num">${fmtInt(active.active ?? health.active)}</span>`, "Across all listeners"),
-      statCard("Providers", `<span class="num">${fmtInt(healthyProviders)}<span class="muted">/${fmtInt(providers.length)}</span></span>`, "Healthy upstreams"),
+      statCard("Providers", `<span class="num">${fmtInt(availableProviders)}<span class="muted">/${fmtInt(providers.length)}</span></span>`, "Not cooling down; connectivity is not probed"),
       statCard("Accounts", `<span class="num">${fmtInt(enabledAccounts)}<span class="muted">/${fmtInt(accounts.length)}</span></span>`, "Enabled accounts"),
       statCard("Models", `<span class="num">${fmtInt(models.length)}</span>`, "Published model IDs"),
       statCard("Quota windows", `<span class="num">${fmtInt(windows.length)}</span>`, cooldowns.length ? `${fmtInt(cooldowns.length)} active cooldowns` : "No active cooldowns"),
@@ -474,6 +614,7 @@
 
   function renderModels(root) {
     const payload = state.data.models || {};
+    const mutationCapable = payload.mutation_capable === true && !state.errors.models;
     const catalog = state.data.catalog || {};
     let models = payload.models || [];
     const sources = payload.catalog_sources || catalog.sources || [];
@@ -500,17 +641,20 @@
       { label: "Model", mono: true, nowrap: false, render: (m) => providerCell(m.id) },
       { label: "Origin", render: (m) => `<span class="badge ${m.selection_origin === "configured" ? "badge-accent" : "badge-neutral"}">${esc(text(m.selection_origin || "discovered"))}</span>` },
       { label: "Targets", nowrap: false, render: (m) => (m.targets || []).map((t) =>
-          `<div class="inline-meta" style="padding-block:1px">${providerCell(t.provider)}<span class="muted">→</span><span class="mono">${esc(text(t.upstream_model))}</span></div>`).join("") || "—" },
+          `<div class="inline-meta target-row">${providerCell(t.provider)}<span class="muted">→</span><span class="mono">${esc(text(t.upstream_model))}</span></div>`).join("") || "—" },
       { label: "Capabilities", nowrap: false, render: (m) => {
           const caps = [...new Set((m.targets || []).flatMap((t) => t.capabilities || []))];
           return caps.length ? caps.map((c) => `<span class="chip">${esc(c)}</span>`).join(" ") : "—";
         } },
       { label: "Exposure", render: (m) => enabledBadge(m.enabled !== false) },
       { label: "Actions", render: (m) => {
+          if (!mutationCapable) return `<span class="muted">Unavailable</span>`;
           const enabled = m.enabled !== false;
           const action = enabled ? "disable" : "enable";
+          const path = `/models/${modelPath(m.id)}/${action}`;
+          const pending = state.pending.has(path);
           return `<div class="row-actions">
-            <button class="btn btn-subtle btn-xs" type="button" data-model-action="${action}" data-model-id="${esc(m.id)}">
+            <button class="btn btn-subtle btn-xs" type="button" data-model-action="${action}" data-model-id="${esc(m.id)}" title="${enabled ? "Disable" : "Enable"} ${esc(m.id)}"${pending ? ` disabled aria-busy="true"` : ""}>
               ${ic(enabled ? "pause" : "play", 13)} ${enabled ? "Disable" : "Enable"}
             </button>
           </div>`;
@@ -551,15 +695,15 @@
     const overrideBlock = (disabledOverrides.length || unmatchedOverrides.length) ? `
       <div class="panel">
         <div class="toolbar"><h2 class="section-title">Catalog overrides</h2></div>
-        ${disabledOverrides.length ? `<p class="section-hint" style="margin-top:8px">Disabled by override</p><div class="inline-meta">${disabledOverrides.map((m) => `<span class="chip mono">${esc(m)}</span>`).join("")}</div>` : ""}
-        ${unmatchedOverrides.length ? `<p class="section-hint" style="margin-top:8px">Unmatched overrides</p><div class="inline-meta">${unmatchedOverrides.map((m) => `<span class="chip mono">${esc(m)}</span>`).join("")}</div>` : ""}
+        ${disabledOverrides.length ? `<p class="section-hint spaced-top-sm">Disabled by override</p><div class="inline-meta">${disabledOverrides.map((m) => `<span class="chip mono">${esc(m)}</span>`).join("")}</div>` : ""}
+        ${unmatchedOverrides.length ? `<p class="section-hint spaced-top-sm">Unmatched overrides</p><div class="inline-meta">${unmatchedOverrides.map((m) => `<span class="chip mono">${esc(m)}</span>`).join("")}</div>` : ""}
       </div>` : "";
 
     root.innerHTML = `
       ${viewHeader("Models", views.models.subtitle, `
         <input id="model-filter" class="filter-input" type="search" placeholder="Filter models" value="${esc(state.filter)}" aria-label="Filter models">
-        <button class="btn btn-outline btn-sm" type="button" data-action="reload-models">${ic("refresh-double", 15)} Reload catalog</button>`)}
-      <section class="grid-stats" style="grid-template-columns:repeat(4,minmax(0,1fr))">${stats}</section>
+        ${mutationCapable ? `<button class="btn btn-outline btn-sm" type="button" data-action="reload-models" title="Refresh configured catalog sources"${state.pending.has("/models/reload") ? ` disabled aria-busy="true"` : ""}>${ic("refresh-double", 15)} Reload catalog</button>` : `<span class="section-hint">Authenticated mutations are unavailable.</span>`}`)}
+      <section class="grid-stats grid-stats-4">${stats}</section>
       ${section("Published models", modelTable, "Enablement is a runtime control; durable policy belongs in catalog overrides.")}
       ${section("Catalog sources", sourceTable)}
       ${aliasTable ? section("Aliases", aliasTable) : ""}
@@ -586,15 +730,40 @@
 
   /* ---------------- Accounts ---------------- */
 
+  function accountIsSelected(account) {
+    return account.selected === true || account.is_selected === true;
+  }
+
+  function accountSupports(account, action) {
+    if (state.errors.accounts) return false;
+    const explicit = account.available_actions ?? account.capabilities ?? account.actions ?? account.supported_actions;
+    if (Array.isArray(explicit)) return explicit.includes(action);
+    if (explicit && typeof explicit === "object" && Object.prototype.hasOwnProperty.call(explicit, action)) return Boolean(explicit[action]);
+    for (const key of [`can_${action}`, `supports_${action}`]) {
+      if (Object.prototype.hasOwnProperty.call(account, key)) return Boolean(account[key]);
+    }
+    if (action === "refresh" || action === "revoke") return String(account.auth_kind || account.authentication || "").toLowerCase() === "oauth";
+    return true;
+  }
+
+  function accountActionButton(account, action, label, icon, title) {
+    const supported = accountSupports(account, action);
+    const selected = action === "switch" && accountIsSelected(account);
+    if (!supported || selected) return "";
+    const path = `/accounts/${encodeURIComponent(account.id)}/${action}`;
+    const pending = state.pending.has(path);
+    return `<button class="btn btn-subtle btn-xs" type="button" data-account-action="${action}" data-account-id="${esc(account.id)}" data-account-provider="${esc(account.provider)}" title="${esc(title || label)}"${pending ? ` disabled aria-busy="true"` : ""}>${ic(icon, 13)} ${esc(label)}</button>`;
+  }
+
   function renderAccounts(root) {
     const accounts = state.data.accounts?.accounts || [];
 
-    const healthy = accounts.filter((a) => a.status === "healthy").length;
+    const selectable = accounts.filter((a) => a.enabled && a.status === "available").length;
     const cooling = accounts.filter((a) => a.status === "cooling_down").length;
 
     const stats = [
       statCard("Accounts", `<span class="num">${fmtInt(accounts.length)}</span>`, "Configured accounts"),
-      statCard("Healthy", `<span class="num">${fmtInt(healthy)}</span>`, "Selectable now"),
+      statCard("Selectable", `<span class="num">${fmtInt(selectable)}</span>`, "Enabled and not cooling down"),
       statCard("Cooling down", `<span class="num">${fmtInt(cooling)}</span>`, "Temporarily excluded"),
       statCard("Enabled", `<span class="num">${fmtInt(accounts.filter((a) => a.enabled).length)}</span>`, "Operator-enabled"),
     ].join("");
@@ -602,6 +771,7 @@
     const accountTable = tableWrap([
       { label: "ID", mono: true, nowrap: false, render: (a) => `<div class="cell-ellipsis" title="${esc(a.id)}">${esc(a.id)}</div>` },
       { label: "Provider", mono: true, render: (a) => providerCell(a.provider) },
+      { label: "Selected", render: (a) => accountIsSelected(a) ? statusBadge("selected", "accent") : `<span class="muted">—</span>` },
       { label: "Enabled", render: (a) => enabledBadge(a.enabled) },
       { label: "Status", render: (a) => statusBadge(a.status) },
       { label: "Failures", align: "right", render: (a) => `<span class="num">${fmtInt(a.failure_count)}</span>` },
@@ -609,12 +779,12 @@
           ? `<span class="num" title="${esc(fmtTime(a.cooldown_until))}">${esc(relTime(a.cooldown_until))}</span>`
           : `<span class="muted">—</span>` },
       { label: "Actions", nowrap: false, render: (a) => {
-          const id = esc(a.id);
+          const enableAction = a.enabled ? "disable" : "enable";
           return `<div class="row-actions">
-            <button class="btn btn-subtle btn-xs" type="button" data-account-action="switch" data-account-id="${id}" title="Make this the selected account for its provider">${ic("switch-on", 13)} Switch</button>
-            <button class="btn btn-subtle btn-xs" type="button" data-account-action="${a.enabled ? "disable" : "enable"}" data-account-id="${id}">${ic(a.enabled ? "pause" : "play", 13)} ${a.enabled ? "Disable" : "Enable"}</button>
-            <button class="btn btn-subtle btn-xs" type="button" data-account-action="refresh" data-account-id="${id}" title="Queue an OAuth token refresh">${ic("refresh-double", 13)} Refresh</button>
-            <button class="btn btn-subtle btn-xs" type="button" data-account-action="revoke" data-account-id="${id}" title="Remove Pooler's local credential and disable the account">${ic("trash", 13)} Revoke</button>
+            ${accountActionButton(a, "switch", "Switch", "switch-on", "Select this account and disable its same-provider siblings")}
+            ${accountActionButton(a, enableAction, a.enabled ? "Disable" : "Enable", a.enabled ? "pause" : "play")}
+            ${accountActionButton(a, "refresh", "Refresh", "refresh-double", "Queue an OAuth token refresh")}
+            ${accountActionButton(a, "revoke", "Revoke", "trash", "Remove Pooler's local credential and disable the account")}
           </div>`;
         } },
     ], accounts, {
@@ -626,7 +796,7 @@
 
     root.innerHTML = `
       ${viewHeader("Accounts", views.accounts.subtitle)}
-      <section class="grid-stats" style="grid-template-columns:repeat(4,minmax(0,1fr))">${stats}</section>
+      <section class="grid-stats grid-stats-4">${stats}</section>
       ${section("Accounts", accountTable, "Switch enables the account and disables its same-provider siblings atomically.")}
       <div class="banner banner-info">
         <span class="banner-icon">${ic("shield", 16)}</span>
@@ -743,23 +913,46 @@
   /* ---------------- Operations ---------------- */
 
   function renderOperations(root) {
+    const health = state.data.health || {};
     const decisions = state.data.decisions?.decisions || [];
     const traces = state.data.traces?.traces || [];
     const audit = state.data.audit?.events || [];
+    const reloads = state.data.reloads?.reloads || [];
+    const mutationCapable = health.management?.mutations === true && !state.errors.health;
     const droppedTraces = state.data.traces?.dropped || 0;
+
+    const runtimeControls = mutationCapable ? `
+      <button class="btn btn-outline btn-sm" type="button" data-action="reload-config" title="Reread and compile the configured source"${state.pending.has("/reload") ? ` disabled aria-busy="true"` : ""}>${ic("refresh", 15)} Reload configuration</button>
+      <button class="btn btn-outline btn-sm" type="button" data-action="reload-models" title="Refresh configured catalog sources"${state.pending.has("/models/reload") ? ` disabled aria-busy="true"` : ""}>${ic("refresh-double", 15)} Reload model catalog</button>`
+      : `<span class="section-hint">Authenticated mutations are unavailable.</span>`;
 
     const actionsPanel = `
       <div class="panel">
         <div class="toolbar">
           <h2 class="section-title">Runtime controls</h2>
           <span class="spacer"></span>
-          <button class="btn btn-outline btn-sm" type="button" data-action="reload-config">${ic("refresh", 15)} Reload configuration</button>
-          <button class="btn btn-outline btn-sm" type="button" data-action="reload-models">${ic("refresh-double", 15)} Reload model catalog</button>
+          ${runtimeControls}
         </div>
-        <p class="section-hint" style="margin-top:8px">
+        <p class="section-hint spaced-top-sm">
           Reload asks the serving process to reread and compile the configured source. Invalid candidates leave the active generation unchanged. Listener and management binding changes require a restart.
         </p>
       </div>`;
+
+    const reloadTable = tableWrap([
+      { label: "Request", mono: true, render: (r) => esc(text(r.request_id)) },
+      { label: "Kind", render: (r) => `<span class="badge badge-neutral">${esc(text(r.kind))}</span>` },
+      { label: "Status", render: (r) => statusBadge(r.status) },
+      { label: "Requested", render: (r) => `<span class="num muted" title="${esc(fmtTime(r.requested_at_ms))}">${esc(relTime(r.requested_at_ms))}</span>` },
+      { label: "Completed", render: (r) => r.completed_at_ms ? `<span class="num muted" title="${esc(fmtTime(r.completed_at_ms))}">${esc(relTime(r.completed_at_ms))}</span>` : `<span class="muted">—</span>` },
+      { label: "Accepted generation", align: "right", render: (r) => `<span class="num">${fmtInt(r.accepted_configuration_generation ?? r.configuration_generation)}</span>` },
+      { label: "Result generation", align: "right", render: (r) => `<span class="num">${fmtInt(r.configuration_generation)}</span>` },
+      { label: "Catalog generation", align: "right", render: (r) => `<span class="num">${fmtInt(r.catalog_generation)}</span>` },
+    ], [...reloads].reverse(), {
+      loading: state.loading && !state.data.reloads,
+      error: endpointError("reloads"),
+      emptyTitle: "No reload requests yet",
+      emptyDescription: "Accepted configuration and catalog reloads appear here with their final outcome.",
+    });
 
     const decisionTable = tableWrap([
       { label: "Time", render: (d) => `<span class="num muted" title="${esc(fmtTime(d.recorded_at))}">${esc(relTime(d.recorded_at))}</span>` },
@@ -778,7 +971,7 @@
       emptyDescription: "Decisions appear as requests flow through the proxy.",
       rowKey: (d, i) => String(d.id || i),
       expandable: (d) => `
-        <div style="padding:4px 0">
+        <div class="detail-content">
           ${tableWrap([
             { label: "Provider", mono: true, render: (c) => providerCell(c.provider_id) },
             { label: "Credential", mono: true, render: (c) => esc(text(c.credential_id)) },
@@ -819,6 +1012,7 @@
     root.innerHTML = `
       ${viewHeader("Operations", views.operations.subtitle)}
       ${actionsPanel}
+      ${section("Reload history", reloadTable, "Bounded process-local status for accepted reload requests; newest first.")}
       ${section("Routing decisions", decisionTable, "Newest first. Select a row to inspect candidates.")}
       ${section("Traces", traceTable, droppedTraces ? `${fmtInt(droppedTraces)} records dropped by bounded retention` : "Bounded process-local retention")}
       ${section("Audit log", auditTable)}`;
@@ -839,7 +1033,7 @@
           <span class="spacer"></span>
           <button class="btn btn-primary btn-sm" type="button" data-action="export">${ic("cloud-download", 15)} Download export</button>
         </div>
-        <p class="section-hint" style="margin-top:8px">
+        <p class="section-hint spaced-top-sm">
           A versioned JSON snapshot of health, plans, accounts, quota, models, metrics, traces, and audit events, redacted at the API boundary.
           It is a diagnostic backup, not a credential backup: credential payloads, secret references, request bodies, and authorization headers are never included, and it cannot restore tokens.
         </p>
@@ -857,7 +1051,7 @@
     const configPanel = `
       <div class="panel">
         <h2 class="section-title">Configuration state</h2>
-        <dl class="kv-list" style="margin-top:12px">
+        <dl class="kv-list spaced-top-md">
           ${configRows.map(([k, v]) => `<dt>${esc(k)}</dt><dd class="mono">${esc(v)}</dd>`).join("")}
         </dl>
       </div>`;
@@ -870,8 +1064,8 @@
     const errorPanel = `
       <div class="panel">
         <h2 class="section-title">Endpoint errors</h2>
-        <p class="section-hint" style="margin-top:4px">Errors observed by this dashboard in the current session, including unavailable state stores and rejected reloads.</p>
-        <div style="margin-top:12px">
+        <p class="section-hint spaced-top-xs">Errors observed by this dashboard in the current session, including unavailable state stores and rejected reloads.</p>
+        <div class="spaced-top-md">
           ${tableWrap([
             { label: "Endpoint", mono: true, render: (e) => esc(e.endpoint) },
             { label: "Error", nowrap: false, render: (e) => esc(e.message) },
@@ -899,29 +1093,48 @@
 
   /* ---------------- Mutations ---------------- */
 
-  async function runMutation(path, { confirm, successMessage, queuedMessage }) {
+  async function runMutation(path, { confirm, successMessage, queuedMessage }, trigger) {
+    if (state.pending.has(path)) return;
+    const sessionGeneration = state.sessionGeneration;
+    state.pending.add(path);
+    if (trigger) {
+      trigger.disabled = true;
+      trigger.setAttribute("aria-busy", "true");
+    }
+    let changed = false;
     try {
       if (confirm) {
         const accepted = await confirmAction(confirm);
-        if (!accepted) return;
+        if (!accepted || sessionGeneration !== state.sessionGeneration) return;
       }
       const result = await mutate(path);
-      if (result.status === "queued" && queuedMessage) {
+      if (sessionGeneration !== state.sessionGeneration) return;
+      changed = true;
+      if ((result.status === "queued" || result.status === "pending") && queuedMessage) {
         notify("info", queuedMessage(result));
       } else {
         notify("success", successMessage ? successMessage(result) : "Done.");
       }
     } catch (error) {
+      if (sessionGeneration !== state.sessionGeneration) return;
       if (error.status === 401) {
         authRequired();
       } else {
         notify("error", esc(error.message));
       }
+    } finally {
+      if (sessionGeneration === state.sessionGeneration) {
+        state.pending.delete(path);
+        if (trigger?.isConnected) {
+          trigger.disabled = false;
+          trigger.removeAttribute("aria-busy");
+        }
+      }
     }
-    await refreshCurrentView();
+    if (changed && sessionGeneration === state.sessionGeneration) await refreshCurrentView();
   }
 
-  function accountAction(accountId, action) {
+  function accountAction(accountId, action, provider, trigger) {
     const path = `/accounts/${encodeURIComponent(accountId)}/${action}`;
     const label = action.charAt(0).toUpperCase() + action.slice(1);
     if (action === "revoke") {
@@ -934,27 +1147,32 @@
         },
         queuedMessage: () => `Revocation queued for ${esc(accountId)}. The result lands in the audit log under Operations.`,
         successMessage: () => `Revoked ${esc(accountId)}.`,
-      });
+      }, trigger);
     }
     if (action === "refresh") {
       return runMutation(path, {
         queuedMessage: () => `Refresh queued for ${esc(accountId)}. The result lands in the audit log under Operations.`,
         successMessage: () => `Refresh requested for ${esc(accountId)}.`,
-      });
+      }, trigger);
     }
     if (action === "switch") {
       return runMutation(path, {
+        confirm: {
+          title: `Switch selected account to ${accountId}?`,
+          copy: `Select <span class="mono">${esc(accountId)}</span>${provider ? ` for <span class="mono">${esc(provider)}</span>` : ""} and disable its same-provider siblings?`,
+          acceptLabel: "Switch account",
+        },
         successMessage: () => `Switched to ${esc(accountId)}; same-provider siblings were disabled.`,
-      });
+      }, trigger);
     }
-    return runMutation(path, { successMessage: () => `${label}d ${esc(accountId)}.` });
+    return runMutation(path, { successMessage: () => `${label}d ${esc(accountId)}.` }, trigger);
   }
 
-  function modelAction(modelId, action) {
+  function modelAction(modelId, action, trigger) {
     const path = `/models/${modelPath(modelId)}/${action}`;
     return runMutation(path, {
       successMessage: () => `${action === "enable" ? "Enabled" : "Disabled"} ${esc(modelId)}.`,
-    });
+    }, trigger);
   }
 
   /* ---------------- Router and polling ---------------- */
@@ -964,10 +1182,25 @@
     return views[hash] ? hash : "overview";
   }
 
-  async function refreshCurrentView() {
-    const view = views[state.route];
-    await loadEndpoints(view.endpoints);
-    view.render($("#view"));
+  function hasFocusedInteractiveView() {
+    if ($("dialog[open]")) return true;
+    const root = $("#view");
+    const active = document.activeElement;
+    return Boolean(active && root.contains(active) && active.matches("a, button, input, select, textarea, summary, [tabindex]:not([tabindex='-1'])"));
+  }
+
+  async function refreshCurrentView({ polling = false } = {}) {
+    if (polling && hasFocusedInteractiveView()) return false;
+    const route = state.route;
+    const view = views[route];
+    const loaded = await loadEndpoints(view.endpoints);
+    if (!loaded || route !== state.route) return false;
+    const root = $("#view");
+    if (polling && hasFocusedInteractiveView()) return false;
+    root.className = `view view-${route}`;
+    view.render(root);
+    renderEndpointState(root, view.endpoints);
+    return true;
   }
 
   function stopPolling() {
@@ -979,8 +1212,11 @@
 
   function startPolling() {
     stopPolling();
+    if (state.authState === "required") return;
     state.pollTimer = setInterval(() => {
-      if (document.visibilityState === "visible") refreshCurrentView();
+      if (document.visibilityState === "visible" && state.authState !== "required") {
+        refreshCurrentView({ polling: true });
+      }
     }, POLL_MS);
   }
 
@@ -989,16 +1225,20 @@
     state.filter = "";
     state.expanded.clear();
     document.querySelectorAll(".nav-link").forEach((link) => {
-      link.classList.toggle("active", link.dataset.route === state.route);
+      const active = link.dataset.route === state.route;
+      link.classList.toggle("active", active);
+      if (active) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
     });
     const view = views[state.route];
+    $("#view").className = `view view-${state.route}`;
     $("#view").innerHTML = `
       ${viewHeader(view.title, view.subtitle)}
-      <div class="table-wrap"><table class="data-table"><tbody>
+      <div class="table-wrap"><table class="data-table"><caption class="sr-only">Loading ${esc(view.title)}</caption><tbody>
         ${Array.from({ length: 5 }, () => `<tr class="skeleton-row"><td><div class="skeleton-bar"></div></td><td><div class="skeleton-bar"></div></td><td><div class="skeleton-bar"></div></td></tr>`).join("")}
       </tbody></table></div>`;
-    await refreshCurrentView();
-    startPolling();
+    const loaded = await refreshCurrentView();
+    if (loaded) startPolling();
   }
 
   /* ---------------- Boot ---------------- */
@@ -1011,6 +1251,12 @@
     $("#session-dialog [data-close]").innerHTML = ic("cancel", 16);
     $("#confirm-dialog [data-close]").innerHTML = ic("cancel", 16);
     $("#token-visibility").innerHTML = ic("eye-empty", 16);
+    $("#token-visibility").title = "Show bearer token";
+
+    $(".skip-link").addEventListener("click", (event) => {
+      event.preventDefault();
+      requestAnimationFrame(() => $("#main").focus());
+    });
 
     $("#theme-toggle").addEventListener("click", () => {
       const rootEl = document.documentElement;
@@ -1030,26 +1276,40 @@
     });
 
     $("#token-apply").addEventListener("click", () => {
+      state.sessionGeneration += 1;
+      state.pending.clear();
+      invalidateReads({ clearData: true });
       state.token = $("#token-input").value.trim();
+      state.authState = state.token ? "checking" : "anonymous";
+      state.authPrompted = false;
+      $("[data-notice=\"auth\"]")?.remove();
       $("#session-dialog").close();
       updateHeader();
-      refreshCurrentView();
+      refreshCurrentView().then((loaded) => { if (loaded) startPolling(); });
     });
     $("#token-input").addEventListener("keydown", (event) => {
       if (event.key === "Enter") $("#token-apply").click();
     });
     $("#token-clear").addEventListener("click", () => {
+      state.sessionGeneration += 1;
+      state.pending.clear();
+      invalidateReads({ clearData: true });
       state.token = "";
+      state.authState = "anonymous";
+      state.authPrompted = false;
       $("#token-input").value = "";
+      $("[data-notice=\"auth\"]")?.remove();
       $("#session-dialog").close();
       updateHeader();
-      refreshCurrentView();
+      refreshCurrentView().then((loaded) => { if (loaded) startPolling(); });
     });
     $("#token-visibility").addEventListener("click", () => {
       const input = $("#token-input");
       const show = input.type === "password";
       input.type = show ? "text" : "password";
       $("#token-visibility").innerHTML = ic(show ? "eye-off" : "eye-empty", 16);
+      $("#token-visibility").setAttribute("aria-label", show ? "Hide bearer token" : "Show bearer token");
+      $("#token-visibility").title = show ? "Hide bearer token" : "Show bearer token";
       input.focus();
     });
 
@@ -1059,17 +1319,17 @@
 
       const accountButton = event.target.closest("[data-account-action]");
       if (accountButton) {
-        accountAction(accountButton.dataset.accountId, accountButton.dataset.accountAction);
+        accountAction(accountButton.dataset.accountId, accountButton.dataset.accountAction, accountButton.dataset.accountProvider, accountButton);
         return;
       }
       const modelButton = event.target.closest("[data-model-action]");
       if (modelButton) {
-        modelAction(modelButton.dataset.modelId, modelButton.dataset.modelAction);
+        modelAction(modelButton.dataset.modelId, modelButton.dataset.modelAction, modelButton);
         return;
       }
       const actionButton = event.target.closest("[data-action]");
       if (actionButton) {
-        handleViewAction(actionButton.dataset.action);
+        handleViewAction(actionButton.dataset.action, actionButton);
         return;
       }
       const expandRow = event.target.closest("[data-expand]");
@@ -1077,7 +1337,12 @@
         const key = expandRow.dataset.expand;
         if (state.expanded.has(key)) state.expanded.delete(key);
         else state.expanded.add(key);
-        views[state.route].render($("#view"));
+        const root = $("#view");
+        const view = views[state.route];
+        view.render(root);
+        renderEndpointState(root, view.endpoints);
+        const replacement = Array.from(root.querySelectorAll("[data-expand]")).find((button) => button.dataset.expand === key);
+        replacement?.focus();
       }
     });
 
@@ -1086,7 +1351,7 @@
     });
   }
 
-  function handleViewAction(action) {
+  function handleViewAction(action, trigger) {
     if (action === "reload-config") {
       runMutation("/reload", {
         confirm: {
@@ -1094,27 +1359,45 @@
           copy: "The serving process rereads and compiles the configured source. Invalid candidates leave the active generation unchanged.",
           acceptLabel: "Reload",
         },
-        queuedMessage: () => "Reload requested. The generation advances once the new candidate compiles.",
+        queuedMessage: (result) => `Reload request ${esc(result.request_id)} accepted. Follow its final outcome in Reload history.`,
         successMessage: () => "Reload requested.",
-      });
+      }, trigger);
     } else if (action === "reload-models") {
       runMutation("/models/reload", {
-        queuedMessage: () => "Model catalog reload requested.",
-        successMessage: () => "Model catalog reload requested.",
-      });
+        queuedMessage: (result) => `Catalog refresh request ${esc(result.request_id)} accepted. Follow its final outcome in Reload history.`,
+      }, trigger);
     } else if (action === "export") {
-      downloadExport()
-        .then(() => notify("success", "Export downloaded."))
+      const path = "/export";
+      if (state.pending.has(path)) return;
+      state.pending.add(path);
+      trigger.disabled = true;
+      trigger.setAttribute("aria-busy", "true");
+      const sessionGeneration = state.sessionGeneration;
+      downloadExport(sessionGeneration)
+        .then((downloaded) => {
+          if (downloaded && sessionGeneration === state.sessionGeneration) notify("success", "Export downloaded.");
+        })
         .catch((error) => {
+          if (sessionGeneration !== state.sessionGeneration) return;
           if (error.status === 401) authRequired();
           else notify("error", esc(error.message));
+        })
+        .finally(() => {
+          if (sessionGeneration !== state.sessionGeneration) return;
+          state.pending.delete(path);
+          if (trigger.isConnected) {
+            trigger.disabled = false;
+            trigger.removeAttribute("aria-busy");
+          }
         });
     }
   }
 
   window.addEventListener("hashchange", navigate);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") refreshCurrentView();
+    if (document.visibilityState === "visible" && state.authState !== "required") {
+      refreshCurrentView({ polling: true });
+    }
   });
 
   bindStaticChrome();

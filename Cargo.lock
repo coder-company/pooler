@@ -1491,6 +1491,7 @@ dependencies = [
  "adapter-codex",
  "anyhow",
  "clap",
+ "http",
  "pooler-auth",
  "pooler-config",
  "pooler-extension",

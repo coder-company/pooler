@@ -356,7 +356,6 @@ async fn reload_loop(
 ) -> Result<()> {
     let mut interval = tokio::time::interval(pooler_config::DEFAULT_RELOAD_POLL_INTERVAL);
     let cancellation = server.cancellation_token();
-    let management_reload = server.management_reload_notifier();
     #[cfg(unix)]
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .context("failed to install SIGHUP handler")?;
@@ -370,32 +369,55 @@ async fn reload_loop(
                 signal.context("SIGHUP handler failed")?;
                 ReloadTrigger::Manual
             }
-            _ = async {
-                match management_reload.as_ref() {
-                    Some(notify) => notify.notified().await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => ReloadTrigger::Manual,
+            request = server.next_management_reload_request() => ReloadTrigger::Management {
+                request_id: request.0,
+                catalog_only: request.1,
+                generation: request.2,
+            },
         };
         #[cfg(not(unix))]
         let event = tokio::select! {
             _ = cancellation.cancelled() => return Ok(()),
             _ = interval.tick(), if watch => ReloadTrigger::Watch,
-            _ = async {
-                match management_reload.as_ref() {
-                    Some(notify) => notify.notified().await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => ReloadTrigger::Manual,
+            request = server.next_management_reload_request() => ReloadTrigger::Management {
+                request_id: request.0,
+                catalog_only: request.1,
+                generation: request.2,
+            },
         };
 
+        let management_request = match event {
+            ReloadTrigger::Management {
+                request_id,
+                catalog_only: true,
+                generation,
+            } => {
+                match server.refresh_catalog(generation).await {
+                    Ok(changed) => {
+                        server.complete_management_reload(request_id, Some(changed));
+                        tracing::info!(request_id, changed, "model catalog refresh completed");
+                    }
+                    Err(error) => {
+                        server.complete_management_reload(request_id, None);
+                        tracing::warn!(request_id, error = %error, "model catalog refresh failed");
+                    }
+                }
+                continue;
+            }
+            ReloadTrigger::Management {
+                request_id,
+                catalog_only: false,
+                generation,
+            } => Some((request_id, generation)),
+            ReloadTrigger::Watch | ReloadTrigger::Manual => None,
+        };
         let candidate = {
             let watcher = Arc::clone(&watcher);
             let polled = tokio::task::spawn_blocking(move || {
                 let mut watcher = watcher.lock().expect("configuration watcher lock poisoned");
                 match event {
                     ReloadTrigger::Watch => watcher.poll().map_err(anyhow::Error::from),
-                    ReloadTrigger::Manual => watcher
+                    ReloadTrigger::Manual | ReloadTrigger::Management { .. } => watcher
                         .force_candidate()
                         .map(Some)
                         .map_err(anyhow::Error::from),
@@ -406,6 +428,9 @@ async fn reload_loop(
             match polled {
                 Ok(candidate) => candidate,
                 Err(error) => {
+                    if let Some((request_id, _)) = management_request {
+                        server.complete_management_reload(request_id, None);
+                    }
                     tracing::warn!(error = %error, "configuration reload source rejected");
                     continue;
                 }
@@ -414,7 +439,7 @@ async fn reload_loop(
         let Some(candidate) = candidate else {
             continue;
         };
-        apply_reload_candidate(&server, &watcher, candidate).await?;
+        apply_reload_candidate(&server, &watcher, candidate, management_request).await?;
     }
 }
 
@@ -422,12 +447,18 @@ async fn reload_loop(
 enum ReloadTrigger {
     Watch,
     Manual,
+    Management {
+        request_id: u64,
+        catalog_only: bool,
+        generation: u64,
+    },
 }
 
 async fn apply_reload_candidate(
     server: &pooler_server::HttpProxyServer,
     watcher: &Arc<Mutex<ConfigWatcher>>,
     candidate: ConfigCandidate,
+    management_request: Option<(u64, u64)>,
 ) -> Result<()> {
     let for_compile = candidate.clone();
     let compiled = tokio::task::spawn_blocking(move || for_compile.compile_with_generation(1))
@@ -436,12 +467,22 @@ async fn apply_reload_candidate(
     let compiled = match compiled {
         Ok(config) => config,
         Err(error) => {
+            if let Some((request_id, _)) = management_request {
+                server.complete_management_reload(request_id, None);
+            }
             tracing::warn!(error = %error, "configuration reload rejected");
             return Ok(());
         }
     };
-    match server.reload(compiled).await {
+    let reload = match management_request {
+        Some((_, generation)) => server.reload_for_generation(compiled, generation).await,
+        None => server.reload(compiled).await,
+    };
+    match reload {
         Ok(outcome) => {
+            if let Some((request_id, _)) = management_request {
+                server.complete_management_reload(request_id, Some(outcome.changed()));
+            }
             tracing::info!(
                 generation = outcome.generation(),
                 changed = outcome.changed(),
@@ -453,6 +494,9 @@ async fn apply_reload_candidate(
                 .accept(candidate);
         }
         Err(error) => {
+            if let Some((request_id, _)) = management_request {
+                server.complete_management_reload(request_id, None);
+            }
             tracing::warn!(error = %error, "configuration reload rejected");
         }
     }
@@ -829,5 +873,68 @@ routes:
                 }
             } if input == PathBuf::from("input.json") && output == PathBuf::from("capture.json")
         ));
+    }
+
+    #[tokio::test]
+    async fn management_configuration_reload_is_applied_and_correlated() {
+        const SECRET_ENV: &str = "POOLER_CLI_MANAGEMENT_RELOAD_TEST_KEY";
+        std::env::set_var(SECRET_ENV, "cli-reload-secret");
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let path = directory.path().join("pooler.yaml");
+        std::fs::write(
+            &path,
+            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_CLI_MANAGEMENT_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:1}}\n",
+        )
+        .expect("initial config writes");
+        let watcher = Arc::new(Mutex::new(
+            ConfigWatcher::new(&path).expect("config watcher"),
+        ));
+        let config = watcher
+            .lock()
+            .expect("config watcher lock")
+            .active()
+            .compile()
+            .expect("initial config compiles");
+        let server = pooler_server::HttpProxyServer::bind(config)
+            .await
+            .expect("server binds");
+        let api = server.management_api().expect("management api");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer cli-reload-secret"),
+        );
+        let accepted = api.handle(&http::Method::POST, "/reload", &headers);
+        assert_eq!(accepted.status, http::StatusCode::ACCEPTED);
+        let (request_id, catalog_only, generation) = server.next_management_reload_request().await;
+        assert!(!catalog_only);
+        assert_eq!(generation, 1);
+
+        std::fs::write(
+            &path,
+            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_CLI_MANAGEMENT_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:2}}\n",
+        )
+        .expect("replacement config writes");
+        let candidate = watcher
+            .lock()
+            .expect("config watcher lock")
+            .force_candidate()
+            .expect("candidate loads");
+        apply_reload_candidate(&server, &watcher, candidate, Some((request_id, generation)))
+            .await
+            .expect("management reload applies");
+        assert_eq!(server.config_generation(), 2);
+
+        let reloads = api.handle(&http::Method::GET, "/reloads", &headers);
+        let reloads: serde_json::Value =
+            serde_json::from_slice(&reloads.body).expect("reload history json");
+        assert_eq!(reloads["reloads"][0]["status"], "succeeded");
+        assert_eq!(
+            reloads["reloads"][0]["accepted_configuration_generation"],
+            1
+        );
+        assert_eq!(reloads["reloads"][0]["configuration_generation"], 2);
+        server.begin_drain();
+        std::env::remove_var(SECRET_ENV);
     }
 }

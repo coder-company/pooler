@@ -11,7 +11,7 @@
   <link rel="stylesheet" href="/management/ui.css">
 </head>
 <body>
-  <a class="skip-link" href="#view">Skip to content</a>
+  <a class="skip-link" href="#main">Skip to content</a>
 
   <header class="app-header">
     <div class="shell header-row">
@@ -24,7 +24,7 @@
       <div class="header-actions">
         <span id="generation-badge" class="badge badge-neutral" title="Active configuration generation">gen —</span>
         <button id="refresh-now" class="btn btn-ghost btn-icon" type="button" aria-label="Refresh now"></button>
-        <button id="theme-toggle" class="btn btn-ghost btn-icon" type="button" aria-label="Toggle dark mode"></button>
+        <button id="theme-toggle" class="btn btn-ghost btn-icon" type="button" aria-label="Switch to dark theme"></button>
         <button id="session-button" class="btn btn-outline btn-sm" type="button">Connect</button>
       </div>
     </div>
@@ -40,22 +40,22 @@
     </div>
   </header>
 
-  <main class="shell app-main" id="main">
+  <main class="shell app-main" id="main" tabindex="-1">
     <div id="banner-area" class="banner-area" aria-live="polite"></div>
     <div id="view"></div>
   </main>
 
   <footer class="shell app-footer">
     <span>Pooler management · values are redacted at the API boundary</span>
-    <span id="footer-updated" class="muted"></span>
+    <span id="footer-updated" class="muted" aria-live="polite"></span>
   </footer>
 
-  <dialog id="session-dialog" class="dialog">
+  <dialog id="session-dialog" class="dialog" aria-labelledby="session-title" aria-describedby="session-copy">
     <div class="dialog-head">
-      <h2 class="dialog-title">Management session</h2>
+      <h2 class="dialog-title" id="session-title">Management session</h2>
       <button class="btn btn-ghost btn-icon" type="button" data-close="session-dialog" aria-label="Close"></button>
     </div>
-    <p class="dialog-copy">
+    <p class="dialog-copy" id="session-copy">
       Mutations require the bearer secret configured under <code class="mono">management.auth</code>.
       The token is held in memory for this tab only and is never stored or sent anywhere except this
       listener&rsquo;s <code class="mono">Authorization</code> header.
@@ -73,7 +73,7 @@
     </div>
   </dialog>
 
-  <dialog id="confirm-dialog" class="dialog">
+  <dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-title" aria-describedby="confirm-copy">
     <div class="dialog-head">
       <h2 class="dialog-title" id="confirm-title">Confirm</h2>
       <button class="btn btn-ghost btn-icon" type="button" data-close="confirm-dialog" aria-label="Close"></button>

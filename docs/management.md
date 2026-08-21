@@ -33,6 +33,7 @@ Send the token as `Authorization: Bearer ...`.
 | `/decisions` | Recent redacted routing decisions |
 | `/traces` | Bounded redacted runtime traces shared by listeners and reload generations |
 | `/audit` | Bounded process-local management mutation audit events |
+| `/reloads` | Bounded correlated status for accepted configuration and catalog reload requests |
 | `/export` | Versioned redacted diagnostic export |
 
 `/export` is a diagnostic backup, not a credential backup. It intentionally cannot restore tokens or secret references. Audit and trace retention is process-local and resets when the process restarts.
@@ -57,7 +58,7 @@ Account enable, disable, and switch operations update the live selection registr
 
 Model enablement is a runtime operator control. It is shared across configuration reload generations in the running process, but is not a replacement for a durable catalog override. For durable model policy, declare `catalog.overrides` in configuration and request a reload.
 
-A reload request notifies the serving CLI's configuration watcher. The watcher rereads and compiles the configured source before publication; invalid candidates leave the active generation unchanged. Listener and management binding changes continue to require a process-level restart.
+`POST /reload` asks the serving CLI to reread and compile the configured source before publication; invalid candidates leave the active generation unchanged. `POST /models/reload` refreshes only the configured remote model-catalog sources and does not reread configuration or advance the configuration generation. Both return a correlated request ID, and `/reloads` reports bounded `pending`, `succeeded`, `unchanged`, or `failed` outcomes. Requests are bound to the configuration generation that accepted them, so queued work cannot apply to a newer generation. Listener and management binding changes continue to require a process-level restart.
 
 ## Cost records
 

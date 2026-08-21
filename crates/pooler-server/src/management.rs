@@ -9,11 +9,13 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -21,6 +23,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::{header, HeaderMap, Method, Response, StatusCode, Uri};
+use http_body::Body as _;
 use http_body_util::Full;
 use hyper::{body::Incoming, service::service_fn, Request};
 use hyper_util::rt::TokioIo;
@@ -30,6 +33,7 @@ use pooler_http::{PoolError, PoolingCoordinator};
 use pooler_store::{CredentialHealthState, CredentialHealthStatus, CredentialState};
 use serde_json::{json, Value};
 use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
     net::{TcpListener, UnixListener},
     sync::{mpsc, Notify},
     task::JoinSet,
@@ -43,6 +47,11 @@ use crate::{merged_model_catalog_value, CatalogRuntime, ConfigSnapshot, ConfigSt
 const DEFAULT_DECISION_LIMIT: usize = 20;
 const MAX_DECISION_LIMIT: usize = 100;
 const MAX_MANAGEMENT_AUDIT_EVENTS: usize = 256;
+const MAX_MANAGEMENT_RELOADS: usize = 256;
+const MAX_PENDING_MANAGEMENT_RELOADS: usize = 16;
+const MAX_MANAGEMENT_HEADER_BYTES: usize = 64 * 1024;
+const MANAGEMENT_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const MANAGEMENT_BODY_GUARD_TIMEOUT: Duration = Duration::from_millis(50);
 const LOOPBACK_HOST_ERROR: &str =
     "management Host header must name localhost or a loopback address";
 
@@ -317,6 +326,50 @@ fn management_model_action(path: &str) -> Option<(String, &str)> {
     None
 }
 
+fn is_management_mutation(method: &Method, path: &str) -> bool {
+    *method == Method::POST
+        && (path == "/reload"
+            || path == "/models/reload"
+            || management_account_action(path).is_some()
+            || management_model_action(path).is_some())
+}
+
+fn mutation_body_rejection(headers: &HeaderMap) -> Option<(StatusCode, &'static str)> {
+    if headers.contains_key(header::TRANSFER_ENCODING) {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            "management mutations do not accept Transfer-Encoding",
+        ));
+    }
+    let lengths = headers
+        .get_all(header::CONTENT_LENGTH)
+        .iter()
+        .collect::<Vec<_>>();
+    if lengths.len() > 1 {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            "management mutations require a single Content-Length",
+        ));
+    }
+    let length = lengths.first()?;
+    let Ok(length) = length.to_str() else {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            "management mutation Content-Length is invalid",
+        ));
+    };
+    let Ok(length) = length.parse::<u64>() else {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            "management mutation Content-Length is invalid",
+        ));
+    };
+    (length != 0).then_some((
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "management mutations do not accept request bodies",
+    ))
+}
+
 fn management_bind_is_loopback(value: &str) -> bool {
     if value.starts_with('/') || value.starts_with("unix:") {
         return false;
@@ -396,6 +449,42 @@ pub(crate) enum NativeAccountAction {
 pub(crate) struct NativeAccountCommand {
     pub(crate) account: String,
     pub(crate) action: NativeAccountAction,
+    pub(crate) generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagementReloadKind {
+    Configuration,
+    Catalog,
+}
+
+impl ManagementReloadKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration",
+            Self::Catalog => "catalog",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManagementReloadRequest {
+    pub(crate) id: u64,
+    pub(crate) kind: ManagementReloadKind,
+    pub(crate) generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReloadControlState {
+    pending: VecDeque<ManagementReloadRequest>,
+    records: VecDeque<Value>,
+}
+
+#[derive(Debug, Default)]
+struct ReloadControl {
+    next_id: AtomicU64,
+    state: Mutex<ReloadControlState>,
+    notify: Arc<Notify>,
 }
 
 pub(crate) struct ManagementRuntimeServices {
@@ -414,7 +503,7 @@ pub struct ManagementApi {
     metrics: pooler_observe::MetricsRegistry,
     traces: pooler_observe::TraceRecorder,
     audit: Arc<Mutex<VecDeque<Value>>>,
-    reload: Arc<Notify>,
+    reload: Arc<ReloadControl>,
     native_commands: Option<mpsc::Sender<NativeAccountCommand>>,
     active: ActiveCounts,
 }
@@ -472,7 +561,7 @@ impl ManagementApi {
             metrics,
             traces: pooler_observe::TraceRecorder::default(),
             audit: Arc::new(Mutex::new(VecDeque::new())),
-            reload: Arc::new(Notify::new()),
+            reload: Arc::new(ReloadControl::default()),
             native_commands: None,
             active,
         }
@@ -513,7 +602,7 @@ impl ManagementApi {
             metrics: services.metrics,
             traces: services.traces,
             audit: Arc::new(Mutex::new(VecDeque::new())),
-            reload: Arc::new(Notify::new()),
+            reload: Arc::new(ReloadControl::default()),
             native_commands: Some(services.native_commands),
             active,
         }
@@ -523,16 +612,18 @@ impl ManagementApi {
         &self,
         action: NativeAccountAction,
         account: &str,
-        succeeded: bool,
+        generation: u64,
+        outcome: &str,
     ) {
         let action = match action {
             NativeAccountAction::Refresh => "refresh",
             NativeAccountAction::Revoke => "revoke",
         };
-        self.record_audit(
+        self.record_audit_with_fields(
             action,
             Some(account),
-            if succeeded { "succeeded" } else { "failed" },
+            outcome,
+            &[("generation", json!(generation))],
         );
     }
 
@@ -549,22 +640,157 @@ impl ManagementApi {
     }
 
     pub(crate) fn reload_notifier(&self) -> Arc<Notify> {
-        Arc::clone(&self.reload)
+        Arc::clone(&self.reload.notify)
+    }
+
+    pub(crate) async fn next_reload_request(&self) -> ManagementReloadRequest {
+        loop {
+            let notified = self.reload.notify.notified();
+            if let Some(request) = self
+                .reload
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending
+                .pop_front()
+            {
+                return request;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn complete_reload(
+        &self,
+        request_id: u64,
+        outcome: &str,
+        configuration_generation: u64,
+        catalog_generation: Option<u64>,
+    ) {
+        let kind = {
+            let mut state = self
+                .reload
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(record) = state
+                .records
+                .iter_mut()
+                .find(|record| record["request_id"] == request_id)
+            else {
+                return;
+            };
+            record["status"] = Value::String(outcome.to_owned());
+            record["completed_at_ms"] = json!(unix_timestamp_ms());
+            record["configuration_generation"] = json!(configuration_generation);
+            if let Some(generation) = catalog_generation {
+                record["catalog_generation"] = json!(generation);
+            }
+            record["kind"]
+                .as_str()
+                .unwrap_or("configuration")
+                .to_owned()
+        };
+        self.record_audit_with_fields(
+            "reload",
+            None,
+            outcome,
+            &[
+                ("request_id", json!(request_id)),
+                ("kind", json!(kind)),
+                ("configuration_generation", json!(configuration_generation)),
+            ],
+        );
+    }
+
+    fn enqueue_reload(
+        &self,
+        kind: ManagementReloadKind,
+        configuration_generation: u64,
+    ) -> Option<ManagementReloadRequest> {
+        let request = ManagementReloadRequest {
+            id: self
+                .reload
+                .next_id
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1),
+            kind,
+            generation: configuration_generation,
+        };
+        {
+            let mut state = self
+                .reload
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.pending.len() >= MAX_PENDING_MANAGEMENT_RELOADS {
+                return None;
+            }
+            state.pending.push_back(request);
+            state.records.push_back(json!({
+                "request_id": request.id,
+                "kind": kind.as_str(),
+                "status": "pending",
+                "requested_at_ms": unix_timestamp_ms(),
+                "accepted_configuration_generation": configuration_generation,
+                "configuration_generation": configuration_generation,
+            }));
+            while state.records.len() > MAX_MANAGEMENT_RELOADS {
+                state.records.pop_front();
+            }
+        }
+        self.record_audit_with_fields(
+            "reload",
+            None,
+            "accepted",
+            &[
+                ("request_id", json!(request.id)),
+                ("kind", json!(kind.as_str())),
+                ("configuration_generation", json!(configuration_generation)),
+            ],
+        );
+        self.reload.notify.notify_one();
+        Some(request)
+    }
+
+    fn reloads(&self, generation: u64) -> ManagementResponse {
+        let records = self
+            .reload
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        ManagementResponse::json(
+            StatusCode::OK,
+            json!({"configuration_generation": generation, "reloads": records}),
+            false,
+        )
     }
 
     fn record_audit(&self, action: &str, subject: Option<&str>, outcome: &str) {
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| {
-                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-            });
+        self.record_audit_with_fields(action, subject, outcome, &[]);
+    }
+
+    fn record_audit_with_fields(
+        &self,
+        action: &str,
+        subject: Option<&str>,
+        outcome: &str,
+        fields: &[(&str, Value)],
+    ) {
         let mut event = json!({
-            "timestamp_ms": timestamp_ms,
+            "timestamp_ms": unix_timestamp_ms(),
             "action": action,
             "outcome": outcome,
         });
         if let Some(subject) = subject {
             event["subject"] = Value::String(subject.to_owned());
+        }
+        for (key, value) in fields {
+            event[*key] = value.clone();
         }
         let event = pooler_observe::RedactionPolicy::strict().sanitize_json(&event);
         let mut audit = self
@@ -618,6 +844,7 @@ impl ManagementApi {
                 } else {
                     NativeAccountAction::Revoke
                 },
+                generation: snapshot.generation().value(),
             };
             return match commands.try_send(command) {
                 Ok(()) => {
@@ -778,6 +1005,9 @@ impl ManagementApi {
             "audit": self.audit.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter().cloned().collect::<Vec<_>>(),
+            "reloads": self.reload.state.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .records.iter().cloned().collect::<Vec<_>>(),
         });
         ManagementResponse::json(
             StatusCode::OK,
@@ -823,11 +1053,7 @@ impl ManagementApi {
             .unwrap_or_else(|| uri.as_ref().map_or(path_and_query, Uri::path));
         let path = if path.is_empty() { "/" } else { path };
         let head = *method == Method::HEAD;
-        let mutation = *method == Method::POST
-            && (path == "/reload"
-                || path == "/models/reload"
-                || management_account_action(path).is_some()
-                || management_model_action(path).is_some());
+        let mutation = is_management_mutation(method, path);
         let ui_asset = management_ui::asset(path).is_some() || (management_prefix && path == "/");
         if *method != Method::GET && !head && !mutation {
             let mut response = ManagementResponse::json(
@@ -849,19 +1075,11 @@ impl ManagementApi {
             );
         }
         let local_ui_shell = ui_asset && management_bind_is_loopback(self.bind());
-        if mutation
-            && headers
-                .get(header::CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length != 0)
-        {
-            self.record_audit(path, None, "rejected_body");
-            return ManagementResponse::json(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                json!({"error": "management mutations do not accept request bodies"}),
-                false,
-            );
+        if mutation {
+            if let Some((status, message)) = mutation_body_rejection(headers) {
+                self.record_audit(path, None, "rejected_body");
+                return ManagementResponse::json(status, json!({"error": message}), false);
+            }
         }
         if mutation && !management_origin_allowed(headers) {
             self.record_audit(path, None, "rejected_origin");
@@ -949,18 +1167,30 @@ impl ManagementApi {
             }
             "/traces" => self.traces(snapshot.generation().value()),
             "/audit" => self.audit(snapshot.generation().value()),
+            "/reloads" => self.reloads(snapshot.generation().value()),
             "/export" => self.export(snapshot, pooling, catalog.as_deref()),
             "/reload" | "/models/reload" if mutation => {
-                self.reload.notify_one();
-                self.record_audit(path, None, "accepted");
-                ManagementResponse::json(
-                    StatusCode::ACCEPTED,
-                    json!({
-                        "generation": snapshot.generation().value(),
-                        "status": "reload_requested"
-                    }),
-                    false,
-                )
+                let kind = if path == "/models/reload" {
+                    ManagementReloadKind::Catalog
+                } else {
+                    ManagementReloadKind::Configuration
+                };
+                match self.enqueue_reload(kind, snapshot.generation().value()) {
+                    Some(request) => ManagementResponse::json(
+                        StatusCode::ACCEPTED,
+                        json!({
+                            "configuration_generation": snapshot.generation().value(),
+                            "request_id": request.id,
+                            "kind": request.kind.as_str(),
+                            "status": "pending"
+                        }),
+                        false,
+                    ),
+                    None => {
+                        self.record_audit(path, None, "queue_unavailable");
+                        state_unavailable()
+                    }
+                }
             }
             path if management_account_action(path).is_some() && mutation => {
                 self.mutate_account(path, snapshot, pooling)
@@ -1025,6 +1255,7 @@ impl ManagementApi {
             json!({
                 "status": "ok",
                 "configuration_generation": snapshot.generation().value(),
+                "management": {"mutations": self.plan.auth().is_some()},
                 "active": self.active.total(),
                 "credential_health_entries": credentials,
                 "cooling_provider_entries": cooling_providers,
@@ -1036,7 +1267,10 @@ impl ManagementApi {
     fn config_generation(&self, snapshot: &ConfigSnapshot<CompiledConfig>) -> ManagementResponse {
         ManagementResponse::json(
             StatusCode::OK,
-            json!({"configuration_generation": snapshot.generation().value()}),
+            json!({
+                "configuration_generation": snapshot.generation().value(),
+                "management": {"mutations": self.plan.auth().is_some()},
+            }),
             false,
         )
     }
@@ -1124,6 +1358,7 @@ impl ManagementApi {
                 }
             }
         }
+        value["mutation_capable"] = json!(self.plan.auth().is_some());
         ManagementResponse::json(StatusCode::OK, value, false)
     }
 
@@ -1205,12 +1440,44 @@ impl ManagementApi {
             .into_iter()
             .map(|state| (state.credential_id.clone(), state))
             .collect::<BTreeMap<_, _>>();
+        let mutation_capable = self.plan.auth().is_some();
         let credentials = snapshot
             .config()
             .accounts()
             .values()
             .map(|account| {
-                credential_health_value(account, states.get(account.id()), health.get(account.id()))
+                let enabled = states
+                    .get(account.id())
+                    .map_or(account.enabled(), |state| state.enabled);
+                let selected = enabled
+                    && !snapshot.config().accounts().values().any(|other| {
+                        other.provider() == account.provider()
+                            && other.id() != account.id()
+                            && states
+                                .get(other.id())
+                                .map_or(other.enabled(), |state| state.enabled)
+                    });
+                let mut available_actions = Vec::new();
+                if mutation_capable {
+                    available_actions.push(if enabled { "disable" } else { "enable" });
+                    if snapshot.config().accounts().values().any(|other| {
+                        other.provider() == account.provider() && other.id() != account.id()
+                    }) {
+                        available_actions.push("switch");
+                    }
+                    if account.auth_kind() == pooler_config::AccountAuthKind::OAuth
+                        && self.native_commands.is_some()
+                    {
+                        available_actions.extend(["refresh", "revoke"]);
+                    }
+                }
+                credential_health_value(
+                    account,
+                    states.get(account.id()),
+                    health.get(account.id()),
+                    selected,
+                    available_actions,
+                )
             })
             .collect::<Vec<_>>();
         let mut value = serde_json::Map::new();
@@ -1218,6 +1485,7 @@ impl ManagementApi {
             "configuration_generation".to_owned(),
             json!(snapshot.generation().value()),
         );
+        value.insert("mutation_capable".to_owned(), json!(mutation_capable));
         value.insert(field.to_owned(), Value::Array(credentials));
         ManagementResponse::json(StatusCode::OK, Value::Object(value), false)
     }
@@ -1600,7 +1868,9 @@ impl ManagementHttpServer {
                         let (stream, _) = result.map_err(|source| ManagementServerError::Listener { message: source.to_string() })?;
                         let api = Arc::clone(&self.api);
                         let cancellation = self.state.cancellation.clone();
-                        tasks.spawn(async move { serve_management_connection(TokioIo::new(stream), api, cancellation).await });
+                        tasks.spawn(async move {
+                            serve_management_connection(stream, api, cancellation).await
+                        });
                     }
                     result = tasks.join_next(), if !tasks.is_empty() => {
                         if let Some(Err(error)) = result {
@@ -1619,7 +1889,9 @@ impl ManagementHttpServer {
                         let (stream, _) = result.map_err(|source| ManagementServerError::Listener { message: source.to_string() })?;
                         let api = Arc::clone(&self.api);
                         let cancellation = self.state.cancellation.clone();
-                        tasks.spawn(async move { serve_management_connection(TokioIo::new(stream), api, cancellation).await });
+                        tasks.spawn(async move {
+                            serve_management_connection(stream, api, cancellation).await
+                        });
                     }
                     result = tasks.join_next(), if !tasks.is_empty() => {
                         if let Some(Err(error)) = result {
@@ -1640,13 +1912,221 @@ impl ManagementHttpServer {
     }
 }
 
+struct PrefixedIo<I> {
+    prefix: Vec<u8>,
+    offset: usize,
+    inner: I,
+}
+
+impl<I> PrefixedIo<I> {
+    fn new(prefix: Vec<u8>, inner: I) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl<I: AsyncRead + Unpin> AsyncRead for PrefixedIo<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        if this.offset < this.prefix.len() {
+            let available = &this.prefix[this.offset..];
+            let amount = available.len().min(buffer.remaining());
+            buffer.put_slice(&available[..amount]);
+            this.offset += amount;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(context, buffer)
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+async fn read_management_header_prefix<I: AsyncRead + Unpin>(
+    io: &mut I,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut prefix = Vec::with_capacity(1024);
+    loop {
+        if prefix.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(Some(prefix));
+        }
+        if prefix.len() >= MAX_MANAGEMENT_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "management request headers exceed the configured bound",
+            ));
+        }
+        let mut chunk = [0_u8; 1024];
+        let remaining = MAX_MANAGEMENT_HEADER_BYTES - prefix.len();
+        let chunk_len = remaining.min(chunk.len());
+        let read = io.read(&mut chunk[..chunk_len]).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        prefix.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn raw_is_management_mutation(prefix: &[u8]) -> bool {
+    let Some(header_end) = prefix.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(headers) = std::str::from_utf8(&prefix[..header_end]) else {
+        return false;
+    };
+    let Some(request_line) = headers.lines().next() else {
+        return false;
+    };
+    let mut request = request_line.split_whitespace();
+    if request.next() != Some("POST") {
+        return false;
+    }
+    let Some(request_target) = request.next() else {
+        return false;
+    };
+    let request_path = request_target.split('?').next().unwrap_or(request_target);
+    let management_path = request_path
+        .strip_prefix("/management")
+        .filter(|path| path.is_empty() || path.starts_with('/'))
+        .unwrap_or(request_path);
+    is_management_mutation(&Method::POST, management_path)
+}
+
+fn raw_mutation_body_rejection(prefix: &[u8]) -> Option<(StatusCode, &'static str)> {
+    let header_end = prefix.windows(4).position(|window| window == b"\r\n\r\n")?;
+    let headers = std::str::from_utf8(&prefix[..header_end]).ok()?;
+    let mut lines = headers.split("\r\n");
+    let mut request = lines.next()?.split_whitespace();
+    if request.next()? != "POST" {
+        return None;
+    }
+    let request_target = request.next()?;
+    let request_path = request_target.split('?').next().unwrap_or(request_target);
+    let management_path = request_path
+        .strip_prefix("/management")
+        .filter(|path| path.is_empty() || path.starts_with('/'))
+        .unwrap_or(request_path);
+    if !is_management_mutation(&Method::POST, management_path) {
+        return None;
+    }
+
+    let mut content_lengths = Vec::new();
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Some((
+                StatusCode::BAD_REQUEST,
+                "management mutations do not accept Transfer-Encoding",
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            content_lengths.push(value.trim());
+        }
+    }
+    if content_lengths.len() > 1 {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            "management mutations require a single Content-Length",
+        ));
+    }
+    if prefix.len() > header_end.saturating_add(4) {
+        return Some((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "management mutations do not accept request bodies",
+        ));
+    }
+    let length = content_lengths.first()?;
+    let Ok(length) = length.parse::<u64>() else {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            "management mutation Content-Length is invalid",
+        ));
+    };
+    (length != 0).then_some((
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "management mutations do not accept request bodies",
+    ))
+}
+
 async fn serve_management_connection<I>(
-    io: TokioIo<I>,
+    mut io: I,
     api: Arc<ManagementApi>,
     cancellation: CancellationToken,
 ) where
-    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let mut prefix = tokio::select! {
+        _ = cancellation.cancelled() => return,
+        result = tokio::time::timeout(
+            MANAGEMENT_HEADER_TIMEOUT,
+            read_management_header_prefix(&mut io),
+        ) => match result {
+            Ok(Ok(Some(prefix))) => prefix,
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return,
+        },
+    };
+    if raw_mutation_body_rejection(&prefix).is_none() && raw_is_management_mutation(&prefix) {
+        let mut probe = [0_u8; 1024];
+        let probe_result = tokio::select! {
+            _ = cancellation.cancelled() => return,
+            result = tokio::time::timeout(
+                MANAGEMENT_BODY_GUARD_TIMEOUT,
+                io.read(&mut probe),
+            ) => result,
+        };
+        match probe_result {
+            Ok(Ok(0)) | Err(_) => {}
+            Ok(Ok(read)) => prefix.extend_from_slice(&probe[..read]),
+            Ok(Err(_)) => return,
+        }
+    }
+    if let Some((status, message)) = raw_mutation_body_rejection(&prefix) {
+        api.record_audit("http_boundary", None, "rejected_body");
+        let response = management_http_response(ManagementResponse::json(
+            status,
+            json!({"error": message}),
+            false,
+        ));
+        let service = service_fn(move |_request: Request<Incoming>| {
+            let response = response.clone();
+            async move { Ok::<_, std::convert::Infallible>(response) }
+        });
+        let connection = hyper::server::conn::http1::Builder::new()
+            .keep_alive(false)
+            .serve_connection(TokioIo::new(PrefixedIo::new(prefix, io)), service);
+        tokio::pin!(connection);
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                connection.as_mut().graceful_shutdown();
+                let _ = connection.await;
+            }
+            _ = &mut connection => {}
+        }
+        return;
+    }
+    let io = TokioIo::new(PrefixedIo::new(prefix, io));
     let service = service_fn(move |request: Request<Incoming>| {
         let api = Arc::clone(&api);
         async move {
@@ -1663,6 +2143,24 @@ async fn serve_management_connection<I>(
                     json!({"error": LOOPBACK_HOST_ERROR}),
                     false,
                 )
+            } else if is_management_mutation(request.method(), management_path) {
+                if let Some((status, message)) = mutation_body_rejection(request.headers()) {
+                    api.record_audit(management_path, None, "rejected_body");
+                    ManagementResponse::json(status, json!({"error": message}), false)
+                } else if !request.body().is_end_stream() {
+                    api.record_audit(management_path, None, "rejected_body");
+                    ManagementResponse::json(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "management mutations require an empty HTTP body"}),
+                        false,
+                    )
+                } else {
+                    api.handle(
+                        request.method(),
+                        request.uri().to_string().as_str(),
+                        request.headers(),
+                    )
+                }
             } else {
                 api.handle(
                     request.method(),
@@ -1723,6 +2221,14 @@ fn response_value(response: ManagementResponse) -> Value {
         .unwrap_or_else(|_| json!({"error": "management view serialization failed"}))
 }
 
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 fn state_unavailable() -> ManagementResponse {
     ManagementResponse::json(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1731,11 +2237,11 @@ fn state_unavailable() -> ManagementResponse {
     )
 }
 
-fn health_status(state: Option<&CredentialHealthState>) -> &'static str {
+fn availability_status(state: Option<&CredentialHealthState>) -> &'static str {
     match state.map(|state| state.status) {
         Some(CredentialHealthStatus::CoolingDown) => "cooling_down",
         Some(CredentialHealthStatus::Disabled) => "disabled",
-        Some(CredentialHealthStatus::Healthy) | None => "healthy",
+        Some(CredentialHealthStatus::Healthy) | None => "available",
     }
 }
 
@@ -1743,12 +2249,17 @@ fn credential_health_value(
     account: &pooler_config::AccountPlan,
     state: Option<&CredentialState>,
     health: Option<&CredentialHealthState>,
+    selected: bool,
+    available_actions: Vec<&'static str>,
 ) -> Value {
     json!({
         "id": account.id(),
         "provider": account.provider(),
+        "auth_kind": account.auth_kind().as_str(),
         "enabled": state.map_or(account.enabled(), |state| state.enabled),
-        "status": health_status(health),
+        "selected": selected,
+        "available_actions": available_actions,
+        "status": availability_status(health),
         "failure_count": health.map_or(0, |health| health.failure_count),
         "cooldown_until": health.and_then(|health| health.cooldown_until),
     })
@@ -1768,7 +2279,7 @@ fn provider_health_value(
         "transport": plan.transport(),
         "auth_configured": plan.auth().is_some() || plan.oauth().is_some() || plan.native().is_some(),
         "native": plan.native().map(|native| native.kind()),
-        "status": if cooling { "cooling_down" } else { "healthy" },
+        "status": if cooling { "cooling_down" } else { "not_cooling" },
     })
 }
 
@@ -1983,6 +2494,23 @@ routes:
         ManagementApi::new(plan, store, pooling, ActiveCounts::new())
     }
 
+    fn authenticated_api(secret_env: &str) -> ManagementApi {
+        let config = pooler_config::compile_yaml(
+            "authenticated-management-test.yaml",
+            &format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{secret_env}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\nmodels: [{{id: public-model, targets: [{{provider: provider-a, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+            ),
+        )
+        .expect("authenticated management config compiles");
+        let plan = config.management().cloned().expect("management plan");
+        let pooling = Arc::new(PoolingCoordinator::new(&config).expect("pooling coordinator"));
+        let store = Arc::new(ConfigStore::with_generation(
+            ConfigGeneration::new(config.generation()),
+            config,
+        ));
+        ManagementApi::new(plan, store, pooling, ActiveCounts::new())
+    }
+
     fn loopback_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, header::HeaderValue::from_static("localhost"));
@@ -2049,7 +2577,13 @@ routes:
         let models = api.handle(&Method::GET, "/models", &headers);
         assert!(String::from_utf8_lossy(&models.body).contains("public-model"));
         let providers = api.handle(&Method::GET, "/health/providers", &headers);
-        assert!(String::from_utf8_lossy(&providers.body).contains("provider-a"));
+        let providers: Value = serde_json::from_slice(&providers.body).expect("providers json");
+        assert_eq!(providers["providers"][0]["id"], "provider-a");
+        assert_eq!(providers["providers"][0]["status"], "not_cooling");
+
+        let config = api.handle(&Method::GET, "/config", &headers);
+        let config: Value = serde_json::from_slice(&config.body).expect("config json");
+        assert_eq!(config["management"]["mutations"], false);
     }
 
     #[test]
@@ -2323,6 +2857,40 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
                 .status,
             StatusCode::PAYLOAD_TOO_LARGE
         );
+        let mut transfer_headers = headers.clone();
+        transfer_headers.insert(
+            header::TRANSFER_ENCODING,
+            header::HeaderValue::from_static("chunked"),
+        );
+        assert_eq!(
+            api.handle(&Method::POST, "/accounts/alpha/disable", &transfer_headers,)
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        let mut malformed_length = headers.clone();
+        malformed_length.insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(
+            api.handle(&Method::POST, "/accounts/alpha/disable", &malformed_length,)
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        let mut multiple_lengths = headers.clone();
+        multiple_lengths.append(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_static("0"),
+        );
+        multiple_lengths.append(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_static("0"),
+        );
+        assert_eq!(
+            api.handle(&Method::POST, "/accounts/alpha/disable", &multiple_lengths,)
+                .status,
+            StatusCode::BAD_REQUEST
+        );
 
         let disabled = api.handle(&Method::POST, "/accounts/alpha/disable", &headers);
         assert_eq!(disabled.status, StatusCode::OK);
@@ -2334,20 +2902,58 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             .iter()
             .find(|account| account["id"] == "alpha")
             .expect("alpha");
+        assert_eq!(accounts["mutation_capable"], true);
         assert_eq!(alpha["enabled"], false);
+        assert_eq!(alpha["auth_kind"], "api_key");
+        assert_eq!(alpha["status"], "disabled");
+        assert_eq!(alpha["selected"], false);
+        let beta = accounts["accounts"]
+            .as_array()
+            .expect("accounts")
+            .iter()
+            .find(|account| account["id"] == "beta")
+            .expect("beta");
+        assert_eq!(beta["status"], "available");
+        assert_eq!(beta["selected"], true);
+        assert!(alpha["available_actions"]
+            .as_array()
+            .expect("available actions")
+            .iter()
+            .any(|action| action == "enable"));
 
         let model = api.handle(&Method::POST, "/models/public/disable", &headers);
         assert_eq!(model.status, StatusCode::OK);
         let models = api.handle(&Method::GET, "/models", &headers);
         let models: Value = serde_json::from_slice(&models.body).expect("models json");
+        assert_eq!(models["mutation_capable"], true);
         assert_eq!(models["models"][0]["enabled"], false);
 
         let notifier = api.reload_notifier();
         let reload = api.handle(&Method::POST, "/reload", &headers);
         assert_eq!(reload.status, StatusCode::ACCEPTED);
+        let reload: Value = serde_json::from_slice(&reload.body).expect("reload json");
+        assert_eq!(reload["kind"], "configuration");
+        assert_eq!(reload["status"], "pending");
+        let request_id = reload["request_id"].as_u64().expect("reload request id");
         tokio::time::timeout(std::time::Duration::from_secs(1), notifier.notified())
             .await
             .expect("reload notification");
+        let request = api.next_reload_request().await;
+        assert_eq!(request.id, request_id);
+        assert_eq!(request.kind, ManagementReloadKind::Configuration);
+        assert_eq!(request.generation, 1);
+        api.complete_reload(request.id, "succeeded", 2, None);
+        let reloads = api.handle(&Method::GET, "/reloads", &headers);
+        let reloads: Value = serde_json::from_slice(&reloads.body).expect("reloads json");
+        assert_eq!(reloads["reloads"][0]["status"], "succeeded");
+
+        let catalog_reload = api.handle(&Method::POST, "/models/reload", &headers);
+        let catalog_reload: Value =
+            serde_json::from_slice(&catalog_reload.body).expect("catalog reload json");
+        assert_eq!(catalog_reload["kind"], "catalog");
+        let catalog_request = api.next_reload_request().await;
+        assert_eq!(catalog_request.kind, ManagementReloadKind::Catalog);
+        api.complete_reload(catalog_request.id, "unchanged", 2, Some(1));
         api.traces.record(
             pooler_observe::TraceRecord::new(pooler_observe::TraceStage::Attempt)
                 .route("route")
@@ -2360,7 +2966,13 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
 
         let audit = api.handle(&Method::GET, "/audit", &headers);
         let audit: Value = serde_json::from_slice(&audit.body).expect("audit json");
-        assert_eq!(audit["events"].as_array().expect("events").len(), 5);
+        let events = audit["events"].as_array().expect("events");
+        assert!(events
+            .iter()
+            .any(|event| { event["request_id"] == request_id && event["outcome"] == "accepted" }));
+        assert!(events
+            .iter()
+            .any(|event| { event["request_id"] == request_id && event["outcome"] == "succeeded" }));
         let export = api.handle(&Method::GET, "/export", &headers);
         let export = String::from_utf8(export.body).expect("export utf8");
         for secret in [
@@ -2507,6 +3119,99 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
     }
 
     #[tokio::test]
+    async fn management_listener_rejects_mutation_framing_at_http_boundary() {
+        let server = ManagementHttpServer::bind(Arc::new(api()))
+            .await
+            .expect("management listener binds");
+        let address: SocketAddr = server
+            .address()
+            .parse()
+            .expect("ephemeral management address");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        for (label, request, expected) in [
+            (
+                "transfer encoding",
+                b"POST /reload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n".as_slice(),
+                "400 Bad Request",
+            ),
+            (
+                "malformed content length",
+                b"POST /reload HTTP/1.1\r\nHost: localhost\r\nContent-Length: invalid\r\nConnection: close\r\n\r\n".as_slice(),
+                "400 Bad Request",
+            ),
+            (
+                "multiple content lengths",
+                b"POST /reload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+                "400 Bad Request",
+            ),
+            (
+                "unframed payload bytes",
+                b"POST /reload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\nx".as_slice(),
+                "413 Payload Too Large",
+            ),
+            (
+                "nonzero content length",
+                b"POST /reload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx".as_slice(),
+                "413 Payload Too Large",
+            ),
+        ] {
+            let mut stream = TcpStream::connect(address)
+                .await
+                .expect("management connects");
+            stream
+                .write_all(request)
+                .await
+                .expect("management request writes");
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut response),
+            )
+            .await
+            .expect("management rejection arrives")
+            .expect("management rejection reads");
+            assert!(
+                String::from_utf8_lossy(&response).contains(expected),
+                "{label} response was {}",
+                String::from_utf8_lossy(&response)
+            );
+        }
+
+        let mut delayed = TcpStream::connect(address)
+            .await
+            .expect("delayed management connection");
+        delayed
+            .write_all(b"POST /reload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("delayed management headers write");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        delayed
+            .write_all(b"x")
+            .await
+            .expect("delayed payload writes");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), delayed.read_to_end(&mut response))
+            .await
+            .expect("delayed body rejection arrives")
+            .expect("delayed body rejection reads");
+        assert!(
+            String::from_utf8_lossy(&response).contains("413 Payload Too Large"),
+            "delayed unframed payload response was {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        server.begin_shutdown();
+        runner
+            .await
+            .expect("management task does not panic")
+            .expect("management task shuts down");
+    }
+
+    #[tokio::test]
     async fn standalone_management_listener_serves_json_and_shuts_down() {
         let server = ManagementHttpServer::bind(Arc::new(api()))
             .await
@@ -2560,5 +3265,92 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             .await
             .expect("management task does not panic")
             .expect("management task shuts down");
+    }
+
+    #[tokio::test]
+    async fn management_listener_accepts_body_free_authenticated_mutations() {
+        const SECRET_ENV: &str = "POOLER_MANAGEMENT_BODY_FREE_TEST_KEY";
+        std::env::set_var(SECRET_ENV, "body-free-secret");
+        let server = ManagementHttpServer::bind(Arc::new(authenticated_api(SECRET_ENV)))
+            .await
+            .expect("management listener binds");
+        let address: SocketAddr = server
+            .address()
+            .parse()
+            .expect("ephemeral management address");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        for request in [
+            b"POST /management/reload HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer body-free-secret\r\nConnection: close\r\n\r\n".as_slice(),
+            b"POST /management/models/reload HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer body-free-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+        ] {
+            let mut stream = TcpStream::connect(address)
+                .await
+                .expect("management connects");
+            stream
+                .write_all(request)
+                .await
+                .expect("management request writes");
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut response),
+            )
+            .await
+            .expect("management response arrives")
+            .expect("management response reads");
+            assert!(
+                String::from_utf8_lossy(&response).contains("202 Accepted"),
+                "body-free mutation response was {}",
+                String::from_utf8_lossy(&response)
+            );
+        }
+
+        server.begin_shutdown();
+        runner
+            .await
+            .expect("management task does not panic")
+            .expect("management task shuts down");
+        std::env::remove_var(SECRET_ENV);
+    }
+
+    #[tokio::test]
+    async fn management_reload_queue_is_bounded_and_recovers_capacity() {
+        const SECRET_ENV: &str = "POOLER_MANAGEMENT_RELOAD_QUEUE_TEST_KEY";
+        std::env::set_var(SECRET_ENV, "reload-queue-secret");
+        let api = authenticated_api(SECRET_ENV);
+        let mut headers = loopback_headers();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer reload-queue-secret"),
+        );
+
+        for _ in 0..MAX_PENDING_MANAGEMENT_RELOADS {
+            assert_eq!(
+                api.handle(&Method::POST, "/reload", &headers).status,
+                StatusCode::ACCEPTED
+            );
+        }
+        assert_eq!(
+            api.handle(&Method::POST, "/reload", &headers).status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let consumed = api.next_reload_request().await;
+        assert_eq!(consumed.generation, 1);
+        assert_eq!(
+            api.handle(&Method::POST, "/models/reload", &headers).status,
+            StatusCode::ACCEPTED
+        );
+        let reloads = api.handle(&Method::GET, "/reloads", &headers);
+        let reloads: Value = serde_json::from_slice(&reloads.body).expect("reload history json");
+        assert_eq!(
+            reloads["reloads"].as_array().expect("reload history").len(),
+            MAX_PENDING_MANAGEMENT_RELOADS + 1
+        );
+        std::env::remove_var(SECRET_ENV);
     }
 }

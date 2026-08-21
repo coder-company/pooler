@@ -47,7 +47,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::management::{ManagementRuntimeServices, NativeAccountAction, NativeAccountCommand};
+use crate::management::{
+    ManagementReloadKind, ManagementRuntimeServices, NativeAccountAction, NativeAccountCommand,
+};
 use crate::tls::{PreparedTls, TlsError};
 use crate::{
     ActiveCounts, ActiveGuard, CatalogRuntime, CatalogRuntimeError, ManagementApi,
@@ -428,6 +430,12 @@ pub enum HttpProxyServerError {
     /// Configured model discovery could not publish a complete refresh.
     #[error(transparent)]
     CatalogRefresh(#[from] pooler_model_catalog::CatalogError),
+    /// No remote model catalog exists in the active generation.
+    #[error("model catalog refresh is unavailable because no catalog is configured")]
+    CatalogUnavailable,
+    /// A queued management operation no longer matches the active generation.
+    #[error("management operation generation changed from {expected} to {actual}")]
+    StaleManagementGeneration { expected: u64, actual: u64 },
 }
 
 /// Result of applying a compiled HTTP runtime candidate.
@@ -483,7 +491,7 @@ impl Drop for UnixSocketPath {
 struct RuntimeState {
     listeners: Mutex<Option<Vec<BoundListener>>>,
     dispatch: Arc<ArcSwap<RuntimeGeneration>>,
-    reload_lock: AsyncMutex<()>,
+    reload_lock: Arc<AsyncMutex<()>>,
     native: Arc<NativeRuntime>,
     retired: Mutex<Vec<Vec<Arc<RuntimeProxy>>>>,
     metrics: MetricsRegistry,
@@ -601,6 +609,7 @@ impl HttpProxyServer {
         let active = ActiveCounts::new();
         let cancellation = CancellationToken::new();
         let (native_commands, native_command_receiver) = mpsc::channel(16);
+        let reload_lock = Arc::new(AsyncMutex::new(()));
         let management_api = config.management().map(|plan| {
             Arc::new(ManagementApi::with_runtime_dispatch(
                 plan.clone(),
@@ -620,6 +629,7 @@ impl HttpProxyServer {
                 native_command_receiver,
                 Arc::clone(&native),
                 Arc::clone(&dispatch),
+                Arc::clone(&reload_lock),
                 Arc::downgrade(api),
                 cancellation.clone(),
             ));
@@ -728,7 +738,7 @@ impl HttpProxyServer {
             state: Arc::new(RuntimeState {
                 listeners: Mutex::new(Some(listeners)),
                 dispatch,
-                reload_lock: AsyncMutex::new(()),
+                reload_lock,
                 native,
                 retired: Mutex::new(Vec::new()),
                 metrics,
@@ -765,13 +775,92 @@ impl HttpProxyServer {
         self.state.management_api.clone()
     }
 
-    /// Notification used by the CLI reload loop for authenticated management requests.
+    /// Notification used by compatibility callers observing management reload requests.
     #[must_use]
     pub fn management_reload_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {
         self.state
             .management_api
             .as_ref()
             .map(|api| api.reload_notifier())
+    }
+
+    /// Wait for the next bounded management reload request.
+    ///
+    /// The boolean is true only for a catalog-only refresh; the final value is
+    /// the accepting configuration generation. A server without management
+    /// enabled waits forever rather than causing caller spin.
+    pub async fn next_management_reload_request(&self) -> (u64, bool, u64) {
+        let Some(api) = self.state.management_api.as_ref() else {
+            return std::future::pending().await;
+        };
+        loop {
+            let request = api.next_reload_request().await;
+            let generation = self.state.dispatch.load_full();
+            if generation.config.generation() == request.generation {
+                return (
+                    request.id,
+                    request.kind == ManagementReloadKind::Catalog,
+                    request.generation,
+                );
+            }
+            let catalog_generation = generation
+                .catalog
+                .as_ref()
+                .map(|catalog| catalog.snapshot().generation());
+            api.complete_reload(
+                request.id,
+                "failed",
+                generation.config.generation(),
+                catalog_generation,
+            );
+        }
+    }
+
+    /// Record a correlated management reload completion in bounded API state.
+    /// `changed` is `None` for failure, `Some(false)` for unchanged, and
+    /// `Some(true)` for success with newly published state.
+    pub fn complete_management_reload(&self, request_id: u64, changed: Option<bool>) {
+        let generation = self.state.dispatch.load_full();
+        let outcome = match changed {
+            Some(true) => "succeeded",
+            Some(false) => "unchanged",
+            None => "failed",
+        };
+        let catalog_generation = generation
+            .catalog
+            .as_ref()
+            .map(|catalog| catalog.snapshot().generation());
+        if let Some(api) = self.state.management_api.as_ref() {
+            api.complete_reload(
+                request_id,
+                outcome,
+                generation.config.generation(),
+                catalog_generation,
+            );
+        }
+    }
+
+    /// Refresh only the active remote model catalog without recompiling or
+    /// publishing a configuration generation.
+    pub async fn refresh_catalog(
+        &self,
+        expected_generation: u64,
+    ) -> Result<bool, HttpProxyServerError> {
+        let _guard = self.state.reload_lock.lock().await;
+        let generation = self.state.dispatch.load_full();
+        let actual_generation = generation.config.generation();
+        if actual_generation != expected_generation {
+            return Err(HttpProxyServerError::StaleManagementGeneration {
+                expected: expected_generation,
+                actual: actual_generation,
+            });
+        }
+        let Some(catalog) = generation.catalog.as_ref() else {
+            return Err(HttpProxyServerError::CatalogUnavailable);
+        };
+        let before = catalog.snapshot().generation();
+        catalog.refresh().await?;
+        Ok(catalog.snapshot().generation() != before)
     }
 
     /// Return the process-shared bounded metrics registry.
@@ -840,8 +929,33 @@ impl HttpProxyServer {
         &self,
         candidate: CompiledConfig,
     ) -> Result<HttpReloadOutcome, HttpProxyServerError> {
+        self.reload_inner(candidate, None).await
+    }
+
+    /// Apply a management-requested candidate only if its accepting generation
+    /// is still active when the reload lock is acquired.
+    pub async fn reload_for_generation(
+        &self,
+        candidate: CompiledConfig,
+        expected_generation: u64,
+    ) -> Result<HttpReloadOutcome, HttpProxyServerError> {
+        self.reload_inner(candidate, Some(expected_generation))
+            .await
+    }
+
+    async fn reload_inner(
+        &self,
+        candidate: CompiledConfig,
+        expected_generation: Option<u64>,
+    ) -> Result<HttpReloadOutcome, HttpProxyServerError> {
         let _guard = self.state.reload_lock.lock().await;
         let current = self.state.dispatch.load_full();
+        if let Some(expected) = expected_generation {
+            let actual = current.config.generation();
+            if expected != actual {
+                return Err(HttpProxyServerError::StaleManagementGeneration { expected, actual });
+            }
+        }
         if !same_listener_bindings(&current.config, &candidate) {
             return Err(HttpProxyServerError::ListenerSetChanged);
         }
@@ -850,9 +964,6 @@ impl HttpProxyServer {
         }
         let tls = prepare_tls_map(&candidate)?;
         if current.config.equivalent(&candidate) && same_tls_map(&current.tls, &tls) {
-            if let Some(catalog) = &current.catalog {
-                catalog.refresh().await?;
-            }
             return Ok(HttpReloadOutcome::Unchanged {
                 generation: current.config.generation(),
             });
@@ -1061,6 +1172,7 @@ async fn run_native_account_commands(
     mut commands: mpsc::Receiver<NativeAccountCommand>,
     native: Arc<NativeRuntime>,
     dispatch: Arc<ArcSwap<RuntimeGeneration>>,
+    reload_lock: Arc<AsyncMutex<()>>,
     management: Weak<ManagementApi>,
     cancellation: CancellationToken,
 ) {
@@ -1072,30 +1184,45 @@ async fn run_native_account_commands(
                 None => break,
             },
         };
+        let _reload_guard = reload_lock.lock().await;
         let generation = dispatch.load_full();
-        let succeeded = match command.action {
-            NativeAccountAction::Refresh => native
-                .refresh_account(
-                    generation.config.as_ref(),
-                    &command.account,
-                    cancellation.child_token(),
-                )
-                .await
-                .is_ok(),
-            NativeAccountAction::Revoke => {
-                let revoked = native
-                    .revoke_account(generation.config.as_ref(), &command.account)
+        let outcome = if generation.config.generation() != command.generation {
+            "stale_generation"
+        } else {
+            let succeeded = match command.action {
+                NativeAccountAction::Refresh => native
+                    .refresh_account(
+                        generation.config.as_ref(),
+                        &command.account,
+                        cancellation.child_token(),
+                    )
                     .await
-                    .is_ok();
-                revoked
-                    && generation
-                        .pooling
-                        .set_account_enabled(&command.account, false)
-                        .is_ok()
+                    .is_ok(),
+                NativeAccountAction::Revoke => {
+                    let revoked = native
+                        .revoke_account(generation.config.as_ref(), &command.account)
+                        .await
+                        .is_ok();
+                    revoked
+                        && generation
+                            .pooling
+                            .set_account_enabled(&command.account, false)
+                            .is_ok()
+                }
+            };
+            if succeeded {
+                "succeeded"
+            } else {
+                "failed"
             }
         };
         if let Some(management) = management.upgrade() {
-            management.record_native_result(command.action, &command.account, succeeded);
+            management.record_native_result(
+                command.action,
+                &command.account,
+                command.generation,
+                outcome,
+            );
         }
     }
 }
@@ -4587,6 +4714,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_management_reload_is_failed_instead_of_applied() {
+        const SECRET_ENV: &str = "POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY";
+        std::env::set_var(SECRET_ENV, "stale-reload-secret");
+        let config = pooler_config::compile_yaml(
+            "management-stale-reload.yaml",
+            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:1}}\n",
+        )
+        .expect("initial management config");
+        let server = HttpProxyServer::bind(config).await.expect("bind server");
+        let api = server.management_api().expect("management api");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer stale-reload-secret"),
+        );
+        let accepted = api.handle(&http::Method::POST, "/reload", &headers);
+        assert_eq!(accepted.status, http::StatusCode::ACCEPTED);
+        let accepted: serde_json::Value =
+            serde_json::from_slice(&accepted.body).expect("accepted reload json");
+        let request_id = accepted["request_id"].as_u64().expect("request id");
+
+        let replacement = pooler_config::compile_yaml(
+            "management-stale-reload.yaml",
+            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:2}}\n",
+        )
+        .expect("replacement management config");
+        assert_eq!(
+            server.reload(replacement).await.expect("runtime reload"),
+            HttpReloadOutcome::Reloaded { generation: 2 }
+        );
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                server.next_management_reload_request(),
+            )
+            .await
+            .is_err(),
+            "stale request should be consumed and the waiter should remain pending"
+        );
+        let reloads = api.handle(&http::Method::GET, "/reloads", &headers);
+        let reloads: serde_json::Value =
+            serde_json::from_slice(&reloads.body).expect("reload history json");
+        let record = reloads["reloads"]
+            .as_array()
+            .expect("reload records")
+            .iter()
+            .find(|record| record["request_id"] == request_id)
+            .expect("correlated reload record");
+        assert_eq!(record["status"], "failed");
+        assert_eq!(record["accepted_configuration_generation"], 1);
+        assert_eq!(record["configuration_generation"], 2);
+
+        let accepted = api.handle(&http::Method::POST, "/reload", &headers);
+        assert_eq!(accepted.status, http::StatusCode::ACCEPTED);
+        let (second_request_id, catalog_only, accepted_generation) =
+            server.next_management_reload_request().await;
+        assert!(!catalog_only);
+        assert_eq!(accepted_generation, 2);
+        let third = pooler_config::compile_yaml(
+            "management-stale-reload.yaml",
+            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:3}}\n",
+        )
+        .expect("third management config");
+        assert_eq!(
+            server
+                .reload(third)
+                .await
+                .expect("concurrent runtime reload"),
+            HttpReloadOutcome::Reloaded { generation: 3 }
+        );
+        let obsolete = pooler_config::compile_yaml(
+            "management-stale-reload.yaml",
+            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:4}}\n",
+        )
+        .expect("obsolete management candidate");
+        assert!(matches!(
+            server
+                .reload_for_generation(obsolete, accepted_generation)
+                .await,
+            Err(HttpProxyServerError::StaleManagementGeneration {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        server.complete_management_reload(second_request_id, None);
+        server.begin_drain();
+        std::env::remove_var(SECRET_ENV);
+    }
+
+    #[tokio::test]
     async fn management_native_account_commands_are_bounded_and_audited() {
         std::env::set_var("POOLER_MANAGEMENT_NATIVE_TEST_KEY", "native-command-secret");
         let config = pooler_config::compile_yaml(
@@ -4626,6 +4844,38 @@ mod tests {
             .expect("audit events")
             .iter()
             .any(|event| event["outcome"] == "queued"));
+
+        let (sender, receiver) = mpsc::channel(1);
+        let stale_worker = tokio::spawn(run_native_account_commands(
+            receiver,
+            Arc::clone(&server.state.native),
+            Arc::clone(&server.state.dispatch),
+            Arc::clone(&server.state.reload_lock),
+            Arc::downgrade(&api),
+            server.cancellation_token(),
+        ));
+        sender
+            .send(NativeAccountCommand {
+                account: "account-a".to_owned(),
+                action: NativeAccountAction::Revoke,
+                generation: 0,
+            })
+            .await
+            .expect("stale command queues");
+        drop(sender);
+        stale_worker.await.expect("stale command worker");
+        let audit = api.handle(&http::Method::GET, "/audit", &headers);
+        let audit: serde_json::Value =
+            serde_json::from_slice(&audit.body).expect("stale audit json");
+        assert!(audit["events"]
+            .as_array()
+            .expect("audit events")
+            .iter()
+            .any(|event| {
+                event["action"] == "revoke"
+                    && event["generation"] == 0
+                    && event["outcome"] == "stale_generation"
+            }));
         server.begin_drain();
         std::env::remove_var("POOLER_MANAGEMENT_NATIVE_TEST_KEY");
     }

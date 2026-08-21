@@ -36,6 +36,9 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12"
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
@@ -44,6 +47,14 @@ jobs:
       - run: cargo fmt --all --check
       - run: bash scripts/check-release-workflow.sh
       - run: ./scripts/check-config-schema.sh
+      - name: Verify dashboard asset provenance
+        run: python3 scripts/tests/test_dashboard_asset_provenance.py
+      - name: Install Playwright browser
+        run: |
+          python3 -m pip install --disable-pip-version-check playwright==1.62.0
+          python3 -m playwright install chromium
+      - name: Run management dashboard browser QA
+        run: python3 scripts/test-management-ui-browser.py --require-playwright
       - run: cargo check --workspace --all-targets --all-features --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
