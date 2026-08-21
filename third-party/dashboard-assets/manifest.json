@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "scope": "Non-Cargo components embedded in the Pooler management dashboard",
+  "components": [
+    {
+      "id": "iconoir",
+      "name": "Iconoir",
+      "sbom_type": "library",
+      "version": "1.2.30",
+      "version_evidence": "Recovered from the @iconify-icons/iconoir package at the generator's recorded source location and its workspace lockfile.",
+      "license_expression": "MIT",
+      "license_file": "licenses/Iconoir-MIT.txt",
+      "copyright_text": "Copyright (c) 2021 Luca Burgio",
+      "source": {
+        "kind": "npm-package",
+        "package": "@iconify-icons/iconoir",
+        "url": "https://www.npmjs.com/package/@iconify-icons/iconoir/v/1.2.30",
+        "generator_input": "A local @iconify-icons/iconoir installation; the absolute development path is recorded in scripts/generate-management-ui-assets.py."
+      },
+      "embedded_assets": [
+        "crates/pooler-server/ui/icons.js"
+      ],
+      "transform": "Selected SVG bodies were extracted into a generated JavaScript registry by scripts/generate-management-ui-assets.py."
+    },
+    {
+      "id": "lobehub-icons",
+      "name": "LobeHub Icons",
+      "sbom_type": "library",
+      "version": "5.16.0",
+      "version_evidence": "Recovered from /tmp/brand-icons/lobehub/package.json, the package used to create the generator input at the time the committed dashboard assets were generated.",
+      "license_expression": "MIT",
+      "license_file": "licenses/LobeHub-Icons-MIT.txt",
+      "copyright_text": "Copyright (c) 2023 LobeHub",
+      "source": {
+        "kind": "npm-package",
+        "package": "@lobehub/icons",
+        "url": "https://www.npmjs.com/package/@lobehub/icons/v/5.16.0",
+        "generator_input": "/tmp/brand-icons/provider-icons.json, produced by scripts/extract-lobehub-icons.mjs"
+      },
+      "embedded_assets": [
+        "crates/pooler-server/ui/providers.js"
+      ],
+      "embedded_subset": "Provider registry entries other than the four Simple Icons gap fills listed in the simple-icons component.",
+      "transform": "Mono React icon components were rendered to SVG bodies, size-filtered, minified, and written into a generated JavaScript registry."
+    },
+    {
+      "id": "simple-icons",
+      "name": "Simple Icons",
+      "sbom_type": "library",
+      "version": "16.28.0",
+      "version_evidence": "Recovered from /tmp/brand-icons/package/package.json, the package at the generator's recorded input location when the committed dashboard assets were generated.",
+      "license_expression": "CC0-1.0",
+      "license_file": "licenses/Simple-Icons-CC0-1.0.md",
+      "copyright_text": "NOASSERTION",
+      "source": {
+        "kind": "npm-package",
+        "package": "simple-icons",
+        "url": "https://www.npmjs.com/package/simple-icons/v/16.28.0",
+        "generator_input": "/tmp/brand-icons/package/icons"
+      },
+      "embedded_assets": [
+        "crates/pooler-server/ui/providers.js"
+      ],
+      "embedded_subset": "The deepgram, gitlab, docker, and digitalocean SVG entries. The configured github gap fill was already supplied by LobeHub Icons and therefore was not copied from Simple Icons.",
+      "transform": "Titles were removed from selected SVGs; SVG bodies were minified and written into the shared provider registry."
+    },
+    {
+      "id": "geist",
+      "name": "Geist",
+      "sbom_type": "file",
+      "version": "1.401",
+      "version_evidence": "The embedded WOFF2 name tables report Version 1.401. The recorded distribution package is @fontsource-variable/geist 5.2.8.",
+      "license_expression": "OFL-1.1",
+      "license_file": "licenses/Geist-OFL-1.1.txt",
+      "copyright_text": "Copyright 2024 The Geist Project Authors (https://github.com/vercel/geist-font.git)",
+      "source": {
+        "kind": "npm-package",
+        "package": "@fontsource-variable/geist",
+        "package_version": "5.2.8",
+        "url": "https://www.npmjs.com/package/@fontsource-variable/geist/v/5.2.8",
+        "generator_input": "The latin, latin-ext, and cyrillic WOFF2 subsets from the package path recorded in scripts/generate-management-ui-assets.py."
+      },
+      "embedded_assets": [
+        "crates/pooler-server/ui/fonts/geist-latin.woff2",
+        "crates/pooler-server/ui/fonts/geist-latin-ext.woff2",
+        "crates/pooler-server/ui/fonts/geist-cyrillic.woff2"
+      ],
+      "transform": "The three package WOFF2 subset files were copied and renamed without font conversion."
+    },
+    {
+      "id": "geist-mono",
+      "name": "Geist Mono",
+      "sbom_type": "file",
+      "version": "1.700",
+      "version_evidence": "The embedded WOFF2 name table reports Version 1.700; no package version or immutable source revision was recorded for the input TTF.",
+      "license_expression": "OFL-1.1",
+      "license_file": "licenses/Geist-OFL-1.1.txt",
+      "copyright_text": "Copyright 2024 The Geist Project Authors (https://github.com/vercel/geist-font.git)",
+      "source": {
+        "kind": "local-file",
+        "package": null,
+        "url": "https://github.com/vercel/geist-font",
+        "generator_input": "workers/og-image/fonts/GeistMono-Regular.ttf in a local arcXiv checkout; its revision and original download provenance were not recorded."
+      },
+      "embedded_assets": [
+        "crates/pooler-server/ui/fonts/geist-mono.woff2"
+      ],
+      "transform": "The source TTF was subset and converted to WOFF2 with fontTools; see scripts/generate-management-ui-assets.py for the selected Unicode ranges and flags."
+    },
+    {
+      "id": "coder-company-marks",
+      "name": "Coder Company marks",
+      "sbom_type": "file",
+      "version": null,
+      "version_evidence": "No mark version or immutable brand-kit revision was recorded.",
+      "license_expression": "NOASSERTION",
+      "license_file": null,
+      "copyright_text": "NOASSERTION",
+      "source": {
+        "kind": "local-file",
+        "package": null,
+        "url": null,
+        "generator_input": "01-logo/mark/coder-company-mark-charcoal-transparent-master.png under the local Coder Company Assets directory; origin, rights owner, and revision were not recorded in this repository."
+      },
+      "embedded_assets": [
+        "crates/pooler-server/ui/assets/mark-charcoal-32.png",
+        "crates/pooler-server/ui/assets/mark-charcoal-64.png",
+        "crates/pooler-server/ui/assets/mark-charcoal-128.png",
+        "crates/pooler-server/ui/assets/mark-charcoal-256.png",
+        "crates/pooler-server/ui/assets/mark-paper-32.png",
+        "crates/pooler-server/ui/assets/mark-paper-64.png",
+        "crates/pooler-server/ui/assets/mark-paper-128.png",
+        "crates/pooler-server/ui/assets/mark-paper-256.png",
+        "crates/pooler-server/ui/assets/mark-stone-32.png",
+        "crates/pooler-server/ui/assets/mark-stone-64.png",
+        "crates/pooler-server/ui/assets/mark-stone-128.png",
+        "crates/pooler-server/ui/assets/mark-stone-256.png",
+        "crates/pooler-server/ui/assets/mark-warm-black-32.png",
+        "crates/pooler-server/ui/assets/mark-warm-black-64.png",
+        "crates/pooler-server/ui/assets/mark-warm-black-128.png",
+        "crates/pooler-server/ui/assets/mark-warm-black-256.png",
+        "crates/pooler-server/ui/assets/mark-white-32.png",
+        "crates/pooler-server/ui/assets/mark-white-64.png",
+        "crates/pooler-server/ui/assets/mark-white-128.png",
+        "crates/pooler-server/ui/assets/mark-white-256.png",
+        "crates/pooler-server/ui/assets/favicon-warm-black-32.png",
+        "crates/pooler-server/ui/assets/favicon-warm-black-64.png",
+        "crates/pooler-server/ui/assets/favicon-paper-32.png",
+        "crates/pooler-server/ui/assets/favicon-paper-64.png"
+      ],
+      "transform": "The alpha channel was trimmed and padded; color variants and resized PNGs were generated. No standalone redistribution license text is available in the recorded source material."
+    }
+  ],
+  "trademark_notice": "Names and logos represented by provider icons or brand marks may be trademarks of their respective holders. The listed software or artwork licenses do not grant trademark rights."
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render deterministic CycloneDX 1.5 and SPDX 2.3 cargo SBOMs."""
+"""Render deterministic CycloneDX 1.5 and SPDX 2.3 release SBOMs."""
 
 from __future__ import annotations
 
@@ -12,11 +12,23 @@ from typing import Any
 import uuid
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_ASSETS_MANIFEST = (
+    REPOSITORY_ROOT / "third-party" / "dashboard-assets" / "manifest.json"
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--epoch", type=int, required=True)
+    parser.add_argument(
+        "--assets-manifest",
+        type=Path,
+        default=DEFAULT_ASSETS_MANIFEST,
+        help="manifest of non-Cargo components embedded in the dashboard",
+    )
     parser.add_argument("--cyclonedx", type=Path, required=True)
     parser.add_argument("--spdx", type=Path, required=True)
     return parser.parse_args()
@@ -68,6 +80,70 @@ def read_packages(metadata_path: Path) -> list[dict[str, Any]]:
     return sorted(packages, key=lambda package: package_key(package))
 
 
+def read_embedded_components(manifest_path: Path) -> list[dict[str, Any]]:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1:
+        raise ValueError("dashboard asset manifest must use schema_version 1")
+    components = manifest.get("components")
+    if not isinstance(components, list):
+        raise ValueError("dashboard asset manifest did not contain a component list")
+
+    seen: set[str] = set()
+    for component in components:
+        if not isinstance(component, dict):
+            raise ValueError("dashboard asset manifest components must be objects")
+        identifier = component.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("dashboard asset manifest component id must be a string")
+        if identifier in seen:
+            raise ValueError(f"duplicate dashboard asset component id: {identifier}")
+        seen.add(identifier)
+        if not isinstance(component.get("name"), str):
+            raise ValueError(f"dashboard asset component {identifier} has no name")
+        if component.get("sbom_type") not in {"file", "library"}:
+            raise ValueError(
+                f"dashboard asset component {identifier} has an invalid sbom_type"
+            )
+        if not isinstance(component.get("license_expression"), str):
+            raise ValueError(
+                f"dashboard asset component {identifier} has no license_expression"
+            )
+        if not isinstance(component.get("source"), dict):
+            raise ValueError(f"dashboard asset component {identifier} has no source")
+        if not isinstance(component.get("embedded_assets"), list):
+            raise ValueError(
+                f"dashboard asset component {identifier} has no embedded_assets list"
+            )
+    return sorted(components, key=lambda component: component["id"])
+
+
+def embedded_component_ref(component: dict[str, Any]) -> str:
+    return f"urn:pooler:embedded-dashboard-asset:{component['id']}"
+
+
+def embedded_spdx_id(component: dict[str, Any]) -> str:
+    digest = hashlib.sha256(component["id"].encode("utf-8")).hexdigest()[:24]
+    return f"SPDXRef-Embedded-{digest}"
+
+
+def embedded_license_entries(component: dict[str, Any]) -> list[dict[str, Any]]:
+    expression = component.get("license_expression")
+    if not expression or expression == "NOASSERTION":
+        return []
+    return [{"license": {"id": expression}}]
+
+
+def embedded_comment(component: dict[str, Any]) -> str:
+    details = [component.get("version_evidence", "")]
+    if component.get("embedded_subset"):
+        details.append(component["embedded_subset"])
+    if component.get("transform"):
+        details.append(component["transform"])
+    assets = ", ".join(component["embedded_assets"])
+    details.append(f"Embedded assets: {assets}")
+    return " ".join(detail.strip() for detail in details if detail).strip()
+
+
 def dependency_refs(
     package: dict[str, Any],
     refs_by_name: dict[str, list[str]],
@@ -78,7 +154,12 @@ def dependency_refs(
     return sorted(refs)
 
 
-def render_cyclonedx(packages: list[dict[str, Any]], version: str, epoch: int) -> dict[str, Any]:
+def render_cyclonedx(
+    packages: list[dict[str, Any]],
+    version: str,
+    epoch: int,
+    embedded_components: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     refs_by_name: dict[str, list[str]] = {}
     for package in packages:
         refs_by_name.setdefault(package["name"], []).append(component_ref(package))
@@ -106,6 +187,38 @@ def render_cyclonedx(packages: list[dict[str, Any]], version: str, epoch: int) -
                 "dependsOn": dependency_refs(package, refs_by_name),
             }
         )
+
+    embedded_refs: list[str] = []
+    for embedded in embedded_components or []:
+        reference = embedded_component_ref(embedded)
+        embedded_refs.append(reference)
+        component = {
+            "bom-ref": reference,
+            "name": embedded["name"],
+            "type": embedded.get("sbom_type", "file"),
+            "properties": [
+                {
+                    "name": "pooler:embedded-assets",
+                    "value": ",".join(embedded["embedded_assets"]),
+                },
+                {
+                    "name": "pooler:provenance",
+                    "value": embedded_comment(embedded),
+                },
+            ],
+        }
+        if embedded.get("version"):
+            component["version"] = embedded["version"]
+        licenses = embedded_license_entries(embedded)
+        if licenses:
+            component["licenses"] = licenses
+        source_url = embedded.get("source", {}).get("url")
+        if source_url:
+            component["externalReferences"] = [
+                {"type": "distribution", "url": source_url}
+            ]
+        components.append(component)
+        dependencies.append({"ref": reference, "dependsOn": []})
 
     root_ref = f"pkg:generic/pooler@{version}"
     cli_refs = refs_by_name.get("pooler-cli", [])
@@ -137,11 +250,19 @@ def render_cyclonedx(packages: list[dict[str, Any]], version: str, epoch: int) -
             },
         },
         "components": components,
-        "dependencies": [{"ref": root_ref, "dependsOn": cli_refs}, *dependencies],
+        "dependencies": [
+            {"ref": root_ref, "dependsOn": sorted([*cli_refs, *embedded_refs])},
+            *dependencies,
+        ],
     }
 
 
-def render_spdx(packages: list[dict[str, Any]], version: str, epoch: int) -> dict[str, Any]:
+def render_spdx(
+    packages: list[dict[str, Any]],
+    version: str,
+    epoch: int,
+    embedded_components: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     refs_by_name: dict[str, list[str]] = {}
     for package in packages:
         refs_by_name.setdefault(package["name"], []).append(spdx_id(package))
@@ -206,8 +327,37 @@ def render_spdx(packages: list[dict[str, Any]], version: str, epoch: int) -> dic
             }
         )
 
+    for embedded in embedded_components or []:
+        package_id = embedded_spdx_id(embedded)
+        expression = embedded.get("license_expression") or "NOASSERTION"
+        source_url = embedded.get("source", {}).get("url") or "NOASSERTION"
+        package = {
+            "SPDXID": package_id,
+            "name": embedded["name"],
+            "downloadLocation": source_url,
+            "licenseConcluded": expression,
+            "licenseDeclared": expression,
+            "filesAnalyzed": False,
+            "copyrightText": embedded.get("copyright_text") or "NOASSERTION",
+            "comment": embedded_comment(embedded),
+        }
+        if embedded.get("version"):
+            package["versionInfo"] = embedded["version"]
+        spdx_packages.append(package)
+        relationships.append(
+            {
+                "spdxElementId": root_id,
+                "relationshipType": "DEPENDS_ON",
+                "relatedSpdxElement": package_id,
+            }
+        )
+
     namespace = f"https://github.com/coder-company/pooler/releases/sbom/{version}/spdx"
-    created = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    created = (
+        datetime.fromtimestamp(epoch, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
     return {
         "spdxVersion": "SPDX-2.3",
         "dataLicense": "CC0-1.0",
@@ -236,11 +386,25 @@ def main() -> int:
     if arguments.epoch < 0:
         raise ValueError("SBOM epoch must not be negative")
     packages = read_packages(arguments.metadata)
+    embedded_components = read_embedded_components(arguments.assets_manifest)
     write_json(
         arguments.cyclonedx,
-        render_cyclonedx(packages, arguments.version, arguments.epoch),
+        render_cyclonedx(
+            packages,
+            arguments.version,
+            arguments.epoch,
+            embedded_components,
+        ),
     )
-    write_json(arguments.spdx, render_spdx(packages, arguments.version, arguments.epoch))
+    write_json(
+        arguments.spdx,
+        render_spdx(
+            packages,
+            arguments.version,
+            arguments.epoch,
+            embedded_components,
+        ),
+    )
     return 0
 
 

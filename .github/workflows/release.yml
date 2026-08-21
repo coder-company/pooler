@@ -288,6 +288,7 @@ jobs:
             --metadata "$metadata" \
             --version "$VERSION" \
             --epoch "$SOURCE_DATE_EPOCH" \
+            --assets-manifest third-party/dashboard-assets/manifest.json \
             --cyclonedx "$sbom_root/pooler.cdx.json" \
             --spdx "$sbom_root/pooler.spdx.json"
 
@@ -295,9 +296,10 @@ jobs:
           stage="${RUNNER_TEMP}/stage/${package_name}"
           artifact_dir="${RUNNER_TEMP}/release/${TARGET}"
           mkdir -p "$stage/bin" "$stage/config" "$stage/compatibility" \
-            "$stage/sbom" "$stage/schema" "$artifact_dir"
+            "$stage/sbom" "$stage/schema" "$stage/third-party" "$artifact_dir"
           install -m 0755 "$first_binary" "$stage/bin/pooler"
           install -m 0644 README.md LICENSE NOTICE "$stage/"
+          cp -R third-party/dashboard-assets "$stage/third-party/"
           install -m 0644 config/pooler.example.yaml config/cursor.example.yaml \
             config/media.example.yaml "$stage/config/"
           install -m 0644 schema/pooler.schema.json "$stage/schema/"
@@ -321,8 +323,14 @@ jobs:
           smoke_root="${RUNNER_TEMP}/smoke/${TARGET}"
           mkdir -p "$smoke_root"
           tar -xzf "$archive" -C "$smoke_root"
-          packaged_binary="${smoke_root}/${package_name}/bin/pooler"
+          packaged_root="${smoke_root}/${package_name}"
+          packaged_binary="${packaged_root}/bin/pooler"
           test -x "$packaged_binary"
+          test -s "${packaged_root}/third-party/dashboard-assets/manifest.json"
+          test -s "${packaged_root}/third-party/dashboard-assets/licenses/Iconoir-MIT.txt"
+          test -s "${packaged_root}/third-party/dashboard-assets/licenses/LobeHub-Icons-MIT.txt"
+          test -s "${packaged_root}/third-party/dashboard-assets/licenses/Simple-Icons-CC0-1.0.md"
+          test -s "${packaged_root}/third-party/dashboard-assets/licenses/Geist-OFL-1.1.txt"
           if [[ "$RUN_SMOKE" == "true" ]]; then
             "$packaged_binary" --version
             "$packaged_binary" \
@@ -436,6 +444,7 @@ jobs:
             --metadata "$metadata" \
             --version "$VERSION" \
             --epoch "$SOURCE_DATE_EPOCH" \
+            --assets-manifest third-party/dashboard-assets/manifest.json \
             --cyclonedx "release/pooler-${VERSION}.cdx.json" \
             --spdx "release/pooler-${VERSION}.spdx.json"
 

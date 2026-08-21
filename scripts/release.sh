@@ -22,6 +22,7 @@ script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root_directory=$(CDPATH= cd -- "$script_directory/.." && pwd)
 archive_helper=$script_directory/archive.py
 sbom_helper=$script_directory/sbom.py
+assets_manifest=$root_directory/third-party/dashboard-assets/manifest.json
 checksum_helper=$script_directory/checksums.sh
 
 targets="x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin"
@@ -171,6 +172,7 @@ for target in $targets; do
         --metadata "$metadata" \
         --version "$metadata_version" \
         --epoch "$epoch" \
+        --assets-manifest "$assets_manifest" \
         --cyclonedx "$cdx" \
         --spdx "$spdx"
 
@@ -206,12 +208,14 @@ for target in $targets; do
     package_name="pooler-$metadata_version-$target"
     stage_parent="$work_directory/stage-$target_safe"
     stage="$stage_parent/$package_name"
-    mkdir -p "$stage/bin" "$stage/config" "$stage/compatibility" "$stage/sbom" "$stage/schema"
+    mkdir -p "$stage/bin" "$stage/config" "$stage/compatibility" "$stage/sbom" \
+        "$stage/schema" "$stage/third-party"
     cp "$binary" "$stage/bin/pooler"
     chmod 755 "$stage/bin/pooler"
     cp "$root_directory/README.md" "$stage/README.md"
     cp "$root_directory/LICENSE" "$stage/LICENSE"
     cp "$root_directory/NOTICE" "$stage/NOTICE"
+    cp -R "$root_directory/third-party/dashboard-assets" "$stage/third-party/"
     cp "$root_directory/schema/pooler.schema.json" "$stage/schema/pooler.schema.json"
     cp "$root_directory/config/pooler.example.yaml" "$stage/config/pooler.example.yaml"
     cp "$root_directory/config/cursor.example.yaml" "$stage/config/cursor.example.yaml"
