@@ -348,3 +348,131 @@ fn the_credential_value_is_never_rendered() {
     assert!(rendered.contains("env:OPERATOR_KEY"));
     assert!(!rendered.contains(SECRET));
 }
+
+/// The upstream credential must not reach any management surface.
+///
+/// `/export` redaction for account and mutation secrets is covered inside
+/// `management.rs`. This closes the remaining case: the credential a preset
+/// supplies for its upstream, observed after a real request has flowed, across
+/// every read endpoint an operator can reach.
+#[tokio::test]
+async fn the_upstream_credential_never_reaches_a_management_surface() {
+    let upstream = StrictProvider::start(ProviderContract::openai(), SECRET).await;
+    let directory = TempDir::new().expect("config directory");
+
+    let mut secret_file = tempfile::NamedTempFile::new_in(directory.path()).expect("secret file");
+    secret_file
+        .write_all(SECRET.as_bytes())
+        .expect("secret contents");
+    let (_, secret) = secret_file.keep().expect("secret persists");
+    let secret_reference = format!("file:{}", secret.display());
+    let path = directory.path().join("gateway.yaml");
+    std::fs::write(
+        &path,
+        format!(
+            "imports:\n  - preset: gateway\n    as: gw\n    with:\n      bind: 127.0.0.1:0\n      upstream_url: http://{}\n      secret: '{secret_reference}'\n\nversion: 1\nmanagement: {{bind: 127.0.0.1:0}}\n",
+            upstream.address()
+        ),
+    )
+    .expect("gateway config");
+    let config = pooler_config::Config::from_path(&path)
+        .expect("gateway loads")
+        .compile()
+        .expect("gateway compiles");
+
+    let server = bind_gateway(config).await;
+    let proxy = server.listener_addresses()[0].address().to_owned();
+    let management = server
+        .management_address()
+        .expect("management address")
+        .to_owned();
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+
+    // Drive a real request so decisions, traces, and metrics are populated.
+    let body = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+    let mut downstream = TcpStream::connect(&proxy).await.expect("proxy connection");
+    downstream
+        .write_all(
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("downstream headers");
+    downstream.write_all(body).await.expect("downstream body");
+    let mut response = Vec::new();
+    downstream
+        .read_to_end(&mut response)
+        .await
+        .expect("downstream response");
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+
+    let surfaces = [
+        "/health",
+        "/listeners",
+        "/routes",
+        "/models",
+        "/catalog",
+        "/accounts",
+        "/health/providers",
+        "/quota",
+        "/metrics",
+        "/decisions",
+        "/traces",
+        "/audit",
+        "/reloads",
+        "/export",
+    ];
+    let mut seen = Vec::new();
+    for surface in surfaces {
+        let mut stream = TcpStream::connect(&management)
+            .await
+            .expect("management connection");
+        stream
+            .write_all(
+                format!("GET {surface} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("management request");
+        let mut bytes = Vec::new();
+        stream
+            .read_to_end(&mut bytes)
+            .await
+            .expect("management response");
+        seen.push((surface, String::from_utf8_lossy(&bytes).to_string()));
+    }
+
+    server.begin_drain();
+    runner.await.expect("server task").expect("server shutdown");
+    let log = upstream.finish().await;
+    log.assert_accepted_everything();
+
+    for (surface, body) in &seen {
+        // Guard against a vacuous pass: a surface that 404s or returns nothing
+        // proves no redaction.
+        assert!(
+            body.starts_with("HTTP/1.1 200"),
+            "{surface} must be reachable to prove anything: {body}"
+        );
+        assert!(
+            body.len() > 64,
+            "{surface} returned no meaningful body: {body}"
+        );
+        assert!(
+            !body.contains(SECRET),
+            "{surface} leaked the credential value"
+        );
+        // A secret reference is a path to owner-private material; it is not a
+        // credential, but it must not be published either.
+        assert!(
+            !body.contains(&secret_reference),
+            "{surface} leaked the secret reference"
+        );
+    }
+}
