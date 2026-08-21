@@ -747,6 +747,8 @@ code, .mono {
 .wizard-actions { display: flex; justify-content: space-between; gap: 8px; margin-top: 24px; }
 .wizard-actions .btn:only-child { margin-left: auto; }
 
+.connection-panel { margin-top: 16px; }
+
 .callout {
   margin-block: 14px;
   padding: 12px 14px;

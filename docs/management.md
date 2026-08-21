@@ -49,6 +49,12 @@ The browser never accepts a provider API key, OAuth client secret, or token. It 
 
 Setup selections may appear in same-origin query strings, but credential values never do. Generated sidecars and downloads use authenticated `fetch` and remain local to the current browser action.
 
+## Connecting configured accounts
+
+The **Accounts** view combines the redacted `/accounts` state with the catalog-derived `/setup/options` authentication facts. **Connect** shows an exact `pooler auth login` command for supported methods and explains methods that require operator-owned registration instead of presenting a control that cannot work safely.
+
+Connection remains terminal-only. API keys stay in environment variables or another protected reference, while OAuth codes and tokens stay in Pooler's encrypted credential store. The dashboard has no credential field and does not place credentials in URLs, request bodies, browser storage, or generated configuration. **Check redacted account status** performs authenticated reads only; it does not send inference traffic and an `available` local credential is not labelled as verified provider connectivity.
+
 ## Mutations
 
 All mutations use `POST`, require configured bearer authentication, and accept an empty body.

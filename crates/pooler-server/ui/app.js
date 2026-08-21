@@ -31,6 +31,7 @@
     endpointMeta: {},
     lastSuccessfulRefresh: null,
     pending: new Set(),
+    connectionAccount: "",
     setup: {
       step: 1,
       provider: "",
@@ -196,6 +197,7 @@
       state.errors = {};
       state.endpointMeta = {};
       state.lastSuccessfulRefresh = null;
+      state.connectionAccount = "";
     }
   }
 
@@ -532,7 +534,7 @@
     accounts: {
       title: "Accounts",
       subtitle: "Redacted account state and operator controls.",
-      endpoints: ["accounts"],
+      endpoints: ["accounts", "setupOptions"],
       render: renderAccounts,
     },
     usage: {
@@ -1036,6 +1038,44 @@
     return `<button class="btn btn-subtle btn-xs" type="button" data-account-action="${action}" data-account-id="${esc(account.id)}" data-account-provider="${esc(account.provider)}" title="${esc(title || label)}"${pending ? ` disabled aria-busy="true"` : ""}>${ic(icon, 13)} ${esc(label)}</button>`;
   }
 
+  function shellArg(value) {
+    const raw = String(value);
+    return /^[A-Za-z0-9_./:@-]+$/u.test(raw) ? raw : `'${raw.replaceAll("'", "'\\''")}'`;
+  }
+
+  function accountProviderProfile(account) {
+    return (state.data.setupOptions?.providers || []).find((provider) =>
+      provider.id === account.provider || (provider.configured_upstreams || []).includes(account.provider)) || null;
+  }
+
+  function accountConnectionGuide(account) {
+    if (!account) return "";
+    const provider = accountProviderProfile(account);
+    const expectedMethod = account.auth_kind === "oauth" ? new Set(["authorization_code_pkce", "device_code"]) : new Set(["api_key"]);
+    const methods = (provider?.authentication || []).filter((method) => expectedMethod.has(method.method) && method.support === "supported");
+    const unavailable = (provider?.authentication || []).filter((method) => expectedMethod.has(method.method) && method.support !== "supported");
+    const commands = methods.map((method) => {
+      const methodName = { authorization_code_pkce: "oauth", device_code: "device-code", api_key: "api-key" }[method.method];
+      const args = ["pooler", "--credential-key-ref", "env:POOLER_STORE_KEY", "auth", "login", account.id];
+      if (provider?.id) args.push("--profile", provider.id);
+      args.push("--method", methodName);
+      return `<div><strong>${esc(method.method.replaceAll("_", " "))}</strong><pre class="code-block"><code>${esc(args.map(shellArg).join(" "))}</code></pre><p class="muted">${esc(method.note)}</p></div>`;
+    }).join("");
+    const environments = provider?.credential_environment_variables || [];
+    const keyInstructions = account.auth_kind === "api_key"
+      ? `<p>Set the provider key outside this browser using ${environments.length ? environments.map((name) => `<code class="mono">${esc(name)}</code>`).join(" or ") : "the protected secret reference already declared in configuration"}. The API-key command prints provider-safe guidance and never accepts the key as an argument.</p>`
+      : `<p>OAuth runs in a trusted terminal and writes tokens only to Pooler's encrypted credential store. The dashboard never receives the authorization code, refresh token, client secret, or access token.</p>`;
+    return `<section class="panel connection-panel" aria-labelledby="connection-title">
+      <div class="toolbar"><h2 class="section-title" id="connection-title" tabindex="-1">Connect ${esc(account.id)}</h2><span class="spacer"></span><button class="btn btn-ghost btn-sm" type="button" data-account-connect-close>Close</button></div>
+      ${keyInstructions}
+      ${commands || '<div class="callout callout-warning"><strong>No safe built-in connection command is available.</strong> Keep using the protected secret or OAuth registration already declared by the operator.</div>'}
+      ${unavailable.length ? `<div class="callout callout-warning"><strong>Not offered</strong><ul class="check-list">${unavailable.map((method) => `<li><span class="mono">${esc(method.method.replaceAll("_", " "))}</span> — ${esc(method.note)}</li>`).join("")}</ul></div>` : ""}
+      ${provider?.documentation_url ? `<p><a class="text-link" href="${esc(provider.documentation_url)}" target="_blank" rel="noreferrer">Open provider authentication documentation</a></p>` : ""}
+      <div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-account-connect-check>Check redacted account status</button></div>
+      <p class="muted">Current local state: ${statusBadge(account.status)}. An available credential is not a provider connectivity probe.</p>
+    </section>`;
+  }
+
   function renderAccounts(root) {
     const accounts = state.data.accounts?.accounts || [];
 
@@ -1062,6 +1102,7 @@
       { label: "Actions", nowrap: false, render: (a) => {
           const enableAction = a.enabled ? "disable" : "enable";
           return `<div class="row-actions">
+            <button class="btn btn-subtle btn-xs" type="button" data-account-connect="${esc(a.id)}">${ic("key-alt", 13)} Connect</button>
             ${accountActionButton(a, "switch", "Switch", "switch-on", "Select this account and disable its same-provider siblings")}
             ${accountActionButton(a, enableAction, a.enabled ? "Disable" : "Enable", a.enabled ? "pause" : "play")}
             ${accountActionButton(a, "refresh", "Refresh", "refresh-double", "Queue an OAuth token refresh")}
@@ -1075,10 +1116,13 @@
       emptyDescription: "Accounts are declared in configuration and authenticated on the server.",
     });
 
+    const connectionAccount = accounts.find((account) => account.id === state.connectionAccount);
+
     root.innerHTML = `
       ${viewHeader("Accounts", views.accounts.subtitle)}
       <section class="grid-stats grid-stats-4">${stats}</section>
       ${section("Accounts", accountTable, "Switch enables the account and disables its same-provider siblings atomically.")}
+      ${accountConnectionGuide(connectionAccount)}
       <div class="banner banner-info">
         <span class="banner-icon">${ic("shield", 16)}</span>
         <div class="banner-body">Refresh and revoke apply to OAuth accounts only, are queued on the native runtime, and their result lands in the audit log under Operations. Revocation removes Pooler's local credential payload; it does not claim provider-side revocation.</div>
@@ -1602,6 +1646,23 @@
 
       const setupButton = event.target.closest("[data-setup-action]");
       if (setupButton) { setupAction(setupButton.dataset.setupAction); return; }
+
+      const connectionButton = event.target.closest("[data-account-connect]");
+      if (connectionButton) {
+        state.connectionAccount = connectionButton.dataset.accountConnect;
+        renderAccounts($("#view"));
+        $("#connection-title")?.focus();
+        return;
+      }
+      if (event.target.closest("[data-account-connect-close]")) {
+        state.connectionAccount = "";
+        renderAccounts($("#view"));
+        return;
+      }
+      if (event.target.closest("[data-account-connect-check]")) {
+        refreshCurrentView();
+        return;
+      }
 
       const accountButton = event.target.closest("[data-account-action]");
       if (accountButton) {

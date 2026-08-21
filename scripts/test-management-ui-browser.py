@@ -60,6 +60,7 @@ def payload(path: str) -> dict:
                 "credential_environment_variables": ["OPENAI_API_KEY"],
                 "authentication": [
                     {"method": "api_key", "support": "supported", "note": "Use a protected reference."},
+                    {"method": "authorization_code_pkce", "support": "supported", "note": "Use browser OAuth with a bundled public profile."},
                     {"method": "device_code", "support": "requires_explicit_configuration", "note": "Operator registration is required."},
                 ],
                 "discovery": {"available": True, "parser": "openai", "path": "/v1/models"},
@@ -315,6 +316,21 @@ def run_browser(playwright) -> None:
         page.wait_for_timeout(550)
         expect(page.locator("#view").get_attribute("class") == "view view-accounts", "stale model request overwrote account view")
         STATE.slow_models = False
+
+        page.locator('[data-account-connect="primary"]').click()
+        page.wait_for_selector(".connection-panel")
+        connection_text = page.locator(".connection-panel").inner_text()
+        expect("auth login primary --profile openai --method oauth" in connection_text, "account connection guide omitted the exact trusted-terminal command")
+        expect(not page.locator('.connection-panel input[type="password"]').count(), "account connection flow accepts credentials in the browser")
+        expect("refresh token" in connection_text and "never receives" in connection_text, "account connection guide omits credential-boundary disclosure")
+        expect("device code" in connection_text and "Operator registration is required" in connection_text, "unavailable account login method is not explained")
+        posts_before_status_check = dict(STATE.posts)
+        page.locator("[data-account-connect-check]").click()
+        page.wait_for_timeout(100)
+        expect(STATE.posts == posts_before_status_check, "account status check sent a mutation")
+        expect(STATE.get_authorization.get("/management/accounts") == "Bearer good-token", "account status check did not use authenticated fetch")
+        page.locator("[data-account-connect-close]").click()
+        expect(not page.locator(".connection-panel").count(), "account connection guide did not close")
 
         switch = page.locator('[data-account-action="switch"]')
         switch.click()
