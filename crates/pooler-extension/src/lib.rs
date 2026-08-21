@@ -1144,11 +1144,43 @@ mod tests {
     use std::{env, fs};
     use tempfile::tempdir;
 
-    fn script(contents: &str) -> PathBuf {
+    /// A script fixture that owns its temporary directory.
+    ///
+    /// The directory must outlive every use of the script, and it must still be
+    /// removed when the test ends. Owning it here satisfies both. The previous
+    /// helper called `std::mem::forget` on the `TempDir` to keep it alive,
+    /// which leaked the path allocation the directory owned and left the
+    /// directory on disk for the life of the process.
+    struct ScriptFixture {
+        /// Held only so its `Drop` removes the directory when the test ends.
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl ScriptFixture {
+        /// Path of the executable script.
+        fn path(&self) -> PathBuf {
+            self.path.clone()
+        }
+
+        /// Directory holding the script, removed when this fixture drops.
+        ///
+        /// This is derived from the script path rather than from the retained
+        /// handle, so the assertion is about the directory the script actually
+        /// lives in and cannot be satisfied by holding some other directory.
+        fn directory(&self) -> PathBuf {
+            self.path
+                .parent()
+                .expect("the script lives in a directory")
+                .to_path_buf()
+        }
+    }
+
+    fn script(contents: &str) -> ScriptFixture {
         script_named("extension.sh", contents)
     }
 
-    fn script_named(name: &str, contents: &str) -> PathBuf {
+    fn script_named(name: &str, contents: &str) -> ScriptFixture {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join(name);
         fs::write(&path, format!("#!/bin/sh\n{contents}\n")).expect("script");
@@ -1158,11 +1190,37 @@ mod tests {
             permissions.set_mode(0o700);
             fs::set_permissions(&path, permissions).expect("permissions");
         }
-        let path = path.clone();
-        // Keep the directory alive through the process by leaking only this
-        // test fixture. The production runtime never owns test temp paths.
-        std::mem::forget(directory);
-        path
+        ScriptFixture {
+            _directory: directory,
+            path,
+        }
+    }
+
+    /// Regression: the fixture must release its temporary directory.
+    ///
+    /// Under the previous `std::mem::forget` lifecycle the directory survived
+    /// the fixture, so this assertion failed and AddressSanitizer reported the
+    /// leaked path allocation.
+    #[test]
+    fn a_script_fixture_removes_its_temporary_directory() {
+        let directory = {
+            let fixture = script("exit 0");
+            let directory = fixture.directory();
+            assert!(
+                directory.exists(),
+                "the fixture directory must exist while in use"
+            );
+            assert!(
+                fixture.path().exists(),
+                "the script must exist while in use"
+            );
+            directory
+        };
+        assert!(
+            !directory.exists(),
+            "the fixture must remove {} when it drops",
+            directory.display()
+        );
     }
 
     fn spec(command: PathBuf, capabilities: &[ExtensionCapability]) -> ExtensionSpec {
@@ -1208,7 +1266,8 @@ mod tests {
         let command = script(
             "read line; [ -z \"$POOLER_EXTENSION_TEST_SECRET\" ] || exit 11; printf '%s\\n' '{\"body\":[111,107],\"metadata\":{}}'",
         );
-        let Some(registry) = registry([spec(command, &[ExtensionCapability::Transform])]) else {
+        let Some(registry) = registry([spec(command.path(), &[ExtensionCapability::Transform])])
+        else {
             env::remove_var(secret_name);
             return;
         };
@@ -1227,7 +1286,8 @@ mod tests {
     #[tokio::test]
     async fn capability_denial_happens_before_spawn() {
         let command = script("exit 99");
-        let Some(registry) = registry([spec(command, &[ExtensionCapability::Inspect])]) else {
+        let Some(registry) = registry([spec(command.path(), &[ExtensionCapability::Inspect])])
+        else {
             return;
         };
         let error = registry
@@ -1244,7 +1304,8 @@ mod tests {
     #[tokio::test]
     async fn crashed_extension_is_anordinary_error() {
         let command = script("exit 17");
-        let Some(registry) = registry([spec(command, &[ExtensionCapability::Transform])]) else {
+        let Some(registry) = registry([spec(command.path(), &[ExtensionCapability::Transform])])
+        else {
             return;
         };
         let error = registry
@@ -1261,7 +1322,8 @@ mod tests {
     #[tokio::test]
     async fn hung_extension_is_killed_at_the_deadline() {
         let command = script("while :; do :; done");
-        let Some(registry) = registry([spec(command, &[ExtensionCapability::Transform])]) else {
+        let Some(registry) = registry([spec(command.path(), &[ExtensionCapability::Transform])])
+        else {
             return;
         };
         let error = registry
@@ -1278,7 +1340,7 @@ mod tests {
     #[tokio::test]
     async fn excessive_output_is_killed_and_bounded() {
         let command = script("read line; head -c 4096 /dev/zero");
-        let mut extension = spec(command, &[ExtensionCapability::Transform]);
+        let mut extension = spec(command.path(), &[ExtensionCapability::Transform]);
         extension.limits = ExtensionLimits {
             max_output_bytes: 32,
             ..extension.limits
@@ -1304,7 +1366,8 @@ mod tests {
             &format!("{marker}.sh"),
             &format!("read line; (while :; do :; done) & while :; do :; done # {marker}"),
         );
-        let Some(registry) = registry([spec(command, &[ExtensionCapability::Transform])]) else {
+        let Some(registry) = registry([spec(command.path(), &[ExtensionCapability::Transform])])
+        else {
             return;
         };
         let cancellation = CancellationToken::new();
@@ -1333,7 +1396,8 @@ mod tests {
         let command = script(
             "read line; test ! -e /home && test ! -e /workspace && ! grep -q '^default' /proc/net/route && printf '%s\\n' '{\"body\":[111,107],\"metadata\":{}}'",
         );
-        let Some(registry) = registry([spec(command, &[ExtensionCapability::Transform])]) else {
+        let Some(registry) = registry([spec(command.path(), &[ExtensionCapability::Transform])])
+        else {
             return;
         };
         let result = registry
