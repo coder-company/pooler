@@ -182,10 +182,10 @@ impl ManagementResponse {
     fn asset(
         status: StatusCode,
         content_type: &'static str,
-        body: &'static str,
+        body: &'static [u8],
         head: bool,
     ) -> Self {
-        Self::body(status, content_type, body.as_bytes().to_vec(), head)
+        Self::body(status, content_type, body.to_vec(), head)
     }
 }
 
@@ -193,7 +193,7 @@ fn security_headers(headers: &mut HeaderMap) {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         header::HeaderValue::from_static(
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
         ),
     );
     headers.insert(
@@ -2065,10 +2065,13 @@ routes:
             ))
         );
         let html_body = String::from_utf8_lossy(&html.body);
-        assert!(html_body.contains("Pooler Control"));
+        assert!(html_body.contains("Pooler"));
+        assert!(html_body.contains("Coder Company"));
         assert!(html_body.contains("/management/ui.js"));
-        assert!(html_body.contains("Listeners"));
-        assert!(html_body.contains("Quota &amp; cooldowns"));
+        assert!(html_body.contains("/management/ui.css"));
+        assert!(html_body.contains("/management/ui/icons.js"));
+        assert!(html_body.contains("/management/ui/providers.js"));
+        assert!(html_body.contains("/management/ui/assets/mark-charcoal-64.png"));
         assert!(!html_body.contains("type=\"submit\""));
         for endpoint in [
             "listeners",
@@ -2087,7 +2090,7 @@ routes:
         assert_eq!(
             html.headers.get(header::CONTENT_SECURITY_POLICY),
             Some(&header::HeaderValue::from_static(
-                "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+                "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
             ))
         );
         assert_eq!(
@@ -2105,15 +2108,40 @@ routes:
         let css = api.handle(&Method::GET, "/management/ui.css", &headers);
         assert_eq!(css.status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&css.body).contains("--surface"));
+        let icons = api.handle(&Method::GET, "/management/ui/icons.js", &headers);
+        assert_eq!(icons.status, StatusCode::OK);
+        let providers = api.handle(&Method::GET, "/management/ui/providers.js", &headers);
+        assert_eq!(providers.status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&providers.body).contains("resolveProviderSlug"));
+        let mark = api.handle(
+            &Method::GET,
+            "/management/ui/assets/mark-charcoal-64.png",
+            &headers,
+        );
+        assert_eq!(mark.status, StatusCode::OK);
+        assert_eq!(
+            mark.headers.get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("image/png"))
+        );
+        let font = api.handle(
+            &Method::GET,
+            "/management/ui/fonts/geist-latin.woff2",
+            &headers,
+        );
+        assert_eq!(font.status, StatusCode::OK);
+        assert_eq!(
+            font.headers.get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("font/woff2"))
+        );
         let js = api.handle(&Method::GET, "/management/ui.js", &headers);
         assert_eq!(js.status, StatusCode::OK);
         let js_body = String::from_utf8_lossy(&js.body);
-        assert!(js_body.contains("/management/metrics"));
+        assert!(js_body.contains("\"/metrics\""));
         assert!(js_body.contains("cache: \"no-store\""));
         assert!(js_body.contains("method: \"POST\""));
         assert!(js_body.contains("Authorization"));
         assert!(js_body.contains("downloadExport"));
-        assert!(js_body.contains("/management/export"));
+        assert!(js_body.contains("`${BASE}/export`"));
         assert!(!js_body.contains("localStorage"));
         assert!(!js_body.contains("sessionStorage"));
         assert!(!js_body.contains("?token="));
@@ -2393,7 +2421,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
 
         let shell = api.handle(&Method::GET, "/management/ui", &loopback_headers());
         assert_eq!(shell.status, StatusCode::OK);
-        assert!(String::from_utf8_lossy(&shell.body).contains("Pooler Control"));
+        assert!(String::from_utf8_lossy(&shell.body).contains("Coder Company"));
 
         let mut correct = HeaderMap::new();
         correct.insert(

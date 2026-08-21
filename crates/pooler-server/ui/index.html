@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Pooler management dashboard. Redacted runtime state, account controls, and diagnostics.">
+  <title>Pooler · Coder Company</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/management/ui/assets/favicon-warm-black-32.png" media="(prefers-color-scheme: light)">
+  <link rel="icon" type="image/png" sizes="32x32" href="/management/ui/assets/favicon-paper-32.png" media="(prefers-color-scheme: dark)">
+  <link rel="stylesheet" href="/management/ui.css">
+</head>
+<body>
+  <a class="skip-link" href="#view">Skip to content</a>
+
+  <header class="app-header">
+    <div class="shell header-row">
+      <a class="brand" href="#/overview" aria-label="Pooler overview">
+        <img class="brand-mark mark-for-light" src="/management/ui/assets/mark-charcoal-64.png" alt="" width="30" height="26">
+        <img class="brand-mark mark-for-dark" src="/management/ui/assets/mark-white-64.png" alt="" width="30" height="26">
+        <span class="brand-name">Pooler</span>
+        <span class="brand-parent">by Coder Company</span>
+      </a>
+      <div class="header-actions">
+        <span id="generation-badge" class="badge badge-neutral" title="Active configuration generation">gen —</span>
+        <button id="refresh-now" class="btn btn-ghost btn-icon" type="button" aria-label="Refresh now"></button>
+        <button id="theme-toggle" class="btn btn-ghost btn-icon" type="button" aria-label="Toggle dark mode"></button>
+        <button id="session-button" class="btn btn-outline btn-sm" type="button">Connect</button>
+      </div>
+    </div>
+    <div class="shell nav-row">
+      <nav class="app-nav" aria-label="Dashboard sections">
+        <a href="#/overview" data-route="overview" class="nav-link"><span class="nav-icon" data-icon="dashboard"></span>Overview</a>
+        <a href="#/models" data-route="models" class="nav-link"><span class="nav-icon" data-icon="cpu"></span>Models</a>
+        <a href="#/accounts" data-route="accounts" class="nav-link"><span class="nav-icon" data-icon="key-alt"></span>Accounts</a>
+        <a href="#/usage" data-route="usage" class="nav-link"><span class="nav-icon" data-icon="graph-up"></span>Usage</a>
+        <a href="#/operations" data-route="operations" class="nav-link"><span class="nav-icon" data-icon="tools"></span>Operations</a>
+        <a href="#/diagnostics" data-route="diagnostics" class="nav-link"><span class="nav-icon" data-icon="activity"></span>Diagnostics</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="shell app-main" id="main">
+    <div id="banner-area" class="banner-area" aria-live="polite"></div>
+    <div id="view"></div>
+  </main>
+
+  <footer class="shell app-footer">
+    <span>Pooler management · values are redacted at the API boundary</span>
+    <span id="footer-updated" class="muted"></span>
+  </footer>
+
+  <dialog id="session-dialog" class="dialog">
+    <div class="dialog-head">
+      <h2 class="dialog-title">Management session</h2>
+      <button class="btn btn-ghost btn-icon" type="button" data-close="session-dialog" aria-label="Close"></button>
+    </div>
+    <p class="dialog-copy">
+      Mutations require the bearer secret configured under <code class="mono">management.auth</code>.
+      The token is held in memory for this tab only and is never stored or sent anywhere except this
+      listener&rsquo;s <code class="mono">Authorization</code> header.
+    </p>
+    <label class="field">
+      <span class="field-label">Bearer token</span>
+      <span class="field-control">
+        <input id="token-input" type="password" autocomplete="off" spellcheck="false" placeholder="Optional for read-only loopback">
+        <button id="token-visibility" class="btn btn-ghost btn-icon" type="button" aria-label="Show token"></button>
+      </span>
+    </label>
+    <div class="dialog-actions">
+      <button id="token-clear" class="btn btn-ghost" type="button">Clear</button>
+      <button id="token-apply" class="btn btn-primary" type="button">Apply</button>
+    </div>
+  </dialog>
+
+  <dialog id="confirm-dialog" class="dialog">
+    <div class="dialog-head">
+      <h2 class="dialog-title" id="confirm-title">Confirm</h2>
+      <button class="btn btn-ghost btn-icon" type="button" data-close="confirm-dialog" aria-label="Close"></button>
+    </div>
+    <p class="dialog-copy" id="confirm-copy"></p>
+    <div class="dialog-actions">
+      <button id="confirm-cancel" class="btn btn-outline" type="button">Cancel</button>
+      <button id="confirm-accept" class="btn btn-primary" type="button">Confirm</button>
+    </div>
+  </dialog>
+
+  <script src="/management/ui/icons.js"></script>
+  <script src="/management/ui/providers.js"></script>
+  <script src="/management/ui.js" defer></script>
+</body>
+</html>
