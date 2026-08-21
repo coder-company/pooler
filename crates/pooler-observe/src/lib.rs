@@ -1054,6 +1054,7 @@ struct CompletionKey {
 struct UsageKey {
     route: String,
     provider: Option<String>,
+    model: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -1140,6 +1141,7 @@ struct UsageMetric {
     input_tokens: u64,
     output_tokens: u64,
     total_tokens: u64,
+    cost_in_usd_ticks: u64,
 }
 
 struct RequestCompletion {
@@ -1150,6 +1152,8 @@ struct RequestCompletion {
     end_to_end_ms: u64,
     class: CompletionClass,
     usage: Option<Usage>,
+    usage_provider: Option<String>,
+    usage_model: Option<String>,
 }
 
 /// In-process metrics registry.  It is cloneable and safe to share across
@@ -1307,11 +1311,23 @@ impl MetricsRegistry {
     /// request guard. Values are counters only; prompt and response bodies
     /// never enter the registry.
     pub fn record_usage(&self, route: impl AsRef<str>, provider: Option<&str>, usage: Usage) {
+        self.record_model_usage(route, provider, None, usage);
+    }
+
+    /// Record provider- and model-attributed usage without retaining credentials.
+    pub fn record_model_usage(
+        &self,
+        route: impl AsRef<str>,
+        provider: Option<&str>,
+        model: Option<&str>,
+        usage: Usage,
+    ) {
         let mut state = lock_unpoisoned(&self.state);
         record_usage_locked(
             &mut state,
             &bounded_label(route.as_ref()),
             provider.map(bounded_label),
+            model.map(bounded_label),
             usage,
             self.config.max_series,
         );
@@ -1388,10 +1404,12 @@ impl MetricsRegistry {
             .map(|(key, value)| UsageMetricSnapshot {
                 route: key.route.clone(),
                 provider: key.provider.clone(),
+                model: key.model.clone(),
                 requests: value.requests,
                 input_tokens: value.input_tokens,
                 output_tokens: value.output_tokens,
                 total_tokens: value.total_tokens,
+                cost_in_usd_ticks: value.cost_in_usd_ticks,
             })
             .collect();
         let decisions = state
@@ -1441,6 +1459,8 @@ impl MetricsRegistry {
             end_to_end_ms,
             class,
             usage,
+            usage_provider,
+            usage_model,
         } = completion;
         let mut state = lock_unpoisoned(&self.state);
         if tracked {
@@ -1478,7 +1498,14 @@ impl MetricsRegistry {
             );
         }
         if let Some(usage) = usage {
-            record_usage_locked(&mut state, &route, None, usage, self.config.max_series);
+            record_usage_locked(
+                &mut state,
+                &route,
+                usage_provider,
+                usage_model,
+                usage,
+                self.config.max_series,
+            );
         }
     }
 }
@@ -1525,6 +1552,17 @@ impl RequestObservation {
 
     /// Complete a request with a normalized class and optional token usage.
     pub fn complete(&mut self, class: CompletionClass, usage: Option<Usage>) {
+        self.complete_for_target(class, usage, None, None);
+    }
+
+    /// Complete a request with provider/model-attributed usage.
+    pub fn complete_for_target(
+        &mut self,
+        class: CompletionClass,
+        usage: Option<Usage>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) {
         if self.completed {
             return;
         }
@@ -1537,6 +1575,8 @@ impl RequestObservation {
             end_to_end_ms: duration_to_millis(self.started.elapsed()),
             class,
             usage,
+            usage_provider: provider.map(bounded_label),
+            usage_model: model.map(bounded_label),
         });
     }
 }
@@ -1623,10 +1663,15 @@ pub struct StateMetric {
 pub struct UsageMetricSnapshot {
     pub route: String,
     pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
     pub requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    /// Provider-reported cost represented as fixed decimal ticks when available.
+    #[serde(default)]
+    pub cost_in_usd_ticks: u64,
 }
 
 /// A bounded decision counter snapshot.
@@ -1759,18 +1804,20 @@ impl MetricsSnapshot {
             push_metric(&mut output, "pooler_state_total", &labels, metric.count);
         }
         for metric in &self.usage {
-            let route_labels = labels(&[("route", metric.route.as_str())]);
-            push_metric(
-                &mut output,
-                "pooler_usage_requests_total",
-                &route_labels,
-                metric.requests,
-            );
             let mut pairs = vec![("route", metric.route.as_str())];
             if let Some(provider) = metric.provider.as_deref() {
                 pairs.push(("provider", provider));
             }
+            if let Some(model) = metric.model.as_deref() {
+                pairs.push(("model", model));
+            }
             let usage_labels = labels(&pairs);
+            push_metric(
+                &mut output,
+                "pooler_usage_requests_total",
+                &usage_labels,
+                metric.requests,
+            );
             push_metric(
                 &mut output,
                 "pooler_usage_input_tokens_total",
@@ -1788,6 +1835,12 @@ impl MetricsSnapshot {
                 "pooler_usage_total_tokens_total",
                 &usage_labels,
                 metric.total_tokens,
+            );
+            push_metric(
+                &mut output,
+                "pooler_usage_cost_usd_ticks_total",
+                &usage_labels,
+                metric.cost_in_usd_ticks,
             );
         }
         for metric in &self.decisions {
@@ -1873,12 +1926,14 @@ fn record_usage_locked(
     state: &mut MetricsState,
     route: &str,
     provider: Option<String>,
+    model: Option<String>,
     usage: Usage,
     max_series: usize,
 ) {
     let key = UsageKey {
         route: route.to_owned(),
         provider,
+        model,
     };
     let exists = state.usage.contains_key(&key);
     if reserve_series(state, exists, max_series) {
@@ -1893,6 +1948,9 @@ fn record_usage_locked(
         value.total_tokens = value
             .total_tokens
             .saturating_add(usage.total_tokens.unwrap_or_default());
+        value.cost_in_usd_ticks = value
+            .cost_in_usd_ticks
+            .saturating_add(usage.cost_in_usd_ticks.unwrap_or_default());
     }
 }
 
@@ -1964,6 +2022,9 @@ pub struct Usage {
     pub output_tokens: Option<u64>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
+    /// Provider-reported cost represented as fixed decimal ticks.
+    #[serde(default)]
+    pub cost_in_usd_ticks: Option<u64>,
 }
 
 /// Normalized result class for a request or attempt.
@@ -2968,13 +3029,16 @@ mod tests {
         assert_eq!(registry.snapshot().routes[0].active, 1);
         request.mark_headers();
         request.mark_first_event();
-        request.complete(
+        request.complete_for_target(
             CompletionClass::Success,
             Some(Usage {
                 input_tokens: Some(3),
                 output_tokens: Some(5),
                 total_tokens: Some(8),
+                cost_in_usd_ticks: Some(12),
             }),
+            Some("provider"),
+            Some("model"),
         );
 
         let snapshot = registry.snapshot();
@@ -2983,6 +3047,9 @@ mod tests {
         assert_eq!(snapshot.routes[0].completed, 1);
         assert_eq!(snapshot.completions[0].class, "success");
         assert_eq!(snapshot.usage[0].total_tokens, 8);
+        assert_eq!(snapshot.usage[0].provider.as_deref(), Some("provider"));
+        assert_eq!(snapshot.usage[0].model.as_deref(), Some("model"));
+        assert_eq!(snapshot.usage[0].cost_in_usd_ticks, 12);
         assert!(snapshot
             .latencies
             .iter()

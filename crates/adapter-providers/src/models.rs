@@ -142,6 +142,77 @@ impl ProviderModelParser {
         Ok(models)
     }
 
+    /// Parse the documented Gemini `models[]` response without retaining
+    /// provider payload fields that Pooler does not understand.
+    pub fn parse_gemini_list(
+        &self,
+        body: &[u8],
+    ) -> Result<Vec<DiscoveredModel>, ModelDiscoveryError> {
+        let value = self.parse_json(body)?;
+        let models = value
+            .get("models")
+            .and_then(Value::as_array)
+            .ok_or(ModelDiscoveryError::InvalidShape)?;
+        self.check_model_count(models.len())?;
+        models
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let object = value
+                    .as_object()
+                    .ok_or(ModelDiscoveryError::InvalidModel { index })?;
+                let id = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .and_then(|name| name.strip_prefix("models/"))
+                    .and_then(|name| self.bounded_identifier(name))
+                    .ok_or(ModelDiscoveryError::InvalidModel { index })?
+                    .to_owned();
+                let display_name =
+                    self.optional_bounded_string(object.get("displayName"), index)?;
+                let methods = object
+                    .get("supportedGenerationMethods")
+                    .and_then(Value::as_array)
+                    .ok_or(ModelDiscoveryError::InvalidModel { index })?;
+                let mut capabilities = CapabilitySet::new();
+                let mut method_names = Vec::with_capacity(methods.len());
+                for method in methods {
+                    let method = method
+                        .as_str()
+                        .and_then(|method| self.bounded_string(method))
+                        .ok_or(ModelDiscoveryError::InvalidModel { index })?;
+                    match method {
+                        "generateContent" => {
+                            capabilities.insert(Capability::Text);
+                        }
+                        "streamGenerateContent" => {
+                            capabilities.insert(Capability::Text);
+                            capabilities.insert(Capability::Streaming);
+                        }
+                        "embedContent" | "batchEmbedContents" => {
+                            capabilities.insert(Capability::Embeddings);
+                        }
+                        _ => {}
+                    }
+                    method_names.push(method);
+                }
+                let mut attributes = BTreeMap::new();
+                if !method_names.is_empty() {
+                    attributes.insert("supported_methods".to_owned(), method_names.join(","));
+                }
+                Ok(DiscoveredModel {
+                    id,
+                    display_name,
+                    owned_by: Some("google".to_owned()),
+                    created: None,
+                    context_length: object.get("inputTokenLimit").and_then(Value::as_u64),
+                    capabilities,
+                    attributes,
+                })
+            })
+            .collect()
+    }
+
     /// Parse a Vertex publisher-model catalog snapshot.
     ///
     /// Google catalog exports have used both `publisherModels[]` and `models[]`;
@@ -382,4 +453,24 @@ fn publisher_from_name(value: &str) -> Option<&str> {
         .or_else(|| value.split_once("/publishers/").map(|(_, suffix)| suffix))?;
     let (publisher, _) = suffix.split_once('/')?;
     (!publisher.is_empty()).then_some(publisher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemini_models_are_bounded_and_capabilities_follow_supported_methods() {
+        let models = ProviderModelParser::default()
+            .parse_gemini_list(
+                br#"{"models":[{"name":"models/gemini-test","displayName":"Gemini Test","inputTokenLimit":32768,"supportedGenerationMethods":["generateContent","streamGenerateContent","embedContent"]}]}"#,
+            )
+            .expect("Gemini model list");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini-test");
+        assert_eq!(models[0].context_length, Some(32_768));
+        assert!(models[0].capabilities.contains(Capability::Text));
+        assert!(models[0].capabilities.contains(Capability::Streaming));
+        assert!(models[0].capabilities.contains(Capability::Embeddings));
+    }
 }

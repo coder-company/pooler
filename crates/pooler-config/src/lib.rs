@@ -294,7 +294,7 @@ pub struct Config {
     pub routes: Vec<RouteConfig>,
     /// Supervised external extension declarations keyed by stable ID.
     pub extensions: BTreeMap<String, ExtensionConfig>,
-    /// Optional read-only management listener. It is disabled by default.
+    /// Optional secure management listener. It is disabled by default.
     pub management: ManagementConfig,
     #[serde(skip)]
     source: Option<Source>,
@@ -506,6 +506,8 @@ pub enum CatalogParserKind {
     OpenAi,
     /// Kimi Open Platform model list with documented baseline capabilities.
     Kimi,
+    /// Google Gemini `models[]` list.
+    Gemini,
     /// Vertex publisher-model catalog export.
     Vertex,
     /// Antigravity compatibility model-hint response.
@@ -519,6 +521,7 @@ impl CatalogParserKind {
         match self {
             Self::OpenAi => "openai",
             Self::Kimi => "kimi",
+            Self::Gemini => "gemini",
             Self::Vertex => "vertex",
             Self::Antigravity => "antigravity",
         }
@@ -527,6 +530,7 @@ impl CatalogParserKind {
     const fn default_path(self) -> Option<&'static str> {
         match self {
             Self::OpenAi | Self::Kimi => Some("/v1/models"),
+            Self::Gemini => Some("/v1beta/models"),
             Self::Vertex => None,
             Self::Antigravity => Some("/v1internal:fetchAvailableModels"),
         }
@@ -831,7 +835,7 @@ pub struct NativeProviderConfig {
 /// compiled into a route plan.
 pub type DownstreamAuthConfig = AuthConfig;
 
-/// Read-only management HTTP listener declaration.
+/// Secure management HTTP listener declaration.
 ///
 /// Management is disabled unless `enabled` is true (or `bind` is supplied).
 /// A loopback listener may run without authentication. Remote management is
@@ -1189,6 +1193,8 @@ pub struct UpstreamPlan {
     auth: Option<AuthPlan>,
     oauth: Option<OAuthPlan>,
     native: Option<NativeProviderPlan>,
+    known_provider: Option<Arc<str>>,
+    required_headers: BTreeMap<Arc<str>, Arc<str>>,
     query: UpstreamQuery,
     source: SourceLabel,
 }
@@ -1248,6 +1254,18 @@ impl UpstreamPlan {
     #[must_use]
     pub fn native(&self) -> Option<&NativeProviderPlan> {
         self.native.as_ref()
+    }
+
+    /// Vendored provider integration selected by this upstream.
+    #[must_use]
+    pub fn known_provider(&self) -> Option<&str> {
+        self.known_provider.as_deref()
+    }
+
+    /// Non-secret headers required by the selected provider integration.
+    #[must_use]
+    pub fn required_headers(&self) -> &BTreeMap<Arc<str>, Arc<str>> {
+        &self.required_headers
     }
 
     /// Query parameters this upstream requires, in declaration order.
@@ -2701,7 +2719,7 @@ impl CompiledConfig {
         self.routes.iter().find(|route| route.id() == id)
     }
 
-    /// Optional read-only management listener.
+    /// Optional secure management listener.
     #[must_use]
     pub const fn management(&self) -> Option<&ManagementPlan> {
         self.management.as_ref()
@@ -2832,11 +2850,17 @@ fn compile_config(
     for (id, declaration) in &config.upstreams {
         let label = upstream_label(source, id, upstreams.len());
         validate_id("upstream", id, &label)?;
+        let known = compile_known_provider(declaration, &label)?;
+        let known_entry = known.map(|(_, provider)| provider);
         let (url, transport, http2, connect_timeout, request_timeout) =
-            compile_upstream(declaration, &label)?;
-        let (oauth, native) = compile_provider_auth(declaration, &label)?;
-        let auth = compile_auth(declaration.auth.as_ref(), &label)?;
-        let query = compile_upstream_query(declaration, &label)?;
+            compile_upstream(declaration, known_entry, &label)?;
+        let (oauth, native) = compile_provider_auth(declaration, known_entry, &label)?;
+        let auth = compile_upstream_auth(declaration, known_entry, &label)?;
+        let required_headers = known_entry.map_or_else(
+            || Ok(BTreeMap::new()),
+            |provider| compile_headers(&provider.integration.required_headers, &label),
+        )?;
+        let query = compile_upstream_query(declaration, known_entry, &label)?;
         upstreams.insert(
             Arc::from(id.as_str()),
             UpstreamPlan {
@@ -2849,6 +2873,8 @@ fn compile_config(
                 auth,
                 oauth,
                 native,
+                known_provider: known.map(|(id, _)| Arc::from(id)),
+                required_headers,
                 query,
                 source: label,
             },
@@ -3221,10 +3247,14 @@ fn compile_accounts(
                     "OAuth account requires explicit upstream oauth configuration",
                 ));
             }
-            if auth_kind == AccountAuthKind::ApiKey && upstream.native().is_some() {
+            if auth_kind == AccountAuthKind::ApiKey
+                && upstream
+                    .native()
+                    .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+            {
                 return Err(invalid(
                     &label,
-                    "API-key account cannot use a native subscription upstream",
+                    "API-key account cannot use the native Codex subscription upstream",
                 ));
             }
             let weight = declaration.weight.unwrap_or(1);
@@ -3664,9 +3694,9 @@ fn compile_cooldown(
 /// missing-URL error, because the operator named a provider they expect Pooler
 /// to know and a generic message would not say why it did not work.
 fn compile_known_provider<'a>(
-    declaration: &UpstreamConfig,
+    declaration: &'a UpstreamConfig,
     label: &SourceLabel,
-) -> Result<Option<&'a str>, ConfigError> {
+) -> Result<Option<(&'a str, &'static KnownProvider)>, ConfigError> {
     let Some(id) = declaration
         .known_provider
         .as_deref()
@@ -3677,7 +3707,7 @@ fn compile_known_provider<'a>(
     };
     ProviderCatalog::builtin()
         .get(id)
-        .map(|provider| Some(provider.base_url.as_str()))
+        .map(|provider| Some((id, provider)))
         .ok_or_else(|| {
             invalid(
                 label,
@@ -3688,10 +3718,10 @@ fn compile_known_provider<'a>(
 
 fn compile_upstream(
     declaration: &UpstreamConfig,
+    known: Option<&KnownProvider>,
     label: &SourceLabel,
 ) -> Result<CompiledTransport, ConfigError> {
     let transport = declaration.transport.as_ref();
-    let known = compile_known_provider(declaration, label)?;
     let explicit_url = transport
         .and_then(|value| value.base_url.as_deref())
         .or(declaration.base_url.as_deref())
@@ -3704,7 +3734,7 @@ fn compile_upstream(
         .map(|_| "https://chatgpt.com");
     let raw_url = explicit_url
         .or(native_codex_default)
-        .or(known)
+        .or_else(|| known.map(|provider| provider.base_url.as_str()))
         .ok_or_else(|| {
             invalid(
                 label,
@@ -3758,13 +3788,35 @@ fn compile_upstream(
     ))
 }
 
+fn compile_upstream_auth(
+    declaration: &UpstreamConfig,
+    known: Option<&KnownProvider>,
+    label: &SourceLabel,
+) -> Result<Option<AuthPlan>, ConfigError> {
+    if declaration.auth.is_some() || declaration.oauth.is_some() {
+        return compile_auth(declaration.auth.as_ref(), label);
+    }
+    let Some(provider) = known else {
+        return Ok(None);
+    };
+    let Some(environment) = provider.env.first() else {
+        return Ok(None);
+    };
+    let integration = &provider.integration;
+    let generated = AuthConfig {
+        kind: Some(integration.auth_kind.clone()),
+        secret: Some(SecretRef::Env(Arc::from(environment.as_str()))),
+        header: integration.auth_header.clone(),
+        value_prefix: integration.auth_value_prefix.clone(),
+    };
+    compile_auth(Some(&generated), label)
+}
+
 fn compile_provider_auth(
     declaration: &UpstreamConfig,
+    known: Option<&KnownProvider>,
     label: &SourceLabel,
 ) -> Result<(Option<OAuthPlan>, Option<NativeProviderPlan>), ConfigError> {
-    if declaration.oauth.is_none() && declaration.native.is_none() {
-        return Ok((None, None));
-    }
     if declaration.oauth.is_some() && declaration.auth.is_some() {
         return Err(invalid(
             label,
@@ -3777,23 +3829,33 @@ fn compile_provider_auth(
         .as_ref()
         .map(|value| compile_oauth(value, label))
         .transpose()?;
-    let native = declaration
-        .native
-        .as_ref()
-        .map(|native| {
-            let kind = required_nonempty(native.kind.as_deref(), label, "native.kind")?;
-            validate_component_id(kind, label, "native.kind")?;
-            let quota_endpoint = native
-                .quota_endpoint
-                .as_deref()
-                .map(|value| compile_secure_endpoint(value, label, "native.quota_endpoint"))
-                .transpose()?;
-            Ok(NativeProviderPlan {
-                kind: Arc::from(kind),
-                quota_endpoint,
-            })
+    let native = if let Some(native) = declaration.native.as_ref() {
+        let kind = required_nonempty(native.kind.as_deref(), label, "native.kind")?;
+        validate_component_id(kind, label, "native.kind")?;
+        let quota_endpoint = native
+            .quota_endpoint
+            .as_deref()
+            .map(|value| compile_secure_endpoint(value, label, "native.quota_endpoint"))
+            .transpose()?;
+        Some(NativeProviderPlan {
+            kind: Arc::from(kind),
+            quota_endpoint,
         })
-        .transpose()?;
+    } else if declaration.oauth.is_none() {
+        known
+            .map(|provider| provider.integration.native_kind.trim())
+            .filter(|kind| !kind.is_empty())
+            .map(|kind| {
+                validate_component_id(kind, label, "known_provider.native_kind")?;
+                Ok(NativeProviderPlan {
+                    kind: Arc::from(kind),
+                    quota_endpoint: None,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
     Ok((oauth, native))
 }
 
@@ -4006,16 +4068,74 @@ struct CatalogSourceRuntime {
     label: SourceLabel,
 }
 
+fn catalog_parser_kind(value: &str) -> Result<CatalogParserKind, &'static str> {
+    match value {
+        "openai" | "open_ai" => Ok(CatalogParserKind::OpenAi),
+        "kimi" => Ok(CatalogParserKind::Kimi),
+        "gemini" => Ok(CatalogParserKind::Gemini),
+        "vertex" => Ok(CatalogParserKind::Vertex),
+        "antigravity" => Ok(CatalogParserKind::Antigravity),
+        _ => Err("known provider has an unsupported discovery parser"),
+    }
+}
+
 fn compile_catalog(
     declaration: Option<&ModelCatalogConfig>,
     source: &Source,
     upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
     accounts: &BTreeMap<Arc<str>, AccountPlan>,
 ) -> Result<Option<ModelCatalogPlan>, ConfigError> {
-    let Some(declaration) = declaration else {
+    let catalog_label = source_label(source, "catalog".to_owned());
+    let automatic = if declaration.is_none() {
+        let mut sources = Vec::new();
+        for upstream in upstreams.values() {
+            let Some(provider_id) = upstream.known_provider() else {
+                continue;
+            };
+            let provider = ProviderCatalog::builtin()
+                .get(provider_id)
+                .ok_or_else(|| invalid(&catalog_label, "known provider integration is missing"))?;
+            let Some(parser) = provider
+                .integration
+                .discovery_parser
+                .as_deref()
+                .map(catalog_parser_kind)
+                .transpose()
+                .map_err(|message| invalid(&catalog_label, message))?
+            else {
+                continue;
+            };
+            let aliases = provider
+                .integration
+                .model_aliases
+                .iter()
+                .map(|(name, alias)| CatalogAliasConfig {
+                    name: name.clone(),
+                    alias: alias.clone(),
+                    ..CatalogAliasConfig::default()
+                })
+                .collect();
+            sources.push(ModelCatalogSourceConfig {
+                id: format!("{}.models", upstream.id()),
+                provider: upstream.id().to_owned(),
+                parser: Some(parser),
+                path: provider.integration.discovery_path.clone(),
+                model_facts_provider: Some(provider_id.to_owned()),
+                aliases,
+                excluded_models: provider.integration.model_exclusions.clone(),
+                ..ModelCatalogSourceConfig::default()
+            });
+        }
+        (!sources.is_empty()).then_some(ModelCatalogConfig {
+            sources,
+            ..ModelCatalogConfig::default()
+        })
+    } else {
+        None
+    };
+    let Some(declaration) = declaration.or(automatic.as_ref()) else {
         return Ok(None);
     };
-    let catalog_label = source_label(source, "catalog".to_owned());
     if declaration.sources.is_empty() {
         return Err(invalid(
             &catalog_label,
@@ -4514,10 +4634,15 @@ fn compile_auth_header(
 /// Compile the static query parameters one upstream requires on every request.
 fn compile_upstream_query(
     declaration: &UpstreamConfig,
+    known: Option<&KnownProvider>,
     label: &SourceLabel,
 ) -> Result<UpstreamQuery, ConfigError> {
-    let mut parameters = Vec::with_capacity(declaration.query.len());
-    for (name, value) in &declaration.query {
+    let mut combined = known
+        .map(|provider| provider.integration.required_query.clone())
+        .unwrap_or_default();
+    combined.extend(declaration.query.clone());
+    let mut parameters = Vec::with_capacity(combined.len());
+    for (name, value) in combined {
         let name = name.trim();
         if name.is_empty() {
             return Err(invalid(
@@ -4531,7 +4656,7 @@ fn compile_upstream_query(
                 "upstream query parameters must not contain query delimiters",
             ));
         }
-        parameters.push((Arc::from(name), Arc::from(value.as_str())));
+        parameters.push((Arc::from(name), Arc::from(value)));
     }
     Ok(Arc::from(parameters))
 }
@@ -5593,9 +5718,45 @@ routes:
 
         let compiled = compile_yaml("known-provider.yaml", &upstream("known_provider: groq"))
             .expect("a known provider is addressable without a URL");
+        let upstream_plan = &compiled.upstreams()["u"];
         assert_eq!(
-            compiled.upstreams()["u"].url().as_str(),
+            upstream_plan.url().as_str(),
             "https://api.groq.com/openai/v1"
+        );
+        assert_eq!(upstream_plan.known_provider(), Some("groq"));
+        assert_eq!(
+            upstream_plan
+                .auth()
+                .expect("catalog auth")
+                .secret()
+                .redacted(),
+            "env:GROQ_API_KEY"
+        );
+        assert_eq!(
+            upstream_plan.native().expect("native binding").kind(),
+            "openai_compatible"
+        );
+        let catalog = compiled.catalog().expect("automatic model discovery");
+        assert_eq!(catalog.sources().len(), 1);
+        assert_eq!(catalog.sources()[0].parser(), CatalogParserKind::OpenAi);
+        assert_eq!(catalog.sources()[0].path(), "/openai/v1/models");
+
+        let anthropic = compile_yaml(
+            "known-provider-anthropic.yaml",
+            &upstream("known_provider: anthropic"),
+        )
+        .expect("Anthropic integration");
+        let anthropic = &anthropic.upstreams()["u"];
+        assert_eq!(
+            anthropic.native().expect("native binding").kind(),
+            "anthropic"
+        );
+        assert_eq!(
+            anthropic
+                .required_headers()
+                .get("anthropic-version")
+                .map(AsRef::as_ref),
+            Some("2023-06-01")
         );
 
         let overridden = compile_yaml(

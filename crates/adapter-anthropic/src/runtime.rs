@@ -92,6 +92,10 @@ impl SemanticAdapter for AnthropicSemanticAdapter {
             .validate(route.loss_policy())
             .map_err(|error| Box::new(error) as BoxError)?;
         let mut context = SelectionContext::from_semantic_request(&decoded.request);
+        if request_has_server_tools(body)? {
+            context.require(pooler_core::Capability::Tools);
+            context.require(pooler_core::Capability::FunctionCalling);
+        }
         if request_streaming(body)? {
             context.require(pooler_core::Capability::Streaming);
         }
@@ -126,6 +130,19 @@ impl SemanticAdapter for AnthropicSemanticAdapter {
             }
         }
     }
+}
+
+fn request_has_server_tools(body: &[u8]) -> Result<bool, BoxError> {
+    let value: Value = serde_json::from_slice(body).map_err(|error| Box::new(error) as BoxError)?;
+    Ok(value
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.as_object()
+                    .is_some_and(|tool| tool.contains_key("type"))
+            })
+        }))
 }
 
 fn request_streaming(body: &[u8]) -> Result<bool, BoxError> {
@@ -573,6 +590,25 @@ routes:
         assert!(selection
             .required_capabilities()
             .contains(pooler_core::Capability::Streaming));
+    }
+
+    #[test]
+    fn server_tool_only_requests_require_tool_capabilities_for_routing() {
+        let route = route();
+        let body = br#"{
+          "model":"claude-test","max_tokens":256,
+          "tools":[{"type":"web_search_20250305","name":"web_search"}],
+          "messages":[{"role":"user","content":"find it"}]
+        }"#;
+        let selection = AnthropicSemanticAdapter
+            .selection_context(&route, &HeaderMap::new(), body)
+            .expect("selection");
+        assert!(selection
+            .required_capabilities()
+            .contains(pooler_core::Capability::Tools));
+        assert!(selection
+            .required_capabilities()
+            .contains(pooler_core::Capability::FunctionCalling));
     }
 
     #[test]

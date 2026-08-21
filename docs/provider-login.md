@@ -89,13 +89,45 @@ xAI OAuth are intentionally unsupported for third-party Pooler clients. Even a
 complete set of endpoint overrides fails before configuration, credential-store,
 or network access; use the documented API-key flow instead.
 
-## Status and revocation
+## Named accounts and lifecycle
 
-`pooler auth status` shows redacted credential metadata only. A built-in alias
-filters its canonical profile, so `status gemini` also matches credentials
-stored for `google`. `pooler auth revoke <configured-upstream>` removes the
-local credential and uses a configured revocation endpoint when encrypted token
-access is available.
+Account names come from `accounts` in the Pooler configuration. Login and import
+never create configuration implicitly: select a configured account with
+`pooler auth login <provider> --account <account>`. When a provider has more
+than one OAuth account, `--account` is required. Owner-private file import is
+currently limited to the documented OpenAI/Codex credential shape:
+
+```console
+pooler --credential-key-ref env:POOLER_STORE_KEY auth import work-openai \
+  --profile openai --from-file ~/.config/private/openai.json
+```
+
+Other providers use documented browser/device login or protected API-key secret
+references; Pooler does not guess proprietary credential file formats.
+
+`pooler auth status` shows redacted credential metadata, including whether a
+stored OAuth token expiry is valid, expired, or unknown. A built-in alias filters
+its canonical profile, so `status gemini` also matches credentials stored for
+`google`.
+
+Use account IDs for deterministic lifecycle operations:
+
+```console
+pooler --credential-key-ref env:POOLER_STORE_KEY auth refresh work-openai
+pooler auth disable personal-openai
+pooler auth enable personal-openai
+pooler auth switch work-openai
+pooler --credential-key-ref env:POOLER_STORE_KEY auth revoke work-openai
+```
+
+`refresh` rotates one OAuth account with the persisted generation compare-and-
+swap contract. `switch` enables the named account and disables sibling accounts
+for the same configured provider; it does not modify the configuration or move
+credentials between providers. `revoke` accepts an account ID, or a provider
+only when exactly one matching account exists. It calls the configured
+revocation endpoint when encrypted token access is available, then removes local
+credential state. API-key values remain in their external `env:`, `file:`, or
+`keyring:` owner and are never copied into the credential database.
 
 OAuth override values, callback codes, state, tokens, and API keys are omitted
 from command debug output and errors. Client IDs, scopes, endpoint URLs, and

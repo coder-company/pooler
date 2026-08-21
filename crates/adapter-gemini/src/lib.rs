@@ -658,6 +658,7 @@ fn decode_tools(
             .as_object()
             .cloned()
             .ok_or_else(|| invalid_shape(&format!("tools[{tool_index}]"), "an object"))?;
+        let function_declarations_present = object.contains_key("functionDeclarations");
         let declaration_count = if let Some(declarations) = object.remove("functionDeclarations") {
             let declarations = as_array(
                 &declarations,
@@ -675,6 +676,7 @@ fn decode_tools(
             0
         };
         layout.push(serde_json::json!({
+            "functionDeclarationsPresent": function_declarations_present,
             "functionDeclarationCount": declaration_count,
             "providerFields": object,
         }));
@@ -1383,6 +1385,17 @@ fn encode_tools(
                 entry,
                 &format!("request.extensions.tool-layout[{layout_index}]"),
             )?;
+            let declarations_present = entry
+                .get("functionDeclarationsPresent")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    invalid_shape(
+                        &format!(
+                            "request.extensions.tool-layout[{layout_index}].functionDeclarationsPresent"
+                        ),
+                        "a boolean",
+                    )
+                })?;
             let count = entry
                 .get("functionDeclarationCount")
                 .ok_or_else(|| {
@@ -1422,7 +1435,7 @@ fn encode_tools(
                     "function declaration counts exceed semantic tools",
                 ));
             }
-            if count > 0 {
+            if declarations_present {
                 tool.insert(
                     "functionDeclarations".to_owned(),
                     Value::Array(declarations[declaration_index..end].to_vec()),

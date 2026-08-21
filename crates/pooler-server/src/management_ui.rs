@@ -1,4 +1,4 @@
-//! Static, read-only management control surface.
+//! Static, authenticated management control surface.
 //!
 //! The first UI intentionally has no build step or third-party runtime. It is
 //! served by the authenticated management listener and reads the redacted
@@ -30,12 +30,13 @@ const INDEX_HTML: &str = r##"<!doctype html>
     <div>
       <p class="eyebrow">POOLER CONTROL</p>
       <h1>Runtime overview</h1>
-      <p class="lede">A read-only view of the active proxy plan and bounded runtime signals.</p>
+      <p class="lede">A secure view of the active proxy plan, bounded runtime signals, and account controls.</p>
     </div>
     <div class="session" aria-label="Management session">
       <label for="token">Bearer token</label>
       <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Optional for local auth">
       <button id="refresh" type="button">Refresh</button>
+      <button id="reload" type="button">Reload config</button>
     </div>
   </header>
 
@@ -77,7 +78,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
         <div id="routes" class="table-wrap"><p class="muted">Loading…</p></div>
       </section>
       <section class="panel" aria-labelledby="models-heading">
-        <div class="section-heading compact"><h2 id="models-heading">Models</h2><a href="/management/models">JSON</a></div>
+        <div class="section-heading compact"><h2 id="models-heading">Models</h2><span><a href="/management/models">JSON</a> · <button id="reload-models" type="button">Reload</button></span></div>
         <div id="models" class="table-wrap"><p class="muted">Loading…</p></div>
       </section>
     </div>
@@ -94,12 +95,17 @@ const INDEX_HTML: &str = r##"<!doctype html>
     </div>
 
     <section class="panel" aria-labelledby="metrics-heading">
-      <div class="section-heading compact"><h2 id="metrics-heading">Metrics</h2><a href="/management/metrics">JSON</a></div>
+      <div class="section-heading compact"><h2 id="metrics-heading">Metrics</h2><span><a href="/management/metrics">JSON</a> · <a href="/management/export">Export</a></span></div>
       <div id="metrics" class="metrics-grid"><p class="muted">Loading…</p></div>
     </section>
+
+    <div class="columns operational">
+      <section class="panel" aria-labelledby="traces-heading"><div class="section-heading compact"><h2 id="traces-heading">Recent traces</h2><a href="/management/traces">JSON</a></div><div id="traces" class="table-wrap"><p class="muted">Loading…</p></div></section>
+      <section class="panel" aria-labelledby="audit-heading"><div class="section-heading compact"><h2 id="audit-heading">Management audit</h2><a href="/management/audit">JSON</a></div><div id="audit" class="table-wrap"><p class="muted">Loading…</p></div></section>
+    </div>
   </main>
 
-  <footer>Pooler management UI · read-only · values are redacted at the API boundary</footer>
+  <footer>Pooler management UI · mutations require bearer auth · values are redacted at the API boundary</footer>
   <script src="/management/ui.js" defer></script>
 </body>
 </html>
@@ -152,6 +158,8 @@ button:hover { filter: brightness(1.08); }
 .panel { min-width: 0; padding: 22px; }
 .panel a { color: var(--accent); font-size: 12px; text-decoration: none; }
 .panel a:hover { text-decoration: underline; }
+.panel button { padding: 5px 8px; font-size: 11px; }
+.actions { display: flex; gap: 5px; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
@@ -184,7 +192,9 @@ const APP_JS: &str = r##"(() => {
     models: "/management/models",
     accounts: "/management/accounts",
     quota: "/management/quota",
-    metrics: "/management/metrics"
+    metrics: "/management/metrics",
+    traces: "/management/traces",
+    audit: "/management/audit"
   };
 
   function requestHeaders() {
@@ -196,6 +206,49 @@ const APP_JS: &str = r##"(() => {
     const response = await fetch(path, { headers: requestHeaders(), cache: "no-store" });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     return response.json();
+  }
+
+  async function mutate(path) {
+    const response = await fetch(path, { method: "POST", headers: requestHeaders(), cache: "no-store" });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    await refresh();
+  }
+
+  function modelPath(id) {
+    return String(id).split("/").map(encodeURIComponent).join("/");
+  }
+
+  function modelActions(row) {
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const action = row.enabled === false ? "enable" : "disable";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action === "enable" ? "Enable" : "Disable";
+    button.addEventListener("click", () => mutate(`/management/models/${modelPath(row.id)}/${action}`).catch(showError));
+    actions.append(button);
+    return actions;
+  }
+
+  function accountActions(row) {
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const choices = row.enabled
+      ? [["Disable", "disable"], ["Switch", "switch"], ["Refresh", "refresh"], ["Revoke", "revoke"]]
+      : [["Enable", "enable"], ["Switch", "switch"], ["Refresh", "refresh"]];
+    choices.forEach(([label, action]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.addEventListener("click", () => mutate(`/management/accounts/${encodeURIComponent(row.id)}/${action}`).catch(showError));
+      actions.append(button);
+    });
+    return actions;
+  }
+
+  function showError(error) {
+    notice.className = "notice error";
+    notice.textContent = `Management action failed: ${error.message}`;
   }
 
   function text(value) {
@@ -214,7 +267,7 @@ const APP_JS: &str = r##"(() => {
     columns.forEach((column) => { const cell = document.createElement("th"); cell.textContent = column.label; head.append(cell); });
     const thead = document.createElement("thead"); thead.append(head); tableNode.append(thead);
     const body = document.createElement("tbody");
-    rows.forEach((row) => { const line = document.createElement("tr"); columns.forEach((column) => { const cell = document.createElement("td"); const value = column.value(row); cell.textContent = text(value); if (column.status) cell.className = statusClass(value); line.append(cell); }); body.append(line); });
+    rows.forEach((row) => { const line = document.createElement("tr"); columns.forEach((column) => { const cell = document.createElement("td"); const value = column.value(row); if (value instanceof Node) cell.append(value); else cell.textContent = text(value); if (column.status) cell.className = statusClass(value); line.append(cell); }); body.append(line); });
     tableNode.append(body); root.replaceChildren(tableNode);
   }
 
@@ -233,12 +286,15 @@ const APP_JS: &str = r##"(() => {
     table("listeners", [{ label: "ID", value: (row) => row.id }, { label: "Bind", value: (row) => row.bind }, { label: "Protocol", value: (row) => row.protocol }, { label: "Routes", value: (row) => row.route_count }], data.listeners.listeners || []);
     table("providers", [{ label: "ID", value: (row) => row.id }, { label: "Transport", value: (row) => row.transport }, { label: "Native", value: (row) => row.native }, { label: "Status", value: (row) => row.status, status: true }], data.providers.providers || []);
     table("routes", [{ label: "ID", value: (row) => row.id }, { label: "Listener", value: (row) => row.listener }, { label: "Path", value: (row) => row.path }, { label: "Target", value: (row) => row.target?.upstream }], data.routes.routes || []);
-    table("models", [{ label: "ID", value: (row) => row.id }, { label: "Targets", value: (row) => row.targets?.length }, { label: "Capabilities", value: (row) => (row.targets || []).flatMap((target) => target.capabilities || []).join(", ") }], data.models.models || []);
-    table("accounts", [{ label: "ID", value: (row) => row.id }, { label: "Provider", value: (row) => row.provider }, { label: "Enabled", value: (row) => row.enabled ? "yes" : "no" }, { label: "Status", value: (row) => row.status, status: true }], data.accounts.accounts || []);
-    table("quota", [{ label: "Scope", value: (row) => row.scope }, { label: "Key", value: (row) => row.key }, { label: "Until", value: (row) => row.until }, { label: "Reason", value: (row) => row.reason }], data.quota.entries || []);
+    table("models", [{ label: "ID", value: (row) => row.id }, { label: "Enabled", value: (row) => row.enabled === false ? "no" : "yes" }, { label: "Targets", value: (row) => row.targets?.length }, { label: "Capabilities", value: (row) => (row.targets || []).flatMap((target) => target.capabilities || []).join(", ") }, { label: "Actions", value: modelActions }], data.models.models || []);
+    table("accounts", [{ label: "ID", value: (row) => row.id }, { label: "Provider", value: (row) => row.provider }, { label: "Enabled", value: (row) => row.enabled ? "yes" : "no" }, { label: "Status", value: (row) => row.status, status: true }, { label: "Actions", value: accountActions }], data.accounts.accounts || []);
+    table("quota", [{ label: "Scope", value: (row) => row.identity?.scope || row.scope }, { label: "Unit", value: (row) => row.unit }, { label: "Remaining", value: (row) => row.remaining }, { label: "Reset", value: (row) => row.reset_at_unix_ms }], data.quota.windows || []);
+    table("traces", [{ label: "Stage", value: (row) => row.stage }, { label: "Route", value: (row) => row.route }, { label: "Provider", value: (row) => row.provider }, { label: "Outcome", value: (row) => row.outcome }], (data.traces.traces || []).slice(-20).reverse());
+    table("audit", [{ label: "Time", value: (row) => row.timestamp_ms }, { label: "Action", value: (row) => row.action }, { label: "Subject", value: (row) => row.subject }, { label: "Outcome", value: (row) => row.outcome }], (data.audit.events || []).slice(-20).reverse());
 
     const snapshot = data.metrics.metrics || {};
-    const metricValues = [["Tracked routes", (snapshot.routes || []).length], ["Attempts", (snapshot.attempts || []).reduce((sum, row) => sum + row.count, 0)], ["Completions", (snapshot.completions || []).reduce((sum, row) => sum + row.count, 0)], ["Dropped series", snapshot.dropped_series || 0]];
+    const usage = snapshot.usage || [];
+    const metricValues = [["Tracked routes", (snapshot.routes || []).length], ["Attempts", (snapshot.attempts || []).reduce((sum, row) => sum + row.count, 0)], ["Input tokens", usage.reduce((sum, row) => sum + row.input_tokens, 0)], ["Output tokens", usage.reduce((sum, row) => sum + row.output_tokens, 0)], ["Cost ticks", usage.reduce((sum, row) => sum + row.cost_in_usd_ticks, 0)], ["Dropped series", snapshot.dropped_series || 0]];
     const metricsRoot = $("metrics");
     metricsRoot.replaceChildren(...metricValues.map(([label, value]) => { const item = document.createElement("div"); item.className = "metric"; const name = document.createElement("span"); name.textContent = label; const count = document.createElement("strong"); count.textContent = text(value); item.append(name, count); return item; }));
     notice.className = "notice";
@@ -258,6 +314,8 @@ const APP_JS: &str = r##"(() => {
   }
 
   $("refresh").addEventListener("click", refresh);
+  $("reload").addEventListener("click", () => mutate("/management/reload").catch(showError));
+  $("reload-models").addEventListener("click", () => mutate("/management/models/reload").catch(showError));
   token.addEventListener("change", refresh);
   refresh();
 })();

@@ -6,7 +6,7 @@ use std::{
     io,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     task::{Context, Poll},
     time::Duration,
 };
@@ -41,12 +41,13 @@ use pooler_observe::MetricsRegistry;
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixListener},
-    sync::Mutex as AsyncMutex,
+    sync::{mpsc, Mutex as AsyncMutex},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::management::{ManagementRuntimeServices, NativeAccountAction, NativeAccountCommand};
 use crate::tls::{PreparedTls, TlsError};
 use crate::{
     ActiveCounts, ActiveGuard, CatalogRuntime, CatalogRuntimeError, ManagementApi,
@@ -169,6 +170,8 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
     ) -> Option<SemanticWebSocketTransport> {
         if DroidOpenAiSemanticAdapter.supports(route) {
             DroidOpenAiSemanticAdapter.websocket_transport(route)
+        } else if XaiSemanticAdapter.supports(route) {
+            XaiSemanticAdapter.websocket_transport(route)
         } else {
             None
         }
@@ -484,6 +487,7 @@ struct RuntimeState {
     native: Arc<NativeRuntime>,
     retired: Mutex<Vec<Vec<Arc<RuntimeProxy>>>>,
     metrics: MetricsRegistry,
+    traces: pooler_observe::TraceRecorder,
     active: ActiveCounts,
     management: Option<ManagementHttpServer>,
     management_api: Option<Arc<ManagementApi>>,
@@ -593,7 +597,10 @@ impl HttpProxyServer {
             catalog: catalog.clone(),
         }));
         let metrics = MetricsRegistry::default();
+        let traces = pooler_observe::TraceRecorder::default();
         let active = ActiveCounts::new();
+        let cancellation = CancellationToken::new();
+        let (native_commands, native_command_receiver) = mpsc::channel(16);
         let management_api = config.management().map(|plan| {
             Arc::new(ManagementApi::with_runtime_dispatch(
                 plan.clone(),
@@ -601,9 +608,22 @@ impl HttpProxyServer {
                 Arc::clone(&pooling),
                 Arc::clone(&dispatch),
                 active.clone(),
-                metrics.clone(),
+                ManagementRuntimeServices {
+                    metrics: metrics.clone(),
+                    traces: traces.clone(),
+                    native_commands,
+                },
             ))
         });
+        if let Some(api) = management_api.as_ref() {
+            tokio::spawn(run_native_account_commands(
+                native_command_receiver,
+                Arc::clone(&native),
+                Arc::clone(&dispatch),
+                Arc::downgrade(api),
+                cancellation.clone(),
+            ));
+        }
         let management = match management_api.as_ref() {
             Some(api) => Some(ManagementHttpServer::bind(Arc::clone(api)).await?),
             None => None,
@@ -628,6 +648,7 @@ impl HttpProxyServer {
                 )?
                 .with_extensions(Arc::clone(&extensions))
                 .with_observability(metrics.clone())
+                .with_trace_recorder(traces.clone())
                 .with_runtime_resources(resources.clone()),
             );
             let bind = plan.bind();
@@ -711,10 +732,11 @@ impl HttpProxyServer {
                 native,
                 retired: Mutex::new(Vec::new()),
                 metrics,
+                traces,
                 active,
                 management,
                 management_api,
-                cancellation: CancellationToken::new(),
+                cancellation,
                 resources,
             }),
             addresses: Arc::new(addresses),
@@ -737,10 +759,19 @@ impl HttpProxyServer {
             .map(ManagementHttpServer::address)
     }
 
-    /// Return the live read-only management API, when enabled.
+    /// Return the live authenticated management API, when enabled.
     #[must_use]
     pub fn management_api(&self) -> Option<Arc<ManagementApi>> {
         self.state.management_api.clone()
+    }
+
+    /// Notification used by the CLI reload loop for authenticated management requests.
+    #[must_use]
+    pub fn management_reload_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.state
+            .management_api
+            .as_ref()
+            .map(|api| api.reload_notifier())
     }
 
     /// Return the process-shared bounded metrics registry.
@@ -851,6 +882,7 @@ impl HttpProxyServer {
                 )?
                 .with_extensions(Arc::clone(&extensions))
                 .with_observability(self.state.metrics.clone())
+                .with_trace_recorder(self.state.traces.clone())
                 .with_runtime_resources(self.state.resources.clone()),
             );
             proxies.insert(id, proxy);
@@ -1022,6 +1054,49 @@ impl HttpProxyServer {
             }
         });
         proxies
+    }
+}
+
+async fn run_native_account_commands(
+    mut commands: mpsc::Receiver<NativeAccountCommand>,
+    native: Arc<NativeRuntime>,
+    dispatch: Arc<ArcSwap<RuntimeGeneration>>,
+    management: Weak<ManagementApi>,
+    cancellation: CancellationToken,
+) {
+    loop {
+        let command = tokio::select! {
+            () = cancellation.cancelled() => break,
+            command = commands.recv() => match command {
+                Some(command) => command,
+                None => break,
+            },
+        };
+        let generation = dispatch.load_full();
+        let succeeded = match command.action {
+            NativeAccountAction::Refresh => native
+                .refresh_account(
+                    generation.config.as_ref(),
+                    &command.account,
+                    cancellation.child_token(),
+                )
+                .await
+                .is_ok(),
+            NativeAccountAction::Revoke => {
+                let revoked = native
+                    .revoke_account(generation.config.as_ref(), &command.account)
+                    .await
+                    .is_ok();
+                revoked
+                    && generation
+                        .pooling
+                        .set_account_enabled(&command.account, false)
+                        .is_ok()
+            }
+        };
+        if let Some(management) = management.upgrade() {
+            management.record_native_result(command.action, &command.account, succeeded);
+        }
     }
 }
 
@@ -3078,13 +3153,13 @@ mod tests {
         let upstream_address = listener.local_addr().expect("pooling upstream address");
         let upstream = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for _ in 0..2 {
+            for index in 0..3 {
                 let (mut stream, _) = listener.accept().await.expect("pooling upstream accepts");
                 let request = read_request(&mut stream)
                     .await
                     .expect("pooling request bytes");
                 let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
-                let quota = request_text.contains("bearer first-token");
+                let quota = request_text.contains("bearer first-token") || index == 2;
                 let (status, body) = if quota {
                     (429, b"quota".as_slice())
                 } else {
@@ -3114,9 +3189,9 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "pooling.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{accounts: [first, second]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, account_pool: pool}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
-                first_secret.reference(),
-                second_secret.reference()
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  a-backup: {{provider: local, secret: {}}}\n  z-primary: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{accounts: [z-primary, a-backup]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, account_pool: pool}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
+                second_secret.reference(),
+                first_secret.reference()
             ),
         )
         .expect("pooling config compiles");
@@ -3137,14 +3212,21 @@ mod tests {
         let response = send_request(address, request.as_bytes()).await;
         assert_eq!(status(&response), 200);
         assert_eq!(response_body(&response), b"ok");
+        let exhausted_request = request.replace("pooling-test-1", "pooling-test-2");
+        let exhausted_response = send_request(address, exhausted_request.as_bytes()).await;
+        assert_eq!(status(&exhausted_response), 429);
+        assert_eq!(response_body(&exhausted_response), b"quota");
         let requests = tokio::time::timeout(TEST_TIMEOUT, upstream)
             .await
             .expect("pooling upstream completes")
             .expect("pooling upstream task");
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert!(String::from_utf8_lossy(&requests[0]).contains("authorization: Bearer first-token"));
         assert!(
             String::from_utf8_lossy(&requests[1]).contains("authorization: Bearer second-token")
+        );
+        assert!(
+            String::from_utf8_lossy(&requests[2]).contains("authorization: Bearer second-token")
         );
         stop_server(&server, runner).await;
     }
@@ -3174,7 +3256,7 @@ mod tests {
                         429,
                         "Too Many Requests",
                         b"quota".as_slice(),
-                        "x-error-code: insufficient_quota\r\nRetry-After: 1\r\n",
+                        "x-error-code: insufficient_quota\r\nRetry-After: 60\r\n",
                     )
                 } else {
                     (200, "OK", b"ok".as_slice(), "")
@@ -3238,16 +3320,13 @@ mod tests {
         assert_eq!(response_body(&response), b"ok");
         upstream.await.expect("pooling upstream task");
 
-        server
-            .pooling()
-            .disable_credential(&pooler_core::CredentialId::new("first").expect("credential"));
         stop_server(&server, runner).await;
         drop(server);
 
         let persisted_states = store.credential_states().expect("credential states");
         assert!(persisted_states
             .iter()
-            .any(|state| state.credential_id == "first" && !state.enabled));
+            .any(|state| state.credential_id == "first" && state.enabled));
         assert!(store
             .cooldowns(0)
             .expect("cooldowns")
@@ -4440,6 +4519,19 @@ mod tests {
         )
         .await;
         assert_eq!(response_body(&first), b"management-first");
+        let traces_before = send_request(
+            management_address,
+            b"GET /traces HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&traces_before), 200);
+        let traces_before: serde_json::Value =
+            serde_json::from_slice(response_body(&traces_before)).expect("trace json");
+        let trace_count_before = traces_before["traces"]
+            .as_array()
+            .expect("trace array")
+            .len();
+        assert!(trace_count_before > 0);
 
         let replacement = pooler_config::compile_yaml(
             "management-runtime.yaml",
@@ -4474,10 +4566,68 @@ mod tests {
         )
         .await;
         assert_eq!(response_body(&second), b"management-second");
+        let traces_after = send_request(
+            management_address,
+            b"GET /traces HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let traces_after: serde_json::Value =
+            serde_json::from_slice(response_body(&traces_after)).expect("trace json");
+        assert!(
+            traces_after["traces"]
+                .as_array()
+                .expect("trace array")
+                .len()
+                > trace_count_before
+        );
 
         first_upstream.await.expect("first upstream");
         second_upstream.await.expect("second upstream");
         stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn management_native_account_commands_are_bounded_and_audited() {
+        std::env::set_var("POOLER_MANAGEMENT_NATIVE_TEST_KEY", "native-command-secret");
+        let config = pooler_config::compile_yaml(
+            "management-native-command.yaml",
+            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_NATIVE_TEST_KEY}}\nupstreams:\n  codex:\n    url: http://127.0.0.1:1\n    native: {kind: codex}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      client_id: test\n      scopes: [openid]\naccounts:\n  account-a: {provider: codex, auth_kind: oauth}\n",
+        )
+        .expect("management native command config");
+        let server = HttpProxyServer::bind(config).await.expect("bind server");
+        let api = server.management_api().expect("management api");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer native-command-secret"),
+        );
+        let response = api.handle(&http::Method::POST, "/accounts/account-a/refresh", &headers);
+        assert_eq!(response.status, http::StatusCode::ACCEPTED);
+
+        let audit = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let response = api.handle(&http::Method::GET, "/audit", &headers);
+                let value: serde_json::Value =
+                    serde_json::from_slice(&response.body).expect("audit json");
+                let events = value["events"].as_array().expect("audit events");
+                if events
+                    .iter()
+                    .any(|event| event["action"] == "refresh" && event["outcome"] == "failed")
+                {
+                    break value;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native command completion audit");
+        assert!(audit["events"]
+            .as_array()
+            .expect("audit events")
+            .iter()
+            .any(|event| event["outcome"] == "queued"));
+        server.begin_drain();
+        std::env::remove_var("POOLER_MANAGEMENT_NATIVE_TEST_KEY");
     }
 
     #[tokio::test]

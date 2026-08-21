@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use pooler_core::{CapabilitySet, ModelDialect};
+use pooler_core::{Capability, CapabilitySet, FactSupport, ModelDialect, ModelProfile};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -126,7 +126,10 @@ pub struct ModelOverrideConfig {
     pub display_name: Option<String>,
     /// Replacement capability set, authoritative over what providers report.
     pub capabilities: Option<CapabilitySet>,
+    /// Replacement bounded model profile, applied to every target.
+    pub profile: Option<ModelProfile>,
     /// Replacement request-shaping facts, applied to every target.
+    /// When both are declared, this narrower dialect override wins.
     pub dialect: Option<ModelDialect>,
     /// Request body fields pinned for this model, keyed by JSON pointer.
     ///
@@ -156,6 +159,7 @@ impl ModelOverrideConfig {
             disabled: self.disabled,
             display_name: self.display_name,
             capabilities: self.capabilities,
+            profile: self.profile,
             dialect: self.dialect,
             overlay,
         };
@@ -175,6 +179,7 @@ pub struct ModelOverride {
     disabled: bool,
     display_name: Option<String>,
     capabilities: Option<CapabilitySet>,
+    profile: Option<ModelProfile>,
     dialect: Option<ModelDialect>,
     overlay: RequestOverlay,
 }
@@ -198,6 +203,12 @@ impl ModelOverride {
         self.capabilities
     }
 
+    /// Replacement bounded model profile, when one was declared.
+    #[must_use]
+    pub const fn profile(&self) -> Option<ModelProfile> {
+        self.profile
+    }
+
     /// Replacement dialect, when one was declared.
     #[must_use]
     pub const fn dialect(&self) -> Option<ModelDialect> {
@@ -214,6 +225,7 @@ impl ModelOverride {
         self.disabled
             || self.display_name.is_some()
             || self.capabilities.is_some()
+            || self.profile.is_some()
             || self.dialect.is_some()
             || !self.overlay.is_empty()
     }
@@ -233,14 +245,33 @@ impl ModelOverride {
             model.request_overlay = self.overlay.clone();
         }
         for target in &mut model.targets {
+            if let Some(profile) = self.profile {
+                target.profile = profile;
+                target.dialect = profile.dialect;
+            }
             if let Some(capabilities) = self.capabilities {
                 target.capabilities = capabilities;
+                target.profile.reasoning = capability_fact(capabilities, Capability::Reasoning);
+                target.profile.tools = capability_fact(capabilities, Capability::Tools);
+                target.profile.structured_output =
+                    capability_fact(capabilities, Capability::StructuredOutput);
+                target.profile.streaming = capability_fact(capabilities, Capability::Streaming);
+                target.profile.attachments = capability_fact(capabilities, Capability::Files);
             }
             if let Some(dialect) = self.dialect {
                 target.dialect = dialect;
+                target.profile.dialect = dialect;
             }
         }
         model
+    }
+}
+
+const fn capability_fact(capabilities: CapabilitySet, capability: Capability) -> FactSupport {
+    if capabilities.contains(capability) {
+        FactSupport::Supported
+    } else {
+        FactSupport::Unsupported
     }
 }
 
@@ -437,9 +468,10 @@ mod tests {
     }
 
     #[test]
-    fn a_capability_set_and_dialect_deserialize_from_operator_syntax() {
+    fn capabilities_profile_and_dialect_deserialize_from_operator_syntax() {
         let declaration: ModelOverrideConfig = serde_json::from_str(
             r#"{"model":"gpt-4o","capabilities":["text","reasoning"],
+                "profile":{"reasoning":"supported","output_limit":4096},
                 "dialect":{"temperature":"rejected"}}"#,
         )
         .expect("operator syntax deserializes");
@@ -451,6 +483,14 @@ mod tests {
                     .into_iter()
                     .collect()
             )
+        );
+        assert_eq!(
+            declaration.profile.map(|profile| profile.reasoning),
+            Some(FactSupport::Supported)
+        );
+        assert_eq!(
+            declaration.profile.and_then(|profile| profile.output_limit),
+            Some(4096)
         );
         assert_eq!(
             declaration.dialect.map(|dialect| dialect.temperature),

@@ -1,4 +1,4 @@
-use pooler_core::{Capability, CapabilitySet, ModelDialect, ModelId};
+use pooler_core::{Capability, CapabilitySet, FactSupport, ModelDialect, ModelId, ModelProfile};
 use pooler_model_catalog::{
     merge_discoveries, AliasConfig, CatalogConfig, CatalogError, CatalogInput, CatalogSourceConfig,
     DiscoveredModel, DiscoveryResponse, ModelOverrideConfig, ModelOverrides, RefreshConfig,
@@ -191,6 +191,11 @@ fn an_operator_override_outranks_every_discovered_fact() {
                         .into_iter()
                         .collect(),
                 ),
+                profile: Some(ModelProfile {
+                    reasoning: FactSupport::Supported,
+                    output_limit: Some(8_192),
+                    ..ModelProfile::DEFAULT
+                }),
                 dialect: Some(ModelDialect::new().rejecting_temperature()),
                 ..ModelOverrideConfig::default()
             },
@@ -232,6 +237,16 @@ fn an_operator_override_outranks_every_discovered_fact() {
     assert_eq!(
         reshaped.targets()[0].dialect(),
         ModelDialect::new().rejecting_temperature()
+    );
+    assert_eq!(reshaped.targets()[0].profile().output_limit, Some(8_192));
+    assert_eq!(
+        reshaped.targets()[0].profile().reasoning,
+        FactSupport::Supported
+    );
+    assert_eq!(
+        reshaped.targets()[0].profile().dialect,
+        ModelDialect::new().rejecting_temperature(),
+        "the narrow dialect override wins over the profile dialect"
     );
 
     // An override for a model no provider serves is reported rather than

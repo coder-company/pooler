@@ -80,7 +80,7 @@ fn refresh(url: &str, from: Option<&Path>, output: &Path, check: bool) -> Result
         if committed != rendered {
             bail!(
                 "model-facts snapshot `{}` is stale; upstream digest is {} \
-                 with {} deviations across {} providers. Run `pooler catalog refresh`.",
+                 with {} model profiles across {} providers. Run `pooler catalog refresh`.",
                 output.display(),
                 facts.source_sha256(),
                 facts.entry_count(),
@@ -88,7 +88,7 @@ fn refresh(url: &str, from: Option<&Path>, output: &Path, check: bool) -> Result
             );
         }
         println!(
-            "model-facts snapshot is current ({} deviations across {} providers, upstream digest {})",
+            "model-facts snapshot is current ({} model profiles across {} providers, upstream digest {})",
             facts.entry_count(),
             facts.provider_count(),
             facts.source_sha256(),
@@ -103,7 +103,7 @@ fn refresh(url: &str, from: Option<&Path>, output: &Path, check: bool) -> Result
         )
     })?;
     println!(
-        "wrote {} ({} deviations across {} providers, {} upstream models, digest {})",
+        "wrote {} ({} model profiles across {} providers, {} upstream models, digest {})",
         output.display(),
         facts.entry_count(),
         facts.provider_count(),
@@ -141,6 +141,7 @@ pub fn providers(search: Option<&str>, json: bool) -> Result<()> {
                     "name": provider.name,
                     "base_url": provider.base_url,
                     "env": provider.env,
+                    "integration": provider.integration,
                 })
             })
             .collect::<Vec<_>>();
@@ -162,7 +163,18 @@ pub fn providers(search: Option<&str>, json: bool) -> Result<()> {
             .env
             .first()
             .map_or_else(String::new, |name| format!("  (env:{name})"));
-        println!("{id:width$}  {}{secret}", provider.base_url);
+        println!(
+            "{id:width$}  {}  dialect={} discovery={} auth={}{}",
+            provider.base_url,
+            provider.integration.request_dialect,
+            provider
+                .integration
+                .discovery_parser
+                .as_deref()
+                .unwrap_or("none"),
+            provider.integration.auth_kind,
+            secret
+        );
     }
     println!();
     println!(
@@ -186,7 +198,7 @@ fn facts(provider: Option<&str>, json: bool) -> Result<()> {
     }
     if let Some(provider) = provider {
         if !facts.covers_provider(provider) {
-            println!("{provider}: no recorded request-shaping deviations");
+            println!("{provider}: no recorded model profiles");
             return Ok(());
         }
     }
@@ -194,7 +206,7 @@ fn facts(provider: Option<&str>, json: bool) -> Result<()> {
     println!("upstream digest: {}", facts.source_sha256());
     println!("upstream models: {}", facts.upstream_model_count());
     println!(
-        "recorded deviations: {} across {} providers",
+        "recorded model profiles: {} across {} providers",
         facts.entry_count(),
         facts.provider_count()
     );

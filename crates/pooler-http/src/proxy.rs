@@ -18,7 +18,7 @@ use std::{
 use adapter_providers::{AuthPlacement, ProviderKind, ProviderResponseClassifier};
 use base64::Engine;
 use bytes::Bytes;
-use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -37,6 +37,7 @@ use pooler_extension::{ExtensionInput, ExtensionRegistry};
 use pooler_observe::{
     AttemptRecord, AttemptResult, CompletionClass, CooldownRecord, DecisionRecord, MetricsRegistry,
     QuotaRecord, RequestObservation, RetryRecord, TraceRecord, TraceRecorder, TraceStage,
+    Usage as ObservedUsage,
 };
 use pooler_policy::{CommitmentState, QuotaObservation, ReplayCheck, SelectionLease};
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
@@ -52,17 +53,18 @@ use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
 use crate::openai_websocket::{
-    materialized_generation, ConnectionIdentity, CredentialGeneration,
-    OpenAiResponsesWebSocketAttempt, OpenAiResponsesWebSocketError, OpenAiResponsesWebSocketPool,
-    SemanticWebSocketResponse, RESPONSES_WEBSOCKET_BETA,
+    materialized_authorization_generation, materialized_generation, ConnectionIdentity,
+    CredentialGeneration, OpenAiResponsesWebSocketAttempt, OpenAiResponsesWebSocketError,
+    OpenAiResponsesWebSocketPool, ResponsesWebSocketFlavor, SemanticWebSocketResponse,
+    RESPONSES_WEBSOCKET_BETA,
 };
 use crate::{
     extract_bearer_token, replayable_response_headers, retry_after_delay, safe_method_for_cache,
     safe_request_for_cache, safe_response_for_cache, strip_hop_by_hop_headers, CacheKey,
     CacheKeyInput, CacheLeader, CacheLookup, CachePolicy, CachedResponse, DrainController,
-    DrainGuard, DrainedBody, FrameLimitedBody, LimitedBody, NativeAuthorization, NativeRuntime,
-    NativeRuntimeError, PoolError, PoolSelection, PoolingCoordinator, ResponseCache,
-    RuntimeResources, SelectionContext, SelectionTiming,
+    DrainGuard, DrainedBody, FrameLimitedBody, LimitedBody, NativeAuthorization,
+    NativeAuthorizationRequest, NativeRuntime, NativeRuntimeError, PoolError, PoolSelection,
+    PoolingCoordinator, ResponseCache, RuntimeResources, SelectionContext, SelectionTiming,
 };
 
 /// The erased body type used by responses returned from [`HttpProxy`].
@@ -111,6 +113,8 @@ pub enum SemanticResponseMode {
 pub enum SemanticWebSocketTransport {
     /// OpenAI Responses `response.create` client messages and JSON server events.
     OpenAiResponses,
+    /// xAI Responses-compatible realtime client messages and JSON server events.
+    XaiResponses,
 }
 
 /// A semantic adapter's transformed downstream response body.
@@ -848,25 +852,25 @@ where
                 "the selected upstream does not use ws or wss".to_owned(),
             ));
         }
-        let _secret = (self.native.supports(upstream)
+        let _secret = (upstream.native().is_some()
             || selection.account_secret().is_some()
             || upstream.auth().is_some())
         .then(|| self.resources.secret_material());
-        let native_auth = if self.native.supports(upstream) {
-            let credential = selection
-                .credential()
-                .ok_or_else(|| ProxyError::Native("credential is not configured".to_owned()))?;
-            Some(
-                self.native
-                    .authorize(upstream, credential, &headers, cancellation.clone())
-                    .await
-                    .map_err(native_error)?,
-            )
-        } else {
-            None
-        };
-        if let Some(native_auth) = native_auth.as_ref() {
-            native_auth.apply_to(&mut headers).map_err(native_error)?;
+        let native_auth = self
+            .native
+            .authorize_selected_attempt(NativeAuthorizationRequest::new(
+                upstream,
+                selection.account_auth_kind(),
+                selection.credential(),
+                selection.account_secret(),
+                upstream.auth(),
+                &headers,
+                cancellation.clone(),
+            ))
+            .await
+            .map_err(native_error)?;
+        if let Some(native_auth) = native_auth {
+            native_auth.apply_once(&mut headers).map_err(native_error)?;
         } else if selection.account_secret().is_some() {
             crate::pool::apply_configured_account_auth(
                 &mut headers,
@@ -1389,23 +1393,42 @@ where
                     upstream: selection.upstream_id().to_owned(),
                 })?;
             let retry_deadline = retry_deadline(started, limits, upstream, selection.policy());
-            let _secret = (self.native.supports(upstream)
+            let _secret = (upstream.native().is_some()
                 || selection.account_secret().is_some()
                 || upstream.auth().is_some())
             .then(|| self.resources.secret_material());
-            let native_auth = if self.native.supports(upstream) {
-                let credential = selection
-                    .credential()
-                    .ok_or_else(|| ProxyError::Native("credential is not configured".to_owned()))?;
-                Some(
-                    self.native
-                        .authorize(upstream, credential, &headers, cancellation.clone())
-                        .await
-                        .map_err(native_error)?,
-                )
-            } else {
-                None
-            };
+            let native_auth = self
+                .native
+                .authorize_selected_attempt(NativeAuthorizationRequest::new(
+                    upstream,
+                    selection.account_auth_kind(),
+                    selection.credential(),
+                    selection.account_secret(),
+                    upstream.auth(),
+                    &headers,
+                    cancellation.clone(),
+                ))
+                .await
+                .map_err(native_error)?;
+            // Keep only non-secret identity state after the authorization is
+            // moved into this one-shot attempt.
+            let native_profile = native_auth
+                .as_ref()
+                .is_some_and(NativeAuthorization::is_refreshable);
+            let native_generation = native_auth
+                .as_ref()
+                .filter(|authorization| authorization.is_refreshable())
+                .map(NativeAuthorization::generation);
+            let connection_generation = native_auth.as_ref().map(|authorization| {
+                if authorization.is_refreshable() {
+                    CredentialGeneration::Native(authorization.generation())
+                } else {
+                    materialized_authorization_generation(
+                        self.config.generation(),
+                        authorization.authorization_delta(),
+                    )
+                }
+            });
             let attempt_started = StdInstant::now();
             let attempt_request = AttemptRequest {
                 route,
@@ -1415,26 +1438,34 @@ where
                 headers: &headers,
                 upstream,
                 selection: &selection,
-                native_auth: native_auth.as_ref(),
+                native_auth,
+                native_profile,
+                connection_generation,
                 cancellation: &cancellation,
                 started,
             };
-            let response = if self.semantic.websocket_transport(route)
-                == Some(SemanticWebSocketTransport::OpenAiResponses)
-                && matches!(upstream.transport(), "ws" | "wss")
-            {
-                match prepared.buffered_bytes_for_attempt(route, &selection) {
-                    Ok(bytes) => {
-                        self.send_openai_responses_websocket_attempt(attempt_request, bytes)
+            let websocket_transport = self.semantic.websocket_transport(route);
+            let response = match (
+                websocket_transport,
+                matches!(upstream.transport(), "ws" | "wss"),
+            ) {
+                (Some(transport), true) => {
+                    match prepared.buffered_bytes_for_attempt(route, &selection) {
+                        Ok(bytes) => {
+                            self.send_openai_responses_websocket_attempt(
+                                attempt_request,
+                                bytes,
+                                transport,
+                            )
                             .await
+                        }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
                 }
-            } else {
-                match prepared.body_for_attempt(route, &selection) {
+                _ => match prepared.body_for_attempt(route, &selection) {
                     Ok(attempt_body) => self.send_attempt(attempt_request, attempt_body).await,
                     Err(error) => Err(error),
-                }
+                },
             };
             let attempt_result = match response.as_ref() {
                 Ok(response) if response.status().is_success() => AttemptResult::Success,
@@ -1464,19 +1495,16 @@ where
                     };
                     if failure_status == Some(401)
                         && is_buffered
-                        && self.native.supports(upstream)
+                        && native_profile
                         && !native_refresh_attempted
                     {
                         native_refresh_attempted = true;
                         let credential = selection.credential().ok_or_else(|| {
                             ProxyError::Native("credential is not configured".to_owned())
                         })?;
-                        let generation = native_auth
-                            .as_ref()
-                            .map(NativeAuthorization::generation)
-                            .ok_or_else(|| {
-                                ProxyError::Native("authorization is unavailable".to_owned())
-                            })?;
+                        let generation = native_generation.ok_or_else(|| {
+                            ProxyError::Native("authorization is unavailable".to_owned())
+                        })?;
                         match self
                             .native
                             .refresh(upstream, credential, generation, cancellation.clone())
@@ -1502,7 +1530,7 @@ where
                                 status: failure_status,
                                 provider_code: None,
                                 message: None,
-                                native_codex: self.native.supports(upstream),
+                                native_codex: native_profile,
                                 quota_observations: &[],
                                 retry_after: None,
                                 replay,
@@ -1550,7 +1578,7 @@ where
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.chars().take(128).collect());
             let mut quota_observations = Vec::new();
-            if self.native.supports(upstream) && !matches!(status, 402 | 429) {
+            if native_profile && !matches!(status, 402 | 429) {
                 provider_code = None;
             }
 
@@ -1573,23 +1601,17 @@ where
                 quota_observations = inspected.quota_observations;
             }
 
-            // A native 401 is eligible for exactly one pre-commit refresh. The
+            // A native OAuth 401 is eligible for exactly one pre-commit refresh. The
             // response is still buffered and no downstream headers have been
             // sent, so retrying remains safe. A failed refresh is returned as
             // the provider response unless invalid_grant disables this account
             // and the configured pool has another eligible target.
-            if status == 401
-                && is_buffered
-                && self.native.supports(upstream)
-                && !native_refresh_attempted
-            {
+            if status == 401 && is_buffered && native_profile && !native_refresh_attempted {
                 native_refresh_attempted = true;
                 let credential = selection
                     .credential()
                     .ok_or_else(|| ProxyError::Native("credential is not configured".to_owned()))?;
-                let generation = native_auth
-                    .as_ref()
-                    .map(NativeAuthorization::generation)
+                let generation = native_generation
                     .ok_or_else(|| ProxyError::Native("authorization is unavailable".to_owned()))?;
                 match self
                     .native
@@ -1623,7 +1645,7 @@ where
                     status: Some(status),
                     provider_code: provider_code.clone(),
                     message: None,
-                    native_codex: self.native.supports(upstream),
+                    native_codex: native_profile,
                     quota_observations: &quota_observations,
                     retry_after,
                     replay,
@@ -1693,12 +1715,14 @@ where
             upstream,
             selection,
             native_auth,
+            native_profile: _,
+            connection_generation: _,
             cancellation,
             started,
         } = request;
         let mut headers = request_headers.clone();
         if let Some(native_auth) = native_auth {
-            native_auth.apply_to(&mut headers).map_err(native_error)?;
+            native_auth.apply_once(&mut headers).map_err(native_error)?;
         } else if selection.account_secret().is_some() {
             let _ = crate::pool::apply_configured_account_auth(
                 &mut headers,
@@ -1781,6 +1805,7 @@ where
         &self,
         request: AttemptRequest<'_>,
         body: Bytes,
+        transport: SemanticWebSocketTransport,
     ) -> Result<Response<ProxyBody>, ProxyError> {
         let AttemptRequest {
             route,
@@ -1791,12 +1816,14 @@ where
             upstream,
             selection,
             native_auth,
+            native_profile,
+            connection_generation,
             cancellation,
             started,
         } = request;
         let mut headers = request_headers.clone();
         if let Some(native_auth) = native_auth {
-            native_auth.apply_to(&mut headers).map_err(native_error)?;
+            native_auth.apply_once(&mut headers).map_err(native_error)?;
         } else if selection.account_secret().is_some() {
             crate::pool::apply_configured_account_auth(
                 &mut headers,
@@ -1807,10 +1834,12 @@ where
         } else {
             apply_configured_upstream_auth(&mut headers, upstream)?;
         }
-        headers.insert(
-            "openai-beta",
-            HeaderValue::from_static(RESPONSES_WEBSOCKET_BETA),
-        );
+        if transport == SemanticWebSocketTransport::OpenAiResponses {
+            headers.insert(
+                "openai-beta",
+                HeaderValue::from_static(RESPONSES_WEBSOCKET_BETA),
+            );
+        }
         route
             .limits()
             .check_headers(
@@ -1819,18 +1848,16 @@ where
             )
             .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
         let endpoint = websocket_uri(upstream, route, downstream_uri)?;
-        let profile = if native_auth.is_some() {
-            "codex_subscription"
-        } else {
-            "openai_api_key"
+        let profile = match transport {
+            SemanticWebSocketTransport::OpenAiResponses if native_profile => "codex_subscription",
+            SemanticWebSocketTransport::OpenAiResponses => "openai_api_key",
+            SemanticWebSocketTransport::XaiResponses => "xai_api_key",
         };
         let account = selection
             .credential()
             .map_or_else(|| upstream.id(), pooler_core::CredentialId::as_str);
-        let generation = native_auth.map_or_else(
-            || materialized_generation(self.config.generation(), &headers),
-            |authorization| CredentialGeneration::Native(authorization.generation()),
-        );
+        let generation = connection_generation
+            .unwrap_or_else(|| materialized_generation(self.config.generation(), &headers));
         let session = downstream_session_identity(request_headers, &body);
         let identity = ConnectionIdentity::new(profile, account, endpoint, generation, session);
         let request_timeout = request_timeout(route.limits(), upstream);
@@ -1848,6 +1875,10 @@ where
                 identity,
                 headers,
                 request_body: body,
+                flavor: match transport {
+                    SemanticWebSocketTransport::OpenAiResponses => ResponsesWebSocketFlavor::OpenAi,
+                    SemanticWebSocketTransport::XaiResponses => ResponsesWebSocketFlavor::Xai,
+                },
                 limits: route.limits().clone(),
                 loss_policy: route.loss_policy(),
                 connect_deadline,
@@ -2099,6 +2130,10 @@ where
         }
         self.pooling
             .persist_affinity(&selection, crate::pool::timestamp_now());
+        let usage_target = UsageTarget {
+            provider: selection.provider().as_str().to_owned(),
+            model: selection.upstream_model().map(str::to_owned),
+        };
         let body = SelectionLeaseBody::new(body, selection.take_lease()).boxed();
         self.traces.record(
             TraceRecord::new(TraceStage::Persistence)
@@ -2107,7 +2142,7 @@ where
                 .outcome("response_ready"),
         );
         let completion = completion_class_for_status(parts.status);
-        let body = ObservedBody::new(body, observation, completion);
+        let body = ObservedBody::new_for_target(body, observation, completion, usage_target);
         let body = DrainedBody::new(body, guard).boxed();
         let mut response = Response::new(body);
         *response.status_mut() = parts.status;
@@ -2130,7 +2165,9 @@ struct AttemptRequest<'a> {
     headers: &'a HeaderMap,
     upstream: &'a UpstreamPlan,
     selection: &'a PoolSelection,
-    native_auth: Option<&'a NativeAuthorization>,
+    native_auth: Option<NativeAuthorization>,
+    native_profile: bool,
+    connection_generation: Option<CredentialGeneration>,
     cancellation: &'a CancellationToken,
     started: StdInstant,
 }
@@ -2242,10 +2279,20 @@ impl Body for SelectionLeaseBody {
     }
 }
 
+const MAX_USAGE_OBSERVATION_BYTES: usize = 256 * 1024;
+
+struct UsageTarget {
+    provider: String,
+    model: Option<String>,
+}
+
 struct ObservedBody {
     inner: Pin<Box<ProxyBody>>,
     observation: Option<RequestObservation>,
     completion: CompletionClass,
+    usage_target: Option<UsageTarget>,
+    usage_bytes: Vec<u8>,
+    usage_overflowed: bool,
 }
 
 impl ObservedBody {
@@ -2254,6 +2301,44 @@ impl ObservedBody {
             inner: Box::pin(inner),
             observation: Some(observation),
             completion,
+            usage_target: None,
+            usage_bytes: Vec::new(),
+            usage_overflowed: false,
+        }
+    }
+
+    fn new_for_target(
+        inner: ProxyBody,
+        observation: RequestObservation,
+        completion: CompletionClass,
+        usage_target: UsageTarget,
+    ) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            observation: Some(observation),
+            completion,
+            usage_target: Some(usage_target),
+            usage_bytes: Vec::new(),
+            usage_overflowed: false,
+        }
+    }
+
+    fn complete(&mut self, completion: CompletionClass) {
+        let Some(mut observation) = self.observation.take() else {
+            return;
+        };
+        let usage = (!self.usage_overflowed)
+            .then(|| extract_observed_usage(&self.usage_bytes))
+            .flatten();
+        if let Some(target) = self.usage_target.as_ref() {
+            observation.complete_for_target(
+                completion,
+                usage,
+                Some(&target.provider),
+                target.model.as_deref(),
+            );
+        } else {
+            observation.complete(completion, usage);
         }
     }
 }
@@ -2268,30 +2353,37 @@ impl Body for ObservedBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let result = self.inner.as_mut().poll_frame(context);
         match &result {
-            Poll::Ready(Some(Ok(_))) => {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref().filter(|_| self.usage_target.is_some()) {
+                    if self.usage_bytes.len().saturating_add(data.len())
+                        <= MAX_USAGE_OBSERVATION_BYTES
+                    {
+                        self.usage_bytes.extend_from_slice(data);
+                    } else {
+                        self.usage_overflowed = true;
+                        self.usage_bytes.clear();
+                    }
+                }
                 if let Some(observation) = self.observation.as_mut() {
                     observation.mark_first_event();
                 }
                 if self.inner.is_end_stream() {
-                    if let Some(mut observation) = self.observation.take() {
-                        observation.complete(self.completion.clone(), None);
-                    }
+                    let completion = self.completion.clone();
+                    self.complete(completion);
                 }
             }
             Poll::Ready(None) => {
-                if let Some(mut observation) = self.observation.take() {
-                    observation.complete(self.completion.clone(), None);
-                }
+                let completion = self.completion.clone();
+                self.complete(completion);
             }
             Poll::Ready(Some(Err(_))) => {
-                if let Some(mut observation) = self.observation.take() {
-                    let completion = if self.completion == CompletionClass::Success {
-                        CompletionClass::IncompleteStream
-                    } else {
-                        self.completion.clone()
-                    };
-                    observation.complete(completion, None);
-                }
+                self.usage_overflowed = true;
+                let completion = if self.completion == CompletionClass::Success {
+                    CompletionClass::IncompleteStream
+                } else {
+                    self.completion.clone()
+                };
+                self.complete(completion);
             }
             Poll::Pending => {}
         }
@@ -2309,15 +2401,134 @@ impl Body for ObservedBody {
 
 impl Drop for ObservedBody {
     fn drop(&mut self) {
-        let Some(mut observation) = self.observation.take() else {
-            return;
-        };
+        if !self.inner.is_end_stream() {
+            self.usage_overflowed = true;
+        }
         let completion = if self.inner.is_end_stream() {
             self.completion.clone()
         } else {
             CompletionClass::Cancelled
         };
-        observation.complete(completion, None);
+        self.complete(completion);
+    }
+}
+
+fn extract_observed_usage(bytes: &[u8]) -> Option<ObservedUsage> {
+    let mut usage = ObservedUsage::default();
+    let mut found = false;
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        visit_usage_values(&value, &mut usage, &mut found);
+    } else if let Ok(text) = std::str::from_utf8(bytes) {
+        for line in text.lines() {
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                visit_usage_values(&value, &mut usage, &mut found);
+            }
+        }
+    }
+    if found {
+        if usage.total_tokens.is_none() {
+            usage.total_tokens = usage
+                .input_tokens
+                .zip(usage.output_tokens)
+                .map(|(input, output)| input.saturating_add(output));
+        }
+        Some(usage)
+    } else {
+        None
+    }
+}
+
+fn visit_usage_values(value: &serde_json::Value, usage: &mut ObservedUsage, found: &mut bool) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(key.as_str(), "usage" | "usageMetadata" | "usage_metadata") {
+                    if let Some(usage_object) = value.as_object() {
+                        merge_usage_value(usage_object, usage, found);
+                    }
+                }
+                visit_usage_values(value, usage, found);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                visit_usage_values(value, usage, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn merge_usage_value(
+    object: &serde_json::Map<String, serde_json::Value>,
+    usage: &mut ObservedUsage,
+    found: &mut bool,
+) {
+    merge_usage_field(
+        &mut usage.input_tokens,
+        numeric_alias(
+            object,
+            &["input_tokens", "prompt_tokens", "promptTokenCount"],
+        ),
+        found,
+    );
+    merge_usage_field(
+        &mut usage.output_tokens,
+        numeric_alias(
+            object,
+            &["output_tokens", "completion_tokens", "candidatesTokenCount"],
+        ),
+        found,
+    );
+    merge_usage_field(
+        &mut usage.total_tokens,
+        numeric_alias(object, &["total_tokens", "totalTokenCount"]),
+        found,
+    );
+    let cost = find_numeric_key(
+        &serde_json::Value::Object(object.clone()),
+        "cost_in_usd_ticks",
+    );
+    merge_usage_field(&mut usage.cost_in_usd_ticks, cost, found);
+}
+
+fn numeric_alias(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Option<u64> {
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(serde_json::Value::as_u64))
+}
+
+fn find_numeric_key(value: &serde_json::Value, wanted: &str) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(object) => object
+            .get(wanted)
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                object
+                    .values()
+                    .find_map(|value| find_numeric_key(value, wanted))
+            }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_numeric_key(value, wanted)),
+        _ => None,
+    }
+}
+
+fn merge_usage_field(target: &mut Option<u64>, value: Option<u64>, found: &mut bool) {
+    if let Some(value) = value {
+        *found = true;
+        *target = Some(target.map_or(value, |current| current.max(value)));
     }
 }
 
@@ -2424,7 +2635,8 @@ fn patch_body_for_target(
     model: &str,
     selection: &PoolSelection,
 ) -> Result<Bytes, ProxyError> {
-    let dialect = selection.dialect();
+    let profile = selection.profile();
+    let dialect = profile.dialect;
     let mut document = PreservedJson::from_bytes(bytes.to_vec())
         .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
     document
@@ -2444,26 +2656,143 @@ fn patch_body_for_target(
             .set_pointer_bounded(pointer, value.clone(), JsonPatchLimits::default())
             .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
     }
-    if !dialect.temperature.is_accepted() && document.pointer("/temperature").is_some() {
-        // A patch body has no extension namespace, so `preserve` cannot keep the
-        // field anywhere the target would accept. Only `degrade` drops it.
+    if !dialect.temperature.is_accepted() {
+        drop_unsupported_parameter(&mut document, route, model, "/temperature", "temperature")?;
+    }
+    if profile.reasoning.is_unsupported() {
+        drop_unsupported_parameter(&mut document, route, model, "/reasoning", "reasoning")?;
+        drop_unsupported_parameter(
+            &mut document,
+            route,
+            model,
+            "/reasoning_effort",
+            "reasoning_effort",
+        )?;
+    } else if let Some(effort) = document
+        .pointer("/reasoning_effort")
+        .and_then(serde_json::Value::as_str)
+    {
+        if !profile.reasoning_efforts.allows(effort) {
+            drop_unsupported_parameter(
+                &mut document,
+                route,
+                model,
+                "/reasoning_effort",
+                "reasoning_effort",
+            )?;
+        }
+    }
+    if profile.tools.is_unsupported() {
+        for (pointer, parameter) in [
+            ("/tools", "tools"),
+            ("/tool_choice", "tool_choice"),
+            ("/parallel_tool_calls", "parallel_tool_calls"),
+        ] {
+            drop_unsupported_parameter(&mut document, route, model, pointer, parameter)?;
+        }
+    } else if profile.parallel_tools.is_unsupported() {
+        drop_unsupported_parameter(
+            &mut document,
+            route,
+            model,
+            "/parallel_tool_calls",
+            "parallel_tool_calls",
+        )?;
+    }
+    if profile.structured_output.is_unsupported() {
+        drop_unsupported_parameter(
+            &mut document,
+            route,
+            model,
+            "/response_format",
+            "response_format",
+        )?;
+    }
+    if profile.streaming.is_unsupported()
+        && document.pointer("/stream") == Some(&serde_json::Value::Bool(true))
+    {
+        return Err(ProxyError::UnsupportedParameter {
+            parameter: "stream".to_owned(),
+            model: model.to_owned(),
+        });
+    }
+    enforce_output_limit(&mut document, route, model, profile.output_limit)?;
+    Ok(Bytes::from(document.bytes().into_owned()))
+}
+
+fn drop_unsupported_parameter(
+    document: &mut PreservedJson,
+    route: &RoutePlan,
+    model: &str,
+    pointer: &str,
+    parameter: &str,
+) -> Result<(), ProxyError> {
+    if document.pointer(pointer).is_none() {
+        return Ok(());
+    }
+    // A patch body has no extension namespace, so `preserve` cannot keep the
+    // field anywhere the target would accept. Only `degrade` drops it.
+    if !route.loss_policy().allows_degradation() {
+        return Err(ProxyError::UnsupportedParameter {
+            parameter: parameter.to_owned(),
+            model: model.to_owned(),
+        });
+    }
+    document
+        .remove(pointer)
+        .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+    tracing::warn!(
+        route = route.id(),
+        upstream_model = model,
+        parameter,
+        "request parameter dropped because the target model rejects it"
+    );
+    Ok(())
+}
+
+fn enforce_output_limit(
+    document: &mut PreservedJson,
+    route: &RoutePlan,
+    model: &str,
+    output_limit: Option<u64>,
+) -> Result<(), ProxyError> {
+    let Some(output_limit) = output_limit else {
+        return Ok(());
+    };
+    for (pointer, parameter) in [
+        ("/max_tokens", "max_tokens"),
+        ("/max_completion_tokens", "max_completion_tokens"),
+        ("/max_output_tokens", "max_output_tokens"),
+    ] {
+        let exceeds_limit = document
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|requested| requested > output_limit);
+        if !exceeds_limit {
+            continue;
+        }
         if !route.loss_policy().allows_degradation() {
             return Err(ProxyError::UnsupportedParameter {
-                parameter: "temperature".to_owned(),
+                parameter: parameter.to_owned(),
                 model: model.to_owned(),
             });
         }
         document
-            .remove("/temperature")
+            .set_pointer_bounded(
+                pointer,
+                serde_json::Value::from(output_limit),
+                JsonPatchLimits::default(),
+            )
             .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
         tracing::warn!(
             route = route.id(),
             upstream_model = model,
-            parameter = "temperature",
-            "request parameter dropped because the target model rejects it"
+            parameter,
+            output_limit,
+            "request token limit clamped to the target model maximum"
         );
     }
-    Ok(Bytes::from(document.bytes().into_owned()))
+    Ok(())
 }
 
 fn should_classify(status: Option<u16>) -> bool {
@@ -3394,10 +3723,24 @@ async fn send_websocket_closes(
     .await;
 }
 /// Resolve and apply one compiled upstream credential at the outbound boundary.
+pub fn apply_configured_upstream_headers(
+    headers: &mut HeaderMap,
+    upstream: &UpstreamPlan,
+) -> Result<(), ProxyError> {
+    for (name, value) in upstream.required_headers() {
+        let name =
+            HeaderName::from_bytes(name.as_bytes()).map_err(|_| ProxyError::UnsupportedAuth)?;
+        let value = HeaderValue::from_str(value).map_err(|_| ProxyError::UnsupportedAuth)?;
+        headers.insert(name, value);
+    }
+    Ok(())
+}
+
 pub fn apply_configured_upstream_auth(
     headers: &mut HeaderMap,
     upstream: &UpstreamPlan,
 ) -> Result<(), ProxyError> {
+    apply_configured_upstream_headers(headers, upstream)?;
     let Some(auth) = upstream.auth() else {
         return Ok(());
     };
@@ -3600,6 +3943,9 @@ fn pool_selection_error(error: PoolError) -> ProxyError {
         PoolError::UnknownModel { model } => {
             ProxyError::InvalidPatch(format!("unknown public model `{model}`"))
         }
+        PoolError::ModelDisabled { model } => {
+            ProxyError::InvalidPatch(format!("public model `{model}` is disabled"))
+        }
         PoolError::InvalidModel => ProxyError::InvalidPatch("request model is invalid".to_owned()),
         other => pool_error(other),
     }
@@ -3714,6 +4060,31 @@ routes:
             .match_route_request(&request)
             .expect("template route matches");
         assert_eq!(route.id(), "templated");
+    }
+
+    #[test]
+    fn usage_observation_normalizes_json_and_streaming_provider_shapes() {
+        let json = br#"{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":7,"totalTokenCount":18}}"#;
+        assert_eq!(
+            extract_observed_usage(json),
+            Some(ObservedUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+                total_tokens: Some(18),
+                cost_in_usd_ticks: None,
+            })
+        );
+
+        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":13,\"output_tokens\":1}}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":9,\"details\":{\"cost_in_usd_ticks\":42}}}}\n\n";
+        assert_eq!(
+            extract_observed_usage(sse),
+            Some(ObservedUsage {
+                input_tokens: Some(13),
+                output_tokens: Some(9),
+                total_tokens: Some(22),
+                cost_in_usd_ticks: Some(42),
+            })
+        );
     }
 
     #[test]

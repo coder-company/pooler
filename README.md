@@ -29,7 +29,9 @@ POOLER_UPSTREAM_KEY=... cargo run -p pooler-cli -- serve --config config/pooler.
 
 Inspect provider login support, aliases, and API-key guidance with `pooler auth
 providers`; the secure profile, OAuth override, device-flow, and status UX is
-documented in [provider login](docs/provider-login.md).
+documented in [provider login](docs/provider-login.md). The authenticated account controls,
+runtime model controls, reload trigger, traces, audit log, usage/cost views, and redacted
+diagnostic export are documented in [operational management](docs/management.md).
 
 Verify every declared compatibility fixture through its adapter or runtime
 boundary:

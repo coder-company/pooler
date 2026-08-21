@@ -177,14 +177,19 @@ pub fn decode_responses_request_with_report(
         parse_input(input, &mut request, &mut report)?;
     }
     if let Some(tools) = object.remove("tools") {
-        let (function_tools, builtin_tools) = parse_tools(&tools, &mut report)?;
+        let (function_tools, preserved_tools) = parse_tools(&tools, &mut report)?;
         request.tools = function_tools;
-        if !builtin_tools.is_empty() {
-            object.insert("tools".to_owned(), Value::Array(builtin_tools));
+        if let Some(preserved_tools) = preserved_tools {
+            object.insert("tools".to_owned(), Value::Array(preserved_tools));
         }
     }
     if let Some(choice) = object.remove("tool_choice") {
-        request.tool_choice = Some(parse_tool_choice(&choice)?);
+        if builtin_tool_choice(&choice) {
+            report.preserve_capability("openai.responses.builtin_tool_choice");
+            object.insert("tool_choice".to_owned(), choice);
+        } else {
+            request.tool_choice = Some(parse_tool_choice(&choice)?);
+        }
     }
     parse_reasoning(object, &mut request, &mut report)?;
     parse_sampling(object, &mut request)?;
@@ -507,12 +512,12 @@ fn parse_summary(
 fn parse_tools(
     value: &Value,
     report: &mut ConversionReport,
-) -> Result<(Vec<ToolDefinition>, Vec<Value>), OpenAiResponsesError> {
+) -> Result<(Vec<ToolDefinition>, Option<Vec<Value>>), OpenAiResponsesError> {
     let tools = value
         .as_array()
         .ok_or_else(|| invalid_shape("tools", "an array"))?;
     let mut function_tools = Vec::new();
-    let mut builtin_tools = Vec::new();
+    let mut has_builtin_tools = false;
     for (index, tool) in tools.iter().enumerate() {
         let field = format!("tools[{index}]");
         let object = tool
@@ -521,7 +526,7 @@ fn parse_tools(
         let kind = required_string(object, "type", &format!("{field}.type"))?;
         if kind != "function" {
             report.preserve_capability(format!("openai.responses.tool.{kind}"));
-            builtin_tools.push(tool.clone());
+            has_builtin_tools = true;
             continue;
         }
         report_unknown_fields(
@@ -541,7 +546,15 @@ fn parse_tools(
         definition.strict = optional_bool(object, "strict", &format!("{field}.strict"))?;
         function_tools.push(definition);
     }
-    Ok((function_tools, builtin_tools))
+    Ok((function_tools, has_builtin_tools.then(|| tools.to_vec())))
+}
+
+fn builtin_tool_choice(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "function")
 }
 
 fn parse_tool_choice(value: &Value) -> Result<ToolChoice, OpenAiResponsesError> {
@@ -709,14 +722,14 @@ pub fn encode_responses_request(
                 .collect::<Result<Vec<_>, _>>()?,
         ),
     );
-    let mut tools = take_preserved_builtin_tools(&mut object)?;
-    tools.extend(
-        request
+    let tools = match take_preserved_tools(&mut object)? {
+        Some(tools) => tools,
+        None => request
             .tools
             .iter()
             .map(|tool| encode_tool(tool, &mut report))
             .collect::<Result<Vec<_>, _>>()?,
-    );
+    };
     if !tools.is_empty() {
         object.insert("tools".to_owned(), Value::Array(tools));
     }
@@ -1200,24 +1213,20 @@ fn preserved_unknown_fields(
     Ok(object)
 }
 
-fn take_preserved_builtin_tools(
+fn take_preserved_tools(
     object: &mut Map<String, Value>,
-) -> Result<Vec<Value>, OpenAiResponsesError> {
+) -> Result<Option<Vec<Value>>, OpenAiResponsesError> {
     let Some(value) = object.remove("tools") else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let tools = value.as_array().ok_or_else(invalid_extension)?;
     for tool in tools {
         let tool = tool.as_object().ok_or_else(invalid_extension)?;
-        let kind = tool
-            .get("type")
+        tool.get("type")
             .and_then(Value::as_str)
             .ok_or_else(invalid_extension)?;
-        if kind == "function" {
-            return Err(invalid_extension());
-        }
     }
-    Ok(tools.clone())
+    Ok(Some(tools.clone()))
 }
 
 fn report_extensions(field: &str, extensions: &Extensions, report: &mut ConversionReport) {
@@ -1506,6 +1515,9 @@ impl OpenAiResponsesEventDecoder {
             "response.failed" => self.decode_failed(object),
             "error" => self.decode_error(object),
             "response.queued" => Ok(Vec::new()),
+            other if is_builtin_lifecycle_event(other) => {
+                Ok(self.decode_builtin_lifecycle_event(object, input))
+            }
             other => Err(OpenAiResponsesError::InvalidStream {
                 message: format!("unsupported Responses event `{other}`"),
             }),
@@ -1575,6 +1587,26 @@ impl OpenAiResponsesEventDecoder {
             self.model = Some(model);
         }
         Ok(())
+    }
+
+    fn decode_builtin_lifecycle_event(
+        &mut self,
+        object: &Map<String, Value>,
+        input: &[u8],
+    ) -> Vec<StreamEvent> {
+        let mut events = self.ensure_response_start();
+        let correlation_id = object
+            .get("item_id")
+            .or_else(|| object.get("output_item_id"))
+            .and_then(Value::as_str);
+        events.push(self.event(
+            StreamEventKind::Opaque {
+                media_type: OPENAI_RESPONSES_BUILTIN_EVENT_MEDIA_TYPE.to_owned(),
+                data: input.to_vec(),
+            },
+            correlation_id,
+        ));
+        events
     }
 
     fn ensure_response_start(&mut self) -> Vec<StreamEvent> {
@@ -2158,6 +2190,20 @@ fn reject_nonempty_message_annotations(
     Ok(())
 }
 
+fn is_builtin_lifecycle_event(kind: &str) -> bool {
+    [
+        "response.web_search_call.",
+        "response.file_search_call.",
+        "response.code_interpreter_call.",
+        "response.image_generation_call.",
+        "response.mcp_call.",
+        "response.mcp_call_arguments.",
+        "response.custom_tool_call_input.",
+    ]
+    .into_iter()
+    .any(|prefix| kind.starts_with(prefix))
+}
+
 fn response_object(
     event: &Map<String, Value>,
 ) -> Result<&Map<String, Value>, OpenAiResponsesError> {
@@ -2505,29 +2551,34 @@ impl OpenAiResponsesEventEncoder {
             .as_object()
             .ok_or_else(|| invalid_shape("opaque event", "an object"))?;
         let event = required_string(object, "type", "opaque event.type")?;
-        if !matches!(
+        let output_item_event = matches!(
             event,
             "response.output_item.added" | "response.output_item.done"
-        ) {
+        );
+        if !output_item_event && !is_builtin_lifecycle_event(event) {
             return Err(OpenAiResponsesError::UnsupportedEvent {
-                message: "preserved built-in event is not an output-item event".to_owned(),
-            });
-        }
-        let item = item_object(object)?;
-        let kind = required_string(item, "type", "opaque event.item.type")?;
-        if matches!(kind, "message" | "reasoning" | "function_call") {
-            return Err(OpenAiResponsesError::UnsupportedEvent {
-                message: "semantic output item cannot be encoded as an opaque built-in event"
-                    .to_owned(),
+                message: "preserved built-in event has an unknown event type".to_owned(),
             });
         }
 
         let mut report = ConversionReport::default();
-        report.preserve_capability(format!("openai.responses.output.{kind}"));
-        report.validate(policy)?;
-        if event == "response.output_item.done" {
-            self.output.push(Value::Object(item.clone()));
+        if output_item_event {
+            let item = item_object(object)?;
+            let kind = required_string(item, "type", "opaque event.item.type")?;
+            if matches!(kind, "message" | "reasoning" | "function_call") {
+                return Err(OpenAiResponsesError::UnsupportedEvent {
+                    message: "semantic output item cannot be encoded as an opaque built-in event"
+                        .to_owned(),
+                });
+            }
+            report.preserve_capability(format!("openai.responses.output.{kind}"));
+            if event == "response.output_item.done" {
+                self.output.push(Value::Object(item.clone()));
+            }
+        } else {
+            report.preserve_capability(format!("openai.responses.event.{event}"));
         }
+        report.validate(policy)?;
         if let Some(output_index) = object.get("output_index").and_then(Value::as_u64) {
             self.next_output_index = self.next_output_index.max(output_index.saturating_add(1));
         }
@@ -3017,14 +3068,17 @@ mod tests {
             "model":"builtin-model",
             "input":"find and inspect it",
             "tools":[
+                {"type":"function","name":"before","parameters":{"type":"object"}},
                 {"type":"web_search","search_context_size":"low"},
                 {
                     "type":"computer_use_preview",
                     "display_width":1024,
                     "display_height":768,
                     "environment":"browser"
-                }
-            ]
+                },
+                {"type":"function","name":"after","parameters":{"type":"object"}}
+            ],
+            "tool_choice":{"type":"web_search"}
         });
         let decoded = decode_responses_request_with_report(
             &serde_json::to_vec(&source).expect("request JSON"),
@@ -3032,7 +3086,15 @@ mod tests {
         .expect("built-in tools decode");
 
         assert!(decoded.report.is_lossless());
-        assert!(decoded.request.tools.is_empty());
+        assert_eq!(
+            decoded
+                .request
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "after"]
+        );
         assert!(decoded
             .report
             .preserved_capabilities
@@ -3044,6 +3106,7 @@ mod tests {
         assert!(encoded.report.is_lossless());
         let value: Value = serde_json::from_slice(&encoded.body).expect("encoded JSON");
         assert_eq!(value["tools"], source["tools"]);
+        assert_eq!(value["tool_choice"], source["tool_choice"]);
 
         let error = encode_chat_request(&decoded.request, LossPolicy::Degrade)
             .expect_err("built-in tools must not leak into another protocol");
@@ -3433,6 +3496,18 @@ mod tests {
                 "sequence_number":4,
                 "output_index":0,
                 "item":{"id":"search_1","type":"web_search_call","status":"searching"}
+            }),
+            json!({
+                "type":"response.web_search_call.searching",
+                "sequence_number":5,
+                "output_index":0,
+                "item_id":"search_1"
+            }),
+            json!({
+                "type":"response.web_search_call.completed",
+                "sequence_number":6,
+                "output_index":0,
+                "item_id":"search_1"
             }),
             json!({
                 "type":"response.output_item.done",

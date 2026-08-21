@@ -441,6 +441,40 @@ impl SqliteStore {
         self.rotate_master_key(master_key)
     }
 
+    /// Atomically enable one credential and disable its configured siblings.
+    pub fn switch_credential(
+        &self,
+        selected: &str,
+        siblings: &[String],
+        updated_at: Timestamp,
+    ) -> StoreResult<Vec<CredentialState>> {
+        non_empty("selected", selected)?;
+        for sibling in siblings {
+            non_empty("sibling", sibling)?;
+        }
+        self.with_immediate_transaction(|transaction| {
+            let mut states = Vec::with_capacity(siblings.len().saturating_add(1));
+            states.push(set_credential_enabled_tx(
+                transaction,
+                selected,
+                true,
+                updated_at,
+            )?);
+            for sibling in siblings
+                .iter()
+                .filter(|sibling| sibling.as_str() != selected)
+            {
+                states.push(set_credential_enabled_tx(
+                    transaction,
+                    sibling,
+                    false,
+                    updated_at,
+                )?);
+            }
+            Ok(states)
+        })
+    }
+
     fn connection(&self) -> StoreResult<MutexGuard<'_, Connection>> {
         self.connection.lock().map_err(|_| StoreError::LockPoisoned)
     }
@@ -857,6 +891,66 @@ fn evict_decisions(transaction: &Transaction<'_>, limit: usize) -> StoreResult<u
         .map_err(sqlite_error)
 }
 
+fn set_credential_enabled_tx(
+    transaction: &Transaction<'_>,
+    credential_id: &str,
+    enabled: bool,
+    updated_at: Timestamp,
+) -> StoreResult<CredentialState> {
+    let old = transaction
+        .query_row(
+            "SELECT credential_id, provider_id, enabled, updated_at, revision
+             FROM credentials WHERE credential_id = ?1",
+            [credential_id],
+            credential_from_row,
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
+    if old.enabled == enabled {
+        return Ok(old);
+    }
+    let revision = old.revision.saturating_add(1);
+    transaction
+        .execute(
+            "UPDATE credentials SET enabled = ?1, updated_at = ?2, revision = ?3
+             WHERE credential_id = ?4",
+            params![
+                i64::from(enabled),
+                updated_at,
+                i64::try_from(revision).unwrap_or(i64::MAX),
+                credential_id
+            ],
+        )
+        .map_err(sqlite_error)?;
+    if enabled {
+        transaction
+            .execute(
+                "UPDATE credential_health SET status = 'healthy', cooldown_until = NULL,
+                 updated_at = ?1 WHERE credential_id = ?2 AND status = 'disabled'",
+                params![updated_at, credential_id],
+            )
+            .map_err(sqlite_error)?;
+    } else {
+        transaction
+            .execute(
+                "INSERT INTO credential_health
+                 (credential_id, status, failure_count, cooldown_until, updated_at)
+                 VALUES (?1, 'disabled', 0, NULL, ?2)
+                 ON CONFLICT(credential_id) DO UPDATE SET
+                   status = 'disabled', cooldown_until = NULL, updated_at = excluded.updated_at",
+                params![credential_id, updated_at],
+            )
+            .map_err(sqlite_error)?;
+    }
+    Ok(CredentialState {
+        enabled,
+        updated_at,
+        revision,
+        ..old
+    })
+}
+
 fn evict_cooldowns(transaction: &Transaction<'_>) -> StoreResult<()> {
     transaction
         .execute(
@@ -952,57 +1046,17 @@ impl Store for SqliteStore {
     ) -> StoreResult<CredentialState> {
         non_empty("credential_id", credential_id)?;
         self.with_transaction(|transaction| {
-            let old: Option<CredentialState> = transaction
-                .query_row(
-                    "SELECT credential_id, provider_id, enabled, updated_at, revision
-                     FROM credentials WHERE credential_id = ?1",
-                    [credential_id],
-                    credential_from_row,
-                )
-                .optional()
-                .map_err(sqlite_error)?;
-            let old =
-                old.ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
-            let revision = old.revision.saturating_add(1);
-            transaction
-                .execute(
-                    "UPDATE credentials SET enabled = ?1, updated_at = ?2, revision = ?3
-                     WHERE credential_id = ?4",
-                    params![
-                        i64::from(enabled),
-                        updated_at,
-                        i64::try_from(revision).unwrap_or(i64::MAX),
-                        credential_id
-                    ],
-                )
-                .map_err(sqlite_error)?;
-            if !enabled {
-                transaction
-                    .execute(
-                        "INSERT INTO credential_health
-                         (credential_id, status, failure_count, cooldown_until, updated_at)
-                         VALUES (?1, 'disabled', 0, NULL, ?2)
-                         ON CONFLICT(credential_id) DO UPDATE SET
-                           status = 'disabled', cooldown_until = NULL, updated_at = excluded.updated_at",
-                        params![credential_id, updated_at],
-                    )
-                    .map_err(sqlite_error)?;
-            } else {
-                transaction
-                    .execute(
-                        "UPDATE credential_health SET status = 'healthy', cooldown_until = NULL,
-                         updated_at = ?1 WHERE credential_id = ?2 AND status = 'disabled'",
-                        params![updated_at, credential_id],
-                    )
-                    .map_err(sqlite_error)?;
-            }
-            Ok(CredentialState {
-                enabled,
-                updated_at,
-                revision,
-                ..old
-            })
+            set_credential_enabled_tx(transaction, credential_id, enabled, updated_at)
         })
+    }
+
+    fn switch_credential(
+        &self,
+        selected: &str,
+        siblings: &[String],
+        updated_at: Timestamp,
+    ) -> StoreResult<Vec<CredentialState>> {
+        SqliteStore::switch_credential(self, selected, siblings, updated_at)
     }
 
     fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool> {
@@ -1400,6 +1454,68 @@ mod tests {
             created_at,
             expires_at,
         )
+    }
+
+    #[test]
+    fn account_switch_is_atomic_and_survives_reopen() {
+        let directory = private_tempdir();
+        let path = directory.path().join("switch.sqlite");
+        {
+            let store = SqliteStore::open(&path).expect("open store");
+            store
+                .upsert_credential_state(CredentialState::new("primary", "provider", false, 1))
+                .expect("primary");
+            store
+                .upsert_credential_state(CredentialState::new("backup", "provider", true, 1))
+                .expect("backup");
+            store
+                .switch_credential("primary", &["backup".to_owned()], 2)
+                .expect("switch");
+        }
+        let reopened = SqliteStore::open(&path).expect("reopen store");
+        assert!(
+            reopened
+                .credential_state("primary")
+                .expect("primary state")
+                .expect("primary exists")
+                .enabled
+        );
+        assert!(
+            !reopened
+                .credential_state("backup")
+                .expect("backup state")
+                .expect("backup exists")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn account_switch_rolls_back_when_any_sibling_is_missing() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        store
+            .upsert_credential_state(CredentialState::new("primary", "provider", false, 1))
+            .expect("primary");
+        store
+            .upsert_credential_state(CredentialState::new("backup", "provider", true, 1))
+            .expect("backup");
+        let error = store
+            .switch_credential("primary", &["backup".to_owned(), "missing".to_owned()], 2)
+            .expect_err("missing sibling must roll back");
+        assert_eq!(error, StoreError::CredentialNotFound("missing".to_owned()));
+        assert!(
+            !store
+                .credential_state("primary")
+                .expect("primary state")
+                .expect("primary exists")
+                .enabled
+        );
+        assert!(
+            store
+                .credential_state("backup")
+                .expect("backup state")
+                .expect("backup exists")
+                .enabled
+        );
     }
 
     #[test]

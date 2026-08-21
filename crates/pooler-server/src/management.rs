@@ -1,10 +1,10 @@
-//! Read-only management HTTP responses.
+//! Authenticated management HTTP responses.
 //!
 //! The management surface is intentionally separate from inference routes.
-//! It accepts no request body, exposes only immutable plans and redacted
-//! mutable state, and never resolves or serializes credential references.
+//! It exposes immutable plans and redacted mutable state, accepts only bounded
+//! body-free control operations, and never serializes credential references.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -13,6 +13,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -25,11 +26,12 @@ use hyper::{body::Incoming, service::service_fn, Request};
 use hyper_util::rt::TokioIo;
 use pooler_auth::{bearer_authorization_matches, SecretRef as RuntimeSecretRef};
 use pooler_config::{CompiledConfig, ManagementPlan};
-use pooler_http::PoolingCoordinator;
+use pooler_http::{PoolError, PoolingCoordinator};
 use pooler_store::{CredentialHealthState, CredentialHealthStatus, CredentialState};
 use serde_json::{json, Value};
 use tokio::{
     net::{TcpListener, UnixListener},
+    sync::{mpsc, Notify},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -40,6 +42,7 @@ use crate::{merged_model_catalog_value, CatalogRuntime, ConfigSnapshot, ConfigSt
 
 const DEFAULT_DECISION_LIMIT: usize = 20;
 const MAX_DECISION_LIMIT: usize = 100;
+const MAX_MANAGEMENT_AUDIT_EVENTS: usize = 256;
 const LOOPBACK_HOST_ERROR: &str =
     "management Host header must name localhost or a loopback address";
 
@@ -236,6 +239,84 @@ fn management_request_host_allowed(
     value.to_str().ok().is_some_and(safe_loopback_host_value)
 }
 
+fn management_origin_allowed(headers: &HeaderMap) -> bool {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let Some(origin) = origins.next() else {
+        return true;
+    };
+    if origins.next().is_some() {
+        return false;
+    }
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    origin
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<Uri>().ok())
+        .and_then(|uri| {
+            uri.authority()
+                .map(|authority| authority.as_str().to_owned())
+        })
+        .is_some_and(|authority| authority.eq_ignore_ascii_case(host))
+}
+
+fn percent_decode_path(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            let hex = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            decoded.push(hex(high)?.checked_mul(16)?.checked_add(hex(low)?)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn management_account_action(path: &str) -> Option<(String, &str)> {
+    let suffix = path.strip_prefix("/accounts/")?;
+    let (account, action) = suffix.rsplit_once('/')?;
+    let account = percent_decode_path(account)?;
+    (!account.is_empty()
+        && account.len() <= 128
+        && !account.contains('/')
+        && matches!(
+            action,
+            "enable" | "disable" | "switch" | "refresh" | "revoke"
+        ))
+    .then_some((account, action))
+}
+
+fn management_model_action(path: &str) -> Option<(String, &str)> {
+    let suffix = path.strip_prefix("/models/")?;
+    for action in ["enable", "disable"] {
+        if let Some(model) = suffix.strip_suffix(&format!("/{action}")) {
+            let model = model
+                .split('/')
+                .map(percent_decode_path)
+                .collect::<Option<Vec<_>>>()?
+                .join("/");
+            return (!model.is_empty() && model.len() <= 256).then_some((model, action));
+        }
+    }
+    None
+}
+
 fn management_bind_is_loopback(value: &str) -> bool {
     if value.starts_with('/') || value.starts_with("unix:") {
         return false;
@@ -305,7 +386,25 @@ pub(crate) struct ManagementSnapshot {
     pub(crate) pooling: Arc<PoolingCoordinator>,
 }
 
-/// Read-only management API backed by an immutable configuration store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeAccountAction {
+    Refresh,
+    Revoke,
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeAccountCommand {
+    pub(crate) account: String,
+    pub(crate) action: NativeAccountAction,
+}
+
+pub(crate) struct ManagementRuntimeServices {
+    pub(crate) metrics: pooler_observe::MetricsRegistry,
+    pub(crate) traces: pooler_observe::TraceRecorder,
+    pub(crate) native_commands: mpsc::Sender<NativeAccountCommand>,
+}
+
+/// Secure management API backed by immutable plans and bounded mutable state.
 #[derive(Clone)]
 pub struct ManagementApi {
     plan: ManagementPlan,
@@ -313,6 +412,10 @@ pub struct ManagementApi {
     runtime_dispatch: Option<Arc<ArcSwap<RuntimeGeneration>>>,
     catalog: Option<Arc<CatalogRuntime>>,
     metrics: pooler_observe::MetricsRegistry,
+    traces: pooler_observe::TraceRecorder,
+    audit: Arc<Mutex<VecDeque<Value>>>,
+    reload: Arc<Notify>,
+    native_commands: Option<mpsc::Sender<NativeAccountCommand>>,
     active: ActiveCounts,
 }
 
@@ -367,6 +470,10 @@ impl ManagementApi {
             runtime_dispatch: None,
             catalog: None,
             metrics,
+            traces: pooler_observe::TraceRecorder::default(),
+            audit: Arc::new(Mutex::new(VecDeque::new())),
+            reload: Arc::new(Notify::new()),
+            native_commands: None,
             active,
         }
     }
@@ -392,7 +499,7 @@ impl ManagementApi {
         pooling: Arc<PoolingCoordinator>,
         runtime_dispatch: Arc<ArcSwap<RuntimeGeneration>>,
         active: ActiveCounts,
-        metrics: pooler_observe::MetricsRegistry,
+        services: ManagementRuntimeServices,
     ) -> Self {
         let generation = pooler_core::ConfigGeneration::new(config.generation());
         Self {
@@ -403,9 +510,30 @@ impl ManagementApi {
             })),
             runtime_dispatch: Some(runtime_dispatch),
             catalog: None,
-            metrics,
+            metrics: services.metrics,
+            traces: services.traces,
+            audit: Arc::new(Mutex::new(VecDeque::new())),
+            reload: Arc::new(Notify::new()),
+            native_commands: Some(services.native_commands),
             active,
         }
+    }
+
+    pub(crate) fn record_native_result(
+        &self,
+        action: NativeAccountAction,
+        account: &str,
+        succeeded: bool,
+    ) {
+        let action = match action {
+            NativeAccountAction::Refresh => "refresh",
+            NativeAccountAction::Revoke => "revoke",
+        };
+        self.record_audit(
+            action,
+            Some(account),
+            if succeeded { "succeeded" } else { "failed" },
+        );
     }
 
     /// Shared activity counters used by the serving runtime.
@@ -418,6 +546,244 @@ impl ManagementApi {
     #[must_use]
     pub fn metrics(&self) -> pooler_observe::MetricsRegistry {
         self.metrics.clone()
+    }
+
+    pub(crate) fn reload_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.reload)
+    }
+
+    fn record_audit(&self, action: &str, subject: Option<&str>, outcome: &str) {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            });
+        let mut event = json!({
+            "timestamp_ms": timestamp_ms,
+            "action": action,
+            "outcome": outcome,
+        });
+        if let Some(subject) = subject {
+            event["subject"] = Value::String(subject.to_owned());
+        }
+        let event = pooler_observe::RedactionPolicy::strict().sanitize_json(&event);
+        let mut audit = self
+            .audit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        audit.push_back(event);
+        while audit.len() > MAX_MANAGEMENT_AUDIT_EVENTS {
+            audit.pop_front();
+        }
+    }
+
+    fn mutate_account(
+        &self,
+        path: &str,
+        snapshot: &ConfigSnapshot<CompiledConfig>,
+        pooling: &PoolingCoordinator,
+    ) -> ManagementResponse {
+        let Some((account, action)) = management_account_action(path) else {
+            return ManagementResponse::json(
+                StatusCode::NOT_FOUND,
+                json!({"error": "management endpoint not found"}),
+                false,
+            );
+        };
+        let Some(account_plan) = snapshot.config().accounts().get(account.as_str()) else {
+            self.record_audit(action, Some(&account), "not_found");
+            return ManagementResponse::json(
+                StatusCode::NOT_FOUND,
+                json!({"error": "configured account not found"}),
+                false,
+            );
+        };
+        if matches!(action, "refresh" | "revoke") {
+            if account_plan.auth_kind() != pooler_config::AccountAuthKind::OAuth {
+                self.record_audit(action, Some(&account), "unsupported_auth_kind");
+                return ManagementResponse::json(
+                    StatusCode::CONFLICT,
+                    json!({"error": "account does not use OAuth credentials"}),
+                    false,
+                );
+            }
+            let Some(commands) = self.native_commands.as_ref() else {
+                self.record_audit(action, Some(&account), "unavailable");
+                return state_unavailable();
+            };
+            let command = NativeAccountCommand {
+                account: account.clone(),
+                action: if action == "refresh" {
+                    NativeAccountAction::Refresh
+                } else {
+                    NativeAccountAction::Revoke
+                },
+            };
+            return match commands.try_send(command) {
+                Ok(()) => {
+                    self.record_audit(action, Some(&account), "queued");
+                    ManagementResponse::json(
+                        StatusCode::ACCEPTED,
+                        json!({
+                            "generation": snapshot.generation().value(),
+                            "account": account,
+                            "action": action,
+                            "status": "queued"
+                        }),
+                        false,
+                    )
+                }
+                Err(_) => {
+                    self.record_audit(action, Some(&account), "queue_unavailable");
+                    state_unavailable()
+                }
+            };
+        }
+        let result = match action {
+            "enable" => pooling.set_account_enabled(&account, true),
+            "disable" => pooling.set_account_enabled(&account, false),
+            "switch" => pooling.switch_account(&account),
+            _ => unreachable!("validated account action"),
+        };
+        match result {
+            Ok(()) => {
+                self.record_audit(action, Some(&account), "succeeded");
+                ManagementResponse::json(
+                    StatusCode::OK,
+                    json!({
+                        "generation": snapshot.generation().value(),
+                        "account": account,
+                        "action": action,
+                        "status": "ok"
+                    }),
+                    false,
+                )
+            }
+            Err(PoolError::InvalidCredential) => {
+                self.record_audit(action, Some(&account), "not_found");
+                ManagementResponse::json(
+                    StatusCode::NOT_FOUND,
+                    json!({"error": "configured account not found"}),
+                    false,
+                )
+            }
+            Err(_) => {
+                self.record_audit(action, Some(&account), "failed");
+                state_unavailable()
+            }
+        }
+    }
+
+    fn mutate_model(
+        &self,
+        path: &str,
+        snapshot: &ConfigSnapshot<CompiledConfig>,
+        pooling: &PoolingCoordinator,
+        catalog: Option<&CatalogRuntime>,
+    ) -> ManagementResponse {
+        let Some((model, action)) = management_model_action(path) else {
+            return ManagementResponse::json(
+                StatusCode::NOT_FOUND,
+                json!({"error": "management endpoint not found"}),
+                false,
+            );
+        };
+        let known = merged_model_catalog_value(snapshot.config(), catalog)
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(|models| {
+                models
+                    .iter()
+                    .any(|entry| entry.get("id").and_then(Value::as_str) == Some(model.as_str()))
+            });
+        if !known {
+            self.record_audit(action, Some(&model), "not_found");
+            return ManagementResponse::json(
+                StatusCode::NOT_FOUND,
+                json!({"error": "published model not found"}),
+                false,
+            );
+        }
+        let enabled = action == "enable";
+        match pooling.set_model_enabled(&model, enabled) {
+            Ok(()) => {
+                self.record_audit(action, Some(&model), "succeeded");
+                ManagementResponse::json(
+                    StatusCode::OK,
+                    json!({
+                        "generation": snapshot.generation().value(),
+                        "model": model,
+                        "enabled": enabled,
+                        "status": "ok"
+                    }),
+                    false,
+                )
+            }
+            Err(PoolError::InvalidModel) => ManagementResponse::json(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "invalid model identifier"}),
+                false,
+            ),
+            Err(_) => state_unavailable(),
+        }
+    }
+
+    fn traces(&self, generation: u64) -> ManagementResponse {
+        let snapshot = self.traces.snapshot();
+        ManagementResponse::json(
+            StatusCode::OK,
+            json!({
+                "generation": generation,
+                "traces": snapshot.records,
+                "dropped": snapshot.dropped
+            }),
+            false,
+        )
+    }
+
+    fn audit(&self, generation: u64) -> ManagementResponse {
+        let audit = self
+            .audit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        ManagementResponse::json(
+            StatusCode::OK,
+            json!({"generation": generation, "events": audit}),
+            false,
+        )
+    }
+
+    fn export(
+        &self,
+        snapshot: &ConfigSnapshot<CompiledConfig>,
+        pooling: &PoolingCoordinator,
+        catalog: Option<&CatalogRuntime>,
+    ) -> ManagementResponse {
+        let value = json!({
+            "schema_version": 1,
+            "generation": snapshot.generation().value(),
+            "health": response_value(self.health(snapshot, pooling)),
+            "listeners": response_value(self.listeners(snapshot)),
+            "routes": response_value(self.routes(snapshot)),
+            "providers": response_value(self.providers(snapshot, pooling)),
+            "accounts": response_value(self.accounts(snapshot, pooling)),
+            "quota": response_value(self.quota(snapshot, pooling)),
+            "models": response_value(self.models(snapshot, catalog, pooling)),
+            "catalog": response_value(self.catalog(snapshot, catalog)),
+            "metrics": self.metrics.snapshot(),
+            "traces": self.traces.snapshot(),
+            "audit": self.audit.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter().cloned().collect::<Vec<_>>(),
+        });
+        ManagementResponse::json(
+            StatusCode::OK,
+            pooler_observe::RedactionPolicy::strict().sanitize_json(&value),
+            false,
+        )
     }
 
     /// Attach an injected catalog to a standalone management API.
@@ -457,16 +823,22 @@ impl ManagementApi {
             .unwrap_or_else(|| uri.as_ref().map_or(path_and_query, Uri::path));
         let path = if path.is_empty() { "/" } else { path };
         let head = *method == Method::HEAD;
+        let mutation = *method == Method::POST
+            && (path == "/reload"
+                || path == "/models/reload"
+                || management_account_action(path).is_some()
+                || management_model_action(path).is_some());
         let ui_asset = management_ui::asset(path).is_some() || (management_prefix && path == "/");
-        if *method != Method::GET && !head {
+        if *method != Method::GET && !head && !mutation {
             let mut response = ManagementResponse::json(
                 StatusCode::METHOD_NOT_ALLOWED,
-                json!({"error": "management endpoint is read-only"}),
+                json!({"error": "management method is not supported"}),
                 false,
             );
-            response
-                .headers
-                .insert(header::ALLOW, header::HeaderValue::from_static("GET, HEAD"));
+            response.headers.insert(
+                header::ALLOW,
+                header::HeaderValue::from_static("GET, HEAD, POST"),
+            );
             return response;
         }
         if !management_request_host_allowed(self, ui_asset, headers) {
@@ -477,7 +849,40 @@ impl ManagementApi {
             );
         }
         let local_ui_shell = ui_asset && management_bind_is_loopback(self.bind());
+        if mutation
+            && headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length != 0)
+        {
+            self.record_audit(path, None, "rejected_body");
+            return ManagementResponse::json(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error": "management mutations do not accept request bodies"}),
+                false,
+            );
+        }
+        if mutation && !management_origin_allowed(headers) {
+            self.record_audit(path, None, "rejected_origin");
+            return ManagementResponse::json(
+                StatusCode::FORBIDDEN,
+                json!({"error": "management mutation Origin does not match Host"}),
+                false,
+            );
+        }
+        if mutation && self.plan.auth().is_none() {
+            self.record_audit(path, None, "authentication_not_configured");
+            return ManagementResponse::json(
+                StatusCode::FORBIDDEN,
+                json!({"error": "management mutations require configured bearer authentication"}),
+                false,
+            );
+        }
         if !local_ui_shell && !self.authorized(headers) {
+            if mutation {
+                self.record_audit(path, None, "unauthorized");
+            }
             let mut response = ManagementResponse::json(
                 StatusCode::UNAUTHORIZED,
                 json!({"error": "management authentication required"}),
@@ -511,20 +916,20 @@ impl ManagementApi {
             .as_ref()
             .and_then(|runtime| runtime.catalog.clone())
             .or_else(|| self.catalog.clone());
+        let asset = if path == "/" && management_prefix {
+            management_ui::asset("/ui")
+        } else {
+            management_ui::asset(path)
+        };
+        if let Some((content_type, body)) = asset {
+            return ManagementResponse::asset(StatusCode::OK, content_type, body, head);
+        }
         let response = match path {
-            "/" if management_prefix => {
-                let (content_type, body) = management_ui::asset("/ui").expect("UI asset");
-                ManagementResponse::asset(StatusCode::OK, content_type, body, head)
-            }
-            path if management_ui::asset(path).is_some() => {
-                let (content_type, body) = management_ui::asset(path).expect("asset exists");
-                ManagementResponse::asset(StatusCode::OK, content_type, body, head)
-            }
             "/health" | "/healthz" | "/" => self.health(snapshot, pooling),
             "/config" | "/config/generation" => self.config_generation(snapshot),
             "/listeners" => self.listeners(snapshot),
             "/routes" => self.routes(snapshot),
-            "/models" => self.models(snapshot, catalog.as_deref()),
+            "/models" => self.models(snapshot, catalog.as_deref(), pooling),
             "/catalog" | "/catalog/sources" => self.catalog(snapshot, catalog.as_deref()),
             "/health/providers" | "/providers/health" => self.providers(snapshot, pooling),
             "/health/credentials" | "/credentials/health" => self.credentials(snapshot, pooling),
@@ -541,6 +946,27 @@ impl ManagementApi {
             "/decisions" | "/decisions/recent" => {
                 let limit = uri.as_ref().and_then(|uri| uri.query()).map(parse_limit);
                 self.decisions(limit, snapshot.generation().value(), pooling)
+            }
+            "/traces" => self.traces(snapshot.generation().value()),
+            "/audit" => self.audit(snapshot.generation().value()),
+            "/export" => self.export(snapshot, pooling, catalog.as_deref()),
+            "/reload" | "/models/reload" if mutation => {
+                self.reload.notify_one();
+                self.record_audit(path, None, "accepted");
+                ManagementResponse::json(
+                    StatusCode::ACCEPTED,
+                    json!({
+                        "generation": snapshot.generation().value(),
+                        "status": "reload_requested"
+                    }),
+                    false,
+                )
+            }
+            path if management_account_action(path).is_some() && mutation => {
+                self.mutate_account(path, snapshot, pooling)
+            }
+            path if management_model_action(path).is_some() && mutation => {
+                self.mutate_model(path, snapshot, pooling, catalog.as_deref())
             }
             _ => ManagementResponse::json(
                 StatusCode::NOT_FOUND,
@@ -688,12 +1114,17 @@ impl ManagementApi {
         &self,
         snapshot: &ConfigSnapshot<CompiledConfig>,
         catalog: Option<&CatalogRuntime>,
+        pooling: &PoolingCoordinator,
     ) -> ManagementResponse {
-        ManagementResponse::json(
-            StatusCode::OK,
-            merged_model_catalog_value(snapshot.config(), catalog),
-            false,
-        )
+        let mut value = merged_model_catalog_value(snapshot.config(), catalog);
+        if let Some(models) = value.get_mut("models").and_then(Value::as_array_mut) {
+            for model in models {
+                if let Some(id) = model.get("id").and_then(Value::as_str) {
+                    model["enabled"] = Value::Bool(pooling.model_enabled(id).unwrap_or(false));
+                }
+            }
+        }
+        ManagementResponse::json(StatusCode::OK, value, false)
     }
 
     fn catalog(
@@ -810,12 +1241,17 @@ impl ManagementApi {
             })
         })
         .collect::<Vec<_>>();
+        let windows = match pooling.quota_states() {
+            Ok(windows) => windows,
+            Err(_) => return state_unavailable(),
+        };
         ManagementResponse::json(
             StatusCode::OK,
             json!({
                 "configuration_generation": snapshot.generation().value(),
-                "active": entries.len(),
-                "entries": entries,
+                "active": windows.len(),
+                "windows": windows,
+                "cooldowns": entries,
             }),
             false,
         )
@@ -1282,6 +1718,11 @@ fn listener_protocol_name(protocol: pooler_config::ListenerProtocol) -> &'static
     }
 }
 
+fn response_value(response: ManagementResponse) -> Value {
+    serde_json::from_slice(&response.body)
+        .unwrap_or_else(|_| json!({"error": "management view serialization failed"}))
+}
+
 fn state_unavailable() -> ManagementResponse {
     ManagementResponse::json(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1403,6 +1844,15 @@ mod tests {
         ) -> StoreResult<CredentialState> {
             self.inner
                 .set_credential_enabled(credential_id, enabled, updated_at)
+        }
+
+        fn switch_credential(
+            &self,
+            selected: &str,
+            siblings: &[String],
+            updated_at: Timestamp,
+        ) -> StoreResult<Vec<CredentialState>> {
+            self.inner.switch_credential(selected, siblings, updated_at)
         }
 
         fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool> {
@@ -1603,7 +2053,7 @@ routes:
     }
 
     #[test]
-    fn management_ui_assets_are_read_only_and_hardened() {
+    fn management_ui_assets_are_authenticated_and_hardened() {
         let api = api();
         let headers = loopback_headers();
         let html = api.handle(&Method::GET, "/management/ui", &headers);
@@ -1646,7 +2096,11 @@ routes:
         let js_body = String::from_utf8_lossy(&js.body);
         assert!(js_body.contains("/management/metrics"));
         assert!(js_body.contains("cache: \"no-store\""));
-        assert!(!js_body.contains("method: \"POST\""));
+        assert!(js_body.contains("method: \"POST\""));
+        assert!(js_body.contains("Authorization"));
+        assert!(!js_body.contains("localStorage"));
+        assert!(!js_body.contains("sessionStorage"));
+        assert!(!js_body.contains("?token="));
     }
 
     #[test]
@@ -1755,7 +2209,9 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         let headers = loopback_headers();
         let response = api.handle(&Method::POST, "/routes", &headers);
         assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
-        assert!(String::from_utf8_lossy(&response.body).contains("read-only"));
+        assert!(String::from_utf8_lossy(&response.body).contains("not supported"));
+        let reload = api.handle(&Method::POST, "/reload", &headers);
+        assert_eq!(reload.status, StatusCode::FORBIDDEN);
 
         let guard = api.active_counts().enter("local");
         let active = api.handle(&Method::GET, "/active", &headers);
@@ -1763,6 +2219,114 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         drop(guard);
         let active = api.handle(&Method::GET, "/active", &headers);
         assert!(String::from_utf8_lossy(&active.body).contains("\"active\":0"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_account_controls_reload_audit_and_export_are_live_and_redacted() {
+        std::env::set_var("POOLER_MANAGEMENT_MUTATION_KEY", "mutation-secret");
+        let first_secret = tempfile::NamedTempFile::new().expect("first secret");
+        let second_secret = tempfile::NamedTempFile::new().expect("second secret");
+        std::fs::write(first_secret.path(), "first-account-secret").expect("write first");
+        std::fs::write(second_secret.path(), "second-account-secret").expect("write second");
+        #[cfg(unix)]
+        for path in [first_secret.path(), second_secret.path()] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("secret permissions");
+        }
+        let config = pooler_config::compile_yaml(
+            "management-mutation-test.yaml",
+            &format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:POOLER_MANAGEMENT_MUTATION_KEY}}}}\nupstreams: {{provider: {{url: http://127.0.0.1:1}}}}\naccounts:\n  alpha: {{provider: provider, secret: 'file:{}'}}\n  beta: {{provider: provider, secret: 'file:{}'}}\naccount_pools: {{accounts: {{accounts: [alpha, beta]}}}}\npolicies: {{accounts: {{selection: {{strategy: ordered_fallback, account_pool: accounts}}}}}}\nmodels: [{{id: public, targets: [{{provider: provider, upstream_model: public}}]}}]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nroutes: [{{id: route, listen: local, ingress: {{mode: patch}}, target: {{provider: provider, model_from: request.model, policy: accounts}}}}]\n",
+                first_secret.path().display(),
+                second_secret.path().display(),
+            ),
+        )
+        .expect("management mutation config");
+        let plan = config.management().cloned().expect("management plan");
+        let pooling = Arc::new(PoolingCoordinator::new(&config).expect("pooling"));
+        let store = Arc::new(ConfigStore::with_generation(
+            ConfigGeneration::new(config.generation()),
+            config,
+        ));
+        let api = ManagementApi::new(plan, store, pooling, ActiveCounts::new());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer mutation-secret"),
+        );
+
+        let mut cross_origin = headers.clone();
+        cross_origin.insert(
+            header::HOST,
+            header::HeaderValue::from_static("127.0.0.1:1"),
+        );
+        cross_origin.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("https://attacker.example"),
+        );
+        assert_eq!(
+            api.handle(&Method::POST, "/accounts/alpha/disable", &cross_origin)
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        let mut body_headers = headers.clone();
+        body_headers.insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_static("1"),
+        );
+        assert_eq!(
+            api.handle(&Method::POST, "/accounts/alpha/disable", &body_headers)
+                .status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let disabled = api.handle(&Method::POST, "/accounts/alpha/disable", &headers);
+        assert_eq!(disabled.status, StatusCode::OK);
+        let accounts = api.handle(&Method::GET, "/accounts", &headers);
+        let accounts: Value = serde_json::from_slice(&accounts.body).expect("accounts json");
+        let alpha = accounts["accounts"]
+            .as_array()
+            .expect("accounts")
+            .iter()
+            .find(|account| account["id"] == "alpha")
+            .expect("alpha");
+        assert_eq!(alpha["enabled"], false);
+
+        let model = api.handle(&Method::POST, "/models/public/disable", &headers);
+        assert_eq!(model.status, StatusCode::OK);
+        let models = api.handle(&Method::GET, "/models", &headers);
+        let models: Value = serde_json::from_slice(&models.body).expect("models json");
+        assert_eq!(models["models"][0]["enabled"], false);
+
+        let notifier = api.reload_notifier();
+        let reload = api.handle(&Method::POST, "/reload", &headers);
+        assert_eq!(reload.status, StatusCode::ACCEPTED);
+        tokio::time::timeout(std::time::Duration::from_secs(1), notifier.notified())
+            .await
+            .expect("reload notification");
+        api.traces.record(
+            pooler_observe::TraceRecord::new(pooler_observe::TraceStage::Attempt)
+                .route("route")
+                .provider("provider")
+                .attribute("authorization", "Bearer trace-secret"),
+        );
+        let traces = api.handle(&Method::GET, "/traces", &headers);
+        assert_eq!(traces.status, StatusCode::OK);
+        assert!(!String::from_utf8_lossy(&traces.body).contains("trace-secret"));
+
+        let audit = api.handle(&Method::GET, "/audit", &headers);
+        let audit: Value = serde_json::from_slice(&audit.body).expect("audit json");
+        assert_eq!(audit["events"].as_array().expect("events").len(), 5);
+        let export = api.handle(&Method::GET, "/export", &headers);
+        let export = String::from_utf8(export.body).expect("export utf8");
+        for secret in [
+            "mutation-secret",
+            "first-account-secret",
+            "second-account-secret",
+        ] {
+            assert!(!export.contains(secret));
+        }
+        std::env::remove_var("POOLER_MANAGEMENT_MUTATION_KEY");
     }
 
     #[test]

@@ -95,6 +95,60 @@ async fn semantic_multipart_preserves_wire_bytes_and_rejects_invalid_or_oversize
 }
 
 #[tokio::test]
+async fn native_media_surface_forwards_images_audio_files_batches_and_embeddings() {
+    let upstream = RecordingUpstream::start(200, b"ok").await;
+    let running = start_server(media_surface_config(upstream.address)).await;
+    let operations: [(&str, &str, &str, &[u8]); 7] = [
+        (
+            "POST",
+            "/v1/images/generations",
+            "application/json",
+            br#"{"prompt":"cat"}"#,
+        ),
+        (
+            "POST",
+            "/v1/audio/speech",
+            "application/json",
+            br#"{"input":"hello"}"#,
+        ),
+        ("POST", "/v1/files", "application/octet-stream", b"upload"),
+        (
+            "GET",
+            "/v1/files/file-1/content",
+            "application/octet-stream",
+            b"",
+        ),
+        (
+            "POST",
+            "/v1/batches",
+            "application/json",
+            br#"{"input_file_id":"file-1"}"#,
+        ),
+        ("GET", "/v1/batches/batch-1", "application/json", b""),
+        (
+            "POST",
+            "/v1/embeddings",
+            "application/json",
+            br#"{"model":"embed","input":"hello"}"#,
+        ),
+    ];
+    for (method, path, content_type, body) in operations {
+        let response =
+            send_method_request(running.address, method, path, content_type, body, "").await;
+        assert_eq!(response_status(&response), 200, "{method} {path}");
+    }
+
+    upstream.wait_for_attempts(operations.len()).await;
+    let requests = upstream.requests();
+    for ((method, path, _, body), request) in operations.into_iter().zip(requests) {
+        assert!(request.starts_with(format!("{method} {path} HTTP/1.1").as_bytes()));
+        assert_eq!(http_body(&request), body);
+    }
+    running.stop().await;
+    upstream.stop().await;
+}
+
+#[tokio::test]
 async fn opaque_streaming_upload_is_never_retried_after_upstream_consumes_it() {
     let secret_directory = tempfile::tempdir().expect("secret directory");
     let first_secret = write_secret(secret_directory.path(), "first", "media-first");
@@ -148,6 +202,16 @@ fn opaque_config(
         ),
     )
     .expect("raw media config")
+}
+
+fn media_surface_config(upstream: SocketAddr) -> CompiledConfig {
+    compile_yaml(
+        "media-surface-runtime.yaml",
+        &format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream}}}}}\nroutes:\n  - {{id: images, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/images}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [images]}}, response: {{mode: opaque}}}}\n  - {{id: audio, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/audio}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [audio]}}, response: {{mode: opaque}}}}\n  - {{id: files, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/files}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [files]}}, response: {{mode: opaque}}}}\n  - {{id: batches, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/batches}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [batch]}}, response: {{mode: opaque}}}}\n  - {{id: embeddings, listen: local, match: {{method: POST, path: /v1/embeddings}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [text, embeddings]}}, response: {{mode: opaque}}}}\n"
+        ),
+    )
+    .expect("media surface config")
 }
 
 fn multipart_config(upstream: SocketAddr, body_limit: usize) -> CompiledConfig {
@@ -284,12 +348,23 @@ async fn send_request(
     body: &[u8],
     extra_headers: &str,
 ) -> Vec<u8> {
+    send_method_request(address, "POST", path, content_type, body, extra_headers).await
+}
+
+async fn send_method_request(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &str,
+) -> Vec<u8> {
     let mut stream = timeout(TEST_TIMEOUT, TcpStream::connect(address))
         .await
         .expect("proxy connect timeout")
         .expect("proxy connection");
     let headers = format!(
-        "POST {path} HTTP/1.1\r\nHost: media.test\r\nContent-Type: {content_type}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: media.test\r\nContent-Type: {content_type}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream

@@ -17,7 +17,10 @@ mod mode;
 
 pub use capabilities::{Capability, CapabilitySet};
 pub use context::{DownstreamIdentity, Extensions, IdentityError, RequestContext};
-pub use dialect::{ModelDialect, ParamSupport};
+pub use dialect::{
+    FactSupport, InterleavedReasoningField, ModelDialect, ModelEndpointVariants, ModelModalities,
+    ModelProfile, ModelRequestTransform, ParamSupport, ReasoningEffortSupport, TokenLimitField,
+};
 pub use error::{
     ErrorClass, ErrorClassification, ErrorScope, PoolerError, PoolerResult, ReplaySafety,
     Retryability,

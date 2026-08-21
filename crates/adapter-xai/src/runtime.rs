@@ -13,7 +13,7 @@ use http_body_util::BodyExt;
 use pooler_config::RoutePlan;
 use pooler_http::{
     BoxError, ProxyBody, SelectionContext, SemanticAdapter, SemanticRequestBody,
-    SemanticResponseBody, SseEncoder, SseEvent, SseLimits, SseParser,
+    SemanticResponseBody, SemanticWebSocketTransport, SseEncoder, SseEvent, SseLimits, SseParser,
 };
 use pooler_protocol::{
     EncodedResponsesEvent, ExtensionKey, LossPolicy, OpenAiResponsesCodec,
@@ -106,6 +106,14 @@ impl SemanticAdapter for XaiSemanticAdapter {
             context.with_codec(codec);
         }
         Ok(context)
+    }
+
+    fn websocket_transport(&self, route: &RoutePlan) -> Option<SemanticWebSocketTransport> {
+        matches!(
+            route_wires(route),
+            Some((RequestWire::Responses, EventWire::Responses))
+        )
+        .then_some(SemanticWebSocketTransport::XaiResponses)
     }
 
     fn decode_response(

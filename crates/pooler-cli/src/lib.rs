@@ -1,11 +1,12 @@
 //! Pooler's command-line interface.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use pooler_auth::MemoryOAuthTokenStore;
 use pooler_config::{Config, ConfigCandidate, ConfigWatcher};
 use pooler_http::{NativeRuntime, PoolingCoordinator};
 use pooler_store::{SqliteOAuthTokenStore, SqliteStore};
@@ -239,13 +240,13 @@ fn fixture_report(
     Ok(())
 }
 
-fn load(path: &PathBuf) -> Result<pooler_config::CompiledConfig> {
+fn load(path: &Path) -> Result<pooler_config::CompiledConfig> {
     Config::from_path(path)?.compile().map_err(Into::into)
 }
 
 fn models(
-    path: &PathBuf,
-    explicit_store_path: Option<&std::path::Path>,
+    path: &Path,
+    explicit_store_path: Option<&Path>,
     credential_key_ref: Option<&str>,
     json: bool,
 ) -> Result<()> {
@@ -281,8 +282,8 @@ fn models(
 }
 
 fn serve(
-    path: &PathBuf,
-    explicit_store_path: Option<&std::path::Path>,
+    path: &Path,
+    explicit_store_path: Option<&Path>,
     credential_key_ref: Option<&str>,
     watch: bool,
 ) -> Result<()> {
@@ -355,6 +356,7 @@ async fn reload_loop(
 ) -> Result<()> {
     let mut interval = tokio::time::interval(pooler_config::DEFAULT_RELOAD_POLL_INTERVAL);
     let cancellation = server.cancellation_token();
+    let management_reload = server.management_reload_notifier();
     #[cfg(unix)]
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .context("failed to install SIGHUP handler")?;
@@ -368,11 +370,23 @@ async fn reload_loop(
                 signal.context("SIGHUP handler failed")?;
                 ReloadTrigger::Manual
             }
+            _ = async {
+                match management_reload.as_ref() {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => ReloadTrigger::Manual,
         };
         #[cfg(not(unix))]
         let event = tokio::select! {
             _ = cancellation.cancelled() => return Ok(()),
             _ = interval.tick(), if watch => ReloadTrigger::Watch,
+            _ = async {
+                match management_reload.as_ref() {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => ReloadTrigger::Manual,
         };
 
         let candidate = {
@@ -460,9 +474,21 @@ fn runtime_resources(
             .native()
             .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
     });
-    if explicit_store_path.is_none() && !has_codex {
+    let has_native = config
+        .upstreams()
+        .values()
+        .any(|upstream| upstream.native().is_some());
+    let persistence_requested = explicit_store_path.is_some()
+        || credential_key_ref.is_some()
+        || std::env::var_os("POOLER_CREDENTIAL_STORE").is_some();
+    if !persistence_requested && !has_codex {
+        let native = if has_native {
+            NativeRuntime::new(config, Arc::new(MemoryOAuthTokenStore::new()))?
+        } else {
+            NativeRuntime::disabled()
+        };
         return Ok(RuntimeResources {
-            native: Arc::new(NativeRuntime::disabled()),
+            native: Arc::new(native),
             pooling: Arc::new(PoolingCoordinator::new(config)?),
         });
     }
@@ -479,6 +505,11 @@ fn runtime_resources(
     let native = if has_codex {
         let token_store = Arc::new(SqliteOAuthTokenStore::new(store));
         Arc::new(NativeRuntime::new_with_sqlite(config, token_store)?)
+    } else if has_native {
+        Arc::new(NativeRuntime::new(
+            config,
+            Arc::new(MemoryOAuthTokenStore::new()),
+        )?)
     } else {
         Arc::new(NativeRuntime::disabled())
     };
@@ -541,6 +572,54 @@ mod tests {
         let cli = Cli::try_parse_from(["pooler", "models", "--json"])
             .expect("models JSON command should parse");
         assert!(matches!(cli.command, Command::Models { json: true }));
+    }
+
+    #[test]
+    fn configured_native_runtime_does_not_require_a_credential_store() {
+        let config = pooler_config::compile_yaml(
+            "cli-configured-native.yaml",
+            "version: 1\nupstreams:\n  xai:\n    url: http://127.0.0.1:1\n    native: {kind: xai}\n",
+        )
+        .expect("configured native config");
+
+        let resources = runtime_resources(&config, None, None).expect("runtime resources");
+        assert!(resources.native.supports(&config.upstreams()["xai"]));
+    }
+
+    #[test]
+    fn explicit_credential_store_preserves_pooling_for_configured_native() {
+        let directory = tempfile::tempdir().expect("temporary store directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("store directory permissions");
+        }
+        let key_path = directory.path().join("store-key");
+        std::fs::write(&key_path, b"cli-configured-native-key").expect("key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("key file permissions");
+        }
+        let store_path = directory.path().join("credentials.sqlite3");
+        let config = pooler_config::compile_yaml(
+            "cli-configured-native-persistent.yaml",
+            r#"
+version: 1
+upstreams:
+  xai:
+    url: http://127.0.0.1:1
+    native: {kind: xai}
+"#,
+        )
+        .expect("configured native config");
+        let key_reference = format!("file:{}", key_path.display());
+        let resources = runtime_resources(&config, Some(&store_path), Some(&key_reference))
+            .expect("runtime resources");
+        assert!(resources.native.supports(&config.upstreams()["xai"]));
+        assert!(store_path.is_file());
     }
 
     #[test]

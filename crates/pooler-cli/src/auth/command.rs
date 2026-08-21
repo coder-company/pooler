@@ -60,10 +60,30 @@ pub enum AuthCommand {
         /// Restrict output to one configured provider.
         provider: Option<String>,
     },
-    /// Revoke local credential metadata for one provider.
+    /// Refresh one configured OAuth account.
+    Refresh {
+        /// Account ID, or a provider with exactly one OAuth account.
+        account: String,
+    },
+    /// Revoke one configured account and remove its local credential state.
     Revoke {
-        /// Provider whose local credential should be removed.
-        provider: String,
+        /// Account ID, or a provider with exactly one account.
+        account: String,
+    },
+    /// Enable one configured account for selection.
+    Enable {
+        /// Configured account ID.
+        account: String,
+    },
+    /// Disable one configured account from selection.
+    Disable {
+        /// Configured account ID.
+        account: String,
+    },
+    /// Select one account and disable its siblings for the same provider.
+    Switch {
+        /// Configured account ID to select.
+        account: String,
     },
 }
 
@@ -105,9 +125,25 @@ impl fmt::Debug for AuthCommand {
                 .debug_struct("Status")
                 .field("provider", provider)
                 .finish(),
-            Self::Revoke { provider } => formatter
+            Self::Refresh { account } => formatter
+                .debug_struct("Refresh")
+                .field("account", account)
+                .finish(),
+            Self::Revoke { account } => formatter
                 .debug_struct("Revoke")
-                .field("provider", provider)
+                .field("account", account)
+                .finish(),
+            Self::Enable { account } => formatter
+                .debug_struct("Enable")
+                .field("account", account)
+                .finish(),
+            Self::Disable { account } => formatter
+                .debug_struct("Disable")
+                .field("account", account)
+                .finish(),
+            Self::Switch { account } => formatter
+                .debug_struct("Switch")
+                .field("account", account)
                 .finish(),
         }
     }
@@ -285,5 +321,20 @@ mod tests {
                 ..
             } if profile == "gemini"
         ));
+    }
+
+    #[test]
+    fn named_account_lifecycle_commands_parse() {
+        for (verb, expected) in [
+            ("refresh", "Refresh"),
+            ("revoke", "Revoke"),
+            ("enable", "Enable"),
+            ("disable", "Disable"),
+            ("switch", "Switch"),
+        ] {
+            let command = AuthHarness::try_parse_from(["auth", verb, "work-account"])
+                .expect("account lifecycle command");
+            assert!(format!("{:?}", command.command).starts_with(expected));
+        }
     }
 }

@@ -368,6 +368,7 @@ fn mixed_tool_objects_keep_their_order_and_function_grouping() {
       "contents":[{"role":"user","parts":[{"text":"Use tools"}]}],
       "tools":[
         {"googleSearch":{}},
+        {"functionDeclarations":[]},
         {"functionDeclarations":[{"name":"first"}]},
         {"codeExecution":{}},
         {

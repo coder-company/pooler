@@ -183,6 +183,48 @@ async fn xai_responses_rest_routes_named_sse_through_native_components() {
 }
 
 #[tokio::test]
+async fn xai_responses_http_client_uses_semantic_realtime_websocket_upstream() {
+    let (upstream_address, upstream_task) = spawn_xai_websocket_upstream().await;
+    let running = start_server(xai_semantic_websocket_config(upstream_address)).await;
+    let request = serde_json::to_vec(&json!({
+        "model":"grok-4.6",
+        "input":"hello",
+        "stream":true,
+        "store":false,
+        "background":false,
+        "search_parameters":{"mode":"auto"}
+    }))
+    .expect("xAI Responses request JSON");
+
+    let response = send_request(running.address, "/v1/responses", &request).await;
+    assert_eq!(response_status(&response), 200);
+    let body = decoded_response_body(&response);
+    let mut parser = SseParser::new();
+    let mut events = parser.feed(&body).expect("downstream xAI realtime SSE");
+    events.extend(parser.finish().expect("complete realtime SSE"));
+    assert!(events.iter().any(|event| {
+        event.event.as_deref() == Some("response.output_text.delta") && event.data.contains("Hello")
+    }));
+    assert!(events
+        .iter()
+        .any(|event| event.event.as_deref() == Some("response.completed")));
+
+    let (path, upstream_request) = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("xAI realtime upstream timeout")
+        .expect("xAI realtime upstream task");
+    assert_eq!(path, "/v1/responses");
+    let upstream_request: Value =
+        serde_json::from_slice(&upstream_request).expect("response.create JSON");
+    assert_eq!(upstream_request["type"], "response.create");
+    assert_eq!(upstream_request["model"], "grok-4.6");
+    assert!(upstream_request.get("stream").is_none());
+    assert!(upstream_request.get("background").is_none());
+    assert_eq!(upstream_request["search_parameters"]["mode"], "auto");
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn xai_responses_websocket_stays_raw_bounded_and_satisfies_codec_lifecycle() {
     let (upstream_address, upstream_task) = spawn_xai_websocket_upstream().await;
     let config = xai_websocket_config(upstream_address);
@@ -283,6 +325,16 @@ fn xai_rest_config(upstream_address: SocketAddr, wire: RestWire) -> pooler_confi
         ),
     )
     .expect("xAI REST runtime config")
+}
+
+fn xai_semantic_websocket_config(upstream_address: SocketAddr) -> pooler_config::CompiledConfig {
+    compile_yaml(
+        "xai-semantic-websocket.yaml",
+        &format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{xai: {{url: ws://{upstream_address}}}}}\nroutes:\n  - id: xai-responses-realtime\n    listen: local\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: decode.xai.responses, encoder: encode.xai.responses}}\n    target: {{provider: xai, path: /v1/responses}}\n    response: {{mode: semantic, decoder: decode.xai.responses.events, encoder: encode.xai.responses.events}}\n"
+        ),
+    )
+    .expect("xAI semantic WebSocket runtime config")
 }
 
 fn xai_websocket_config(upstream_address: SocketAddr) -> pooler_config::CompiledConfig {

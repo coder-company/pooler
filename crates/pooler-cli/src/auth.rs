@@ -8,16 +8,18 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use adapter_codex::CodexCredential;
 use anyhow::{bail, Context, Result};
 use pooler_auth::{
-    AuthorizationAttempt, CredentialId, HyperOAuthTransport, OAuthClientConfig,
-    OAuthCredentialProfile, OAuthIdentity, OAuthRevoker, OAuthState, OAuthTokenStore, OAuthTokens,
-    PkcePair, ProviderLoginRegistry, StandardOAuthProvider,
+    refresh_with_store, AuthorizationAttempt, CredentialId, OAuthCredentialProfile, OAuthIdentity,
+    OAuthState, OAuthTokenStore, OAuthTokens, PkcePair, ProviderLoginRegistry, RefreshCoordinator,
 };
+#[cfg(test)]
+use pooler_auth::{HyperOAuthTransport, OAuthClientConfig, StandardOAuthProvider};
 use pooler_config::{
     AccountAuthKind, AccountPlan, CompiledConfig, Config, OAuthPlan, DEFAULT_OAUTH_CALLBACK,
 };
@@ -262,11 +264,34 @@ pub fn run(
             &credential_store_path(explicit_store_path)?,
             credential_key_ref,
         ),
-        AuthCommand::Revoke { provider } => revoke(
-            &provider,
+        AuthCommand::Refresh { account } => refresh(
+            &account,
             config_path,
             &credential_store_path(explicit_store_path)?,
             credential_key_ref,
+        ),
+        AuthCommand::Revoke { account } => revoke(
+            &account,
+            config_path,
+            &credential_store_path(explicit_store_path)?,
+            credential_key_ref,
+        ),
+        AuthCommand::Enable { account } => set_account_enabled(
+            &account,
+            true,
+            config_path,
+            &credential_store_path(explicit_store_path)?,
+        ),
+        AuthCommand::Disable { account } => set_account_enabled(
+            &account,
+            false,
+            config_path,
+            &credential_store_path(explicit_store_path)?,
+        ),
+        AuthCommand::Switch { account } => switch_account(
+            &account,
+            config_path,
+            &credential_store_path(explicit_store_path)?,
         ),
     }
 }
@@ -616,28 +641,6 @@ pub(crate) fn load_master_key(reference: Option<&str>) -> Result<MasterKey> {
         .map_err(|_| anyhow::anyhow!("credential key is unavailable"))
 }
 
-fn build_oauth_provider(
-    provider: &str,
-    oauth: &OAuthPlan,
-    callback: Url,
-) -> Result<StandardOAuthProvider> {
-    let mut config = OAuthClientConfig::new(
-        oauth.client_id().to_owned(),
-        callback,
-        oauth.authorization_endpoint().clone(),
-        oauth.token_endpoint().clone(),
-    )?
-    .with_scopes(oauth.scopes().iter().map(ToString::to_string));
-    if let Some(endpoint) = oauth.revocation_endpoint() {
-        config = config.with_revocation_endpoint(endpoint.clone());
-    }
-    if let Some(endpoint) = oauth.identity_endpoint() {
-        config = config.with_identity_endpoint(endpoint.clone());
-    }
-    let transport = HyperOAuthTransport::new(64 * 1024)?;
-    StandardOAuthProvider::new(provider.to_owned(), config, Arc::new(transport)).map_err(Into::into)
-}
-
 pub(crate) fn configured_oauth<'a>(
     config: &'a CompiledConfig,
     provider: &str,
@@ -698,8 +701,19 @@ fn status(
             .transpose()?
             .flatten();
         if let Some(metadata) = metadata {
+            let expiry = if metadata.expired
+                || metadata
+                    .expires_at
+                    .is_some_and(|expires_at| expires_at <= SystemTime::now())
+            {
+                "expired"
+            } else if metadata.expires_at.is_some() {
+                "valid"
+            } else {
+                "unknown"
+            };
             println!(
-                "provider={} account={} kind={} profile={} status={status} account_id={} generation={}",
+                "provider={} account={} kind={} profile={} status={status} expiry={expiry} account_id={} generation={}",
                 account.provider(),
                 account.id(),
                 metadata.auth_kind,
@@ -723,49 +737,214 @@ fn status(
     Ok(())
 }
 
-fn revoke(
-    provider: &str,
+fn refresh(
+    selector: &str,
     config_path: &Path,
     store_path: &Path,
     credential_key_ref: Option<&str>,
 ) -> Result<()> {
-    CredentialId::new(provider.to_owned())
-        .map_err(|_| anyhow::anyhow!("provider ID is invalid"))?;
+    let config = Config::from_path(config_path)?.compile()?;
+    let account = resolve_account_selector(&config, selector, Some(AccountAuthKind::OAuth))?;
+    let credential = CredentialId::new(account.id().to_owned())
+        .map_err(|_| anyhow::anyhow!("account ID is invalid"))?;
+    let store = SqliteStore::open_encrypted(store_path, load_master_key(credential_key_ref)?)
+        .context("could not open encrypted credential store")?;
+    let token_store = SqliteOAuthTokenStore::new(store);
+    let provider_client = stored_oauth_provider(&config, account, &token_store)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("could not initialize OAuth runtime")?;
+    let snapshot = runtime.block_on(refresh_with_store(
+        &RefreshCoordinator::new(),
+        provider_client.as_ref(),
+        &token_store,
+        credential,
+        CancellationToken::new(),
+    ))?;
+    println!(
+        "refreshed credential: provider={} account={} generation={}",
+        account.provider(),
+        account.id(),
+        snapshot.generation()
+    );
+    Ok(())
+}
+
+fn revoke(
+    selector: &str,
+    config_path: &Path,
+    store_path: &Path,
+    credential_key_ref: Option<&str>,
+) -> Result<()> {
+    let config = Config::from_path(config_path)?.compile()?;
+    let account = resolve_account_selector(&config, selector, None)?;
+    let credential = CredentialId::new(account.id().to_owned())
+        .map_err(|_| anyhow::anyhow!("account ID is invalid"))?;
     let store = if let Some(reference) = credential_key_ref {
         SqliteStore::open_encrypted(store_path, load_master_key(Some(reference))?)
             .context("could not open encrypted credential store")?
     } else {
         SqliteStore::open(store_path).context("could not open credential store")?
     };
-    if credential_key_ref.is_some() {
-        let config = Config::from_path(config_path)?.compile()?;
-        let oauth = configured_oauth(&config, provider)?;
-        let callback = validate_loopback_callback(oauth.callback().as_str())?;
-        let provider_client = build_oauth_provider(provider, oauth, callback)?;
+    if credential_key_ref.is_some() && account.auth_kind() == AccountAuthKind::OAuth {
         let token_store = SqliteOAuthTokenStore::new(store.clone());
-        let credential = CredentialId::new(provider.to_owned())
-            .map_err(|_| anyhow::anyhow!("provider ID is invalid"))?;
+        let provider_client = stored_oauth_provider(&config, account, &token_store)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("could not initialize OAuth runtime")?;
         if let Some(snapshot) = runtime.block_on(token_store.load(&credential))? {
-            runtime.block_on(provider_client.revoke(
-                snapshot.tokens(),
-                tokio_util::sync::CancellationToken::new(),
-            ))?;
+            runtime
+                .block_on(provider_client.revoke(snapshot.tokens(), CancellationToken::new()))?;
         }
         runtime.block_on(token_store.remove(&credential))?;
     }
     if store
-        .remove_credential_state(provider)
+        .remove_credential_state(account.id())
         .context("could not revoke credential metadata")?
     {
-        println!("revoked local credential: provider={provider}");
+        println!(
+            "revoked local credential: provider={} account={}",
+            account.provider(),
+            account.id()
+        );
     } else {
-        println!("no credential for provider={provider}");
+        println!("no local credential for account={}", account.id());
     }
     Ok(())
+}
+
+fn set_account_enabled(
+    account_id: &str,
+    enabled: bool,
+    config_path: &Path,
+    store_path: &Path,
+) -> Result<()> {
+    let config = Config::from_path(config_path)?.compile()?;
+    let account = configured_account(&config, account_id)?;
+    let store = SqliteStore::open(store_path).context("could not open credential store")?;
+    let state = ensure_credential_state(&store, account)?;
+    if state.enabled != enabled {
+        store
+            .set_credential_enabled(account.id(), enabled, now_millis())
+            .context("could not update credential state")?;
+    }
+    println!(
+        "account state: provider={} account={} status={}",
+        account.provider(),
+        account.id(),
+        if enabled { "enabled" } else { "disabled" }
+    );
+    Ok(())
+}
+
+fn switch_account(account_id: &str, config_path: &Path, store_path: &Path) -> Result<()> {
+    let config = Config::from_path(config_path)?.compile()?;
+    let selected = configured_account(&config, account_id)?;
+    let store = SqliteStore::open(store_path).context("could not open credential store")?;
+    ensure_credential_state(&store, selected)?;
+    let siblings = config
+        .accounts()
+        .values()
+        .filter(|account| {
+            account.provider() == selected.provider() && account.id() != selected.id()
+        })
+        .map(|account| {
+            ensure_credential_state(&store, account)?;
+            Ok(account.id().to_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    store
+        .switch_credential(selected.id(), &siblings, now_millis())
+        .context("could not switch provider accounts")?;
+    println!(
+        "switched account: provider={} account={}",
+        selected.provider(),
+        selected.id()
+    );
+    Ok(())
+}
+
+fn configured_account<'a>(config: &'a CompiledConfig, account_id: &str) -> Result<&'a AccountPlan> {
+    CredentialId::new(account_id.to_owned())
+        .map_err(|_| anyhow::anyhow!("account ID is invalid"))?;
+    config
+        .accounts()
+        .get(account_id)
+        .ok_or_else(|| anyhow::anyhow!("account `{account_id}` is not configured"))
+}
+
+fn resolve_account_selector<'a>(
+    config: &'a CompiledConfig,
+    selector: &str,
+    auth_kind: Option<AccountAuthKind>,
+) -> Result<&'a AccountPlan> {
+    if let Some(account) = config.accounts().get(selector) {
+        if auth_kind.is_some_and(|kind| account.auth_kind() != kind) {
+            bail!("account `{selector}` does not use the required authentication kind");
+        }
+        return Ok(account);
+    }
+    let registry = ProviderLoginRegistry::builtin();
+    let mut matches = config.accounts().values().filter(|account| {
+        auth_kind.is_none_or(|kind| account.auth_kind() == kind)
+            && provider_filter_matches(&registry, selector, account.provider())
+    });
+    let account = matches
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("`{selector}` is not a configured account or provider"))?;
+    if matches.next().is_some() {
+        bail!("provider `{selector}` has multiple matching accounts; use an account ID");
+    }
+    Ok(account)
+}
+
+fn ensure_credential_state(store: &SqliteStore, account: &AccountPlan) -> Result<CredentialState> {
+    if let Some(state) = store
+        .credential_state(account.id())
+        .context("could not read credential state")?
+    {
+        if state.provider_id != account.provider() {
+            bail!("stored account provider does not match configuration");
+        }
+        return Ok(state);
+    }
+    store
+        .upsert_credential_state(CredentialState::new(
+            account.id(),
+            account.provider(),
+            account.enabled(),
+            now_millis(),
+        ))
+        .context("could not record credential metadata")
+}
+
+fn stored_oauth_provider(
+    config: &CompiledConfig,
+    account: &AccountPlan,
+    token_store: &SqliteOAuthTokenStore,
+) -> Result<Box<dyn LoginOAuthProvider>> {
+    let credential = CredentialId::new(account.id().to_owned())
+        .map_err(|_| anyhow::anyhow!("account ID is invalid"))?;
+    let metadata = token_store.profile_metadata(&credential)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "OAuth credential is not stored for account `{}`",
+            account.id()
+        )
+    })?;
+    let registry = ProviderLoginRegistry::builtin();
+    let profile = registry.resolve(&metadata.provider_profile);
+    let oauth = configured_oauth(config, account.provider())?;
+    let callback = validate_loopback_callback(oauth.callback().as_str())?;
+    let settings =
+        ResolvedOAuthSettings::new(oauth, callback, &OAuthOverrideArgs::default(), profile)?;
+    build_login_provider(
+        account.provider(),
+        profile,
+        AuthLoginMethod::AuthorizationCodePkce,
+        &settings,
+    )
 }
 
 fn now_millis() -> u64 {
@@ -1180,6 +1359,100 @@ upstreams:
             .map(|index| format!("scope-{index}"))
             .collect::<Vec<_>>();
         assert!(validate_client_and_scopes("client", &scopes).is_err());
+    }
+
+    #[test]
+    fn account_selector_requires_a_name_when_provider_has_multiple_accounts() {
+        let config = pooler_config::compile_yaml(
+            "multi-account-auth.yaml",
+            r#"
+version: 1
+upstreams:
+  codex:
+    url: https://chatgpt.com
+    native: {kind: codex}
+    oauth:
+      authorization_endpoint: https://auth.openai.com/oauth/authorize
+      token_endpoint: https://auth.openai.com/oauth/token
+      client_id: pooler-test
+      scopes: [openid]
+accounts:
+  work: {provider: codex, auth_kind: oauth}
+  personal: {provider: codex, auth_kind: oauth}
+"#,
+        )
+        .expect("multi-account config");
+
+        assert_eq!(
+            resolve_account_selector(&config, "work", Some(AccountAuthKind::OAuth))
+                .expect("named account")
+                .id(),
+            "work"
+        );
+        let error = resolve_account_selector(&config, "openai", Some(AccountAuthKind::OAuth))
+            .expect_err("provider alias must be ambiguous");
+        assert!(error.to_string().contains("multiple matching accounts"));
+    }
+
+    #[test]
+    fn switch_and_enable_disable_update_named_account_state() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private directory");
+        let config_path = directory.path().join("pooler.yaml");
+        let store_path = directory.path().join("credentials.sqlite3");
+        std::fs::write(
+            &config_path,
+            r#"
+version: 1
+upstreams:
+  xai:
+    url: https://api.x.ai
+    native: {kind: xai}
+accounts:
+  work: {provider: xai, auth_kind: api_key, secret: env:XAI_WORK_KEY}
+  personal: {provider: xai, auth_kind: api_key, secret: env:XAI_PERSONAL_KEY}
+"#,
+        )
+        .expect("config");
+
+        switch_account("personal", &config_path, &store_path).expect("switch account");
+        let store = SqliteStore::open(&store_path).expect("credential store");
+        assert!(
+            store
+                .credential_state("personal")
+                .expect("personal state")
+                .expect("personal account")
+                .enabled
+        );
+        assert!(
+            !store
+                .credential_state("work")
+                .expect("work state")
+                .expect("work account")
+                .enabled
+        );
+
+        set_account_enabled("work", true, &config_path, &store_path).expect("enable account");
+        set_account_enabled("personal", false, &config_path, &store_path).expect("disable account");
+        assert!(
+            store
+                .credential_state("work")
+                .expect("work state")
+                .expect("work account")
+                .enabled
+        );
+        assert!(
+            !store
+                .credential_state("personal")
+                .expect("personal state")
+                .expect("personal account")
+                .enabled
+        );
     }
 
     #[test]

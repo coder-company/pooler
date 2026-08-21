@@ -295,6 +295,9 @@
         "model": {
           "type": "string"
         },
+        "profile": {
+          "$ref": "#/$defs/model_profile"
+        },
         "request": {
           "additionalProperties": true,
           "type": "object"
@@ -390,6 +393,7 @@
             "openai",
             "open_ai",
             "kimi",
+            "gemini",
             "vertex",
             "antigravity"
           ],
@@ -832,6 +836,216 @@
           "enum": [
             "accepted",
             "rejected"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "model_profile": {
+      "additionalProperties": false,
+      "properties": {
+        "attachments": {
+          "enum": [
+            "unknown",
+            "supported",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "context_limit": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "endpoint_variants": {
+          "additionalProperties": false,
+          "properties": {
+            "chat_completions": {
+              "type": "boolean"
+            },
+            "generate_content": {
+              "type": "boolean"
+            },
+            "messages": {
+              "type": "boolean"
+            },
+            "realtime": {
+              "type": "boolean"
+            },
+            "responses": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "input_limit": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "input_modalities": {
+          "additionalProperties": false,
+          "properties": {
+            "audio": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "boolean"
+            },
+            "pdf": {
+              "type": "boolean"
+            },
+            "text": {
+              "type": "boolean"
+            },
+            "video": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "interleaved_reasoning": {
+          "enum": [
+            "reasoning_content",
+            "reasoning_details"
+          ],
+          "type": "string"
+        },
+        "output_limit": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "output_modalities": {
+          "additionalProperties": false,
+          "properties": {
+            "audio": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "boolean"
+            },
+            "pdf": {
+              "type": "boolean"
+            },
+            "text": {
+              "type": "boolean"
+            },
+            "video": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "parallel_tools": {
+          "enum": [
+            "unknown",
+            "supported",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "reasoning": {
+          "enum": [
+            "unknown",
+            "supported",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "reasoning_budget_tokens": {
+          "enum": [
+            "unknown",
+            "supported",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "reasoning_efforts": {
+          "additionalProperties": false,
+          "properties": {
+            "default": {
+              "type": "boolean"
+            },
+            "high": {
+              "type": "boolean"
+            },
+            "low": {
+              "type": "boolean"
+            },
+            "max": {
+              "type": "boolean"
+            },
+            "medium": {
+              "type": "boolean"
+            },
+            "minimal": {
+              "type": "boolean"
+            },
+            "none": {
+              "type": "boolean"
+            },
+            "xhigh": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "reasoning_toggle": {
+          "enum": [
+            "unknown",
+            "supported",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "request_transform": {
+          "enum": [
+            "protocol_default",
+            "open_ai_chat",
+            "anthropic_messages",
+            "gemini_generate_content",
+            "xai_chat",
+            "kimi_chat"
+          ],
+          "type": "string"
+        },
+        "streaming": {
+          "enum": [
+            "unknown",
+            "supported",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "structured_output": {
+          "enum": [
+            "unknown",
+            "supported",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "temperature": {
+          "enum": [
+            "accepted",
+            "rejected"
+          ],
+          "type": "string"
+        },
+        "token_limit_field": {
+          "enum": [
+            "protocol_default",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "generation_config_max_output_tokens"
+          ],
+          "type": "string"
+        },
+        "tools": {
+          "enum": [
+            "unknown",
+            "supported",
+            "unsupported"
           ],
           "type": "string"
         }

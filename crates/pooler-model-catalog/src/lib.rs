@@ -29,8 +29,8 @@ pub use overrides::{
     MAX_MODEL_OVERRIDES, MAX_OVERLAY_FIELDS, MAX_OVERLAY_POINTER_BYTES, MAX_OVERLAY_VALUE_BYTES,
 };
 pub use provider_catalog::{
-    KnownProvider, ProviderCatalog, ProviderCatalogError, MAX_PROVIDER_CATALOG_BYTES,
-    MAX_PROVIDER_CATALOG_ENTRIES, MAX_PROVIDER_CATALOG_FIELD_BYTES,
+    KnownProvider, KnownProviderIntegration, ProviderCatalog, ProviderCatalogError,
+    MAX_PROVIDER_CATALOG_BYTES, MAX_PROVIDER_CATALOG_ENTRIES, MAX_PROVIDER_CATALOG_FIELD_BYTES,
     PROVIDER_CATALOG_SCHEMA_VERSION,
 };
 
@@ -43,7 +43,9 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::{stream, StreamExt};
-use pooler_core::{CapabilitySet, ComponentId, IdentifierError, ModelDialect, ModelId, ProviderId};
+use pooler_core::{
+    CapabilitySet, ComponentId, IdentifierError, ModelDialect, ModelId, ModelProfile, ProviderId,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -629,6 +631,9 @@ pub struct DiscoveredModel {
     /// Request-shaping deviations observed for this upstream model.
     #[serde(default)]
     pub dialect: ModelDialect,
+    /// Bounded capability, reasoning, media, and token-limit facts.
+    #[serde(default)]
+    pub profile: ModelProfile,
 }
 
 impl DiscoveredModel {
@@ -640,6 +645,7 @@ impl DiscoveredModel {
             display_name: None,
             capabilities,
             dialect: ModelDialect::DEFAULT,
+            profile: ModelProfile::DEFAULT,
         }
     }
 
@@ -654,6 +660,15 @@ impl DiscoveredModel {
     #[must_use]
     pub const fn with_dialect(mut self, dialect: ModelDialect) -> Self {
         self.dialect = dialect;
+        self.profile.dialect = dialect;
+        self
+    }
+
+    /// Attach all evidence-backed model facts observed for this model.
+    #[must_use]
+    pub const fn with_profile(mut self, profile: ModelProfile) -> Self {
+        self.dialect = profile.dialect;
+        self.profile = profile;
         self
     }
 }
@@ -776,6 +791,7 @@ pub struct CatalogTarget {
     upstream_model: ModelId,
     capabilities: CapabilitySet,
     dialect: ModelDialect,
+    profile: ModelProfile,
     force_mapping: bool,
     priority: i32,
     provenance: Vec<ModelProvenance>,
@@ -810,6 +826,15 @@ impl CatalogTarget {
     #[must_use]
     pub const fn dialect(&self) -> ModelDialect {
         self.dialect
+    }
+
+    /// Evidence-backed capability, reasoning, media, and token-limit facts.
+    ///
+    /// Like the dialect, this profile comes from the first deterministic source
+    /// for the target rather than combining facts from potentially stale origins.
+    #[must_use]
+    pub const fn profile(&self) -> ModelProfile {
+        self.profile
     }
 
     /// Whether response model fields must be rewritten to the public ID.
@@ -1183,6 +1208,7 @@ struct Candidate {
     upstream_model: ModelId,
     capabilities: CapabilitySet,
     dialect: ModelDialect,
+    profile: ModelProfile,
     force_mapping: bool,
     priority: i32,
     provenance: ModelProvenance,
@@ -1207,6 +1233,7 @@ fn push_candidate(
         upstream_model: model.id.clone(),
         capabilities: model.capabilities,
         dialect: model.dialect,
+        profile: model.profile,
         force_mapping,
         priority: source.priority,
         provenance: ModelProvenance {
@@ -1271,6 +1298,7 @@ fn compile_public_model(
                 upstream_model: candidate.upstream_model,
                 capabilities: candidate.capabilities,
                 dialect: candidate.dialect,
+                profile: candidate.profile,
                 force_mapping: candidate.force_mapping,
                 priority: candidate.priority,
                 provenance: vec![candidate.provenance],

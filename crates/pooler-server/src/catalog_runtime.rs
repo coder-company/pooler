@@ -29,14 +29,15 @@ use pooler_config::{
     AccountPlan, CatalogParserKind, CompiledConfig, ModelCatalogPlan, ModelCatalogSourcePlan,
     UpstreamPlan,
 };
-use pooler_core::CapabilitySet;
+use pooler_core::{Capability, CapabilitySet};
 use pooler_http::{
-    apply_configured_account_auth, apply_configured_upstream_auth, collect_body_limited,
+    apply_configured_account_auth, apply_configured_upstream_auth,
+    apply_configured_upstream_headers, collect_body_limited, NativeAuthorizationRequest,
     NativeRuntime,
 };
 use pooler_model_catalog::{
     CatalogError, CatalogService, CatalogSnapshot, DiscoveryFailure, DiscoveryFailureKind,
-    DiscoveryFuture, DiscoveryResponse, ModelDiscovery, ModelFacts, RefreshReport,
+    DiscoveryFuture, DiscoveryResponse, ModelDiscovery, ModelFacts, ProviderCatalog, RefreshReport,
     RegisteredSource, SourceId,
 };
 use serde_json::{json, Value};
@@ -328,6 +329,7 @@ impl ParsedProviderDiscovery {
         let models = match self.parser_kind {
             CatalogParserKind::OpenAi => self.parser.parse_openai_list(fetched.body()),
             CatalogParserKind::Kimi => self.parser.parse_kimi_list(fetched.body()),
+            CatalogParserKind::Gemini => self.parser.parse_gemini_list(fetched.body()),
             CatalogParserKind::Vertex => self.parser.parse_vertex_catalog(fetched.body()),
             CatalogParserKind::Antigravity => self
                 .parser
@@ -361,13 +363,129 @@ impl ParsedProviderDiscovery {
     /// keyed by the upstream model ID so a source that renames or prefixes a
     /// model for clients still resolves the upstream model's real dialect.
     fn apply_model_facts(&self, response: &mut DiscoveryResponse) {
+        let provider = ProviderCatalog::builtin().get(&self.model_facts_provider);
         let facts = ModelFacts::builtin();
-        if !facts.covers_provider(&self.model_facts_provider) {
-            return;
-        }
         for model in &mut response.models {
-            model.dialect = facts.dialect(&self.model_facts_provider, model.id.as_str());
+            if let Some(provider) = provider {
+                for name in &provider.integration.capabilities {
+                    if let Some(capability) = Capability::ALL
+                        .into_iter()
+                        .find(|capability| capability.as_str() == name)
+                    {
+                        model.capabilities.insert(capability);
+                    }
+                }
+            }
+            let mut profile = facts.profile(&self.model_facts_provider, model.id.as_str());
+            if let Some(provider) = provider {
+                if profile.streaming.is_unknown()
+                    && provider
+                        .integration
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "streaming")
+                {
+                    profile.streaming = pooler_core::FactSupport::Supported;
+                }
+                profile.token_limit_field = match provider.integration.request_dialect.as_str() {
+                    "anthropic" => pooler_core::TokenLimitField::MaxTokens,
+                    "gemini" => pooler_core::TokenLimitField::GenerationConfigMaxOutputTokens,
+                    _ => profile.token_limit_field,
+                };
+                profile.request_transform = match provider.integration.native_kind.as_str() {
+                    "xai" => pooler_core::ModelRequestTransform::XaiChat,
+                    "kimi" => pooler_core::ModelRequestTransform::KimiChat,
+                    _ => match provider.integration.request_dialect.as_str() {
+                        "openai" => pooler_core::ModelRequestTransform::OpenAiChat,
+                        "anthropic" => pooler_core::ModelRequestTransform::AnthropicMessages,
+                        "gemini" => pooler_core::ModelRequestTransform::GeminiGenerateContent,
+                        _ => profile.request_transform,
+                    },
+                };
+                for family in &provider.integration.endpoint_families {
+                    match family.as_str() {
+                        "chat_completions" => profile.endpoint_variants.chat_completions = true,
+                        "responses" => profile.endpoint_variants.responses = true,
+                        "messages" => profile.endpoint_variants.messages = true,
+                        "generate_content" | "stream_generate_content" => {
+                            profile.endpoint_variants.generate_content = true;
+                        }
+                        "realtime" => profile.endpoint_variants.realtime = true,
+                        _ => {}
+                    }
+                }
+            }
+            apply_profile_capabilities(&mut model.capabilities, profile);
+            model.dialect = profile.dialect;
+            model.profile = profile;
         }
+    }
+}
+
+fn apply_profile_capabilities(
+    capabilities: &mut CapabilitySet,
+    profile: pooler_core::ModelProfile,
+) {
+    update_capability(capabilities, Capability::Reasoning, profile.reasoning);
+    update_capability(capabilities, Capability::Tools, profile.tools);
+    update_capability(capabilities, Capability::FunctionCalling, profile.tools);
+    update_capability(
+        capabilities,
+        Capability::StructuredOutput,
+        profile.structured_output,
+    );
+    update_capability(
+        capabilities,
+        Capability::JsonSchema,
+        profile.structured_output,
+    );
+    update_capability(capabilities, Capability::Streaming, profile.streaming);
+    if profile.attachments.is_supported()
+        || profile.input_modalities.pdf
+        || profile.input_modalities.video
+    {
+        capabilities.insert(Capability::Files);
+    } else if profile.attachments.is_unsupported() {
+        capabilities.remove(Capability::Files);
+    }
+    if profile.input_modalities.text || profile.output_modalities.text {
+        capabilities.insert(Capability::Text);
+    }
+    if profile.input_modalities.image || profile.output_modalities.image {
+        capabilities.insert(Capability::Images);
+    }
+    if profile.input_modalities.audio || profile.output_modalities.audio {
+        capabilities.insert(Capability::Audio);
+    }
+    if profile.input_modalities.audio {
+        capabilities.insert(Capability::InputAudio);
+    }
+    if profile.output_modalities.audio {
+        capabilities.insert(Capability::OutputAudio);
+    }
+    if (!profile.input_modalities.is_empty() || !profile.output_modalities.is_empty())
+        && !profile.input_modalities.image
+        && !profile.output_modalities.image
+    {
+        capabilities.remove(Capability::Images);
+    }
+    if !profile.input_modalities.is_empty() && !profile.input_modalities.audio {
+        capabilities.remove(Capability::InputAudio);
+    }
+    if !profile.output_modalities.is_empty() && !profile.output_modalities.audio {
+        capabilities.remove(Capability::OutputAudio);
+    }
+}
+
+fn update_capability(
+    capabilities: &mut CapabilitySet,
+    capability: Capability,
+    support: pooler_core::FactSupport,
+) {
+    if support.is_supported() {
+        capabilities.insert(capability);
+    } else if support.is_unsupported() {
+        capabilities.remove(capability);
     }
 }
 
@@ -473,16 +591,29 @@ impl HttpProviderCatalogFetcher {
             header::ACCEPT,
             http::HeaderValue::from_static("application/json"),
         );
+        apply_configured_upstream_headers(&mut headers, &self.upstream)
+            .map_err(|_| authentication_failure())?;
         let cancellation = CancellationToken::new();
-        if self.native.supports(&self.upstream) {
-            let account = self.account.as_ref().ok_or_else(authentication_failure)?;
-            let credential =
-                CredentialId::new(account.id()).map_err(|_| authentication_failure())?;
-            let authorization = self
-                .native
-                .authorize(&self.upstream, &credential, &headers, cancellation)
-                .await
-                .map_err(|_| authentication_failure())?;
+        let credential = self
+            .account
+            .as_ref()
+            .map(|account| CredentialId::new(account.id()))
+            .transpose()
+            .map_err(|_| authentication_failure())?;
+        let native_authorization = self
+            .native
+            .authorize_selected_attempt(NativeAuthorizationRequest::new(
+                &self.upstream,
+                self.account.as_ref().map(AccountPlan::auth_kind),
+                credential.as_ref(),
+                self.account.as_ref().and_then(AccountPlan::secret),
+                self.upstream.auth(),
+                &headers,
+                cancellation,
+            ))
+            .await
+            .map_err(|_| authentication_failure())?;
+        if let Some(authorization) = native_authorization {
             authorization
                 .apply_to(&mut headers)
                 .map_err(|_| authentication_failure())?;
@@ -670,6 +801,7 @@ fn discovered_model_value(model: &pooler_model_catalog::CatalogModel) -> Value {
                     .map(|capability| capability.as_str())
                     .collect::<Vec<_>>(),
                 "dialect": target.dialect(),
+                "profile": target.profile(),
                 "force_mapping": target.force_mapping(),
                 "priority": target.priority(),
                 "provenance": target.provenance(),

@@ -19,6 +19,36 @@ const CLIENT_X_GOOG_API_KEY: &str = "client-x-goog-key-must-not-leak";
 const CLIENT_API_KEY: &str = "client-api-key-must-not-leak";
 
 #[tokio::test]
+async fn non_native_oauth_account_fails_before_proxy_transport() {
+    let upstream = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("OAuth upstream binds");
+    let upstream_address = upstream.local_addr().expect("OAuth upstream address");
+    let config = compile_yaml(
+        "non-native-oauth-proxy.yaml",
+        &format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  plain:\n    url: http://{upstream_address}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  subscription:\n    provider: plain\n    auth_kind: oauth\npolicies:\n  oauth:\n    selection: {{strategy: fill_first, accounts: [subscription]}}\nroutes:\n  - id: oauth\n    listen: local\n    match: {{method: POST, path: /v1/chat/completions, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: plain, policy: oauth}}\n    response: {{mode: opaque}}\n"
+        ),
+    )
+    .expect("non-native OAuth proxy config");
+    let running = start_server(config).await;
+    let response = send_semantic_request(
+        running.address,
+        "/v1/chat/completions",
+        br#"{"model":"test","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(response_status(&response), 502);
+    assert!(
+        timeout(Duration::from_millis(100), upstream.accept())
+            .await
+            .is_err(),
+        "non-native OAuth opened an upstream transport"
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn anthropic_semantic_route_injects_configured_x_api_key_only() {
     let upstream_body = serde_json::to_vec(&json!({
         "id":"msg-auth",

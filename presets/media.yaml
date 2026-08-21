@@ -60,6 +60,22 @@ routes:
     response:
       mode: opaque
 
+  - id: embeddings
+    listen: media
+    match:
+      methods: [POST]
+      path: /v1/embeddings
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+    ingress:
+      mode: opaque
+    target:
+      provider: media
+      capabilities: [text, embeddings]
+    response:
+      mode: opaque
+
   - id: batches
     listen: media
     match:
@@ -134,5 +150,4 @@ routes:
       capabilities: [text, files]
       codecs: [decode.media.multipart]
     response:
-      mode: opaque
-
+      mode: opaque # response remains byte-for-byte opaque

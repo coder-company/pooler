@@ -35,6 +35,7 @@ pub fn config_schema() -> Value {
         catalog_model_override_schema(),
     );
     definitions.insert("model_dialect".to_owned(), model_dialect_schema());
+    definitions.insert("model_profile".to_owned(), model_profile_schema());
     definitions.insert("cooldown".to_owned(), cooldown_schema());
     definitions.insert("duration".to_owned(), duration_schema());
     definitions.insert("extension".to_owned(), extension_schema());
@@ -181,6 +182,7 @@ fn catalog_model_override_schema() -> Value {
                     None,
                 )),
             ),
+            ("profile", optional(reference("model_profile"))),
             ("dialect", optional(reference("model_dialect"))),
             ("request", optional(json_map_schema())),
         ]),
@@ -195,6 +197,95 @@ fn model_dialect_schema() -> Value {
             "temperature",
             optional(string_enum(["accepted", "rejected"])),
         )]),
+        &[],
+        false,
+    )
+}
+
+fn model_profile_schema() -> Value {
+    let support = || optional(string_enum(["unknown", "supported", "unsupported"]));
+    object_schema(
+        properties([
+            (
+                "temperature",
+                optional(string_enum(["accepted", "rejected"])),
+            ),
+            ("reasoning", support()),
+            ("tools", support()),
+            ("parallel_tools", support()),
+            ("structured_output", support()),
+            ("attachments", support()),
+            ("streaming", support()),
+            ("reasoning_toggle", support()),
+            ("reasoning_budget_tokens", support()),
+            (
+                "reasoning_efforts",
+                optional(boolean_flags_schema([
+                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "default",
+                ])),
+            ),
+            (
+                "interleaved_reasoning",
+                optional(string_enum(["reasoning_content", "reasoning_details"])),
+            ),
+            (
+                "input_modalities",
+                optional(boolean_flags_schema([
+                    "text", "image", "audio", "pdf", "video",
+                ])),
+            ),
+            (
+                "output_modalities",
+                optional(boolean_flags_schema([
+                    "text", "image", "audio", "pdf", "video",
+                ])),
+            ),
+            ("context_limit", optional(integer_schema(Some(1), None))),
+            ("input_limit", optional(integer_schema(Some(1), None))),
+            ("output_limit", optional(integer_schema(Some(1), None))),
+            (
+                "token_limit_field",
+                optional(string_enum([
+                    "protocol_default",
+                    "max_tokens",
+                    "max_completion_tokens",
+                    "max_output_tokens",
+                    "generation_config_max_output_tokens",
+                ])),
+            ),
+            (
+                "request_transform",
+                optional(string_enum([
+                    "protocol_default",
+                    "open_ai_chat",
+                    "anthropic_messages",
+                    "gemini_generate_content",
+                    "xai_chat",
+                    "kimi_chat",
+                ])),
+            ),
+            (
+                "endpoint_variants",
+                optional(boolean_flags_schema([
+                    "chat_completions",
+                    "responses",
+                    "messages",
+                    "generate_content",
+                    "realtime",
+                ])),
+            ),
+        ]),
+        &[],
+        false,
+    )
+}
+
+fn boolean_flags_schema<const N: usize>(names: [&'static str; N]) -> Value {
+    object_schema(
+        names
+            .into_iter()
+            .map(|name| (name, optional(boolean_schema())))
+            .collect(),
         &[],
         false,
     )
@@ -270,7 +361,14 @@ fn catalog_source_schema() -> Value {
             ("account", optional(id_schema())),
             (
                 "parser",
-                string_enum(["openai", "open_ai", "kimi", "vertex", "antigravity"]),
+                string_enum([
+                    "openai",
+                    "open_ai",
+                    "kimi",
+                    "gemini",
+                    "vertex",
+                    "antigravity",
+                ]),
             ),
             ("path", optional(string_schema())),
             (

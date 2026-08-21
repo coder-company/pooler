@@ -19,12 +19,12 @@ CLIProxyAPI currently has the broader integration product.
 
 | Area | CLIProxyAPI Plus today | Pooler today | Practical gap |
 | --- | --- | --- | --- |
-| Provider breadth | OpenAI, Gemini, Claude, Codex, Grok/xAI, Kimi, Antigravity and compatibility providers | Native Codex plus Cursor, Factory and Devin client adapters; generic upstream routes | Native provider adapters and tested provider-specific behavior |
-| Login experience | Provider-specific Claude, Codex, Kimi, xAI and Antigravity login commands | Generic OAuth contracts and Codex implementation | Turnkey subscription login for additional providers |
-| Model catalog | Large merged catalog with aliases, exclusions, prefixes and virtual mappings | Strict configured model registry and route-local mappings | Discovery and lifecycle management of provider catalogs |
-| Account operations | Ready-to-run multi-account rotation, quota switching and provider/project recovery | General policies for health, cooldowns, affinity, retries and persistence | Live provider account integrations that populate the policy engine |
-| Protocol surface | Provider-native OpenAI Responses, Claude, Gemini Generate Content/Interactions, xAI WebSocket and media paths | HTTP, SSE, WebSocket and Connect primitives; semantic OpenAI/Factory/Devin paths | Provider-native endpoint and media semantics |
-| Management | Remote management API, browser panel ecosystem, account/config/model controls, quota and usage tooling | Authenticated read-only management, diagnostics, metrics, traces and decisions | Browser operations, remote account lifecycle and cost/quota dashboards |
+| Provider breadth | OpenAI, Gemini, Claude, Codex, Grok/xAI, Kimi, Antigravity and compatibility providers | Native bindings for those families plus Cursor, Factory and Devin client adapters and catalog-driven compatible providers | Live credential-gated provider evidence |
+| Login experience | Provider-specific Claude, Codex, Kimi, xAI and Antigravity login commands | Safe account lifecycle contracts and documented Codex OAuth; API-key guidance for other providers | Turnkey subscription login only where public provider contracts exist |
+| Model catalog | Large merged catalog with aliases, exclusions, prefixes and virtual mappings | Vendored provider integrations, automatic discovery, model facts, aliases, exclusions and operator overrides | Ongoing evidence refresh and live-provider validation |
+| Account operations | Ready-to-run multi-account rotation, quota switching and provider/project recovery | Ordered fallback, quota scopes, persisted atomic switching, account lifecycle controls and isolated OAuth refresh | Secret-gated real-account acceptance evidence |
+| Protocol surface | Provider-native OpenAI Responses, Claude, Gemini Generate Content/Interactions, xAI WebSocket and media paths | Native Responses, Anthropic, Gemini, xAI realtime, media, files, batches and embeddings semantics | Remaining live-provider conformance evidence |
+| Management | Remote management API, browser panel ecosystem, account/config/model controls, quota and usage tooling | Authenticated browser/API account and runtime-model controls, safe reload, quota/usage/cost views, traces, audit and redacted export | Remote TLS and durable browser-managed configuration editing |
 | Extensions | Broad trusted plugin ABI for auth, models, scheduling, execution, translation, interception, CLI and management | Capability-limited external/WASM inspection and transformation | Plugin registry, provider plugin catalog and broader extension hooks |
 | Operator UX | TUI, standalone modes and provider login switches | CLI/server workflow | Interactive operational tooling |
 

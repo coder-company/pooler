@@ -41,15 +41,17 @@ pub use headers::{
 pub use media::{
     MediaSemanticAdapter, MediaSemanticAdapterError, MEDIA_BINARY_DECODER, MEDIA_MULTIPART_DECODER,
 };
-pub use native::{NativeAuthorization, NativeRuntime, NativeRuntimeError};
+pub use native::{
+    NativeAuthorization, NativeAuthorizationRequest, NativeRuntime, NativeRuntimeError,
+};
 pub use pool::{
     apply_configured_account_auth, PoolError, PoolFailure, PoolSelection, PoolingCoordinator,
     SelectionContext, SelectionTiming,
 };
 pub use proxy::{
-    apply_configured_upstream_auth, BoxError, HttpProxy, NoSemanticAdapter, ProxyBody, ProxyError,
-    SemanticAdapter, SemanticRequestBody, SemanticResponseBody, SemanticResponseHint,
-    SemanticResponseMode, SemanticWebSocketTransport,
+    apply_configured_upstream_auth, apply_configured_upstream_headers, BoxError, HttpProxy,
+    NoSemanticAdapter, ProxyBody, ProxyError, SemanticAdapter, SemanticRequestBody,
+    SemanticResponseBody, SemanticResponseHint, SemanticResponseMode, SemanticWebSocketTransport,
 };
 pub use resources::{RuntimeResourceGuard, RuntimeResourceSnapshot, RuntimeResources};
 pub use sse::{

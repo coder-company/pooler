@@ -455,6 +455,12 @@ pub trait Store: Send + Sync {
         enabled: bool,
         updated_at: Timestamp,
     ) -> StoreResult<CredentialState>;
+    fn switch_credential(
+        &self,
+        selected: &str,
+        siblings: &[String],
+        updated_at: Timestamp,
+    ) -> StoreResult<Vec<CredentialState>>;
     fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool>;
 
     fn upsert_credential_health(
@@ -724,6 +730,63 @@ impl Store for MemoryStore {
             }
         }
         Ok(state)
+    }
+
+    fn switch_credential(
+        &self,
+        selected: &str,
+        siblings: &[String],
+        updated_at: Timestamp,
+    ) -> StoreResult<Vec<CredentialState>> {
+        non_empty("selected", selected)?;
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        if !inner.credentials.contains_key(selected) {
+            return Err(StoreError::CredentialNotFound(selected.to_owned()));
+        }
+        for sibling in siblings {
+            non_empty("sibling", sibling)?;
+            if !inner.credentials.contains_key(sibling) {
+                return Err(StoreError::CredentialNotFound(sibling.clone()));
+            }
+        }
+        let mut states = Vec::with_capacity(siblings.len().saturating_add(1));
+        for (credential_id, enabled) in std::iter::once((selected, true)).chain(
+            siblings
+                .iter()
+                .filter(|sibling| sibling.as_str() != selected)
+                .map(|sibling| (sibling.as_str(), false)),
+        ) {
+            let Some(state) = inner.credentials.get_mut(credential_id) else {
+                return Err(StoreError::CredentialNotFound(credential_id.to_owned()));
+            };
+            if state.enabled != enabled {
+                state.enabled = enabled;
+                state.updated_at = updated_at;
+                state.revision = state.revision.saturating_add(1);
+            }
+            states.push(state.clone());
+            if enabled {
+                if let Some(health) = inner.health.get_mut(credential_id) {
+                    if health.status == CredentialHealthStatus::Disabled {
+                        health.status = CredentialHealthStatus::Healthy;
+                        health.cooldown_until = None;
+                        health.updated_at = updated_at;
+                    }
+                }
+            } else {
+                inner.health.insert(
+                    credential_id.to_owned(),
+                    CredentialHealthState {
+                        credential_id: credential_id.to_owned(),
+                        status: CredentialHealthStatus::Disabled,
+                        failure_count: 0,
+                        cooldown_until: None,
+                        updated_at,
+                    },
+                );
+            }
+        }
+        Ok(states)
     }
 
     fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool> {

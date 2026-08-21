@@ -250,6 +250,8 @@ pub struct SelectionRequest {
     /// `None` keeps the historical behavior of considering every registered
     /// account for the requested model.
     pub allowed_credentials: Option<BTreeSet<CredentialId>>,
+    /// Configured credential order retained for ordered fallback.
+    pub ordered_credentials: Vec<CredentialId>,
     /// Credentials already attempted by this request and therefore ineligible
     /// for account rotation.
     pub excluded_credentials: BTreeSet<CredentialId>,
@@ -272,6 +274,7 @@ impl SelectionRequest {
         Self {
             model,
             allowed_credentials: None,
+            ordered_credentials: Vec::new(),
             excluded_credentials: BTreeSet::new(),
             required_capabilities: CapabilitySet::new(),
             codec: None,
@@ -292,7 +295,8 @@ impl SelectionRequest {
         mut self,
         credentials: impl IntoIterator<Item = CredentialId>,
     ) -> Self {
-        self.allowed_credentials = Some(credentials.into_iter().collect());
+        self.ordered_credentials = credentials.into_iter().collect();
+        self.allowed_credentials = Some(self.ordered_credentials.iter().cloned().collect());
         self
     }
 
@@ -1392,7 +1396,19 @@ fn choose_index(
             }
             selected
         }
-        SelectionStrategy::FillFirst | SelectionStrategy::OrderedFallback => eligible[0],
+        SelectionStrategy::FillFirst => eligible[0],
+        SelectionStrategy::OrderedFallback => eligible
+            .iter()
+            .copied()
+            .min_by_key(|index| {
+                let credential = &evaluations[*index].entry.registration.credential;
+                request
+                    .ordered_credentials
+                    .iter()
+                    .position(|configured| configured == credential)
+                    .unwrap_or(usize::MAX)
+            })
+            .unwrap_or(eligible[0]),
         SelectionStrategy::LeastInFlight => eligible
             .iter()
             .copied()
@@ -1696,7 +1712,10 @@ mod tests {
     use pooler_core::Capability;
 
     use super::*;
-    use crate::FailureClassifier;
+    use crate::{
+        FailureClassifier, ProviderNeutralQuotaClassifier, QuotaClassifier, QuotaObservation,
+        QuotaSignal,
+    };
 
     fn ids(credential: &str, provider: &str, model: &str) -> CredentialRegistration {
         CredentialRegistration::from_strings(
@@ -1755,6 +1774,127 @@ mod tests {
         drop(first);
         let second = registry.select(request("model", now)).expect("select");
         assert_eq!(second.registration().credential().as_str(), "b");
+    }
+
+    #[test]
+    fn ordered_fallback_uses_configured_order_instead_of_registration_order() {
+        let registry = CredentialRegistry::new();
+        registry
+            .register(ids("a-backup", "provider-a", "model"))
+            .expect("register backup");
+        registry
+            .register(ids("z-primary", "provider-z", "model"))
+            .expect("register primary");
+        let request = SelectionRequest::new(ModelId::new("model").expect("model"))
+            .with_capabilities(CapabilitySet::from(Capability::Text))
+            .with_strategy(SelectionStrategy::OrderedFallback)
+            .with_allowed_credentials([
+                CredentialId::new("z-primary").expect("primary"),
+                CredentialId::new("a-backup").expect("backup"),
+            ]);
+
+        let selected = registry.select(request).expect("ordered selection");
+        assert_eq!(selected.registration().credential().as_str(), "z-primary");
+    }
+
+    #[test]
+    fn every_quota_scope_applies_only_to_matching_credentials() {
+        let cases = [
+            (QuotaScope::Credential, vec!["c1"]),
+            (QuotaScope::CredentialModel, vec!["c1"]),
+            (QuotaScope::Project, vec!["c1", "c2"]),
+            (QuotaScope::ProjectModel, vec!["c1"]),
+            (QuotaScope::Provider, vec!["c1", "c2", "c3"]),
+            (QuotaScope::ProviderModel, vec!["c1", "c3"]),
+        ];
+        for (scope, expected) in cases {
+            let registry = CredentialRegistry::new();
+            let project_one = QuotaProjectKey::new("project-one").expect("project one");
+            let project_two = QuotaProjectKey::new("project-two").expect("project two");
+            for registration in [
+                ids("c1", "provider-one", "model-one").with_quota_project(project_one.clone()),
+                ids("c2", "provider-one", "model-two").with_quota_project(project_one.clone()),
+                ids("c3", "provider-one", "model-one").with_quota_project(project_two),
+                ids("c4", "provider-two", "model-one"),
+            ] {
+                registry.register(registration).expect("register");
+            }
+            let now = Instant::now();
+            registry
+                .set_quota_snapshot(
+                    &CredentialId::new("c1").expect("c1"),
+                    QuotaSnapshot::new(scope, QuotaUnit::Requests, QuotaState::Exhausted, now)
+                        .with_window(Some(10), Some(0)),
+                )
+                .expect("set scoped quota");
+
+            for credential in ["c1", "c2", "c3", "c4"] {
+                let snapshots = registry
+                    .quota_snapshots(&CredentialId::new(credential).expect("credential"), now)
+                    .expect("quota snapshots");
+                assert_eq!(
+                    !snapshots.is_empty(),
+                    expected.contains(&credential),
+                    "scope {scope:?} for {credential}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quota_deadline_and_explicit_recovery_restore_configured_primary() {
+        let registry = CredentialRegistry::new();
+        registry
+            .register(ids("primary", "provider-a", "model"))
+            .expect("register primary");
+        registry
+            .register(ids("backup", "provider-b", "model"))
+            .expect("register backup");
+        let primary = CredentialId::new("primary").expect("primary");
+        let backup = CredentialId::new("backup").expect("backup");
+        let ordered_request = |now| {
+            SelectionRequest::new(ModelId::new("model").expect("model"))
+                .with_capabilities(CapabilitySet::from(Capability::Text))
+                .with_strategy(SelectionStrategy::OrderedFallback)
+                .with_allowed_credentials([primary.clone(), backup.clone()])
+                .at(now)
+        };
+        let now = Instant::now();
+        registry
+            .mark_quota_exhausted(&primary, now.checked_add(Duration::from_secs(5)))
+            .expect("mark quota");
+        let backup_lease = registry
+            .select(ordered_request(now))
+            .expect("backup during quota window");
+        assert_eq!(backup_lease.registration().credential(), &backup);
+        drop(backup_lease);
+
+        let after_reset = now.checked_add(Duration::from_secs(6)).expect("reset time");
+        let primary_lease = registry
+            .select(ordered_request(after_reset))
+            .expect("primary after reset");
+        assert_eq!(primary_lease.registration().credential(), &primary);
+        drop(primary_lease);
+
+        registry
+            .mark_quota_exhausted(&primary, None)
+            .expect("mark unbounded quota");
+        let recovered = ProviderNeutralQuotaClassifier::default().classify(
+            &QuotaObservation::new(
+                QuotaSignal::Recovered,
+                QuotaScope::Credential,
+                QuotaUnit::Requests,
+            )
+            .with_window(Some(100), Some(100)),
+            after_reset,
+        );
+        registry
+            .apply_quota_classification(&primary, &recovered)
+            .expect("apply recovery");
+        let primary_lease = registry
+            .select(ordered_request(after_reset))
+            .expect("primary after explicit recovery");
+        assert_eq!(primary_lease.registration().credential(), &primary);
     }
 
     #[test]

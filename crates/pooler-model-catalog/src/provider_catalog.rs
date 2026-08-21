@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+use pooler_core::Capability;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -49,10 +50,68 @@ pub struct KnownProvider {
     /// Base URL every request to this provider is built on.
     pub base_url: String,
     /// Environment variables this provider's own tooling reads its key from,
-    /// in the order that tooling prefers them. Present for suggestion only;
-    /// configuration still names the secret it uses.
+    /// in the order that tooling prefers them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
+    /// Complete provider integration facts. Omitted entries use the documented
+    /// OpenAI-compatible defaults rather than becoming endpoint-only records.
+    #[serde(default)]
+    pub integration: KnownProviderIntegration,
+}
+
+/// Zero-config facts applied when a known provider is selected.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KnownProviderIntegration {
+    /// Authentication placement (`bearer_secret`, `x_api_key`, or `header`).
+    pub auth_kind: String,
+    /// Header used by `auth_kind: header`.
+    pub auth_header: Option<String>,
+    /// Non-secret prefix used by `auth_kind: header`.
+    pub auth_value_prefix: Option<String>,
+    /// Bounded model-discovery parser.
+    pub discovery_parser: Option<String>,
+    /// Absolute model-discovery path.
+    pub discovery_path: Option<String>,
+    /// Exact upstream-to-public model aliases.
+    pub model_aliases: BTreeMap<String, String>,
+    /// Provider model names withheld from automatic publication.
+    pub model_exclusions: Vec<String>,
+    /// Request dialect used as the provider-level fallback.
+    pub request_dialect: String,
+    /// Conservative provider-level capability hints.
+    pub capabilities: Vec<String>,
+    /// Response classifier family used for quota and retry evidence.
+    pub quota_classifier: String,
+    /// Documented endpoint families exposed by this integration.
+    pub endpoint_families: Vec<String>,
+    /// Non-secret headers required on every provider request.
+    pub required_headers: BTreeMap<String, String>,
+    /// Non-secret query parameters required on every provider request.
+    pub required_query: BTreeMap<String, String>,
+    /// Provider-neutral native binding kind.
+    pub native_kind: String,
+}
+
+impl Default for KnownProviderIntegration {
+    fn default() -> Self {
+        Self {
+            auth_kind: "bearer_secret".to_owned(),
+            auth_header: None,
+            auth_value_prefix: None,
+            discovery_parser: Some("openai".to_owned()),
+            discovery_path: Some("/v1/models".to_owned()),
+            model_aliases: BTreeMap::new(),
+            model_exclusions: Vec::new(),
+            request_dialect: "openai".to_owned(),
+            capabilities: vec!["text".to_owned(), "streaming".to_owned()],
+            quota_classifier: "openai".to_owned(),
+            endpoint_families: vec!["chat_completions".to_owned(), "models".to_owned()],
+            required_headers: BTreeMap::new(),
+            required_query: BTreeMap::new(),
+            native_kind: "openai_compatible".to_owned(),
+        }
+    }
 }
 
 impl ProviderCatalog {
@@ -134,6 +193,51 @@ impl ProviderCatalog {
             bounded_field(&provider.base_url)?;
             for name in &provider.env {
                 bounded_field(name)?;
+            }
+            let integration = &provider.integration;
+            for value in [
+                integration.auth_kind.as_str(),
+                integration.request_dialect.as_str(),
+                integration.quota_classifier.as_str(),
+                integration.native_kind.as_str(),
+            ] {
+                bounded_field(value)?;
+            }
+            for value in integration
+                .auth_header
+                .iter()
+                .chain(integration.auth_value_prefix.iter())
+                .chain(integration.discovery_parser.iter())
+                .chain(integration.discovery_path.iter())
+                .chain(integration.capabilities.iter())
+                .chain(integration.model_exclusions.iter())
+                .chain(integration.endpoint_families.iter())
+                .filter(|value| !value.is_empty())
+            {
+                bounded_field(value)?;
+            }
+            if integration.capabilities.iter().any(|name| {
+                !Capability::ALL
+                    .into_iter()
+                    .any(|capability| capability.as_str() == name)
+            }) {
+                return Err(ProviderCatalogError::InvalidField);
+            }
+            for (key, value) in integration
+                .model_aliases
+                .iter()
+                .chain(integration.required_headers.iter())
+                .chain(integration.required_query.iter())
+            {
+                bounded_field(key)?;
+                bounded_field(value)?;
+            }
+            if integration
+                .discovery_path
+                .as_deref()
+                .is_some_and(|path| !path.starts_with('/') || path.starts_with("//"))
+            {
+                return Err(ProviderCatalogError::InvalidField);
             }
             // A base URL carrying a query or fragment would be silently
             // dropped when a request path is applied to it, and a template
@@ -225,6 +329,27 @@ mod tests {
                 .unwrap_or_else(|| panic!("`{id}` must be a known provider"));
             assert!(provider.base_url.starts_with("https://"));
             assert!(!provider.env.is_empty(), "`{id}` must suggest a key source");
+        }
+    }
+
+    #[test]
+    fn every_known_provider_has_complete_zero_config_facts() {
+        for (id, provider) in ProviderCatalog::builtin().iter() {
+            let integration = &provider.integration;
+            assert!(!integration.auth_kind.is_empty(), "{id}: auth placement");
+            assert!(
+                integration.discovery_parser.is_some(),
+                "{id}: discovery parser"
+            );
+            assert!(integration.discovery_path.is_some(), "{id}: discovery path");
+            assert!(!integration.request_dialect.is_empty(), "{id}: dialect");
+            assert!(!integration.capabilities.is_empty(), "{id}: capabilities");
+            assert!(!integration.quota_classifier.is_empty(), "{id}: quota");
+            assert!(
+                !integration.endpoint_families.is_empty(),
+                "{id}: endpoint families"
+            );
+            assert!(!integration.native_kind.is_empty(), "{id}: native kind");
         }
     }
 

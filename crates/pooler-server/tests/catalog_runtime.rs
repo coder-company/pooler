@@ -1,13 +1,16 @@
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use http::{HeaderMap, Method, StatusCode};
-use pooler_http::PoolingCoordinator;
+use pooler_auth::MemoryOAuthTokenStore;
+use pooler_http::{NativeRuntime, PoolingCoordinator};
 use pooler_model_catalog::{DiscoveryFailure, DiscoveryFailureKind};
 use pooler_server::{
     ActiveCounts, CatalogFetchFuture, CatalogFetcherRegistration, CatalogRuntime, FetchedCatalog,
     HttpProxyServer, ManagementApi, ProviderCatalogFetcher,
 };
+use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -66,6 +69,175 @@ routes:
 "#,
     )
     .expect("catalog runtime config")
+}
+
+#[tokio::test]
+async fn catalog_configured_native_uses_account_key_and_static_auth_without_account() {
+    let static_file = NamedTempFile::new().expect("static catalog secret file");
+    let account_file = NamedTempFile::new().expect("account catalog secret file");
+    let mut static_file = static_file;
+    let mut account_file = account_file;
+    static_file
+        .write_all(b"catalog-static-key")
+        .expect("static catalog secret");
+    account_file
+        .write_all(b"catalog-account-key")
+        .expect("account catalog secret");
+
+    let account_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("account catalog listener");
+    let account_address = account_listener.local_addr().expect("account address");
+    let account_task = tokio::spawn(async move {
+        let (mut stream, _) = account_listener.accept().await.expect("account connection");
+        let request = read_http_request(&mut stream).await;
+        write_catalog_response(&mut stream).await;
+        request
+    });
+    let account_config = pooler_config::compile_yaml(
+        "catalog-native-account.yaml",
+        &format!(
+            "version: 1\nupstreams:\n  xai:\n    url: http://{account_address}\n    native: {{kind: xai}}\n    auth: {{kind: header, header: x-provider-key, value_prefix: 'Token ', secret: 'file:{}'}}\naccounts:\n  account:\n    provider: xai\n    auth_kind: api_key\n    secret: 'file:{}'\ncatalog:\n  sources: [{{id: xai.primary, provider: xai, parser: open_ai, account: account}}]\n",
+            static_file.path().display(),
+            account_file.path().display()
+        ),
+    )
+    .expect("native account catalog config");
+    let account_native = Arc::new(
+        NativeRuntime::new(&account_config, Arc::new(MemoryOAuthTokenStore::new()))
+            .expect("native account runtime"),
+    );
+    let account_catalog = CatalogRuntime::from_config(&account_config, account_native)
+        .expect("native account catalog construction")
+        .expect("native account catalog");
+    account_catalog
+        .refresh()
+        .await
+        .expect("account catalog refresh");
+    let account_request = account_task.await.expect("account catalog task");
+    assert!(account_request
+        .lines()
+        .any(|line| { line.eq_ignore_ascii_case("x-provider-key: Token catalog-account-key") }));
+    assert!(!account_request.contains("catalog-static-key"));
+
+    let static_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("static catalog listener");
+    let static_address = static_listener.local_addr().expect("static address");
+    let static_task = tokio::spawn(async move {
+        let (mut stream, _) = static_listener.accept().await.expect("static connection");
+        let request = read_http_request(&mut stream).await;
+        write_catalog_response(&mut stream).await;
+        request
+    });
+    let static_config = pooler_config::compile_yaml(
+        "catalog-native-static.yaml",
+        &format!(
+            "version: 1\nupstreams:\n  xai:\n    url: http://{static_address}\n    native: {{kind: xai}}\n    auth: {{kind: header, header: x-provider-key, value_prefix: 'Token ', secret: 'file:{}'}}\ncatalog:\n  sources: [{{id: xai.primary, provider: xai, parser: open_ai}}]\n",
+            static_file.path().display()
+        ),
+    )
+    .expect("native static catalog config");
+    let static_native = Arc::new(
+        NativeRuntime::new(&static_config, Arc::new(MemoryOAuthTokenStore::new()))
+            .expect("native static runtime"),
+    );
+    let static_catalog = CatalogRuntime::from_config(&static_config, static_native)
+        .expect("native static catalog construction")
+        .expect("native static catalog");
+    static_catalog
+        .refresh()
+        .await
+        .expect("static catalog refresh");
+    let static_request = static_task.await.expect("static catalog task");
+    assert!(static_request
+        .lines()
+        .any(|line| { line.eq_ignore_ascii_case("x-provider-key: Token catalog-static-key") }));
+}
+
+#[tokio::test]
+async fn catalog_unknown_native_and_non_native_oauth_fail_before_transport() {
+    let unknown_file = NamedTempFile::new().expect("unknown native secret file");
+    let mut unknown_file = unknown_file;
+    unknown_file
+        .write_all(b"unknown-native-key")
+        .expect("unknown native secret");
+    let unknown_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("unknown native listener");
+    let unknown_address = unknown_listener.local_addr().expect("unknown address");
+    let unknown_config = pooler_config::compile_yaml(
+        "catalog-unknown-native.yaml",
+        &format!(
+            "version: 1\nupstreams:\n  future:\n    url: http://{unknown_address}\n    native: {{kind: future_provider}}\n    auth: {{kind: bearer, secret: 'file:{}'}}\ncatalog:\n  sources: [{{id: future.primary, provider: future, parser: open_ai}}]\n",
+            unknown_file.path().display()
+        ),
+    )
+    .expect("unknown native catalog config");
+    let unknown_native = Arc::new(
+        NativeRuntime::new(&unknown_config, Arc::new(MemoryOAuthTokenStore::new()))
+            .expect("unknown native runtime"),
+    );
+    let unknown_catalog = CatalogRuntime::from_config(&unknown_config, unknown_native)
+        .expect("unknown native catalog construction")
+        .expect("unknown native catalog");
+    unknown_catalog
+        .refresh()
+        .await
+        .expect_err("unknown native must fail closed");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            unknown_listener.accept()
+        )
+        .await
+        .is_err(),
+        "unknown native opened a transport"
+    );
+
+    let oauth_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("OAuth listener");
+    let oauth_address = oauth_listener.local_addr().expect("OAuth address");
+    let oauth_config = pooler_config::compile_yaml(
+        "catalog-non-native-oauth.yaml",
+        &format!(
+            "version: 1\nupstreams:\n  plain:\n    url: http://{oauth_address}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  subscription:\n    provider: plain\n    auth_kind: oauth\ncatalog:\n  sources: [{{id: plain.primary, provider: plain, parser: open_ai, account: subscription}}]\n"
+        ),
+    )
+    .expect("non-native OAuth catalog config");
+    let oauth_catalog =
+        CatalogRuntime::from_config(&oauth_config, Arc::new(NativeRuntime::disabled()))
+            .expect("non-native OAuth catalog construction")
+            .expect("non-native OAuth catalog");
+    oauth_catalog
+        .refresh()
+        .await
+        .expect_err("non-native OAuth must fail closed");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            oauth_listener.accept()
+        )
+        .await
+        .is_err(),
+        "non-native OAuth opened a transport"
+    );
+}
+
+async fn write_catalog_response(stream: &mut TcpStream) {
+    let body = br#"{"data":[{"id":"catalog-model"}]}"#;
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("catalog response headers");
+    stream.write_all(body).await.expect("catalog response body");
 }
 
 #[tokio::test]
@@ -215,8 +387,18 @@ catalog:
     );
     assert!(
         dialect("direct/gpt-4o").is_default(),
-        "models with no recorded deviation keep the protocol default"
+        "models with no recorded temperature deviation keep the protocol default"
     );
+    let direct_capabilities = snapshot
+        .get("direct/gpt-4o")
+        .expect("OpenAI model is discovered")
+        .targets()[0]
+        .capabilities();
+    assert!(direct_capabilities.contains(pooler_core::Capability::Text));
+    assert!(direct_capabilities.contains(pooler_core::Capability::Images));
+    assert!(direct_capabilities.contains(pooler_core::Capability::Tools));
+    assert!(direct_capabilities.contains(pooler_core::Capability::StructuredOutput));
+    assert!(direct_capabilities.contains(pooler_core::Capability::Streaming));
 
     let view = pooler_server::merged_model_catalog_value(&config, Some(&runtime));
     let rejected = view["models"]
@@ -229,6 +411,23 @@ catalog:
         rejected["targets"][0]["dialect"]["temperature"], "rejected",
         "the model view exposes the dialect that will shape upstream requests"
     );
+    let profiled = view["models"]
+        .as_array()
+        .expect("model array")
+        .iter()
+        .find(|model| model["id"] == "direct/gpt-4o")
+        .expect("profiled model in the view");
+    assert_eq!(profiled["targets"][0]["profile"]["tools"], "supported");
+    assert_eq!(
+        profiled["targets"][0]["profile"]["request_transform"],
+        "open_ai_chat"
+    );
+    assert!(profiled["targets"][0]["profile"]["context_limit"]
+        .as_u64()
+        .is_some_and(|limit| limit > 0));
+    assert!(profiled["targets"][0]["profile"]["output_limit"]
+        .as_u64()
+        .is_some_and(|limit| limit > 0));
 }
 
 #[tokio::test]
@@ -516,12 +715,18 @@ async fn serve_discovery_then_optional_inference(
 async fn proxy_a_request_rejecting_temperature(
     loss_policy: Option<&str>,
 ) -> (String, Option<String>) {
-    proxy_a_request_with_catalog_overrides(loss_policy, "").await
+    proxy_a_request_with_catalog_overrides(
+        loss_policy,
+        "",
+        br#"{"model":"gpt-image-1.5","temperature":0.7,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await
 }
 
 async fn proxy_a_request_with_catalog_overrides(
     loss_policy: Option<&str>,
     overrides: &str,
+    body: &[u8],
 ) -> (String, Option<String>) {
     let upstream = TcpListener::bind("127.0.0.1:0")
         .await
@@ -529,7 +734,7 @@ async fn proxy_a_request_with_catalog_overrides(
     let upstream_address = upstream.local_addr().expect("fake provider address");
     let provider = tokio::spawn(serve_discovery_then_optional_inference(
         upstream,
-        br#"{"data":[{"id":"gpt-image-1.5"}]}"#,
+        br#"{"data":[{"id":"gpt-image-1.5"},{"id":"gpt-4o"}]}"#,
     ));
 
     let loss_policy =
@@ -566,7 +771,6 @@ catalog:
     let mut downstream = TcpStream::connect(&proxy_address)
         .await
         .expect("proxy connection");
-    let body = br#"{"model":"gpt-image-1.5","temperature":0.7,"messages":[{"role":"user","content":"hi"}]}"#;
     downstream
         .write_all(
             format!(
@@ -614,6 +818,44 @@ async fn a_rejected_parameter_is_dropped_before_the_upstream_request() {
 }
 
 #[tokio::test]
+async fn unsupported_tool_facts_are_enforced_before_the_upstream_request() {
+    let body = br#"{"model":"gpt-image-1.5","tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"hi"}]}"#;
+    let (response, upstream_request) = proxy_a_request_with_catalog_overrides(None, "", body).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let upstream_request = upstream_request.expect("degraded request reaches upstream");
+    assert!(
+        !upstream_request.contains("\"tools\""),
+        "unsupported tools must be removed: {upstream_request}"
+    );
+
+    let (response, upstream_request) =
+        proxy_a_request_with_catalog_overrides(Some("reject"), "", body).await;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        upstream_request.is_none(),
+        "rejection occurs before transport"
+    );
+}
+
+#[tokio::test]
+async fn output_limit_facts_clamp_or_reject_before_transport() {
+    let body =
+        br#"{"model":"gpt-4o","max_tokens":20000,"messages":[{"role":"user","content":"hi"}]}"#;
+    let (response, upstream_request) = proxy_a_request_with_catalog_overrides(None, "", body).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let upstream_request = upstream_request.expect("clamped request reaches upstream");
+    assert!(upstream_request.contains("\"max_tokens\":16384"));
+
+    let (response, upstream_request) =
+        proxy_a_request_with_catalog_overrides(Some("reject"), "", body).await;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        upstream_request.is_none(),
+        "rejection occurs before transport"
+    );
+}
+
+#[tokio::test]
 async fn an_operator_override_pins_a_request_field_and_outranks_vendored_facts() {
     // The vendored snapshot records this model as rejecting `temperature`, so
     // without the override the parameter would be dropped before the upstream
@@ -621,7 +863,8 @@ async fn an_operator_override_pins_a_request_field_and_outranks_vendored_facts()
     // the override reach the wire.
     let (response, upstream_request) = proxy_a_request_with_catalog_overrides(
         None,
-        "  overrides:\n    - model: gpt-image-1.5\n      dialect: {temperature: accepted}\n      request:\n        /reasoning_effort: high\n",
+        "  overrides:\n    - model: gpt-image-1.5\n      capabilities: [text, images, files, reasoning, streaming]\n      dialect: {temperature: accepted}\n      request:\n        /reasoning_effort: high\n",
+        br#"{"model":"gpt-image-1.5","temperature":0.7,"messages":[{"role":"user","content":"hi"}]}"#,
     )
     .await;
 

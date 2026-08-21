@@ -128,11 +128,19 @@ impl Default for OpenAiResponsesWebSocketPool {
     }
 }
 
+/// Provider flavor for one Responses-compatible WebSocket turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponsesWebSocketFlavor {
+    OpenAi,
+    Xai,
+}
+
 /// Inputs for one semantic Responses WebSocket attempt.
 pub(crate) struct OpenAiResponsesWebSocketAttempt {
     pub identity: ConnectionIdentity,
     pub headers: HeaderMap,
     pub request_body: Bytes,
+    pub flavor: ResponsesWebSocketFlavor,
     pub limits: RouteLimits,
     pub loss_policy: LossPolicy,
     pub connect_deadline: Instant,
@@ -365,6 +373,7 @@ impl OpenAiResponsesWebSocketPool {
             identity,
             headers,
             request_body,
+            flavor,
             limits,
             loss_policy,
             connect_deadline,
@@ -383,7 +392,7 @@ impl OpenAiResponsesWebSocketPool {
                 &cancellation,
             )
             .await?;
-        let full_request = prepare_full_request(&request_body)?;
+        let full_request = prepare_full_request(&request_body, flavor)?;
         let request = request_for_connection(&full_request, connection.continuation.take());
         let request = serde_json::to_string(&request)
             .map_err(|_| OpenAiResponsesWebSocketError::InvalidRequest)?;
@@ -589,15 +598,26 @@ impl OpenAiResponsesWebSocketPool {
     }
 }
 
-fn prepare_full_request(input: &[u8]) -> Result<Value, OpenAiResponsesWebSocketError> {
+fn prepare_full_request(
+    input: &[u8],
+    flavor: ResponsesWebSocketFlavor,
+) -> Result<Value, OpenAiResponsesWebSocketError> {
     let mut value: Value =
         serde_json::from_slice(input).map_err(|_| OpenAiResponsesWebSocketError::InvalidRequest)?;
     let object = value
         .as_object_mut()
         .ok_or(OpenAiResponsesWebSocketError::InvalidRequest)?;
     object.remove("type");
-    object.insert("store".to_owned(), Value::Bool(false));
-    object.insert("stream".to_owned(), Value::Bool(true));
+    match flavor {
+        ResponsesWebSocketFlavor::OpenAi => {
+            object.insert("store".to_owned(), Value::Bool(false));
+            object.insert("stream".to_owned(), Value::Bool(true));
+        }
+        ResponsesWebSocketFlavor::Xai => {
+            object.remove("stream");
+            object.remove("background");
+        }
+    }
     Ok(value)
 }
 
@@ -817,6 +837,36 @@ pub(crate) fn materialized_generation(
     CredentialGeneration::Materialized(fingerprint)
 }
 
+/// Fingerprint an already-materialized native authorization delta.
+///
+/// Header names and values are sorted and length-framed before hashing so the
+/// result is independent of insertion order and cannot collide through simple
+/// concatenation. The delta itself never leaves this function.
+pub(crate) fn materialized_authorization_generation(
+    configuration_generation: u64,
+    authorization_delta: &HeaderMap,
+) -> CredentialGeneration {
+    let mut entries = authorization_delta
+        .iter()
+        .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"pooler-native-authorization-delta-v1");
+    context.update(&configuration_generation.to_be_bytes());
+    for (name, value) in entries {
+        context.update(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_be_bytes());
+        context.update(&name);
+        context.update(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        context.update(&value);
+    }
+    let digest = context.finish();
+    let mut fingerprint = [0_u8; 32];
+    fingerprint.copy_from_slice(digest.as_ref());
+    CredentialGeneration::Materialized(fingerprint)
+}
+
 fn bounded_usize(value: u64) -> usize {
     value.min(usize::MAX as u64) as usize
 }
@@ -902,6 +952,36 @@ mod tests {
         assert!(!base.same_credential_scope(&other_endpoint));
         assert!(base.same_credential_scope(&other_session));
         assert_ne!(base, other_session);
+    }
+
+    #[test]
+    fn materialized_authorization_generation_is_stable_and_tracks_custom_headers() {
+        let mut first = HeaderMap::new();
+        first.append("x-custom-auth", HeaderValue::from_static("secret-a"));
+        first.append("x-custom-auth", HeaderValue::from_static("second"));
+        first.insert("authorization", HeaderValue::from_static("Bearer stable"));
+
+        let mut same_material_different_order = HeaderMap::new();
+        same_material_different_order
+            .insert("authorization", HeaderValue::from_static("Bearer stable"));
+        same_material_different_order.append("x-custom-auth", HeaderValue::from_static("second"));
+        same_material_different_order.append("x-custom-auth", HeaderValue::from_static("secret-a"));
+
+        assert_eq!(
+            materialized_authorization_generation(7, &first),
+            materialized_authorization_generation(7, &same_material_different_order)
+        );
+
+        let mut changed = first.clone();
+        changed.insert("x-custom-auth", HeaderValue::from_static("secret-b"));
+        assert_ne!(
+            materialized_authorization_generation(7, &first),
+            materialized_authorization_generation(7, &changed)
+        );
+        assert_ne!(
+            materialized_authorization_generation(7, &first),
+            materialized_authorization_generation(8, &first)
+        );
     }
 
     #[test]
@@ -1051,6 +1131,7 @@ mod tests {
             request_body: Bytes::from_static(
                 br#"{"model":"gpt-test","input":[{"role":"user","content":"hello"}],"store":true,"stream":true}"#,
             ),
+            flavor: ResponsesWebSocketFlavor::OpenAi,
             limits: RouteLimits::default(),
             loss_policy: LossPolicy::Reject,
             connect_deadline: now + Duration::from_secs(2),

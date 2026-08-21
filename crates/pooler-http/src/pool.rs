@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -19,12 +19,12 @@ use adapter_providers::AuthPlacement;
 use http::HeaderMap;
 use pooler_auth::SecretRef as AuthSecretRef;
 use pooler_config::{
-    AccountPlan, CompiledConfig, PolicyPlan, RoutePlan, SecretRef,
+    AccountAuthKind, AccountPlan, CompiledConfig, PolicyPlan, RoutePlan, SecretRef,
     SelectionStrategy as ConfigSelectionStrategy,
 };
 use pooler_core::{
     Capability, CapabilitySet, ConfigGeneration, CredentialId, ErrorClass, ModelDialect, ModelId,
-    ProviderId, RouteId,
+    ModelProfile, ProviderId, RouteId,
 };
 use pooler_model_catalog::{CatalogService, CatalogSnapshot, RequestOverlay};
 use pooler_policy::{
@@ -42,6 +42,7 @@ use pooler_store::{
 use thiserror::Error;
 
 const TYPED_QUOTA_STORE_SCOPE: &str = "typed_quota_v1";
+const MAX_DISABLED_MODELS: usize = 4_096;
 
 /// Request-local semantic information needed by account selection.
 ///
@@ -202,7 +203,7 @@ impl SelectionContext {
 pub struct PoolSelection {
     upstream_id: Arc<str>,
     upstream_model: Option<Arc<str>>,
-    dialect: ModelDialect,
+    profile: ModelProfile,
     request_overlay: RequestOverlay,
     account: Option<AccountPlan>,
     lease: Option<SelectionLease>,
@@ -222,7 +223,7 @@ impl std::fmt::Debug for PoolSelection {
             .debug_struct("PoolSelection")
             .field("upstream_id", &self.upstream_id)
             .field("upstream_model", &self.upstream_model)
-            .field("dialect", &self.dialect)
+            .field("profile", &self.profile)
             .field("request_overlay", &self.request_overlay)
             .field("provider", &self.provider)
             .field("has_account", &self.account.is_some())
@@ -253,7 +254,13 @@ impl PoolSelection {
     /// than the one the first candidate would have used.
     #[must_use]
     pub const fn dialect(&self) -> ModelDialect {
-        self.dialect
+        self.profile.dialect
+    }
+
+    /// Evidence-backed facts for the selected upstream model.
+    #[must_use]
+    pub const fn profile(&self) -> ModelProfile {
+        self.profile
     }
 
     /// Request body fields an operator pinned for the selected public model.
@@ -271,6 +278,12 @@ impl PoolSelection {
     #[must_use]
     pub fn account_secret(&self) -> Option<&SecretRef> {
         self.account.as_ref().and_then(AccountPlan::secret)
+    }
+
+    /// Selected account authentication kind, without exposing its secret.
+    #[must_use]
+    pub fn account_auth_kind(&self) -> Option<AccountAuthKind> {
+        self.account.as_ref().map(AccountPlan::auth_kind)
     }
 
     /// Whether this selection can participate in a retry policy.
@@ -369,6 +382,8 @@ pub enum PoolError {
     InvalidProvider,
     #[error("invalid credential identifier")]
     InvalidCredential,
+    #[error("model `{model}` is disabled by the operator")]
+    ModelDisabled { model: String },
     #[error("model `{model}` is not configured")]
     UnknownModel { model: String },
     #[error("pool policy `{policy}` has no eligible account")]
@@ -387,6 +402,7 @@ pub struct PoolingCoordinator {
     store: Arc<dyn Store>,
     request_sequence: Arc<AtomicU64>,
     catalog: Option<Arc<CatalogService>>,
+    disabled_models: Arc<RwLock<BTreeSet<String>>>,
 }
 
 impl std::fmt::Debug for PoolingCoordinator {
@@ -395,6 +411,13 @@ impl std::fmt::Debug for PoolingCoordinator {
             .debug_struct("PoolingCoordinator")
             .field("registries", &self.registries.len())
             .field("accounts", &self.accounts.len())
+            .field(
+                "disabled_models",
+                &self
+                    .disabled_models
+                    .read()
+                    .map_or(0, |disabled| disabled.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -444,6 +467,7 @@ impl PoolingCoordinator {
             store,
             request_sequence: Arc::new(AtomicU64::new(0)),
             catalog: None,
+            disabled_models: Arc::new(RwLock::new(BTreeSet::new())),
         };
         coordinator.restore_account_state(config)?;
         Ok(coordinator)
@@ -457,6 +481,7 @@ impl PoolingCoordinator {
         let mut coordinator = Self::with_store(config, Arc::clone(&self.store))?;
         coordinator.request_sequence = Arc::clone(&self.request_sequence);
         coordinator.catalog.clone_from(&self.catalog);
+        coordinator.disabled_models = Arc::clone(&self.disabled_models);
         Ok(coordinator)
     }
 
@@ -519,16 +544,120 @@ impl PoolingCoordinator {
             .map_err(|_| PoolError::Store)
     }
 
+    /// Return deduplicated, redacted typed quota windows for management views.
+    pub fn quota_states(&self) -> Result<Vec<pooler_policy::PersistedQuotaSnapshot>, PoolError> {
+        let now = Instant::now();
+        let now_unix_ms = timestamp_now();
+        let mut records = BTreeMap::new();
+        for registry in self.registries.values() {
+            for record in registry
+                .quota_state_records(now, now_unix_ms)
+                .map_err(|_| PoolError::Selection)?
+            {
+                records.insert(format!("{record:?}"), record);
+            }
+        }
+        Ok(records.into_values().collect())
+    }
+
     /// Disable one credential after provider evidence proves it needs
     /// interactive reauthorization. The state is persisted and removed from
     /// every model/route registry in this coordinator.
     pub fn disable_credential(&self, credential: &CredentialId) {
-        let _ = self
-            .store
-            .set_credential_enabled(credential.as_str(), false, timestamp_now());
-        for registry in self.registries.values() {
-            let _ = registry.disable(credential.clone());
+        let _ = self.set_account_enabled(credential.as_str(), false);
+    }
+
+    /// Enable or disable one configured account in persistence and live registries.
+    pub fn set_account_enabled(&self, account_id: &str, enabled: bool) -> Result<(), PoolError> {
+        if !self.accounts.contains_key(account_id) {
+            return Err(PoolError::InvalidCredential);
         }
+        let credential = CredentialId::new(account_id).map_err(|_| PoolError::InvalidCredential)?;
+        self.store
+            .set_credential_enabled(account_id, enabled, timestamp_now())
+            .map_err(|_| PoolError::Store)?;
+        for registry in self.registries.values() {
+            if enabled {
+                registry
+                    .enable(&credential)
+                    .map_err(|_| PoolError::Selection)?;
+            } else {
+                registry
+                    .disable(credential.clone())
+                    .map_err(|_| PoolError::Selection)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically persist a provider account switch and publish it to live registries.
+    pub fn switch_account(&self, account_id: &str) -> Result<(), PoolError> {
+        let selected = self
+            .accounts
+            .get(account_id)
+            .ok_or(PoolError::InvalidCredential)?;
+        let siblings = self
+            .accounts
+            .values()
+            .filter(|account| {
+                account.provider() == selected.provider() && account.id() != selected.id()
+            })
+            .map(|account| account.id().to_owned())
+            .collect::<Vec<_>>();
+        self.store
+            .switch_credential(account_id, &siblings, timestamp_now())
+            .map_err(|_| PoolError::Store)?;
+        let selected_id =
+            CredentialId::new(account_id).map_err(|_| PoolError::InvalidCredential)?;
+        let sibling_ids = siblings
+            .iter()
+            .map(|id| CredentialId::new(id).map_err(|_| PoolError::InvalidCredential))
+            .collect::<Result<Vec<_>, _>>()?;
+        for registry in self.registries.values() {
+            registry
+                .enable(&selected_id)
+                .map_err(|_| PoolError::Selection)?;
+            for sibling in &sibling_ids {
+                registry
+                    .disable(sibling.clone())
+                    .map_err(|_| PoolError::Selection)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enable or disable one public model for new selections.
+    pub fn set_model_enabled(&self, model: &str, enabled: bool) -> Result<(), PoolError> {
+        let model = ModelId::new(model.to_owned()).map_err(|_| PoolError::InvalidModel)?;
+        let mut disabled = self
+            .disabled_models
+            .write()
+            .map_err(|_| PoolError::Selection)?;
+        if enabled {
+            disabled.remove(model.as_str());
+        } else if disabled.contains(model.as_str()) || disabled.len() < MAX_DISABLED_MODELS {
+            disabled.insert(model.as_str().to_owned());
+        } else {
+            return Err(PoolError::Selection);
+        }
+        Ok(())
+    }
+
+    /// Whether the operator currently permits selection of one public model.
+    pub fn model_enabled(&self, model: &str) -> Result<bool, PoolError> {
+        let disabled = self
+            .disabled_models
+            .read()
+            .map_err(|_| PoolError::Selection)?;
+        Ok(!disabled.contains(model))
+    }
+
+    /// Return operator-disabled public model IDs in deterministic order.
+    pub fn disabled_models(&self) -> Result<Vec<String>, PoolError> {
+        self.disabled_models
+            .read()
+            .map(|disabled| disabled.iter().cloned().collect())
+            .map_err(|_| PoolError::Selection)
     }
 
     /// Select one target. The returned lease must remain alive until the
@@ -573,6 +702,11 @@ impl PoolingCoordinator {
         let catalog = self.catalog.as_ref().map(|catalog| catalog.snapshot());
         let (logical_model, static_upstream, static_model) =
             resolve_static_target(config, route, requested_model, catalog.as_deref())?;
+        if !self.model_enabled(&logical_model)? {
+            return Err(PoolError::ModelDisabled {
+                model: logical_model,
+            });
+        }
         let Some(policy) = policy else {
             if selection_contract_is_declared(route, requested_model)
                 && !target_satisfies_context(
@@ -590,7 +724,7 @@ impl PoolingCoordinator {
                 ProviderId::new(static_upstream.clone()).map_err(|_| PoolError::InvalidProvider)?;
             let model_id =
                 ModelId::new(logical_model.to_owned()).map_err(|_| PoolError::InvalidModel)?;
-            let dialect = resolve_target_dialect(
+            let profile = resolve_target_profile(
                 catalog.as_deref(),
                 &logical_model,
                 &static_upstream,
@@ -599,7 +733,7 @@ impl PoolingCoordinator {
             return Ok(PoolSelection {
                 upstream_id: Arc::from(static_upstream),
                 upstream_model: static_model.map(Arc::from),
-                dialect,
+                profile,
                 request_overlay: resolve_request_overlay(catalog.as_deref(), &logical_model),
                 account: None,
                 lease: None,
@@ -711,7 +845,7 @@ impl PoolingCoordinator {
             &lease,
             selected_model.as_deref(),
         );
-        let dialect = resolve_target_dialect(
+        let profile = resolve_target_profile(
             catalog.as_deref(),
             &logical_model,
             provider.as_str(),
@@ -720,7 +854,7 @@ impl PoolingCoordinator {
         Ok(PoolSelection {
             upstream_id: Arc::from(provider.as_str()),
             upstream_model: selected_model.map(Arc::from),
-            dialect,
+            profile,
             request_overlay: resolve_request_overlay(catalog.as_deref(), &logical_model),
             account,
             lease: Some(lease),
@@ -937,7 +1071,7 @@ impl PoolingCoordinator {
             &lease,
             upstream_model.as_deref(),
         );
-        let dialect = resolve_target_dialect(
+        let profile = resolve_target_profile(
             self.catalog
                 .as_ref()
                 .map(|catalog| catalog.snapshot())
@@ -949,7 +1083,7 @@ impl PoolingCoordinator {
         PoolSelection {
             upstream_id: Arc::from(provider.as_str()),
             upstream_model,
-            dialect,
+            profile,
             request_overlay: resolve_request_overlay(
                 self.catalog
                     .as_ref()
@@ -1644,14 +1778,14 @@ fn resolve_static_target(
 /// commit to any of them, so the dialect is matched on the selected provider and
 /// upstream model rather than taken from the first candidate. Statically
 /// configured models carry no discovered facts and keep the protocol default.
-fn resolve_target_dialect(
+fn resolve_target_profile(
     catalog: Option<&CatalogSnapshot>,
     model: &str,
     provider: &str,
     upstream_model: Option<&str>,
-) -> ModelDialect {
+) -> ModelProfile {
     let Some(upstream_model) = upstream_model else {
-        return ModelDialect::DEFAULT;
+        return ModelProfile::DEFAULT;
     };
     catalog
         .and_then(|catalog| catalog.get(model))
@@ -1661,7 +1795,7 @@ fn resolve_target_dialect(
                     && target.upstream_model().as_str() == upstream_model
             })
         })
-        .map_or(ModelDialect::DEFAULT, |target| target.dialect())
+        .map_or(ModelProfile::DEFAULT, |target| target.profile())
 }
 
 /// Resolve the request-body fields an operator pinned for a public model.
@@ -1773,7 +1907,7 @@ fn config_strategy(strategy: ConfigSelectionStrategy) -> pooler_policy::Selectio
     }
 }
 
-fn account_allow_list(config: &CompiledConfig, policy: &PolicyPlan) -> Option<BTreeSet<String>> {
+fn account_allow_list(config: &CompiledConfig, policy: &PolicyPlan) -> Option<Vec<String>> {
     let selection = policy.selection();
     if let Some(pool) = selection.account_pool().or(policy.account_pool()) {
         return config.account_pools().get(pool).map(|pool| {
@@ -2582,6 +2716,46 @@ routes:
             final_selection.credential().map(CredentialId::as_str),
             Some("third")
         );
+    }
+
+    #[test]
+    fn operator_model_enablement_survives_runtime_reconfiguration() {
+        let config = pooled_config(false);
+        let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
+        coordinator
+            .set_model_enabled("public/model", false)
+            .expect("disable model");
+        coordinator
+            .set_model_enabled("pooled", false)
+            .expect("disable route model");
+        assert!(matches!(
+            coordinator.select(
+                &config,
+                &config.routes()[0],
+                None,
+                &HeaderMap::new(),
+                0,
+                Instant::now(),
+            ),
+            Err(PoolError::ModelDisabled { model }) if model == "pooled"
+        ));
+        coordinator
+            .set_model_enabled("pooled", true)
+            .expect("enable route model");
+        assert!(!coordinator
+            .model_enabled("public/model")
+            .expect("model state"));
+        let reconfigured = coordinator.reconfigure(&config).expect("reconfigure");
+        assert_eq!(
+            reconfigured.disabled_models().expect("disabled models"),
+            vec!["public/model".to_owned()]
+        );
+        reconfigured
+            .set_model_enabled("public/model", true)
+            .expect("enable model");
+        assert!(coordinator
+            .model_enabled("public/model")
+            .expect("shared model state"));
     }
 
     #[test]

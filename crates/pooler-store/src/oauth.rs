@@ -4,7 +4,7 @@
 //! the store contains metadata only, while callers receive protected
 //! [`pooler_auth::OAuthTokens`] and a real metadata revision for CAS refresh.
 
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pooler_auth::{
     AuthKind, CredentialId, OAuthCredentialProfile, OAuthIdentity, OAuthStoreError,
@@ -32,6 +32,8 @@ pub struct CredentialProfileMetadata {
     pub account_id_present: bool,
     /// Store revision used as the credential generation.
     pub generation: u64,
+    /// Provider token expiry, when supplied by the provider.
+    pub expires_at: Option<SystemTime>,
     /// Imported provider expiry marker.
     pub expired: bool,
     /// Imported provider disablement marker.
@@ -145,6 +147,11 @@ impl SqliteOAuthTokenStore {
             provider_profile: persisted.provider_profile.unwrap_or_default(),
             account_id_present: persisted.account_id.is_some(),
             generation: state.revision,
+            expires_at: persisted.expires_at_seconds.map(|seconds| {
+                UNIX_EPOCH
+                    .checked_add(Duration::from_secs(seconds))
+                    .unwrap_or(UNIX_EPOCH)
+            }),
             expired: persisted.expired,
             disabled: persisted.disabled,
         }))
@@ -542,5 +549,34 @@ mod tests {
                 .expose_secret(),
             "access-token"
         );
+    }
+
+    #[test]
+    fn profile_metadata_reports_token_expiry_without_exposing_tokens() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"oauth-expiry-test-key").expect("master key"),
+        )
+        .expect("store");
+        let state = store
+            .upsert_credential_state(CredentialState::new("account", "codex", true, 1))
+            .expect("metadata");
+        let token_store = SqliteOAuthTokenStore::new(store);
+        let credential = CredentialId::new("account").expect("credential");
+        let expires_at = UNIX_EPOCH + Duration::from_secs(4_000_000_000);
+        let profile = OAuthCredentialProfile::new(
+            "openai",
+            OAuthTokens::bearer("access-token", Some("refresh-token"), Some(expires_at)),
+        );
+        token_store
+            .compare_and_swap_profile(&credential, state.revision, &profile)
+            .expect("profile");
+
+        let metadata = token_store
+            .profile_metadata(&credential)
+            .expect("metadata")
+            .expect("stored metadata");
+        assert_eq!(metadata.expires_at, Some(expires_at));
+        assert!(!format!("{metadata:?}").contains("access-token"));
+        assert!(!format!("{metadata:?}").contains("refresh-token"));
     }
 }
