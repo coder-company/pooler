@@ -28,6 +28,8 @@ pub const OPENAI_RESPONSES_REASONING_SUMMARY_EXTENSION: &str = "openai.responses
 const UNKNOWN_FIELDS_NAMESPACE: &str = "openai.responses";
 const UNKNOWN_FIELDS_NAME: &str = "unknown_request_fields";
 const REASONING_SUMMARY_NAME: &str = "reasoning_summary";
+pub(crate) const OPENAI_RESPONSES_BUILTIN_EVENT_MEDIA_TYPE: &str =
+    "application/vnd.openai.responses.builtin-output-event+json";
 const DEFAULT_RESPONSE_ID: &str = "resp_pooler";
 const FILE_ID_SOURCE_PREFIX: &str = "openai-file-id:";
 
@@ -175,7 +177,11 @@ pub fn decode_responses_request_with_report(
         parse_input(input, &mut request, &mut report)?;
     }
     if let Some(tools) = object.remove("tools") {
-        request.tools = parse_tools(&tools, &mut report)?;
+        let (function_tools, builtin_tools) = parse_tools(&tools, &mut report)?;
+        request.tools = function_tools;
+        if !builtin_tools.is_empty() {
+            object.insert("tools".to_owned(), Value::Array(builtin_tools));
+        }
     }
     if let Some(choice) = object.remove("tool_choice") {
         request.tool_choice = Some(parse_tool_choice(&choice)?);
@@ -501,43 +507,41 @@ fn parse_summary(
 fn parse_tools(
     value: &Value,
     report: &mut ConversionReport,
-) -> Result<Vec<ToolDefinition>, OpenAiResponsesError> {
-    value
+) -> Result<(Vec<ToolDefinition>, Vec<Value>), OpenAiResponsesError> {
+    let tools = value
         .as_array()
-        .ok_or_else(|| invalid_shape("tools", "an array"))?
-        .iter()
-        .enumerate()
-        .map(|(index, tool)| {
-            let field = format!("tools[{index}]");
-            let object = tool
-                .as_object()
-                .ok_or_else(|| invalid_shape(&field, "an object"))?;
-            let kind = required_string(object, "type", &format!("{field}.type"))?;
-            if kind != "function" {
-                report.unsupported_required(
-                    format!("{field}.type"),
-                    "only function tools have a protocol-neutral definition",
-                );
-                return Ok(ToolDefinition::new(format!("unsupported_{index}"), None));
-            }
-            report_unknown_fields(
-                object,
-                &["type", "name", "description", "parameters", "strict"],
-                &field,
-                report,
-            );
-            let name = required_string(object, "name", &format!("{field}.name"))?;
-            let parameters = object
-                .get("parameters")
-                .map(|parameters| PreservedJson::from_value(parameters.clone()))
-                .transpose()?;
-            let mut definition = ToolDefinition::new(name, parameters);
-            definition.description =
-                optional_string(object, "description", &format!("{field}.description"))?;
-            definition.strict = optional_bool(object, "strict", &format!("{field}.strict"))?;
-            Ok(definition)
-        })
-        .collect()
+        .ok_or_else(|| invalid_shape("tools", "an array"))?;
+    let mut function_tools = Vec::new();
+    let mut builtin_tools = Vec::new();
+    for (index, tool) in tools.iter().enumerate() {
+        let field = format!("tools[{index}]");
+        let object = tool
+            .as_object()
+            .ok_or_else(|| invalid_shape(&field, "an object"))?;
+        let kind = required_string(object, "type", &format!("{field}.type"))?;
+        if kind != "function" {
+            report.preserve_capability(format!("openai.responses.tool.{kind}"));
+            builtin_tools.push(tool.clone());
+            continue;
+        }
+        report_unknown_fields(
+            object,
+            &["type", "name", "description", "parameters", "strict"],
+            &field,
+            report,
+        );
+        let name = required_string(object, "name", &format!("{field}.name"))?;
+        let parameters = object
+            .get("parameters")
+            .map(|parameters| PreservedJson::from_value(parameters.clone()))
+            .transpose()?;
+        let mut definition = ToolDefinition::new(name, parameters);
+        definition.description =
+            optional_string(object, "description", &format!("{field}.description"))?;
+        definition.strict = optional_bool(object, "strict", &format!("{field}.strict"))?;
+        function_tools.push(definition);
+    }
+    Ok((function_tools, builtin_tools))
 }
 
 fn parse_tool_choice(value: &Value) -> Result<ToolChoice, OpenAiResponsesError> {
@@ -705,17 +709,16 @@ pub fn encode_responses_request(
                 .collect::<Result<Vec<_>, _>>()?,
         ),
     );
-    if !request.tools.is_empty() {
-        object.insert(
-            "tools".to_owned(),
-            Value::Array(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| encode_tool(tool, &mut report))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-        );
+    let mut tools = take_preserved_builtin_tools(&mut object)?;
+    tools.extend(
+        request
+            .tools
+            .iter()
+            .map(|tool| encode_tool(tool, &mut report))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    if !tools.is_empty() {
+        object.insert("tools".to_owned(), Value::Array(tools));
     }
     if let Some(choice) = request.tool_choice.as_ref() {
         object.insert("tool_choice".to_owned(), encode_tool_choice(choice));
@@ -1197,6 +1200,26 @@ fn preserved_unknown_fields(
     Ok(object)
 }
 
+fn take_preserved_builtin_tools(
+    object: &mut Map<String, Value>,
+) -> Result<Vec<Value>, OpenAiResponsesError> {
+    let Some(value) = object.remove("tools") else {
+        return Ok(Vec::new());
+    };
+    let tools = value.as_array().ok_or_else(invalid_extension)?;
+    for tool in tools {
+        let tool = tool.as_object().ok_or_else(invalid_extension)?;
+        let kind = tool
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_extension)?;
+        if kind == "function" {
+            return Err(invalid_extension());
+        }
+    }
+    Ok(tools.clone())
+}
+
 fn report_extensions(field: &str, extensions: &Extensions, report: &mut ConversionReport) {
     if !extensions.is_empty() {
         report.unsupported_required(
@@ -1461,7 +1484,7 @@ impl OpenAiResponsesEventDecoder {
         }
         match kind {
             "response.created" | "response.in_progress" => self.decode_response_start(object),
-            "response.output_item.added" => self.decode_output_item_added(object),
+            "response.output_item.added" => self.decode_output_item_added(object, input),
             "response.content_part.added" => self.decode_content_part_added(object),
             "response.output_text.delta" => self.decode_text_delta(object),
             "response.output_text.done" => Ok(Vec::new()),
@@ -1477,7 +1500,7 @@ impl OpenAiResponsesEventDecoder {
             "response.function_call_arguments.done" => self.decode_function_done(object),
             "response.refusal.delta" => self.decode_refusal_delta(object),
             "response.refusal.done" => Ok(Vec::new()),
-            "response.output_item.done" => self.decode_output_item_done(object),
+            "response.output_item.done" => self.decode_output_item_done(object, input),
             "response.completed" => self.decode_completed(object, false),
             "response.incomplete" => self.decode_completed(object, true),
             "response.failed" => self.decode_failed(object),
@@ -1567,16 +1590,22 @@ impl OpenAiResponsesEventDecoder {
     fn decode_output_item_added(
         &mut self,
         object: &Map<String, Value>,
+        input: &[u8],
     ) -> Result<Vec<StreamEvent>, OpenAiResponsesError> {
         let item = item_object(object)?;
         let item_id = required_string(item, "id", "event.item.id")?.to_owned();
         let kind = required_string(item, "type", "event.item.type")?;
-        if !matches!(kind, "message" | "reasoning" | "function_call") {
-            return Err(OpenAiResponsesError::InvalidStream {
-                message: format!("unsupported Responses output item `{kind}`"),
-            });
-        }
         let mut events = self.ensure_response_start();
+        if !matches!(kind, "message" | "reasoning" | "function_call") {
+            events.push(self.event(
+                StreamEventKind::Opaque {
+                    media_type: OPENAI_RESPONSES_BUILTIN_EVENT_MEDIA_TYPE.to_owned(),
+                    data: input.to_vec(),
+                },
+                Some(&item_id),
+            ));
+            return Ok(events);
+        }
         match kind {
             "message" => {
                 self.text_items.entry(item_id).or_insert(false);
@@ -1823,6 +1852,7 @@ impl OpenAiResponsesEventDecoder {
     fn decode_output_item_done(
         &mut self,
         object: &Map<String, Value>,
+        input: &[u8],
     ) -> Result<Vec<StreamEvent>, OpenAiResponsesError> {
         let item = item_object(object)?;
         let item_id = required_string(item, "id", "event.item.id")?.to_owned();
@@ -1833,9 +1863,13 @@ impl OpenAiResponsesEventDecoder {
             }
             "reasoning" => self.close_reasoning(&item_id, item),
             "function_call" => self.close_function(&item_id, item),
-            kind => Err(OpenAiResponsesError::InvalidStream {
-                message: format!("unsupported Responses output item `{kind}`"),
-            }),
+            _ => Ok(vec![self.event(
+                StreamEventKind::Opaque {
+                    media_type: OPENAI_RESPONSES_BUILTIN_EVENT_MEDIA_TYPE.to_owned(),
+                    data: input.to_vec(),
+                },
+                Some(&item_id),
+            )]),
         }
     }
 
@@ -2442,6 +2476,11 @@ impl OpenAiResponsesEventEncoder {
                     "Responses media output events are not implemented by this codec",
                 );
             }
+            StreamEventKind::Opaque { media_type, data }
+                if media_type == OPENAI_RESPONSES_BUILTIN_EVENT_MEDIA_TYPE =>
+            {
+                return self.encode_preserved_builtin_event(data, policy);
+            }
             StreamEventKind::Opaque { .. } => {
                 report.unsupported_required(
                     "opaque_event",
@@ -2454,6 +2493,54 @@ impl OpenAiResponsesEventEncoder {
             .into_iter()
             .map(|(name, value)| self.finish_encoded_event(name, value, report.clone()))
             .collect()
+    }
+
+    fn encode_preserved_builtin_event(
+        &mut self,
+        data: &[u8],
+        policy: LossPolicy,
+    ) -> Result<Vec<EncodedResponsesEvent>, OpenAiResponsesError> {
+        let value: Value = serde_json::from_slice(data)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid_shape("opaque event", "an object"))?;
+        let event = required_string(object, "type", "opaque event.type")?;
+        if !matches!(
+            event,
+            "response.output_item.added" | "response.output_item.done"
+        ) {
+            return Err(OpenAiResponsesError::UnsupportedEvent {
+                message: "preserved built-in event is not an output-item event".to_owned(),
+            });
+        }
+        let item = item_object(object)?;
+        let kind = required_string(item, "type", "opaque event.item.type")?;
+        if matches!(kind, "message" | "reasoning" | "function_call") {
+            return Err(OpenAiResponsesError::UnsupportedEvent {
+                message: "semantic output item cannot be encoded as an opaque built-in event"
+                    .to_owned(),
+            });
+        }
+
+        let mut report = ConversionReport::default();
+        report.preserve_capability(format!("openai.responses.output.{kind}"));
+        report.validate(policy)?;
+        if event == "response.output_item.done" {
+            self.output.push(Value::Object(item.clone()));
+        }
+        if let Some(output_index) = object.get("output_index").and_then(Value::as_u64) {
+            self.next_output_index = self.next_output_index.max(output_index.saturating_add(1));
+        }
+        if let Some(sequence) = object.get("sequence_number").and_then(Value::as_u64) {
+            self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
+        } else {
+            self.next_sequence = self.next_sequence.saturating_add(1);
+        }
+        Ok(vec![EncodedResponsesEvent {
+            event: event.to_owned(),
+            body: data.to_vec(),
+            report,
+        }])
     }
 
     fn start_text(
@@ -2843,8 +2930,8 @@ mod tests {
         OpenAiResponsesEventDecoder, OpenAiResponsesEventEncoder,
     };
     use crate::{
-        FinishReason, LossPolicy, ReasoningBlock, StreamEvent, StreamEventKind, StreamValidator,
-        Usage,
+        encode_chat_request, FinishReason, LossPolicy, OpenAiChatError, OpenAiChatEventEncoder,
+        ReasoningBlock, StreamEvent, StreamEventKind, StreamValidator, Usage,
     };
 
     #[test]
@@ -2922,6 +3009,45 @@ mod tests {
                 .iter()
                 .any(|item| item["type"] == "function_call_output")
         }));
+    }
+
+    #[test]
+    fn builtin_tools_round_trip_without_fabricated_functions() {
+        let source = json!({
+            "model":"builtin-model",
+            "input":"find and inspect it",
+            "tools":[
+                {"type":"web_search","search_context_size":"low"},
+                {
+                    "type":"computer_use_preview",
+                    "display_width":1024,
+                    "display_height":768,
+                    "environment":"browser"
+                }
+            ]
+        });
+        let decoded = decode_responses_request_with_report(
+            &serde_json::to_vec(&source).expect("request JSON"),
+        )
+        .expect("built-in tools decode");
+
+        assert!(decoded.report.is_lossless());
+        assert!(decoded.request.tools.is_empty());
+        assert!(decoded
+            .report
+            .preserved_capabilities
+            .iter()
+            .any(|capability| capability == "openai.responses.tool.web_search"));
+
+        let encoded = encode_responses_request(&decoded.request, LossPolicy::Reject)
+            .expect("built-in tools re-encode");
+        assert!(encoded.report.is_lossless());
+        let value: Value = serde_json::from_slice(&encoded.body).expect("encoded JSON");
+        assert_eq!(value["tools"], source["tools"]);
+
+        let error = encode_chat_request(&decoded.request, LossPolicy::Degrade)
+            .expect_err("built-in tools must not leak into another protocol");
+        assert!(matches!(error, OpenAiChatError::Conversion(_)));
     }
 
     #[test]
@@ -3300,33 +3426,71 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_unsupported_output_items_and_content_parts() {
+    fn builtin_output_items_round_trip_opaquely_and_reject_cross_protocol_encoding() {
         let events = [
             json!({
                 "type":"response.output_item.added",
-                "item":{"id":"search_1","type":"web_search_call"}
+                "sequence_number":4,
+                "output_index":0,
+                "item":{"id":"search_1","type":"web_search_call","status":"searching"}
             }),
             json!({
                 "type":"response.output_item.done",
-                "item":{"id":"computer_1","type":"computer_call"}
-            }),
-            json!({
-                "type":"response.content_part.added",
-                "item_id":"message_1",
-                "part":{"type":"output_image"}
+                "sequence_number":9,
+                "output_index":1,
+                "item":{
+                    "id":"computer_1",
+                    "type":"computer_call",
+                    "status":"completed",
+                    "call_id":"call_1",
+                    "action":{"type":"screenshot"}
+                }
             }),
         ];
 
-        for event in events {
+        for source in events {
+            let body = serde_json::to_vec(&source).expect("event JSON");
             let mut decoder = OpenAiResponsesEventDecoder::new();
-            let error = decoder
-                .decode_event(None, &serde_json::to_vec(&event).expect("event JSON"))
-                .expect_err("unsupported output must not be discarded");
-            assert!(
-                error.to_string().contains("unsupported Responses"),
-                "unexpected error: {error}"
-            );
+            let decoded = decoder
+                .decode_event(None, &body)
+                .expect("built-in output item decodes");
+            let opaque = decoded
+                .iter()
+                .find(|event| matches!(event.kind, StreamEventKind::Opaque { .. }))
+                .expect("opaque built-in event");
+
+            let mut responses_encoder = OpenAiResponsesEventEncoder::new();
+            let encoded = responses_encoder
+                .encode_event(opaque, LossPolicy::Reject)
+                .expect("same-wire built-in event re-encodes");
+            assert_eq!(encoded.len(), 1);
+            assert_eq!(encoded[0].event, source["type"]);
+            assert_eq!(encoded[0].body, body);
+            assert!(encoded[0].report.is_lossless());
+
+            let mut chat_encoder = OpenAiChatEventEncoder::new();
+            let error = chat_encoder
+                .encode_event(opaque, LossPolicy::Degrade)
+                .expect_err("built-in output must not be dropped across protocols");
+            assert!(matches!(error, OpenAiChatError::Conversion(_)));
         }
+    }
+
+    #[test]
+    fn decoder_rejects_unsupported_content_parts() {
+        let event = json!({
+            "type":"response.content_part.added",
+            "item_id":"message_1",
+            "part":{"type":"output_image"}
+        });
+        let mut decoder = OpenAiResponsesEventDecoder::new();
+        let error = decoder
+            .decode_event(None, &serde_json::to_vec(&event).expect("event JSON"))
+            .expect_err("unsupported content must not be discarded");
+        assert!(
+            error.to_string().contains("unsupported Responses"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

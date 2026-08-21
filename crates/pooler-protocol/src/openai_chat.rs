@@ -2150,6 +2150,15 @@ impl OpenAiChatEventEncoder {
             StreamEventKind::TextStart
             | StreamEventKind::TextEnd
             | StreamEventKind::ToolCallEnd { .. } => return Ok(None),
+            StreamEventKind::Opaque { media_type, .. }
+                if media_type
+                    == crate::openai_responses::OPENAI_RESPONSES_BUILTIN_EVENT_MEDIA_TYPE =>
+            {
+                report.unsupported_required(
+                    "event",
+                    "OpenAI Responses built-in output cannot be represented as an OpenAI Chat event",
+                );
+            }
             StreamEventKind::Metadata { .. }
             | StreamEventKind::Media { .. }
             | StreamEventKind::Warning { .. }
