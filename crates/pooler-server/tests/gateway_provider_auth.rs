@@ -146,6 +146,16 @@ fn post<'a>(path: &'a str, body: &'a [u8]) -> Call<'a> {
     }
 }
 
+fn call_without_body<'a>(method: &'a str, path: &'a str) -> Call<'a> {
+    Call {
+        method,
+        path,
+        content_type: None,
+        body: b"",
+        extra_headers: "",
+    }
+}
+
 fn assert_all_accepted(log: &ProviderLog, responses: &[String]) {
     log.assert_accepted_everything();
     for response in responses {
@@ -215,32 +225,79 @@ async fn anthropic_routes_satisfy_a_strict_anthropic_endpoint() {
 
 #[tokio::test]
 async fn gemini_routes_satisfy_a_strict_gemini_endpoint() {
-    let (log, responses) = exchange(
-        ProviderContract::gemini(),
-        "google",
-        &[
-            get("/v1beta/models"),
-            post(
-                "/v1beta/models/gemini-2.5-pro:generateContent",
-                br#"{"contents":[{"parts":[{"text":"hi"}]}]}"#,
-            ),
-            post(
-                "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
-                br#"{"contents":[{"parts":[{"text":"hi"}]}]}"#,
-            ),
-            post(
-                "/v1beta/models/gemini-2.5-pro:countTokens",
-                br#"{"contents":[{"parts":[{"text":"hi"}]}]}"#,
-            ),
-        ],
-    )
-    .await;
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/gemini/gateway-same-wire-2026-08-21.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(MANIFEST_FIXTURE).expect("Gemini compatibility fixture");
+    let requests = fixture["requests"].as_array().expect("fixture requests");
+    let bodies = requests
+        .iter()
+        .map(|request| {
+            request["body"]
+                .is_object()
+                .then(|| serde_json::to_vec(&request["body"]).expect("fixture body JSON"))
+        })
+        .collect::<Vec<_>>();
+    let calls = requests
+        .iter()
+        .zip(&bodies)
+        .map(|(request, body)| Call {
+            method: request["method"].as_str().expect("fixture method"),
+            path: request["path"].as_str().expect("fixture path"),
+            content_type: body.as_ref().map(|_| "application/json"),
+            body: body.as_deref().unwrap_or_default(),
+            extra_headers: "",
+        })
+        .collect::<Vec<_>>();
+    let (log, responses) = exchange(ProviderContract::gemini(), "google", &calls).await;
 
-    assert_all_accepted(&log, &responses);
+    log.assert_accepted_everything();
+    for (index, response) in responses.iter().enumerate() {
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "Gemini call {index} must return the provider's success: {response}"
+        );
+    }
     let generate = log
         .accepted_for("/v1beta/models/gemini-2.5-pro:generateContent")
         .expect("generateContent reached the upstream");
     assert_eq!(generate.header("x-goog-api-key"), Some(SECRET));
+}
+
+#[tokio::test]
+async fn gemini_gateway_rejects_unknown_actions_and_encoded_model_separators_locally() {
+    let (log, responses) = exchange(
+        ProviderContract::gemini(),
+        "google",
+        &[
+            post(
+                "/v1beta/models/gemini-2.5-pro:unknownAction",
+                br#"{"contents":[{"parts":[{"text":"hi"}]}]}"#,
+            ),
+            post(
+                "/v1beta/models/team%2Fgemini:countTokens",
+                br#"{"contents":[{"parts":[{"text":"hi"}]}]}"#,
+            ),
+            call_without_body("POST", "/v1beta/interactions/int_wrong_method"),
+            call_without_body("DELETE", "/v1beta/interactions/int_wrong_method/cancel"),
+        ],
+    )
+    .await;
+
+    log.assert_accepted_everything();
+    assert!(
+        log.accepted.iter().all(|request| {
+            !request.path.contains("unknownAction") && !request.path.contains("team%2Fgemini")
+        }),
+        "invalid Gemini paths must never reach the provider: {:?}",
+        log.accepted
+    );
+    for response in responses {
+        assert!(
+            response.starts_with("HTTP/1.1 400") || response.starts_with("HTTP/1.1 405"),
+            "invalid Gemini path or method must be a local client error: {response}"
+        );
+    }
 }
 
 /// A caller must never smuggle a provider credential through the gateway. The

@@ -118,6 +118,14 @@ impl SelectionContext {
         context
     }
 
+    /// Set the public model decoded by a provider-specific adapter.
+    pub fn with_model(&mut self, model: impl Into<String>) {
+        let model = model.into();
+        if !model.trim().is_empty() {
+            self.model = Some(model);
+        }
+    }
+
     /// Add a route-level requirement discovered by an adapter.
     pub const fn require(&mut self, capability: Capability) {
         self.required_capabilities.insert(capability);
@@ -775,9 +783,29 @@ impl PoolingCoordinator {
             .and_then(|id| config.policies().get(id))
             .cloned();
 
-        let requested_model =
-            model.or_else(|| route.target().model_source().and_then(|_| context.model()));
         let catalog = self.catalog.as_ref().map(|catalog| catalog.snapshot());
+        let contextual_model = context.model().filter(|model| {
+            config.models().get(*model).is_some_and(|plan| {
+                plan.targets()
+                    .iter()
+                    .any(|target| target.provider() == route.target().upstream())
+            }) || catalog
+                .as_deref()
+                .and_then(|catalog| catalog.get(model))
+                .is_some_and(|model| {
+                    model
+                        .targets()
+                        .iter()
+                        .any(|target| target.provider().as_str() == route.target().upstream())
+                })
+        });
+        let requested_model = model.or_else(|| {
+            if route.target().model_source().is_some() {
+                context.model()
+            } else {
+                contextual_model
+            }
+        });
         let (logical_model, static_upstream, static_model) =
             resolve_static_target(config, route, requested_model, catalog.as_deref())?;
         if !self.model_enabled(&logical_model)? {
@@ -1819,12 +1847,16 @@ fn resolve_static_target(
     model: Option<&str>,
     catalog: Option<&CatalogSnapshot>,
 ) -> Result<(String, String, Option<String>), PoolError> {
-    if route.target().model_source().is_some() {
-        let model = model.ok_or(PoolError::InvalidModel)?;
+    if let Some(model) = model {
         if let Some(plan) = config.models().get(model) {
-            let target = plan.targets().first().ok_or(PoolError::UnknownModel {
-                model: model.to_owned(),
-            })?;
+            let target = plan
+                .targets()
+                .iter()
+                .find(|target| target.provider() == route.target().upstream())
+                .or_else(|| plan.targets().first())
+                .ok_or(PoolError::UnknownModel {
+                    model: model.to_owned(),
+                })?;
             return Ok((
                 model.to_owned(),
                 target.provider().to_owned(),
@@ -1833,7 +1865,13 @@ fn resolve_static_target(
         }
         if let Some(target) = catalog
             .and_then(|catalog| catalog.get(model))
-            .and_then(|model| model.targets().first())
+            .and_then(|model| {
+                model
+                    .targets()
+                    .iter()
+                    .find(|target| target.provider().as_str() == route.target().upstream())
+                    .or_else(|| model.targets().first())
+            })
         {
             return Ok((
                 model.to_owned(),
@@ -1841,9 +1879,13 @@ fn resolve_static_target(
                 Some(target.upstream_model().to_string()),
             ));
         }
-        return Err(PoolError::UnknownModel {
-            model: model.to_owned(),
-        });
+        if route.target().model_source().is_some() {
+            return Err(PoolError::UnknownModel {
+                model: model.to_owned(),
+            });
+        }
+    } else if route.target().model_source().is_some() {
+        return Err(PoolError::InvalidModel);
     }
     Ok((
         model.unwrap_or(route.id()).to_owned(),
@@ -1930,7 +1972,7 @@ fn target_satisfies_context(
     context: &SelectionContext,
     catalog: Option<&CatalogSnapshot>,
 ) -> bool {
-    let (capabilities, codecs) = if let Some(model) = model {
+    let (capabilities, codec_supported) = if let Some(model) = model {
         if let Some(plan) = config.models().get(model) {
             let Some(target) = plan
                 .targets()
@@ -1940,7 +1982,12 @@ fn target_satisfies_context(
             else {
                 return false;
             };
-            (target.capabilities(), target.codecs())
+            (
+                target.capabilities(),
+                context.codec().is_none_or(|codec| {
+                    target.codecs().iter().any(|value| value.as_ref() == codec)
+                }),
+            )
         } else {
             let Some(target) = catalog
                 .and_then(|catalog| catalog.get(model))
@@ -1954,18 +2001,39 @@ fn target_satisfies_context(
             else {
                 return false;
             };
-            (target.capabilities(), &[][..])
+            (
+                target.capabilities(),
+                context
+                    .codec()
+                    .is_none_or(|codec| profile_supports_codec(target.profile(), codec)),
+            )
         }
     } else {
-        (route.target().capabilities(), route.target().codecs())
+        (
+            route.target().capabilities(),
+            context.codec().is_none_or(|codec| {
+                route
+                    .target()
+                    .codecs()
+                    .iter()
+                    .any(|value| value.as_ref() == codec)
+            }),
+        )
     };
     let required_capabilities = context
         .required_capabilities()
         .union(route.target().capabilities());
-    capabilities.contains_all(required_capabilities)
-        && context
-            .codec()
-            .is_none_or(|codec| codecs.iter().any(|value| value.as_ref() == codec))
+    capabilities.contains_all(required_capabilities) && codec_supported
+}
+
+fn profile_supports_codec(profile: ModelProfile, codec: &str) -> bool {
+    match codec {
+        "decode.gemini.generate_content" => {
+            profile.request_transform == pooler_core::ModelRequestTransform::GeminiGenerateContent
+                || profile.endpoint_variants.generate_content
+        }
+        _ => false,
+    }
 }
 
 fn route_registry_key(route: &str) -> String {
@@ -2027,7 +2095,8 @@ fn affinity_value(
         | "devin.conversation_id"
         | "devin.cascade_id"
         | "devin.execution_id"
-        | "openai.previous_response_id" => context
+        | "openai.previous_response_id"
+        | "gemini.interaction_id" => context
             .affinity_value(key)
             .map(str::to_owned)
             .or_else(|| semantic_header_value(key, headers)),
@@ -2306,6 +2375,109 @@ routes:
             .filter_reasons
             .iter()
             .any(|reason| matches!(reason, pooler_policy::FilterReason::CodecUnavailable(_))));
+    }
+
+    #[test]
+    fn semantic_model_uses_known_alias_and_passes_unknown_provider_model_through() {
+        let config = pooler_config::compile_yaml(
+            "optional-semantic-model.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:1}}
+upstreams:
+  local: {url: http://127.0.0.1:1}
+  other: {url: http://127.0.0.1:2}
+models:
+  - id: public-model
+    targets:
+      - {provider: local, upstream_model: private-model, capabilities: [text], codecs: [decode.gemini.generate_content]}
+  - id: foreign-only
+    targets:
+      - {provider: other, upstream_model: foreign-model, capabilities: [text]}
+routes:
+  - id: semantic
+    listen: local
+    ingress: {mode: semantic, decoder: decode.gemini.generate_content}
+    target: {provider: local}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("semantic model config");
+        let route = config.route("semantic").expect("route");
+        let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
+
+        let mut known = SelectionContext::default();
+        known.with_model("public-model");
+        known.require(Capability::Text);
+        known.with_codec("decode.gemini.generate_content");
+        let selected = coordinator
+            .select_with_context(
+                &config,
+                route,
+                None,
+                &HeaderMap::new(),
+                &known,
+                SelectionTiming::new(1, Instant::now()),
+            )
+            .expect("known alias selected");
+        assert_eq!(selected.upstream_model(), Some("private-model"));
+
+        let mut unknown = SelectionContext::default();
+        unknown.with_model("provider-model-not-in-catalog");
+        unknown.require(Capability::Text);
+        unknown.with_codec("decode.gemini.generate_content");
+        let selected = coordinator
+            .select_with_context(
+                &config,
+                route,
+                None,
+                &HeaderMap::new(),
+                &unknown,
+                SelectionTiming::new(1, Instant::now()),
+            )
+            .expect("unknown provider model passes through");
+        assert_eq!(selected.provider().as_str(), "local");
+        assert_eq!(selected.upstream_model(), None);
+
+        let mut foreign = SelectionContext::default();
+        foreign.with_model("foreign-only");
+        foreign.require(Capability::Text);
+        let selected = coordinator
+            .select_with_context(
+                &config,
+                route,
+                None,
+                &HeaderMap::new(),
+                &foreign,
+                SelectionTiming::new(1, Instant::now()),
+            )
+            .expect("foreign-only alias is not inferred across providers");
+        assert_eq!(selected.provider().as_str(), "local");
+        assert_eq!(selected.upstream_model(), None);
+    }
+
+    #[test]
+    fn gemini_interaction_id_is_a_policy_affinity_source() {
+        let config = pooler_config::compile_yaml(
+            "gemini-affinity.yaml",
+            r#"
+version: 1
+policies:
+  interactions:
+    selection:
+      strategy: round_robin
+      affinity: {key: gemini.interaction_id, ttl: 30m}
+"#,
+        )
+        .expect("Gemini affinity config");
+        let policy = &config.policies()["interactions"];
+        let mut context = SelectionContext::default();
+        context.with_affinity_value("gemini.interaction_id", "int_123");
+
+        assert_eq!(
+            affinity_value(policy, &HeaderMap::new(), &context),
+            Some("int_123".to_owned())
+        );
     }
 
     #[test]

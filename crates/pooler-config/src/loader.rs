@@ -737,7 +737,7 @@ enum GatewaySurface {
 /// A route is mounted only when the selected provider documents that family
 /// and satisfies the surface, so a Gemini path is never mounted against an
 /// Anthropic upstream merely because both document `models`.
-const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 9] = [
+const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 19] = [
     ("models", GatewaySurface::Discovery("/v1/models"), "models"),
     (
         "chat-completions",
@@ -767,9 +767,59 @@ const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 9] = [
         "models",
     ),
     (
+        "gemini-model-get",
+        GatewaySurface::Discovery("/v1beta/models"),
+        "models",
+    ),
+    (
         "gemini-model-actions",
         GatewaySurface::Dialect("gemini"),
         "generate_content",
+    ),
+    (
+        "gemini-interactions-v1-create",
+        GatewaySurface::Dialect("gemini"),
+        "interactions",
+    ),
+    (
+        "gemini-interactions-v1-resources",
+        GatewaySurface::Dialect("gemini"),
+        "interactions",
+    ),
+    (
+        "gemini-interactions-v1-cancel",
+        GatewaySurface::Dialect("gemini"),
+        "interactions",
+    ),
+    (
+        "gemini-interactions-v1beta-create",
+        GatewaySurface::Dialect("gemini"),
+        "interactions",
+    ),
+    (
+        "gemini-interactions-v1beta-resources",
+        GatewaySurface::Dialect("gemini"),
+        "interactions",
+    ),
+    (
+        "gemini-interactions-v1beta-cancel",
+        GatewaySurface::Dialect("gemini"),
+        "interactions",
+    ),
+    (
+        "gemini-interactions-v1beta2-create",
+        GatewaySurface::Dialect("gemini"),
+        "interactions",
+    ),
+    (
+        "gemini-interactions-v1beta2-resources",
+        GatewaySurface::Dialect("gemini"),
+        "interactions",
+    ),
+    (
+        "gemini-interactions-v1beta2-cancel",
+        GatewaySurface::Dialect("gemini"),
+        "interactions",
     ),
 ];
 

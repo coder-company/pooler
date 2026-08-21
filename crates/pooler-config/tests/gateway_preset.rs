@@ -180,7 +180,23 @@ fn each_provider_mounts_only_its_documented_endpoint_families() {
             "anthropic",
             &["gw-models", "gw-messages", "gw-messages-count-tokens"],
         ),
-        ("google", &["gw-gemini-models", "gw-gemini-model-actions"]),
+        (
+            "google",
+            &[
+                "gw-gemini-models",
+                "gw-gemini-model-get",
+                "gw-gemini-model-actions",
+                "gw-gemini-interactions-v1-create",
+                "gw-gemini-interactions-v1-resources",
+                "gw-gemini-interactions-v1-cancel",
+                "gw-gemini-interactions-v1beta-create",
+                "gw-gemini-interactions-v1beta-resources",
+                "gw-gemini-interactions-v1beta-cancel",
+                "gw-gemini-interactions-v1beta2-create",
+                "gw-gemini-interactions-v1beta2-resources",
+                "gw-gemini-interactions-v1beta2-cancel",
+            ],
+        ),
     ];
 
     for (provider, routes) in expected {

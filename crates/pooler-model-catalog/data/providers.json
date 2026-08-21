@@ -1535,6 +1535,7 @@
         "endpoint_families": [
           "generate_content",
           "stream_generate_content",
+          "interactions",
           "models"
         ],
         "required_headers": {},

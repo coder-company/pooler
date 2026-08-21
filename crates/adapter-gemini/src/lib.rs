@@ -24,6 +24,10 @@ use thiserror::Error;
 pub const GENERATE_CONTENT_ACTION: &str = "generateContent";
 /// Gemini REST action for a streaming GenerateContent request.
 pub const STREAM_GENERATE_CONTENT_ACTION: &str = "streamGenerateContent";
+/// Gemini REST action for a CountTokens request.
+pub const COUNT_TOKENS_ACTION: &str = "countTokens";
+/// Gemini REST action for cancelling a background Interaction.
+pub const CANCEL_INTERACTION_ACTION: &str = "cancel";
 /// Media type used by unary Gemini request and response bodies.
 pub const GEMINI_JSON_CONTENT_TYPE: &str = "application/json";
 /// Query value that selects server-sent events for streamGenerateContent.
@@ -50,53 +54,119 @@ const FUNCTION_ID_ABSENT_EXTENSION: &str = "function-id-absent";
 const THOUGHT_SIGNATURE_EXTENSION: &str = "thought-signature";
 const THINKING_BUDGET_EXTENSION: &str = "thinking-budget";
 
-/// Which Gemini GenerateContent REST method matched a request path.
+/// Which documented Gemini REST operation matched a request path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GeminiMethod {
+    /// `models.list`.
+    ListModels,
+    /// `models.get`.
+    GetModel,
     /// `models.generateContent`.
     GenerateContent,
     /// `models.streamGenerateContent`.
     StreamGenerateContent,
+    /// `models.countTokens`.
+    CountTokens,
+    /// `interactions.create`.
+    CreateInteraction,
+    /// An Interaction resource used by `get` or `delete`.
+    Interaction,
+    /// `interactions.cancel`.
+    CancelInteraction,
 }
 
 impl GeminiMethod {
-    /// Returns whether this method produces a streamed response.
+    /// Returns whether this operation always produces a streamed response.
     #[must_use]
     pub const fn is_streaming(self) -> bool {
         matches!(self, Self::StreamGenerateContent)
     }
 }
 
-/// A model and method extracted from a Gemini REST path.
+/// A resource and operation extracted from a documented Gemini REST path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GeminiPath<'a> {
-    /// Model identifier between `/models/` and the action suffix.
-    pub model: &'a str,
-    /// GenerateContent method selected by the action suffix.
+    /// API version from the first path segment.
+    pub api_version: &'a str,
+    /// Model identifier for a model-scoped operation.
+    pub model: Option<&'a str>,
+    /// Interaction identifier for an interaction-scoped operation.
+    pub interaction_id: Option<&'a str>,
+    /// Operation selected by the resource path or action suffix.
     pub method: GeminiMethod,
 }
 
-/// Matches both v1 and v1beta Gemini model paths without accepting unrelated actions.
+/// Match documented model and Interactions resource paths without accepting
+/// extra segments, encoded separators, or unknown actions.
 #[must_use]
 pub fn parse_gemini_path(path_and_query: &str) -> Option<GeminiPath<'_>> {
     let path = path_and_query.split('?').next()?;
-    let model_and_action = path
-        .strip_prefix("/v1/models/")
-        .or_else(|| path.strip_prefix("/v1beta/models/"))?;
-    let (model, action) = model_and_action.rsplit_once(':')?;
-    let method = match action {
-        GENERATE_CONTENT_ACTION => GeminiMethod::GenerateContent,
-        STREAM_GENERATE_CONTENT_ACTION => GeminiMethod::StreamGenerateContent,
-        _ => return None,
-    };
-    if model.is_empty()
-        || !model
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
+    let mut segments = path.strip_prefix('/')?.split('/');
+    let api_version = segments.next()?;
+    if !matches!(api_version, "v1" | "v1beta" | "v1beta2") {
         return None;
     }
-    Some(GeminiPath { model, method })
+    match segments.next()? {
+        "models" if api_version != "v1beta2" => {
+            let Some(model_and_action) = segments.next() else {
+                return Some(GeminiPath {
+                    api_version,
+                    model: None,
+                    interaction_id: None,
+                    method: GeminiMethod::ListModels,
+                });
+            };
+            if segments.next().is_some() {
+                return None;
+            }
+            let (model, method) = match model_and_action.rsplit_once(':') {
+                Some((model, GENERATE_CONTENT_ACTION)) => (model, GeminiMethod::GenerateContent),
+                Some((model, STREAM_GENERATE_CONTENT_ACTION)) => {
+                    (model, GeminiMethod::StreamGenerateContent)
+                }
+                Some((model, COUNT_TOKENS_ACTION)) => (model, GeminiMethod::CountTokens),
+                Some(_) => return None,
+                None => (model_and_action, GeminiMethod::GetModel),
+            };
+            valid_resource_id(model).then_some(GeminiPath {
+                api_version,
+                model: Some(model),
+                interaction_id: None,
+                method,
+            })
+        }
+        "interactions" => {
+            let Some(interaction_id) = segments.next() else {
+                return Some(GeminiPath {
+                    api_version,
+                    model: None,
+                    interaction_id: None,
+                    method: GeminiMethod::CreateInteraction,
+                });
+            };
+            let method = match segments.next() {
+                None => GeminiMethod::Interaction,
+                Some(CANCEL_INTERACTION_ACTION) if segments.next().is_none() => {
+                    GeminiMethod::CancelInteraction
+                }
+                Some(_) => return None,
+            };
+            valid_resource_id(interaction_id).then_some(GeminiPath {
+                api_version,
+                model: None,
+                interaction_id: Some(interaction_id),
+                method,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn valid_resource_id(value: &str) -> bool {
+    !matches!(value, "" | "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 /// Failures while converting Gemini GenerateContent requests or responses.

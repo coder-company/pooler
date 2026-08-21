@@ -163,7 +163,11 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
     }
 
     fn model_in_request_body(&self, route: &pooler_config::RoutePlan) -> bool {
-        !GeminiSemanticAdapter.supports(route)
+        if GeminiSemanticAdapter.supports(route) {
+            GeminiSemanticAdapter.model_in_request_body(route)
+        } else {
+            true
+        }
     }
 
     fn websocket_transport(

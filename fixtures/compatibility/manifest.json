@@ -239,6 +239,31 @@
       "notes": [
         "No live provider authorization or conformance fixture is committed."
       ]
+    },
+    {
+      "adapter": "gemini",
+      "protocol": "models-actions-interactions",
+      "version": "2026-08-21",
+      "fixture": "../gemini/gateway-same-wire-2026-08-21.json",
+      "equivalence": "http_same_wire",
+      "status": "sanitized_local_reference",
+      "source": "Sanitized Google Models and Interactions REST request shapes replayed through the gateway against Pooler's strict loopback Google contract",
+      "supported_capabilities": [
+        "model_discovery",
+        "model_get",
+        "generate_content",
+        "stream_generate_content",
+        "count_tokens",
+        "interactions_create_get_delete_cancel"
+      ],
+      "unsupported_capabilities": [
+        "live_provider",
+        "cross_protocol_translation"
+      ],
+      "notes": [
+        "This is executable same-wire routing evidence, not a live Google provider conformance claim.",
+        "Replay: cargo test -p pooler-server --test gateway_provider_auth gemini_routes_satisfy_a_strict_gemini_endpoint --locked."
+      ]
     }
   ]
 }

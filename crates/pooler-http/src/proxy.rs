@@ -1303,8 +1303,7 @@ where
                 (
                     PreparedBody::Buffered {
                         bytes: Bytes::from(prepared.body),
-                        patch_model: route.target().model_source().is_some()
-                            && self.semantic.model_in_request_body(route),
+                        patch_model: self.semantic.model_in_request_body(route),
                     },
                     None,
                     selection_context,

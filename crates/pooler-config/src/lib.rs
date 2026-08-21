@@ -3570,6 +3570,7 @@ fn validate_affinity_key(value: &str, label: &SourceLabel) -> Result<(), ConfigE
         "devin.cascade_id",
         "devin.execution_id",
         "openai.previous_response_id",
+        "gemini.interaction_id",
         "anthropic.metadata",
         "hash:selected_fields",
     ];

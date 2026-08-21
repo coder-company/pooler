@@ -23,21 +23,67 @@ const LOSS_POLICIES: [LossPolicy; 3] = [
 ];
 
 #[test]
-fn path_matcher_distinguishes_unary_and_streaming_methods() {
+fn path_matcher_distinguishes_documented_model_and_interaction_operations() {
     let unary =
         parse_gemini_path("/v1beta/models/gemini-2.5-flash:generateContent").expect("unary path");
-    assert_eq!(unary.model, "gemini-2.5-flash");
+    assert_eq!(unary.api_version, "v1beta");
+    assert_eq!(unary.model, Some("gemini-2.5-flash"));
     assert_eq!(unary.method, GeminiMethod::GenerateContent);
     assert!(!unary.method.is_streaming());
 
     let stream = parse_gemini_path("/v1/models/gemini-3.1-pro:streamGenerateContent?alt=sse")
         .expect("stream path");
-    assert_eq!(stream.model, "gemini-3.1-pro");
+    assert_eq!(stream.model, Some("gemini-3.1-pro"));
     assert_eq!(stream.method, GeminiMethod::StreamGenerateContent);
     assert!(stream.method.is_streaming());
-    assert!(parse_gemini_path("/v1/models/x:countTokens").is_none());
-    assert!(parse_gemini_path("/custom/models/x:generateContent").is_none());
-    assert!(parse_gemini_path("/v1/models/team/x:generateContent").is_none());
+
+    let count =
+        parse_gemini_path("/v1beta/models/gemini-2.5-pro:countTokens").expect("countTokens path");
+    assert_eq!(count.model, Some("gemini-2.5-pro"));
+    assert_eq!(count.method, GeminiMethod::CountTokens);
+    assert_eq!(
+        parse_gemini_path("/v1/models/gemini-2.5-pro")
+            .expect("model get")
+            .method,
+        GeminiMethod::GetModel
+    );
+    assert_eq!(
+        parse_gemini_path("/v1beta/models")
+            .expect("model list")
+            .method,
+        GeminiMethod::ListModels
+    );
+
+    let create = parse_gemini_path("/v1beta2/interactions?trace=1").expect("create interaction");
+    assert_eq!(create.method, GeminiMethod::CreateInteraction);
+    assert_eq!(create.interaction_id, None);
+    let get = parse_gemini_path("/v1/interactions/int_123").expect("interaction resource");
+    assert_eq!(get.method, GeminiMethod::Interaction);
+    assert_eq!(get.interaction_id, Some("int_123"));
+    assert_eq!(
+        parse_gemini_path("/v1beta/interactions/int_123/cancel")
+            .expect("cancel interaction")
+            .method,
+        GeminiMethod::CancelInteraction
+    );
+
+    for invalid in [
+        "/custom/models/x:generateContent",
+        "/v1/models/team/x:generateContent",
+        "/v1/models/x:unknown",
+        "/v1/models/x%2Fy:generateContent",
+        "/v1beta2/models/x:generateContent",
+        "/v1/interactions/int/extra",
+        "/v1/interactions/int%2Fextra",
+        "/v1/interactions/int:unknown",
+        "/v1/interactions/int/cancel/extra",
+        "/v1/models/.",
+        "/v1/models/..:countTokens",
+        "/v1/interactions/.",
+        "/v1/interactions/../cancel",
+    ] {
+        assert!(parse_gemini_path(invalid).is_none(), "accepted {invalid}");
+    }
 }
 
 #[test]

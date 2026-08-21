@@ -45,7 +45,7 @@ absent rather than present and broken.
 | --- | --- |
 | `openai`, `xai` | `models`, `chat-completions`, `responses`, `responses-compact`, `responses-websocket` |
 | `anthropic` | `models`, `messages`, `messages-count-tokens` |
-| `google` | `gemini-models`, `gemini-model-actions` |
+| `google` | `gemini-models`, `gemini-model-get`, `gemini-model-actions`, and create/resource/cancel routes for `v1`, `v1beta`, and `v1beta2` Interactions |
 
 | Route | Method and path | Family | Mode |
 | --- | --- | --- | --- |
@@ -56,16 +56,20 @@ absent rather than present and broken.
 | `responses-websocket` | `GET /v1/responses` (upgrade) | `responses` | opaque tunnel |
 | `messages` | `POST /v1/messages` | `messages` | patch |
 | `messages-count-tokens` | `POST /v1/messages/count_tokens` | `messages` | patch |
-| `gemini-models` | `GET /v1beta/models` | `models` | opaque (forwarded) |
-| `gemini-model-actions` | `/v1beta/models/*` including `:generateContent`, `:streamGenerateContent`, and `:countTokens` | `generate_content` | opaque (forwarded) |
+| `gemini-models` | `GET /v1beta/models` | `models` | opaque discovery response |
+| `gemini-model-get` | `GET /v1beta/models/{model}` | `models` | semantic selection, same-wire response |
+| `gemini-model-actions` | `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, or `:countTokens` | `generate_content` | semantic selection, same-wire response |
+| `gemini-interactions-*-create` | `POST /v1/interactions`, `/v1beta/interactions`, or `/v1beta2/interactions` | `interactions` | semantic selection, same-wire response |
+| `gemini-interactions-*-resources` | `GET`/`DELETE .../interactions/{id}` | `interactions` | semantic affinity, same-wire response |
+| `gemini-interactions-*-cancel` | `POST .../interactions/{id}/cancel` | `interactions` | semantic affinity, same-wire response |
 
 The `models` routes are told apart by the provider's documented discovery path
 rather than by dialect, so Anthropic keeps its OpenAI-shaped `/v1/models` list
-while Gemini gets `/v1beta/models`.
+while Gemini gets `/v1beta/models`. The Interactions versions follow Google's
+current stable/beta reference plus the documented `v1beta2` migration surface.
 
-Embeddings, images, audio, files, batches, legacy completions, and Gemini
-Interactions are **not** mounted: no shipped provider integration documents
-those endpoint families, so the preset cannot honestly claim them. They remain
+Embeddings, images, audio, files, batches, and legacy completions are **not**
+mounted when the selected provider does not document those families. They remain
 available to hand-authored routes, where the operator asserts the endpoint
 exists.
 
@@ -131,18 +135,30 @@ this preset translates between protocols. Routes that do that are configured
 explicitly with a decoder and an encoder, and their compatibility claims live in
 `fixtures/compatibility/MATRIX.md`.
 
-Gemini carries the model and the action in the request path rather than in a
-body field, so those routes forward opaquely instead of pretending a body
-inspector can select a target.
+Gemini carries the model in a model-action path, except for Interactions create,
+which carries `model` in its JSON body. These routes therefore use Gemini
+semantic ingress rather than an OpenAI body inspector. The adapter rejects
+unknown actions, extra path segments, and encoded separators before an upstream
+call; extracts the public model and required capabilities; runs normal model,
+account, and policy selection; rewrites a known public alias to its upstream
+model; and preserves caller query parameters. Streaming GenerateContent alone
+normalizes `alt` to the documented single `alt=sse` value.
 
-**These Gemini routes forward; they do not yet resolve.** A public alias in the
-path is not rewritten to the upstream model, and no per-model account selection
-or capability filtering happens for them. `adapter-gemini` implements strict
-path parsing, alias-aware upstream model rewriting, and query preservation for
-`:generateContent` and `:streamGenerateContent` on semantic routes, but the
-preset does not yet mount those semantic routes; `:countTokens`, model GET, and
-Interactions have no semantic implementation at all. Configure a semantic
-Gemini route explicitly when you need resolution rather than forwarding.
+A model already present in static configuration or the refreshed catalog is
+resolved and capability-filtered. A provider model not in either source is sent
+to the selected Google upstream unchanged, so the turnkey gateway does not turn
+a newly released model into a local `unknown model` error. For Interactions,
+known model aliases are rewritten in the body. Resource IDs and
+`previous_interaction_id` are exposed as the `gemini.interaction_id` affinity
+source, so a pooling policy can select follow-up operations consistently. Pooler
+does not inspect opaque responses to bind a newly returned ID to the account that
+created it; deployments that require that ownership guarantee must supply an
+explicit caller affinity key or a single owning account. Agent-backed creates
+have no model to rewrite and pass through after strict JSON validation.
+
+The response remains provider-native Gemini JSON or SSE. “Semantic” here means
+validated routing and selection, not a claim that Pooler translates Gemini into
+a different client protocol.
 
 ## Where the model list comes from
 
@@ -180,6 +196,9 @@ Each claim above is backed by an executable test.
 | `/v1/models` serves the active view and hides routing | `crates/pooler-server/tests/gateway_models.rs` |
 | A disabled or capability-mismatched model is not advertised | `gateway_models.rs::an_operator_disabled_model_leaves_the_published_view`, `::a_model_lacking_a_required_capability_is_not_published` |
 | Caller body preservation and the WebSocket tunnel | `crates/pooler-server/tests/gateway_preset.rs` |
+| Strict Gemini model/action/Interactions paths and credentials | `gateway_provider_auth.rs::gemini_routes_satisfy_a_strict_gemini_endpoint` |
+| Invalid Gemini actions and encoded separators never reach the provider | `gateway_provider_auth.rs::gemini_gateway_rejects_unknown_actions_and_encoded_model_separators_locally` |
+| Gemini alias rewriting, capability context, and query preservation | `crates/pooler-server/tests/gemini_runtime.rs`, `crates/adapter-gemini/src/runtime.rs` unit tests |
 
 Provider traffic is judged by `pooler_testkit::StrictProvider`, which enforces
 path, method, credential placement, required headers, query shape, content
@@ -191,6 +210,5 @@ was generous.
 ## Not yet claimed
 
 The Responses WebSocket route is an opaque tunnel, not a semantic
-implementation. The Gemini routes forward rather than resolve, as described
-above. Live-provider conformance for the preset is a separate gate and has not
-been run.
+implementation. Live-provider conformance for the preset is a separate gate and
+has not been run.

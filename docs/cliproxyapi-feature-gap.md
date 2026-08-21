@@ -27,7 +27,7 @@ CLIProxyAPI currently has the broader integration product.
 | Management | Remote management API, browser panel ecosystem, account/config/model controls, quota and usage tooling | Authenticated browser/API account and runtime-model controls, safe reload, quota/usage/cost views, traces, audit and redacted export | Remote TLS and durable browser-managed configuration editing |
 | Extensions | Broad trusted plugin ABI for auth, models, scheduling, execution, translation, interception, CLI and management | Capability-limited external/WASM inspection and transformation | Plugin registry, provider plugin catalog and broader extension hooks |
 | Operator UX | TUI, standalone modes and provider login switches | CLI/server workflow | Interactive operational tooling |
-| Turnkey endpoint surface | One ready-to-use gateway mounts the expected endpoints by default | The [`gateway` preset](gateway.md) mounts sixteen routes across the OpenAI, Anthropic and Gemini surfaces from one import, with catalog-driven model selection and explicit bounds | Closed for mounted reachability; per-endpoint semantic translation remains route-by-route and evidence-gated |
+| Turnkey endpoint surface | One ready-to-use gateway mounts the expected endpoints by default | The [`gateway` preset](gateway.md) mounts nineteen provider-filtered routes across the OpenAI, Anthropic and Gemini surfaces from one import, with catalog-driven model selection and explicit bounds | Closed for mounted reachability; per-endpoint semantic translation remains route-by-route and evidence-gated |
 
 Primary CLIProxyAPI evidence:
 
@@ -81,7 +81,7 @@ Preserve Pooler's routing, loss, commitment, security and extension boundaries.
 Do not move provider quirks into the core merely to increase feature count.
 Build the missing integration layer in this order:
 
-1. Native Anthropic and Gemini adapters with real provider fixtures.
+1. Keep the native Anthropic and Gemini adapters pinned to strict fixtures and add credential-gated live-provider conformance evidence.
 2. Provider-specific OAuth/login modules mounted on the generic credential
    and refresh contracts.
 3. A merged model-catalog service with aliases, exclusions, provenance and
@@ -91,8 +91,7 @@ Build the missing integration layer in this order:
 5. A secure management UI over the existing authenticated management API.
 6. A signed extension registry and provider plugin catalog that retain the
    current process/WASM isolation boundary.
-7. Native Responses, Gemini Interactions, xAI WebSocket and media routes only
-   when real fixtures establish their required semantics.
+7. Replace the opaque Responses WebSocket tunnel and expand remaining xAI/media semantics only when strict fixtures establish their required behavior; keep Gemini Interactions same-wire until live evidence supports stronger claims.
 
 That path closes CLIProxyAPI's usability advantage without sacrificing the
 properties that make Pooler a safer protocol runtime.

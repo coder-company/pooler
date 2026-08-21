@@ -201,9 +201,11 @@ routes:
     response:
       mode: opaque
 
-  # ------------------------------------------------------------- media family
-  # These surfaces stay opaque so multipart parts, binary payloads, and
-  # provider-specific fields survive byte for byte.
+  # ------------------------------------------------------------- Gemini family
+  # Gemini carries model identifiers in model-action paths. Semantic ingress
+  # validates the exact documented operation and supplies the model and request
+  # capabilities to normal alias, account, and policy selection. Responses stay
+  # same-wire because the client and provider already speak Gemini JSON/SSE.
   - id: gemini-models
     listen: gateway
     match:
@@ -219,11 +221,29 @@ routes:
     response:
       mode: opaque
 
+  - id: gemini-model-get
+    listen: gateway
+    match:
+      methods: [GET]
+      path_template: "/v1beta/models/{model}"
+    limits:
+      max_request_body_bytes: 65536
+      max_frame_bytes: 8388608
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: models
+      provider: gateway
+    response:
+      mode: opaque
+
   - id: gemini-model-actions
     listen: gateway
     match:
-      methods: [GET, POST]
-      path_prefix: /v1beta/models
+      methods: [POST]
+      path_template: "/v1beta/models/{model_action}"
+      content_types: [application/json]
     limits:
       max_request_body_bytes: 33554432
       max_frame_bytes: 33554432
@@ -231,9 +251,170 @@ routes:
       max_queue_bytes: 8388608
       max_queue_items: 256
     ingress:
-      mode: opaque
+      mode: semantic
+      decoder: decode.gemini.generate_content
     target:
       endpoint_family: generate_content
+      provider: gateway
+    response:
+      mode: opaque
+
+  # Both official Interactions versions are mounted. v1/v1beta are the current
+  # reference surfaces; v1beta2 is retained for the documented migration path.
+  # Resource IDs become affinity inputs for an operator-supplied pooling policy.
+  # Opaque responses do not bind a newly returned ID to the creating account.
+  - id: gemini-interactions-v1-create
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/interactions
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: interactions
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: gemini-interactions-v1-resources
+    listen: gateway
+    match:
+      methods: [GET, DELETE]
+      path_template: "/v1/interactions/{interaction}"
+    limits:
+      max_request_body_bytes: 65536
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: interactions
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: gemini-interactions-v1-cancel
+    listen: gateway
+    match:
+      methods: [POST]
+      path_template: "/v1/interactions/{interaction}/cancel"
+    limits:
+      max_request_body_bytes: 65536
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: interactions
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: gemini-interactions-v1beta-create
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1beta/interactions
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: interactions
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: gemini-interactions-v1beta-resources
+    listen: gateway
+    match:
+      methods: [GET, DELETE]
+      path_template: "/v1beta/interactions/{interaction}"
+    limits:
+      max_request_body_bytes: 65536
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: interactions
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: gemini-interactions-v1beta-cancel
+    listen: gateway
+    match:
+      methods: [POST]
+      path_template: "/v1beta/interactions/{interaction}/cancel"
+    limits:
+      max_request_body_bytes: 65536
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: interactions
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: gemini-interactions-v1beta2-create
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1beta2/interactions
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: interactions
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: gemini-interactions-v1beta2-resources
+    listen: gateway
+    match:
+      methods: [GET, DELETE]
+      path_template: "/v1beta2/interactions/{interaction}"
+    limits:
+      max_request_body_bytes: 65536
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: interactions
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: gemini-interactions-v1beta2-cancel
+    listen: gateway
+    match:
+      methods: [POST]
+      path_template: "/v1beta2/interactions/{interaction}/cancel"
+    limits:
+      max_request_body_bytes: 65536
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: interactions
       provider: gateway
     response:
       mode: opaque

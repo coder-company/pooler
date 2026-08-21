@@ -17,6 +17,7 @@ use pooler_http::{
     SseLimits, SseParser,
 };
 use pooler_protocol::{LossPolicy, StreamEvent};
+use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -38,12 +39,13 @@ pub struct GeminiSemanticAdapter;
 
 impl SemanticAdapter for GeminiSemanticAdapter {
     fn supports(&self, route: &RoutePlan) -> bool {
-        route_accepts_only_post(route)
-            && route.ingress().mode() == pooler_core::BodyMode::Semantic
-            && route.ingress().decoder() == Some(GEMINI_REQUEST_DECODER)
-            && route.response().mode() == pooler_core::BodyMode::Semantic
-            && route.response().decoder() == Some(GEMINI_RESPONSE_DECODER)
-            && route.response().encoder() == Some(GEMINI_RESPONSE_ENCODER)
+        let semantic_ingress = route.ingress().mode() == pooler_core::BodyMode::Semantic
+            && route.ingress().decoder() == Some(GEMINI_REQUEST_DECODER);
+        let supported_response = route.response().mode() == pooler_core::BodyMode::Opaque
+            || (route.response().mode() == pooler_core::BodyMode::Semantic
+                && route.response().decoder() == Some(GEMINI_RESPONSE_DECODER)
+                && route.response().encoder() == Some(GEMINI_RESPONSE_ENCODER));
+        semantic_ingress && supported_response
     }
 
     fn encode_request(
@@ -78,8 +80,8 @@ impl SemanticAdapter for GeminiSemanticAdapter {
         selection_context_for_path(route, path, body)
     }
 
-    fn model_in_request_body(&self, _route: &RoutePlan) -> bool {
-        false
+    fn model_in_request_body(&self, route: &RoutePlan) -> bool {
+        route.matcher().path().value().contains("/interactions")
     }
 
     fn rewrite_upstream_uri(
@@ -137,26 +139,48 @@ fn encode_request_for_path(
     path: crate::GeminiPath<'_>,
     body: &[u8],
 ) -> Result<SemanticRequestBody, BoxError> {
-    let decoded = GeminiGenerateContentCodec::decode_request_with_report(body, path.model)
-        .map_err(|error| Box::new(error) as BoxError)?;
-    decoded
-        .report
-        .validate(route.loss_policy())
-        .map_err(|error| Box::new(error) as BoxError)?;
-    let encoded = GeminiGenerateContentCodec::encode_request(&decoded.request, route.loss_policy())
-        .map_err(|error| Box::new(error) as BoxError)?;
-    if encoded.model != path.model {
-        return Err(Box::new(GeminiRuntimeError::ModelChanged));
-    }
+    let (body, mode) = match path.method {
+        GeminiMethod::GenerateContent | GeminiMethod::StreamGenerateContent => {
+            let model = path.model.ok_or(GeminiRuntimeError::UnsupportedRoute)?;
+            let decoded = GeminiGenerateContentCodec::decode_request_with_report(body, model)
+                .map_err(|error| Box::new(error) as BoxError)?;
+            decoded
+                .report
+                .validate(route.loss_policy())
+                .map_err(|error| Box::new(error) as BoxError)?;
+            let encoded =
+                GeminiGenerateContentCodec::encode_request(&decoded.request, route.loss_policy())
+                    .map_err(|error| Box::new(error) as BoxError)?;
+            if encoded.model != model {
+                return Err(Box::new(GeminiRuntimeError::ModelChanged));
+            }
+            let mode = if path.method.is_streaming() {
+                SemanticResponseMode::ServerSentEvents
+            } else {
+                SemanticResponseMode::Json
+            };
+            (encoded.body, mode)
+        }
+        GeminiMethod::CountTokens | GeminiMethod::CreateInteraction => {
+            require_json_object(body)?;
+            (body.to_vec(), SemanticResponseMode::AdapterDefault)
+        }
+        GeminiMethod::GetModel
+        | GeminiMethod::Interaction
+        | GeminiMethod::CancelInteraction
+        | GeminiMethod::ListModels => {
+            if !body.is_empty() {
+                return Err(Box::new(GeminiRuntimeError::UnexpectedRequestBody));
+            }
+            (Vec::new(), SemanticResponseMode::AdapterDefault)
+        }
+    };
     Ok(SemanticRequestBody {
-        body: encoded.body,
+        body,
         content_type: HeaderValue::from_static(GEMINI_JSON_CONTENT_TYPE),
         response_hint: SemanticResponseHint {
-            mode: match path.method {
-                GeminiMethod::GenerateContent => SemanticResponseMode::Json,
-                GeminiMethod::StreamGenerateContent => SemanticResponseMode::ServerSentEvents,
-            },
-            requested_model: Some(path.model.to_owned()),
+            mode,
+            requested_model: path.model.map(ToOwned::to_owned),
         },
     })
 }
@@ -166,18 +190,129 @@ fn selection_context_for_path(
     path: crate::GeminiPath<'_>,
     body: &[u8],
 ) -> Result<SelectionContext, BoxError> {
-    let decoded = GeminiGenerateContentCodec::decode_request_with_report(body, path.model)
+    let mut context = match path.method {
+        GeminiMethod::GenerateContent | GeminiMethod::StreamGenerateContent => {
+            let model = path.model.ok_or(GeminiRuntimeError::UnsupportedRoute)?;
+            let decoded = GeminiGenerateContentCodec::decode_request_with_report(body, model)
+                .map_err(|error| Box::new(error) as BoxError)?;
+            decoded
+                .report
+                .validate(route.loss_policy())
+                .map_err(|error| Box::new(error) as BoxError)?;
+            let mut context = SelectionContext::from_semantic_request(&decoded.request);
+            context.with_codec(GEMINI_REQUEST_DECODER);
+            context
+        }
+        GeminiMethod::CountTokens => count_tokens_selection_context(
+            route,
+            path.model.ok_or(GeminiRuntimeError::UnsupportedRoute)?,
+            body,
+        )?,
+        GeminiMethod::GetModel => {
+            if !body.is_empty() {
+                return Err(Box::new(GeminiRuntimeError::UnexpectedRequestBody));
+            }
+            let mut context = SelectionContext::default();
+            context.with_model(path.model.ok_or(GeminiRuntimeError::UnsupportedRoute)?);
+            context.require(pooler_core::Capability::Text);
+            context
+        }
+        GeminiMethod::CreateInteraction => interaction_selection_context(body)?,
+        GeminiMethod::Interaction | GeminiMethod::CancelInteraction => {
+            if !body.is_empty() {
+                return Err(Box::new(GeminiRuntimeError::UnexpectedRequestBody));
+            }
+            let mut context = SelectionContext::default();
+            if let Some(interaction_id) = path.interaction_id {
+                context.with_affinity_value("gemini.interaction_id", interaction_id);
+            }
+            context
+        }
+        GeminiMethod::ListModels => SelectionContext::default(),
+    };
+    if path.method.is_streaming() {
+        context.require(pooler_core::Capability::Streaming);
+    }
+    Ok(context)
+}
+
+fn count_tokens_selection_context(
+    route: &RoutePlan,
+    model: &str,
+    body: &[u8],
+) -> Result<SelectionContext, BoxError> {
+    let value = require_json_object(body)?;
+    let request_body = if let Some(request) = value.get("generateContentRequest") {
+        serde_json::to_vec(request).map_err(|error| Box::new(error) as BoxError)?
+    } else if value.contains_key("contents") {
+        body.to_vec()
+    } else {
+        return Err(Box::new(GeminiRuntimeError::MissingCountTokensInput));
+    };
+    let decoded = GeminiGenerateContentCodec::decode_request_with_report(&request_body, model)
         .map_err(|error| Box::new(error) as BoxError)?;
     decoded
         .report
         .validate(route.loss_policy())
         .map_err(|error| Box::new(error) as BoxError)?;
-    let mut context = SelectionContext::from_semantic_request(&decoded.request);
-    if path.method.is_streaming() {
-        context.require(pooler_core::Capability::Streaming);
+    Ok(SelectionContext::from_semantic_request(&decoded.request))
+}
+
+fn interaction_selection_context(body: &[u8]) -> Result<SelectionContext, BoxError> {
+    let value = require_json_object(body)?;
+    if !value.contains_key("input") {
+        return Err(Box::new(GeminiRuntimeError::MissingInteractionInput));
     }
-    context.with_codec(GEMINI_REQUEST_DECODER);
+    let mut context = SelectionContext::default();
+    if let Some(model) = value.get("model") {
+        let model = model
+            .as_str()
+            .filter(|model| !model.trim().is_empty())
+            .ok_or(GeminiRuntimeError::InvalidInteractionModel)?;
+        context.with_model(model);
+    } else if let Some(agent) = value.get("agent") {
+        agent
+            .as_str()
+            .filter(|agent| !agent.trim().is_empty())
+            .ok_or(GeminiRuntimeError::InvalidInteractionAgent)?;
+    } else {
+        return Err(Box::new(GeminiRuntimeError::MissingInteractionTarget));
+    }
+    context.require(pooler_core::Capability::Text);
+    if let Some(stream) = value.get("stream") {
+        if stream
+            .as_bool()
+            .ok_or(GeminiRuntimeError::InvalidInteractionStream)?
+        {
+            context.require(pooler_core::Capability::Streaming);
+        }
+    }
+    if let Some(tools) = value.get("tools") {
+        let tools = tools
+            .as_array()
+            .ok_or(GeminiRuntimeError::InvalidInteractionTools)?;
+        if !tools.is_empty() {
+            context.require(pooler_core::Capability::Tools);
+            context.require(pooler_core::Capability::FunctionCalling);
+        }
+    }
+    if let Some(previous) = value.get("previous_interaction_id") {
+        let previous = previous
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or(GeminiRuntimeError::InvalidPreviousInteractionId)?;
+        context.with_affinity_value("gemini.interaction_id", previous);
+    }
     Ok(context)
+}
+
+fn require_json_object(body: &[u8]) -> Result<serde_json::Map<String, Value>, BoxError> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|_| Box::new(GeminiRuntimeError::InvalidRequestJson) as BoxError)?;
+    match value {
+        Value::Object(object) => Ok(object),
+        _ => Err(Box::new(GeminiRuntimeError::InvalidRequestObject)),
+    }
 }
 
 fn decode_response_for_method(
@@ -205,19 +340,23 @@ fn decode_response_for_method(
         content_type: match method {
             GeminiMethod::GenerateContent => HeaderValue::from_static(GEMINI_JSON_CONTENT_TYPE),
             GeminiMethod::StreamGenerateContent => HeaderValue::from_static("text/event-stream"),
+            _ => return Err(Box::new(GeminiRuntimeError::UnsupportedRoute)),
         },
     })
 }
 
 fn route_method(route: &RoutePlan) -> Option<GeminiMethod> {
-    if !route_accepts_only_post(route) {
+    if route.matcher().methods().len() != 1 || route.matcher().methods()[0].as_ref() != "POST" {
         return None;
     }
-    parse_gemini_path(route.matcher().path().value()).map(|path| path.method)
-}
-
-fn route_accepts_only_post(route: &RoutePlan) -> bool {
-    route.matcher().methods().len() == 1 && route.matcher().methods()[0].as_ref() == "POST"
+    parse_gemini_path(route.matcher().path().value())
+        .map(|path| path.method)
+        .filter(|method| {
+            matches!(
+                method,
+                GeminiMethod::GenerateContent | GeminiMethod::StreamGenerateContent
+            )
+        })
 }
 
 fn route_path(route: &RoutePlan) -> Result<crate::GeminiPath<'_>, BoxError> {
@@ -231,9 +370,6 @@ fn request_path(uri: &Uri) -> Result<crate::GeminiPath<'_>, BoxError> {
 }
 
 fn checked_gemini_path(path: &str) -> Option<crate::GeminiPath<'_>> {
-    if !path.starts_with("/v1/models/") && !path.starts_with("/v1beta/models/") {
-        return None;
-    }
     parse_gemini_path(path)
 }
 
@@ -244,30 +380,38 @@ fn rewrite_gemini_uri(
 ) -> Result<Uri, GeminiRuntimeError> {
     let path =
         checked_gemini_path(downstream_uri.path()).ok_or(GeminiRuntimeError::UnsupportedRoute)?;
-    let model = upstream_model.unwrap_or(path.model);
+    if path.model.is_none() {
+        return Ok(upstream_uri);
+    }
+    let model = upstream_model
+        .or(path.model)
+        .ok_or(GeminiRuntimeError::InvalidModel)?;
     if !valid_model_segment(model) {
         return Err(GeminiRuntimeError::InvalidModel);
     }
-    let prefix = if downstream_uri.path().starts_with("/v1beta/models/") {
-        "/v1beta/models/"
-    } else {
-        "/v1/models/"
-    };
-    let action = match path.method {
-        GeminiMethod::GenerateContent => crate::GENERATE_CONTENT_ACTION,
-        GeminiMethod::StreamGenerateContent => crate::STREAM_GENERATE_CONTENT_ACTION,
-    };
     let mut query = upstream_uri
         .query()
         .unwrap_or_default()
         .split('&')
-        .filter(|part| !part.is_empty() && part.split('=').next() != Some("alt"))
+        .filter(|part| {
+            !part.is_empty()
+                && (!path.method.is_streaming() || part.split('=').next() != Some("alt"))
+        })
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     if path.method.is_streaming() {
         query.push(GEMINI_SSE_QUERY.to_owned());
     }
-    let mut path_and_query = format!("{prefix}{model}:{action}");
+    let suffix = match path.method {
+        GeminiMethod::GetModel => String::new(),
+        GeminiMethod::GenerateContent => format!(":{}", crate::GENERATE_CONTENT_ACTION),
+        GeminiMethod::StreamGenerateContent => {
+            format!(":{}", crate::STREAM_GENERATE_CONTENT_ACTION)
+        }
+        GeminiMethod::CountTokens => format!(":{}", crate::COUNT_TOKENS_ACTION),
+        _ => return Err(GeminiRuntimeError::UnsupportedRoute),
+    };
+    let mut path_and_query = format!("/{}/models/{model}{suffix}", path.api_version);
     if !query.is_empty() {
         path_and_query.push('?');
         path_and_query.push_str(&query.join("&"));
@@ -282,7 +426,7 @@ fn rewrite_gemini_uri(
 }
 
 fn valid_model_segment(model: &str) -> bool {
-    !model.is_empty()
+    !matches!(model, "" | "." | "..")
         && model
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -357,6 +501,7 @@ impl GeminiResponseBody {
                     self.process_sse_event(&event)?;
                 }
             }
+            _ => return Err(Box::new(GeminiRuntimeError::UnsupportedRoute)),
         }
         Ok(())
     }
@@ -415,6 +560,7 @@ impl GeminiResponseBody {
                     .map_err(|error| Box::new(error) as BoxError)?;
                 self.encode_stream_events(&semantic)?;
             }
+            _ => return Err(Box::new(GeminiRuntimeError::UnsupportedRoute)),
         }
         self.ended = true;
         Ok(())
@@ -506,10 +652,32 @@ impl Body for GeminiResponseBody {
 
 #[derive(Debug, Error)]
 enum GeminiRuntimeError {
-    #[error("route or request is not a supported POST Gemini GenerateContent path")]
+    #[error("route or request is not a supported Gemini path")]
     UnsupportedRoute,
     #[error("Gemini model is not a valid URL path segment")]
     InvalidModel,
+    #[error("Gemini request body is not valid JSON")]
+    InvalidRequestJson,
+    #[error("Gemini request body must be a JSON object")]
+    InvalidRequestObject,
+    #[error("Gemini operation does not accept a request body")]
+    UnexpectedRequestBody,
+    #[error("Gemini CountTokens request requires `contents` or `generateContentRequest`")]
+    MissingCountTokensInput,
+    #[error("Gemini Interaction request requires `input`")]
+    MissingInteractionInput,
+    #[error("Gemini Interaction model must be a non-empty string")]
+    InvalidInteractionModel,
+    #[error("Gemini Interaction agent must be a non-empty string")]
+    InvalidInteractionAgent,
+    #[error("Gemini Interaction stream must be a boolean")]
+    InvalidInteractionStream,
+    #[error("Gemini Interaction tools must be an array")]
+    InvalidInteractionTools,
+    #[error("Gemini previous_interaction_id must be a non-empty string")]
+    InvalidPreviousInteractionId,
+    #[error("Gemini Interaction requires either `model` or `agent`")]
+    MissingInteractionTarget,
     #[error("Gemini upstream URI could not be constructed")]
     InvalidUpstreamUri,
     #[error("Gemini model changed while encoding the same-wire request")]
@@ -564,6 +732,96 @@ mod tests {
                 .filter(|part| part.split('=').next() == Some("alt"))
                 .collect::<Vec<_>>(),
             vec![GEMINI_SSE_QUERY]
+        );
+    }
+
+    #[test]
+    fn rewrite_changes_count_tokens_model_without_changing_query() {
+        let downstream: Uri = "/v1beta/models/public:countTokens?trace=abc&alt=json"
+            .parse()
+            .expect("downstream URI");
+        let upstream: Uri =
+            "https://generativelanguage.googleapis.com/v1beta/models/public:countTokens?trace=abc&alt=json&key=server-key"
+                .parse()
+                .expect("upstream URI");
+
+        let rewritten =
+            rewrite_gemini_uri(&downstream, Some("private"), upstream).expect("rewritten URI");
+
+        assert_eq!(
+            rewritten.path_and_query().expect("path and query").as_str(),
+            "/v1beta/models/private:countTokens?trace=abc&alt=json&key=server-key"
+        );
+    }
+
+    #[test]
+    fn rewrite_rejects_dot_segment_upstream_aliases() {
+        let downstream: Uri = "/v1beta/models/public:countTokens"
+            .parse()
+            .expect("downstream URI");
+        let upstream: Uri =
+            "https://generativelanguage.googleapis.com/v1beta/models/public:countTokens"
+                .parse()
+                .expect("upstream URI");
+
+        for model in [".", ".."] {
+            assert!(
+                rewrite_gemini_uri(&downstream, Some(model), upstream.clone()).is_err(),
+                "accepted dot-segment alias {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_preserves_interaction_resource_and_query() {
+        let downstream: Uri = "/v1beta/interactions/int_123?stream=true&last_event_id=evt_2"
+            .parse()
+            .expect("downstream URI");
+        let upstream: Uri =
+            "https://generativelanguage.googleapis.com/v1beta/interactions/int_123?stream=true&last_event_id=evt_2&key=server-key"
+                .parse()
+                .expect("upstream URI");
+
+        let rewritten =
+            rewrite_gemini_uri(&downstream, None, upstream.clone()).expect("rewritten URI");
+
+        assert_eq!(rewritten, upstream);
+    }
+
+    #[test]
+    fn interaction_selection_extracts_model_capabilities_and_affinity() {
+        let context = interaction_selection_context(
+            br#"{"model":"public","input":"hi","stream":true,"tools":[{"type":"function"}],"previous_interaction_id":"int_123"}"#,
+        )
+        .expect("interaction context");
+
+        assert_eq!(context.model(), Some("public"));
+        assert!(context
+            .required_capabilities()
+            .contains(pooler_core::Capability::Text));
+        assert!(context
+            .required_capabilities()
+            .contains(pooler_core::Capability::Streaming));
+        assert!(context
+            .required_capabilities()
+            .contains(pooler_core::Capability::Tools));
+        assert!(context
+            .required_capabilities()
+            .contains(pooler_core::Capability::FunctionCalling));
+        assert_eq!(
+            context.affinity_value("gemini.interaction_id"),
+            Some("int_123")
+        );
+
+        let without_tools =
+            interaction_selection_context(br#"{"model":"public","input":"hi","tools":[]}"#)
+                .expect("empty tools array");
+        assert!(!without_tools
+            .required_capabilities()
+            .contains(pooler_core::Capability::Tools));
+        assert!(
+            interaction_selection_context(br#"{"model":"public","input":"hi","tools":null}"#)
+                .is_err()
         );
     }
 }

@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 pub struct ProviderRoute {
     /// Accepted method.
     pub method: &'static str,
-    /// Accepted path. A trailing `*` matches any suffix.
+    /// Accepted path. One `*` matches a non-empty run of path bytes.
     pub path: &'static str,
     /// Required request content type, if the endpoint takes a body.
     pub content_type: Option<&'static str>,
@@ -150,10 +150,59 @@ impl ProviderContract {
                     response: GEMINI_MODELS,
                 },
                 ProviderRoute {
-                    method: "POST",
+                    method: "GET",
                     path: "/v1beta/models/*",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1beta/models/*:generateContent",
                     content_type: Some("application/json"),
                     required_body_fields: &["contents"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1beta/models/*:streamGenerateContent",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["contents"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1beta/models/*:countTokens",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["contents"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1beta/interactions",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["model", "input"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1beta/interactions/*",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "DELETE",
+                    path: "/v1beta/interactions/*",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1beta/interactions/*/cancel",
+                    content_type: Some("application/json"),
+                    required_body_fields: &[],
                     response: ACCEPTED,
                 },
             ],
@@ -327,9 +376,17 @@ impl Rejection {
 }
 
 fn path_matches(pattern: &str, path: &str) -> bool {
-    pattern.strip_suffix('*').map_or(pattern == path, |prefix| {
-        path.starts_with(prefix) && path.len() > prefix.len()
-    })
+    let Some((prefix, suffix)) = pattern.split_once('*') else {
+        return pattern == path;
+    };
+    if !path.starts_with(prefix)
+        || !path.ends_with(suffix)
+        || path.len() <= prefix.len().saturating_add(suffix.len())
+    {
+        return false;
+    }
+    let wildcard = &path[prefix.len()..path.len() - suffix.len()];
+    !wildcard.contains('/')
 }
 
 fn check(
@@ -379,14 +436,6 @@ fn check(
             ));
         }
     }
-    if let Some(query) = &request.query {
-        return Err(Rejection::new(
-            400,
-            "Bad Request",
-            format!("unexpected query string {query}"),
-        ));
-    }
-
     let matching: Vec<&ProviderRoute> = contract
         .routes
         .iter()
@@ -402,6 +451,17 @@ fn check(
             format!("{} is not allowed here", request.method),
         ));
     };
+    if let Some(query) = &request.query {
+        let documented_stream_query =
+            route.path.ends_with(":streamGenerateContent") && query == "alt=sse";
+        if !documented_stream_query {
+            return Err(Rejection::new(
+                400,
+                "Bad Request",
+                format!("unexpected query string {query}"),
+            ));
+        }
+    }
 
     match (route.content_type, request.header("content-type")) {
         (Some(expected), Some(actual)) if actual.starts_with(expected) => {}

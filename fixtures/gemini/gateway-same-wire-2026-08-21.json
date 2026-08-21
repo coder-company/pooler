@@ -1,0 +1,51 @@
+{
+  "fixture_version": "2026-08-21",
+  "provenance": "Sanitized request shapes from the Google Gemini Models and Interactions REST references, replayed against Pooler's strict loopback Google contract; no live credential or provider response is included.",
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/v1beta/models",
+      "body": null
+    },
+    {
+      "method": "GET",
+      "path": "/v1beta/models/gemini-2.5-pro",
+      "body": null
+    },
+    {
+      "method": "POST",
+      "path": "/v1beta/models/gemini-2.5-pro:generateContent",
+      "body": {"contents": [{"parts": [{"text": "sanitized"}]}]}
+    },
+    {
+      "method": "POST",
+      "path": "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+      "body": {"contents": [{"parts": [{"text": "sanitized"}]}]}
+    },
+    {
+      "method": "POST",
+      "path": "/v1beta/models/gemini-2.5-pro:countTokens",
+      "body": {"contents": [{"parts": [{"text": "sanitized"}]}]}
+    },
+    {
+      "method": "POST",
+      "path": "/v1beta/interactions",
+      "body": {"model": "gemini-2.5-pro", "input": "sanitized"}
+    },
+    {
+      "method": "GET",
+      "path": "/v1beta/interactions/int_sanitized",
+      "body": null
+    },
+    {
+      "method": "POST",
+      "path": "/v1beta/interactions/int_sanitized/cancel",
+      "body": null
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1beta/interactions/int_sanitized",
+      "body": null
+    }
+  ]
+}

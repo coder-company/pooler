@@ -12,7 +12,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = ROOT / "fixtures/compatibility/manifest.json"
 
@@ -141,6 +140,19 @@ VERIFIERS: dict[EntryKey, Verifier] = {
         "config_structural",
         "not_established",
     ): ConfigCheck(),
+    (
+        "gemini",
+        "models-actions-interactions",
+        "2026-08-21",
+        "../gemini/gateway-same-wire-2026-08-21.json",
+        "http_same_wire",
+        "sanitized_local_reference",
+    ): CargoTest(
+        package="pooler-server",
+        target="gateway_provider_auth",
+        source="crates/pooler-server/tests/gateway_provider_auth.rs",
+        test_name="gemini_routes_satisfy_a_strict_gemini_endpoint",
+    ),
 }
 
 
@@ -226,7 +238,9 @@ def assert_test_includes_fixture(verifier: CargoTest, fixture_path: Path) -> Non
     try:
         source = source_path.read_text(encoding="utf-8")
     except OSError as error:
-        raise ValueError(f"could not read verifier source {source_path}: {error}") from error
+        raise ValueError(
+            f"could not read verifier source {source_path}: {error}"
+        ) from error
     binding_pattern = re.compile(
         rf"#\[(?:tokio::)?test(?:\([^]]*\))?\]\s*"
         rf"(?:async\s+)?fn\s+{re.escape(verifier.test_name)}\s*\([^)]*\)\s*"
@@ -319,11 +333,15 @@ def main(arguments: list[str]) -> int:
             print(f"could not run verifier: {error}", file=sys.stderr)
             return_code = 127
         plain_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
-        test_ran = not isinstance(verifier, CargoTest) or re.search(
-            rf"^test (?:\S+::)*{re.escape(verifier.test_name)} \.\.\. ok$",
-            plain_output,
-            re.MULTILINE,
-        ) is not None
+        test_ran = (
+            not isinstance(verifier, CargoTest)
+            or re.search(
+                rf"^test (?:\S+::)*{re.escape(verifier.test_name)} \.\.\. ok$",
+                plain_output,
+                re.MULTILINE,
+            )
+            is not None
+        )
         passed = return_code == 0 and test_ran
         failed = failed or not passed
         differences = []

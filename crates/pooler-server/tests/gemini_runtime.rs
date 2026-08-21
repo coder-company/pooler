@@ -305,6 +305,103 @@ async fn gemini_path_template_rewrites_model_alias_and_normalizes_stream_query()
     running.stop().await;
 }
 
+#[tokio::test]
+async fn gemini_count_tokens_alias_rewrites_path_and_preserves_query_and_body() {
+    let upstream_body = br#"{"totalTokens":3}"#.to_vec();
+    let (upstream_address, upstream_task) = spawn_upstream("application/json", upstream_body).await;
+    let config = gemini_same_wire_alias_config(
+        upstream_address,
+        "POST",
+        "/v1beta/models/public-gemini:countTokens",
+    );
+    let running = start_server(config).await;
+    let request = br#"{"contents":[{"parts":[{"text":"count me"}]}]}"#;
+
+    let response = send_request(
+        running.address,
+        "/v1beta/models/public-gemini:countTokens?trace=count&alt=json",
+        request,
+    )
+    .await;
+    assert_eq!(response_status(&response), 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&decoded_response_body(&response)).expect("count response"),
+        json!({"totalTokens":3})
+    );
+
+    let upstream_request = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("upstream timeout")
+        .expect("upstream task");
+    assert_request_line(
+        &upstream_request,
+        "/v1beta/models/private-gemini:countTokens?trace=count&alt=json&key=server-key",
+    );
+    assert_eq!(http_body(&upstream_request), request);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn gemini_model_get_alias_rewrites_path_and_preserves_query() {
+    let upstream_body = br#"{"name":"models/private-gemini"}"#.to_vec();
+    let (upstream_address, upstream_task) = spawn_upstream("application/json", upstream_body).await;
+    let config =
+        gemini_same_wire_alias_config(upstream_address, "GET", "/v1beta/models/public-gemini");
+    let running = start_server(config).await;
+
+    let response = send_method_request(
+        running.address,
+        "GET",
+        "/v1beta/models/public-gemini?view=full",
+        b"",
+    )
+    .await;
+    assert_eq!(response_status(&response), 200);
+
+    let upstream_request = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("upstream timeout")
+        .expect("upstream task");
+    assert_method_request_line(
+        &upstream_request,
+        "GET",
+        "/v1beta/models/private-gemini?view=full&key=server-key",
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn gemini_interaction_alias_rewrites_body_and_preserves_query() {
+    let upstream_body = br#"{"id":"int_123","status":"completed"}"#.to_vec();
+    let (upstream_address, upstream_task) = spawn_upstream("application/json", upstream_body).await;
+    let config = gemini_same_wire_alias_config(upstream_address, "POST", "/v1beta/interactions");
+    let running = start_server(config).await;
+    let request = br#"{"model":"public-gemini","input":"hello","stream":true}"#;
+
+    let response = send_request(
+        running.address,
+        "/v1beta/interactions?trace=interaction",
+        request,
+    )
+    .await;
+    assert_eq!(response_status(&response), 200);
+
+    let upstream_request = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("upstream timeout")
+        .expect("upstream task");
+    assert_request_line(
+        &upstream_request,
+        "/v1beta/interactions?trace=interaction&key=server-key",
+    );
+    let forwarded: Value =
+        serde_json::from_slice(http_body(&upstream_request)).expect("forwarded Interaction JSON");
+    assert_eq!(forwarded["model"], "private-gemini");
+    assert_eq!(forwarded["input"], "hello");
+    assert_eq!(forwarded["stream"], true);
+    running.stop().await;
+}
+
 fn gemini_config(
     upstream_address: SocketAddr,
     downstream_path: &str,
@@ -316,6 +413,20 @@ fn gemini_config(
         ),
     )
     .expect("Gemini runtime config")
+}
+
+fn gemini_same_wire_alias_config(
+    upstream_address: SocketAddr,
+    method: &str,
+    downstream_path: &str,
+) -> pooler_config::CompiledConfig {
+    compile_yaml(
+        "gemini-same-wire-alias-runtime.yaml",
+        &format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}, query: {{key: server-key}}}}}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{provider: local, upstream_model: private-gemini, capabilities: [text, streaming, tools, function_calling], codecs: [decode.gemini.generate_content]}}\nroutes:\n  - id: gemini-same-wire-alias\n    listen: local\n    match: {{method: {method}, path: '{downstream_path}'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local}}\n    response: {{mode: opaque}}\n    loss_policy: reject\n"
+        ),
+    )
+    .expect("Gemini same-wire alias config")
 }
 
 fn gemini_alias_config(upstream_address: SocketAddr) -> pooler_config::CompiledConfig {
@@ -396,12 +507,26 @@ async fn spawn_upstream(
 }
 
 async fn send_request(address: SocketAddr, path: &str, body: &[u8]) -> Vec<u8> {
+    send_method_request(address, "POST", path, body).await
+}
+
+async fn send_method_request(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Vec<u8> {
     let mut stream = timeout(TEST_TIMEOUT, TcpStream::connect(address))
         .await
         .expect("proxy connect timeout")
         .expect("proxy connection");
+    let content_type = if body.is_empty() {
+        String::new()
+    } else {
+        "Content-Type: application/json\r\n".to_owned()
+    };
     let headers = format!(
-        "POST {path} HTTP/1.1\r\nHost: gemini-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: gemini-test\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream
@@ -495,13 +620,17 @@ fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
 }
 
 fn assert_request_line(request: &[u8], path: &str) {
+    assert_method_request_line(request, "POST", path);
+}
+
+fn assert_method_request_line(request: &[u8], method: &str, path: &str) {
     let end = request
         .windows(2)
         .position(|window| window == b"\r\n")
         .expect("request line");
     assert_eq!(
         std::str::from_utf8(&request[..end]).expect("request line UTF-8"),
-        format!("POST {path} HTTP/1.1")
+        format!("{method} {path} HTTP/1.1")
     );
 }
 
