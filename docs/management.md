@@ -26,6 +26,7 @@ Send the token as `Authorization: Bearer ...`.
 | Endpoint | Purpose |
 | --- | --- |
 | `/health` | Process, configuration, store, and active-request status |
+| `/setup/options`, `/setup/config`, `/setup/test` | Catalog-derived first-run choices, compiler-validated sidecar generation, and truthful active-runtime checks |
 | `/listeners`, `/routes`, `/models` | Active compiled plan and published model view |
 | `/health/providers`, `/accounts` | Provider and redacted account health |
 | `/quota` | Typed quota windows plus active cooldowns |
@@ -37,6 +38,16 @@ Send the token as `Authorization: Bearer ...`.
 | `/export` | Versioned redacted diagnostic export |
 
 `/export` is a diagnostic backup, not a credential backup. It intentionally cannot restore tokens or secret references. Audit and trace retention is process-local and resets when the process restarts.
+
+## First-run setup
+
+The dashboard&rsquo;s **Setup** view is a five-stage wizard: provider, account authentication, model, client, and verification. Its choices come from Pooler&rsquo;s built-in provider-login and provider-catalog registries plus the active redacted account and model views. Unsupported provider/client dialect combinations are not offered.
+
+The browser never accepts a provider API key, OAuth client secret, or token. It displays a trusted-terminal `pooler auth login` command and generates YAML containing only documented `env:` references. OAuth methods that require operator-owned registration details are explained but not offered by the wizard. `/setup/config` compiles the generated YAML before returning it. The result is a managed sidecar candidate: download and review it separately, run `pooler check --config pooler.setup.yaml`, then start it with `pooler serve --config pooler.setup.yaml`. Pooler does not rewrite the operator's hand-written YAML or comments.
+
+**Test active connection** requests a catalog-only reload when authenticated mutations are available, waits for the correlated reload result, and then reads `/setup/test`. A connection is reported as `verified` only when the active generation contains the selected provider/account/model and has a successful bounded model-discovery observation. Static configuration or a non-cooling provider alone is reported as `not_probed`; the wizard does not send a potentially billable inference request and does not call that state healthy.
+
+Setup selections may appear in same-origin query strings, but credential values never do. Generated sidecars and downloads use authenticated `fetch` and remain local to the current browser action.
 
 ## Mutations
 

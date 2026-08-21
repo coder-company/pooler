@@ -27,9 +27,13 @@ use http_body::Body as _;
 use http_body_util::Full;
 use hyper::{body::Incoming, service::service_fn, Request};
 use hyper_util::rt::TokioIo;
-use pooler_auth::{bearer_authorization_matches, SecretRef as RuntimeSecretRef};
-use pooler_config::{CompiledConfig, ManagementPlan};
+use pooler_auth::{
+    bearer_authorization_matches, ProviderLoginMethod, ProviderLoginRegistry, ProviderLoginSupport,
+    SecretRef as RuntimeSecretRef,
+};
+use pooler_config::{compile_yaml, CompiledConfig, ManagementPlan};
 use pooler_http::{PoolError, PoolingCoordinator};
+use pooler_model_catalog::ProviderCatalog;
 use pooler_store::{CredentialHealthState, CredentialHealthStatus, CredentialState};
 use serde_json::{json, Value};
 use tokio::{
@@ -295,6 +299,198 @@ fn percent_decode_path(value: &str) -> Option<String> {
         }
     }
     String::from_utf8(decoded).ok()
+}
+
+fn management_query_value(query: Option<&str>, key: &str) -> Option<String> {
+    query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find_map(|(name, value)| {
+            (name == key).then(|| percent_decode_path(&value.replace('+', " ")))?
+        })
+}
+
+fn valid_setup_component(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_setup_model(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn setup_support_name(support: ProviderLoginSupport) -> &'static str {
+    match support {
+        ProviderLoginSupport::Supported => "supported",
+        ProviderLoginSupport::RequiresExplicitConfiguration => "requires_explicit_configuration",
+        ProviderLoginSupport::Unsupported => "unsupported",
+    }
+}
+
+fn setup_client_compatible(client: &str, dialect: &str) -> bool {
+    match client {
+        "native" => true,
+        "openai" | "codex" | "cursor" | "droid" | "factory" | "devin" => dialect == "openai",
+        "anthropic" => dialect == "anthropic",
+        "gemini" => dialect == "gemini",
+        _ => false,
+    }
+}
+
+fn setup_route_yaml(client: &str, dialect: &str, provider: &str) -> Result<String, &'static str> {
+    if !setup_client_compatible(client, dialect) {
+        return Err("selected client does not match the provider request dialect");
+    }
+    let target = format!("{{provider: {provider}, policy: setup-account}}");
+    let route = match client {
+        "factory" => format!(
+            "  - id: setup-factory\n    listen: gateway\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: {provider}, path: /v1/chat/completions, model_from: request.model, policy: setup-account}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: degrade\n"
+        ),
+        "devin" => format!(
+            "  - id: setup-devin\n    listen: gateway\n    match: {{method: POST, path: /exa.api_server_pb.ApiServerService/GetChatMessage, content_types: [application/connect+proto]}}\n    ingress: {{mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}}\n    target: {{provider: {provider}, path: /v1/chat/completions, policy: setup-account}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}}\n    loss_policy: reject\n"
+        ),
+        _ => {
+            let path_prefix = match dialect {
+                "anthropic" => "/v1/",
+                "gemini" => "/v1beta/",
+                _ => "/v1/",
+            };
+            format!(
+                "  - id: setup-gateway\n    listen: gateway\n    match: {{methods: [GET, POST, DELETE], path_prefix: {path_prefix}}}\n    ingress: {{mode: opaque}}\n    target: {target}\n    response: {{mode: opaque}}\n"
+            )
+        }
+    };
+    Ok(route)
+}
+
+fn generate_setup_config(
+    provider_id: &str,
+    auth_method: &str,
+    account_id: &str,
+    model_id: &str,
+    client: &str,
+) -> Result<String, &'static str> {
+    if !valid_setup_component(provider_id, 128)
+        || !valid_setup_component(account_id, 128)
+        || !valid_setup_model(model_id)
+    {
+        return Err("setup selection contains an invalid identifier");
+    }
+    let catalog = ProviderCatalog::builtin();
+    let provider = catalog
+        .get(provider_id)
+        .ok_or("selected provider is not in the built-in catalog")?;
+    let login = ProviderLoginRegistry::builtin().resolve(provider_id);
+    let oauth_method = match auth_method {
+        "api_key" => {
+            if login.is_some_and(|definition| {
+                definition.support(ProviderLoginMethod::ApiKey) != ProviderLoginSupport::Supported
+            }) {
+                return Err("selected provider does not support API-key login in this wizard");
+            }
+            false
+        }
+        "authorization_code_pkce" => {
+            let definition = login.ok_or("selected provider has no OAuth login profile")?;
+            match definition.support(ProviderLoginMethod::AuthorizationCodePkce) {
+                ProviderLoginSupport::Supported => {}
+                ProviderLoginSupport::RequiresExplicitConfiguration => {
+                    return Err(
+                        "browser OAuth requires operator-owned registration details that this wizard cannot collect",
+                    );
+                }
+                ProviderLoginSupport::Unsupported => {
+                    return Err("selected provider does not support browser OAuth login");
+                }
+            }
+            true
+        }
+        "device_code" => {
+            let definition = login.ok_or("selected provider has no OAuth login profile")?;
+            match definition.support(ProviderLoginMethod::DeviceCode) {
+                ProviderLoginSupport::Supported => {}
+                ProviderLoginSupport::RequiresExplicitConfiguration => {
+                    return Err(
+                        "device login requires operator-owned registration details that this wizard cannot collect",
+                    );
+                }
+                ProviderLoginSupport::Unsupported => {
+                    return Err("selected provider does not support device-code login");
+                }
+            }
+            true
+        }
+        _ => return Err("unknown authentication method"),
+    };
+    let secret_environment = provider.env.first().map(String::as_str).or_else(|| {
+        login.and_then(|definition| definition.api_key_environment_variables().first().copied())
+    });
+    if !oauth_method && secret_environment.is_none() {
+        return Err("selected provider has no documented API-key environment variable");
+    }
+    let route = setup_route_yaml(client, &provider.integration.request_dialect, provider_id)?;
+    let account = if oauth_method {
+        format!("  {account_id}:\n    provider: {provider_id}\n    auth_kind: oauth\n")
+    } else {
+        format!(
+            "  {account_id}:\n    provider: {provider_id}\n    auth_kind: api_key\n    secret: env:{}\n",
+            secret_environment.expect("API-key environment checked")
+        )
+    };
+    let discovery = match (
+        provider.integration.discovery_parser.as_deref(),
+        provider.integration.discovery_path.as_deref(),
+    ) {
+        (Some(parser), Some(path)) => format!(
+            "catalog:\n  sources:\n    - id: setup-{provider_id}\n      provider: {provider_id}\n      account: {account_id}\n      parser: {parser}\n      path: {path}\n\n"
+        ),
+        _ => String::new(),
+    };
+    let quoted_model =
+        serde_json::to_string(model_id).map_err(|_| "model identifier is invalid")?;
+    let model_mapping = if discovery.is_empty() {
+        format!(
+            "models:\n  - id: {quoted_model}\n    targets:\n      - provider: {provider_id}\n        upstream_model: {quoted_model}\n\n"
+        )
+    } else {
+        String::new()
+    };
+    let bind = match client {
+        "factory" => "127.0.0.1:18474",
+        "devin" => "127.0.0.1:18473",
+        _ => "127.0.0.1:8319",
+    };
+    let upstream_native = if oauth_method && provider_id == "openai" {
+        "    native: {kind: codex}\n"
+    } else {
+        ""
+    };
+    let config = format!(
+        "version: 1\n\nlisteners:\n  gateway:\n    bind: {bind}\n\nupstreams:\n  {provider_id}:\n    known_provider: {provider_id}\n{upstream_native}\naccounts:\n{account}\naccount_pools:\n  setup:\n    accounts: [{account_id}]\n\npolicies:\n  setup-account:\n    selection:\n      strategy: ordered_fallback\n      account_pool: setup\n\n{model_mapping}{discovery}routes:\n{route}\nmanagement:\n  bind: 127.0.0.1:18477\n  auth:\n    secret: env:POOLER_MANAGEMENT_TOKEN\n"
+    );
+    compile_yaml("management-setup-generated.yaml", &config)
+        .map_err(|_| "generated configuration did not pass Pooler validation")?;
+    Ok(config)
+}
+
+fn setup_selection(
+    query: Option<&str>,
+) -> Result<(String, String, String, String, String), &'static str> {
+    let required = |key| {
+        management_query_value(query, key)
+            .filter(|value| !value.is_empty())
+            .ok_or("setup request is missing a required selection")
+    };
+    Ok((
+        required("provider")?,
+        required("auth")?,
+        required("account")?,
+        required("model")?,
+        required("client")?,
+    ))
 }
 
 fn management_account_action(path: &str) -> Option<(String, &str)> {
@@ -1145,6 +1341,14 @@ impl ManagementApi {
         let response = match path {
             "/health" | "/healthz" | "/" => self.health(snapshot, pooling),
             "/config" | "/config/generation" => self.config_generation(snapshot),
+            "/setup/options" => self.setup_options(snapshot),
+            "/setup/config" => self.setup_config(uri.as_ref().and_then(Uri::query)),
+            "/setup/test" => self.setup_test(
+                uri.as_ref().and_then(Uri::query),
+                snapshot,
+                catalog.as_deref(),
+                pooling,
+            ),
             "/listeners" => self.listeners(snapshot),
             "/routes" => self.routes(snapshot),
             "/models" => self.models(snapshot, catalog.as_deref(), pooling),
@@ -1270,6 +1474,219 @@ impl ManagementApi {
             json!({
                 "configuration_generation": snapshot.generation().value(),
                 "management": {"mutations": self.plan.auth().is_some()},
+            }),
+            false,
+        )
+    }
+
+    fn setup_options(&self, snapshot: &ConfigSnapshot<CompiledConfig>) -> ManagementResponse {
+        let registry = ProviderLoginRegistry::builtin();
+        let catalog = ProviderCatalog::builtin();
+        let providers = catalog
+            .iter()
+            .map(|(id, provider)| {
+                let definition = registry.resolve(id);
+                let mut authentication = definition.map_or_else(Vec::new, |definition| {
+                    definition
+                        .capabilities()
+                        .iter()
+                        .map(|capability| {
+                            json!({
+                                "method": capability.method().to_string(),
+                                "support": setup_support_name(capability.support()),
+                                "note": capability.note(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                if !provider.env.is_empty()
+                    && !authentication.iter().any(|method| method["method"] == "api_key")
+                {
+                    authentication.push(json!({
+                        "method": "api_key",
+                        "support": "supported",
+                        "note": "Use a provider-issued API key through a protected secret reference.",
+                    }));
+                }
+                let configured_upstreams = snapshot
+                    .config()
+                    .upstreams()
+                    .iter()
+                    .filter(|(upstream_id, upstream)| {
+                        upstream.known_provider() == Some(id)
+                            || Arc::<str>::as_ref(upstream_id) == id
+                    })
+                    .map(|(upstream_id, _)| Arc::<str>::as_ref(upstream_id))
+                    .collect::<Vec<_>>();
+                let clients = [
+                    "native", "openai", "anthropic", "gemini", "codex", "cursor", "droid",
+                    "factory", "devin",
+                ]
+                .into_iter()
+                .filter(|client| {
+                    setup_client_compatible(client, &provider.integration.request_dialect)
+                })
+                .collect::<Vec<_>>();
+                json!({
+                    "id": id,
+                    "name": provider.name,
+                    "authentication": authentication,
+                    "credential_environment_variables": provider.env,
+                    "documentation_url": definition.map(|definition| definition.documentation_url()),
+                    "request_dialect": provider.integration.request_dialect,
+                    "native_kind": provider.integration.native_kind,
+                    "capabilities": provider.integration.capabilities,
+                    "endpoint_families": provider.integration.endpoint_families,
+                    "discovery": {
+                        "available": provider.integration.discovery_parser.is_some()
+                            && provider.integration.discovery_path.is_some(),
+                        "parser": provider.integration.discovery_parser,
+                        "path": provider.integration.discovery_path,
+                    },
+                    "configured_upstreams": configured_upstreams,
+                    "clients": clients,
+                })
+            })
+            .collect::<Vec<_>>();
+        ManagementResponse::json(
+            StatusCode::OK,
+            json!({
+                "schema_version": 1,
+                "configuration_generation": snapshot.generation().value(),
+                "providers": providers,
+                "clients": [
+                    {"id": "native", "name": "Provider-native API", "description": "Pass through the provider's documented request dialect."},
+                    {"id": "openai", "name": "OpenAI-compatible client", "description": "Use the local /v1 API from OpenAI-compatible SDKs."},
+                    {"id": "anthropic", "name": "Anthropic SDK", "description": "Use the local Anthropic Messages API."},
+                    {"id": "gemini", "name": "Gemini SDK", "description": "Use the local Gemini Generate Content API."},
+                    {"id": "codex", "name": "Codex", "description": "Point Codex at the local OpenAI-compatible listener."},
+                    {"id": "cursor", "name": "Cursor", "description": "Point Cursor at the local OpenAI-compatible listener."},
+                    {"id": "droid", "name": "Factory Droid", "description": "Point Droid's OpenAI-compatible provider at Pooler."},
+                    {"id": "factory", "name": "Factory protocol", "description": "Expose Pooler's Factory v3 adapter."},
+                    {"id": "devin", "name": "Devin protocol", "description": "Expose Pooler's Devin Connect adapter."},
+                ],
+            }),
+            false,
+        )
+    }
+
+    fn setup_config(&self, query: Option<&str>) -> ManagementResponse {
+        let selection =
+            setup_selection(query).and_then(|(provider, auth, account, model, client)| {
+                generate_setup_config(&provider, &auth, &account, &model, &client)
+            });
+        match selection {
+            Ok(config) => ManagementResponse::json(
+                StatusCode::OK,
+                json!({"schema_version": 1, "validated": true, "configuration": config}),
+                false,
+            ),
+            Err(error) => {
+                ManagementResponse::json(StatusCode::BAD_REQUEST, json!({"error": error}), false)
+            }
+        }
+    }
+
+    fn setup_test(
+        &self,
+        query: Option<&str>,
+        snapshot: &ConfigSnapshot<CompiledConfig>,
+        catalog: Option<&CatalogRuntime>,
+        pooling: &PoolingCoordinator,
+    ) -> ManagementResponse {
+        let Ok((provider_id, auth, account_id, model_id, client)) = setup_selection(query) else {
+            return ManagementResponse::json(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "setup request is missing a required selection"}),
+                false,
+            );
+        };
+        if let Err(error) =
+            generate_setup_config(&provider_id, &auth, &account_id, &model_id, &client)
+        {
+            return ManagementResponse::json(
+                StatusCode::BAD_REQUEST,
+                json!({"error": error}),
+                false,
+            );
+        }
+        let upstream_ids = snapshot
+            .config()
+            .upstreams()
+            .iter()
+            .filter(|(upstream_id, upstream)| {
+                upstream.known_provider() == Some(provider_id.as_str())
+                    || Arc::<str>::as_ref(upstream_id) == provider_id.as_str()
+            })
+            .map(|(upstream_id, _)| Arc::<str>::as_ref(upstream_id))
+            .collect::<Vec<_>>();
+        let provider_configured = !upstream_ids.is_empty();
+        let accounts = response_value(self.accounts(snapshot, pooling));
+        let account = accounts["accounts"].as_array().and_then(|accounts| {
+            accounts
+                .iter()
+                .find(|account| account["id"].as_str() == Some(account_id.as_str()))
+        });
+        let account_configured = account.is_some_and(|account| {
+            account["provider"]
+                .as_str()
+                .is_some_and(|provider| upstream_ids.contains(&provider))
+        });
+        let account_available = account.is_some_and(|account| {
+            account["enabled"].as_bool() == Some(true)
+                && matches!(
+                    account["status"].as_str(),
+                    Some("available" | "selected" | "unknown")
+                )
+        });
+        let models = response_value(self.models(snapshot, catalog, pooling));
+        let model = models["models"].as_array().and_then(|models| {
+            models
+                .iter()
+                .find(|model| model["id"].as_str() == Some(model_id.as_str()))
+        });
+        let model_available = model.is_some_and(|model| {
+            model["enabled"].as_bool() != Some(false)
+                && model["targets"].as_array().is_some_and(|targets| {
+                    targets.iter().any(|target| {
+                        target["provider"]
+                            .as_str()
+                            .is_some_and(|provider| upstream_ids.contains(&provider))
+                    })
+                })
+        });
+        let catalog_view = merged_model_catalog_value(snapshot.config(), catalog);
+        let discovery_verified =
+            catalog_view["catalog_sources"]
+                .as_array()
+                .is_some_and(|sources| {
+                    sources.iter().any(|source| {
+                        source["provider"]
+                            .as_str()
+                            .is_some_and(|provider| upstream_ids.contains(&provider))
+                            && source["account"].as_str() == Some(account_id.as_str())
+                            && !source["state"].is_null()
+                    })
+                });
+        let all_ready = provider_configured
+            && account_configured
+            && account_available
+            && model_available
+            && discovery_verified;
+        ManagementResponse::json(
+            StatusCode::OK,
+            json!({
+                "schema_version": 1,
+                "configuration_generation": snapshot.generation().value(),
+                "ready": all_ready,
+                "connection": if discovery_verified {"verified"} else {"not_probed"},
+                "checks": [
+                    {"id": "generated_configuration", "status": "passed", "detail": "Generated YAML passed Pooler's compiler."},
+                    {"id": "provider", "status": if provider_configured {"passed"} else {"pending"}, "detail": if provider_configured {"Provider is present in the active generation."} else {"Apply the generated configuration and reload Pooler."}},
+                    {"id": "account", "status": if account_configured && account_available {"passed"} else {"pending"}, "detail": if account_configured && account_available {"The selected account is enabled in the active generation."} else {"Configure the account and complete its credential flow."}},
+                    {"id": "model", "status": if model_available {"passed"} else {"pending"}, "detail": if model_available {"The selected model is published for this provider."} else {"Reload model discovery or apply the generated static model mapping."}},
+                    {"id": "connectivity", "status": if discovery_verified {"passed"} else {"not_run"}, "detail": if discovery_verified {"A successful bounded model-discovery observation exists for this provider and account."} else {"No successful outbound catalog observation exists for this provider and account. This check does not send a billable inference request."}},
+                ],
             }),
             false,
         )
@@ -3282,6 +3699,115 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             .await
             .expect("management task does not panic")
             .expect("management task shuts down");
+    }
+
+    #[test]
+    fn setup_options_are_catalog_derived_and_do_not_expose_secrets() {
+        let response = api().handle(&Method::GET, "/setup/options", &loopback_headers());
+        assert_eq!(response.status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&response.body).expect("setup options json");
+        let openai = value["providers"]
+            .as_array()
+            .and_then(|providers| providers.iter().find(|provider| provider["id"] == "openai"))
+            .expect("built-in OpenAI provider");
+        assert_eq!(openai["request_dialect"], "openai");
+        assert!(openai["authentication"]
+            .as_array()
+            .is_some_and(|methods| methods.iter().any(|method| method["method"] == "api_key")));
+        let moonshot = value["providers"]
+            .as_array()
+            .and_then(|providers| {
+                providers
+                    .iter()
+                    .find(|provider| provider["id"] == "moonshotai")
+            })
+            .expect("Moonshot catalog provider");
+        assert!(moonshot["authentication"]
+            .as_array()
+            .is_some_and(|methods| {
+                methods.iter().any(|method| {
+                    method["method"] == "device_code"
+                        && method["support"] == "requires_explicit_configuration"
+                })
+            }));
+        let body = String::from_utf8(response.body).expect("UTF-8 setup options");
+        assert!(!body.contains("sk-"));
+        assert!(!body.contains("client_secret"));
+    }
+
+    #[test]
+    fn setup_configuration_is_secret_free_and_compiler_validated() {
+        let response = api().handle(
+            &Method::GET,
+            "/setup/config?provider=openai&auth=api_key&account=primary&model=gpt-5&client=openai",
+            &loopback_headers(),
+        );
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let value: Value = serde_json::from_slice(&response.body).expect("setup config json");
+        assert_eq!(value["validated"], true);
+        let config = value["configuration"].as_str().expect("generated YAML");
+        assert!(config.contains("secret: env:OPENAI_API_KEY"));
+        assert!(!config.contains("Bearer "));
+        compile_yaml("setup-roundtrip.yaml", config).expect("generated YAML compiles again");
+        for (provider, model, client) in [
+            ("anthropic", "claude-3-7-sonnet", "anthropic"),
+            ("google", "gemini-2.5-pro", "gemini"),
+            ("openai", "gpt-5", "factory"),
+            ("openai", "org/model@revision", "native"),
+            ("openai", "gpt-5", "devin"),
+        ] {
+            let generated = generate_setup_config(provider, "api_key", "primary", model, client)
+                .unwrap_or_else(|error| panic!("{provider}/{client} generation failed: {error}"));
+            compile_yaml(format!("setup-{provider}-{client}.yaml"), &generated)
+                .unwrap_or_else(|error| panic!("{provider}/{client} did not compile: {error}"));
+        }
+        let oauth = generate_setup_config("openai", "device_code", "personal", "gpt-5", "codex")
+            .expect("supported device-code setup compiles");
+        assert!(oauth.contains("auth_kind: oauth"));
+        assert!(!oauth.contains("OPENAI_API_KEY"));
+        assert_eq!(
+            generate_setup_config(
+                "moonshotai",
+                "device_code",
+                "primary",
+                "kimi-k2",
+                "openai",
+            )
+            .expect_err("explicitly configured device flow is not wizard-safe"),
+            "device login requires operator-owned registration details that this wizard cannot collect"
+        );
+
+        let incompatible = api().handle(
+            &Method::GET,
+            "/setup/config?provider=anthropic&auth=api_key&account=primary&model=claude&client=gemini",
+            &loopback_headers(),
+        );
+        assert_eq!(incompatible.status, StatusCode::BAD_REQUEST);
+        let injected = api().handle(
+            &Method::GET,
+            "/setup/config?provider=openai&auth=api_key&account=primary%0Aadmin&model=gpt-5&client=openai",
+            &loopback_headers(),
+        );
+        assert_eq!(injected.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn setup_connection_test_does_not_claim_unmeasured_health() {
+        let response = api().handle(
+            &Method::GET,
+            "/setup/test?provider=openai&auth=api_key&account=primary&model=gpt-5&client=openai",
+            &loopback_headers(),
+        );
+        assert_eq!(response.status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&response.body).expect("setup test json");
+        assert_eq!(value["ready"], false);
+        assert_eq!(value["connection"], "not_probed");
+        assert_eq!(value["checks"][4]["status"], "not_run");
     }
 
     #[tokio::test]

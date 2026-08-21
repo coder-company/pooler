@@ -51,6 +51,45 @@ STATE = MockState()
 def payload(path: str) -> dict:
     generation = {"configuration_generation": 7}
     responses = {
+        "/management/setup/options": {
+            **generation,
+            "providers": [{
+                "id": "openai", "name": "OpenAI", "request_dialect": "openai",
+                "native_kind": "openai_compatible", "capabilities": ["text", "streaming"],
+                "endpoint_families": ["chat_completions", "models"],
+                "credential_environment_variables": ["OPENAI_API_KEY"],
+                "authentication": [
+                    {"method": "api_key", "support": "supported", "note": "Use a protected reference."},
+                    {"method": "device_code", "support": "requires_explicit_configuration", "note": "Operator registration is required."},
+                ],
+                "discovery": {"available": True, "parser": "openai", "path": "/v1/models"},
+                "configured_upstreams": ["openai"],
+                "clients": ["native", "openai", "codex", "cursor", "droid", "factory", "devin"],
+            }],
+            "clients": [
+                {"id": "native", "name": "Provider-native API", "description": "Native"},
+                {"id": "openai", "name": "OpenAI-compatible client", "description": "OpenAI"},
+                {"id": "codex", "name": "Codex", "description": "Codex"},
+                {"id": "cursor", "name": "Cursor", "description": "Cursor"},
+                {"id": "droid", "name": "Factory Droid", "description": "Droid"},
+                {"id": "factory", "name": "Factory protocol", "description": "Factory"},
+                {"id": "devin", "name": "Devin protocol", "description": "Devin"},
+            ],
+        },
+        "/management/setup/config": {
+            "schema_version": 1,
+            "validated": True,
+            "configuration": "version: 1\nupstreams:\n  openai:\n    known_provider: openai\naccounts:\n  primary:\n    secret: env:OPENAI_API_KEY\n",
+        },
+        "/management/setup/test": {
+            **generation,
+            "ready": True,
+            "connection": "verified",
+            "checks": [
+                {"id": "generated_configuration", "status": "passed", "detail": "Generated YAML passed."},
+                {"id": "connectivity", "status": "passed", "detail": "Bounded discovery succeeded."},
+            ],
+        },
         "/management/health": {**generation, "status": "ok", "management": {"mutations": True}, "credential_health_entries": 1, "cooling_provider_entries": 0},
         "/management/active": {"active": 1, "by_listener": {"main": 1}},
         "/management/health/providers": {**generation, "providers": [{"id": "openai", "transport": "http", "native": "openai", "auth_configured": True, "status": "not_cooling"}]},
@@ -102,9 +141,14 @@ class Handler(BaseHTTPRequestHandler):
         if route.startswith("/management/ui/assets/"):
             static[route] = UI / "assets" / route.rsplit("/", 1)[-1]
         source = static.get(route)
-        if source and source.is_file():
+        if source:
             mime = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
-            self.send_bytes(200, source.read_bytes(), mime)
+            try:
+                body = source.read_bytes()
+            except OSError as error:
+                self.send_bytes(500, str(error).encode(), "text/plain")
+                return
+            self.send_bytes(200, body, mime)
             return
 
         if not route.startswith("/management/"):
@@ -196,7 +240,44 @@ def run_browser(playwright) -> None:
         expect(page.locator("#theme-toggle").get_attribute("aria-label") in {"Switch to dark theme", "Switch to light theme"}, "theme control label is ambiguous")
         expect(page.locator("#session-dialog").get_attribute("aria-labelledby") == "session-title", "session dialog is unlabelled")
 
-        for route in ("overview", "models", "accounts", "usage", "operations", "diagnostics"):
+        page.locator('[data-route="setup"]').click()
+        page.wait_for_selector(".view-setup .setup-progress")
+        expect(not page.locator('.view-setup input[type="password"]').count(), "setup wizard accepts a credential value")
+        expect(page.locator("[style]").count() == 0, "setup wizard rendered an inline style")
+        page.locator('[data-setup-action="next"]').click()
+        expect(not page.locator('#setup-auth option[value="device_code"]').count(), "explicit-registration flow was offered as runnable")
+        expect("Operator registration is required" in page.locator(".view-setup").inner_text(), "unavailable authentication method lacks an accessible explanation")
+        page.locator("#setup-account").fill("primary")
+        page.locator('[data-setup-action="next"]').click()
+        expect(page.locator("#setup-model").input_value() == "gpt-test", "setup did not reuse active model facts")
+        page.locator('[data-setup-action="next"]').click()
+        page.locator("#setup-client").select_option("openai")
+        page.locator('[data-setup-action="next"]').click()
+        page.wait_for_selector(".setup-config")
+        setup_yaml = page.locator(".setup-config").inner_text()
+        expect("env:OPENAI_API_KEY" in setup_yaml, "generated setup omitted protected secret reference")
+        expect("sk-" not in setup_yaml and "Bearer " not in setup_yaml, "generated setup exposed a credential value")
+        expect(STATE.get_authorization.get("/management/setup/config") == "Bearer good-token", "setup configuration did not use authenticated fetch")
+        expect(page.get_by_role("link", name="Finish setup").count() == 0, "setup could finish before connection evidence")
+        page.locator('[data-setup-action="test"]').click()
+        page.wait_for_selector("text=Connection evidence verified")
+        expect(page.get_by_role("link", name="Finish setup").count() == 1, "verified setup has no finish action")
+        expect(STATE.posts.get("/management/models/reload") == 1, "setup connection test did not request model discovery")
+        expect(STATE.post_bodies.get("/management/models/reload") == b"", "setup connection test mutation sent a body")
+        expect(STATE.get_authorization.get("/management/setup/test") == "Bearer good-token", "setup connection test did not use authenticated fetch")
+        expect(page.evaluate("localStorage.length === 0 && sessionStorage.length === 0"), "setup state was persisted in browser storage")
+        STATE.reject_all = True
+        page.locator("#refresh-now").click()
+        page.wait_for_selector("text=Authorization required")
+        expect(page.locator(".setup-config").count() == 0, "generated setup remained visible after authentication rejection")
+        STATE.reject_all = False
+        page.locator("#token-input").fill("good-token")
+        page.locator("#token-apply").click()
+        page.locator("#session-button", has_text="Connected").wait_for()
+        page.locator('[data-setup-action="generate"]').click()
+        page.wait_for_selector(".setup-config")
+
+        for route in ("setup", "overview", "models", "accounts", "usage", "operations", "diagnostics"):
             page.locator(f'[data-route="{route}"]').click()
             page.wait_for_selector(f".view-{route}")
             expect(page.locator('.nav-link[aria-current="page"]').get_attribute("data-route") == route, f"{route} navigation state missing")
@@ -300,6 +381,9 @@ def run_browser(playwright) -> None:
         page.locator('[data-route="operations"]').click()
         page.wait_for_selector(".view-operations")
         expect(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "320px operations layout overflows the viewport")
+        page.locator('[data-route="setup"]').click()
+        page.wait_for_selector(".view-setup .setup-config")
+        expect(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "320px setup layout overflows the viewport")
         expect(not errors, f"browser page errors: {errors}")
         print("PASS: management dashboard browser QA")
     finally:
@@ -324,6 +408,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def missing_playwright_browser(message: str) -> bool:
+    return any(marker in message for marker in ("Executable doesn't exist", "playwright install"))
+
 def main() -> int:
     args = parse_args()
     try:
@@ -336,7 +423,7 @@ def main() -> int:
             run_browser(playwright)
     except Exception as error:
         message = str(error)
-        if "Executable doesn't exist" in message or "playwright install" in message:
+        if missing_playwright_browser(message):
             print(f"SKIP: Playwright Chromium is unavailable ({error}). See --help for installation.")
             return 1 if args.require_playwright else 0
         raise

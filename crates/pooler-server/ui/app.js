@@ -31,6 +31,18 @@
     endpointMeta: {},
     lastSuccessfulRefresh: null,
     pending: new Set(),
+    setup: {
+      step: 1,
+      provider: "",
+      auth: "",
+      account: "",
+      model: "",
+      client: "",
+      configuration: "",
+      testResult: null,
+      busy: false,
+      generation: 0,
+    },
   };
 
   /* ---------------- Small helpers ---------------- */
@@ -187,6 +199,13 @@
     }
   }
 
+  function clearSetupResults() {
+    state.setup.generation += 1;
+    state.setup.configuration = "";
+    state.setup.testResult = null;
+    state.setup.busy = false;
+  }
+
   function renderAuthorizationRequired() {
     const root = $("#view");
     const view = views[state.route] || views.overview;
@@ -204,6 +223,7 @@
     const firstPrompt = !state.authPrompted;
     state.sessionGeneration += 1;
     state.pending.clear();
+    clearSetupResults();
     invalidateReads({ clearData: true });
     state.authState = "required";
     state.authPrompted = true;
@@ -433,6 +453,7 @@
   }
 
   const ENDPOINTS = {
+    setupOptions: { path: "/setup/options" },
     health: { path: "/health" },
     active: { path: "/active" },
     listeners: { path: "/listeners" },
@@ -490,6 +511,12 @@
   /* ---------------- Views ---------------- */
 
   const views = {
+    setup: {
+      title: "First-run setup",
+      subtitle: "Choose a provider, connect an account safely, select a model and client, then verify the active runtime.",
+      endpoints: ["setupOptions", "models", "accounts", "health"],
+      render: renderSetup,
+    },
     overview: {
       title: "Overview",
       subtitle: "Runtime health, providers, accounts, and quota at a glance.",
@@ -528,7 +555,261 @@
     },
   };
 
-  /* ---------------- Overview ---------------- */
+
+  /* ---------------- First-run setup ---------------- */
+
+  function setupProvider() {
+    const providers = state.data.setupOptions?.providers || [];
+    return providers.find((provider) => provider.id === state.setup.provider) || null;
+  }
+
+  function setupDefaults() {
+    const providers = state.data.setupOptions?.providers || [];
+    if (!providers.length) return;
+    if (!providers.some((provider) => provider.id === state.setup.provider)) {
+      const configured = providers.find((provider) => (provider.configured_upstreams || []).length);
+      state.setup.provider = (configured || providers.find((provider) => provider.id === "openai") || providers[0]).id;
+    }
+    const provider = setupProvider();
+    const methods = (provider?.authentication || []).filter((method) => method.support === "supported");
+    if (!methods.some((method) => method.method === state.setup.auth)) {
+      state.setup.auth = (methods.find((method) => method.method === "api_key") || methods[0] || {}).method || "";
+    }
+    if (!(provider?.clients || []).includes(state.setup.client)) {
+      state.setup.client = (provider?.clients || ["native"])[0];
+    }
+    if (!state.setup.account) state.setup.account = `${state.setup.provider}-primary`;
+    const configuredModels = setupModels(provider);
+    if (!state.setup.model && configuredModels.length) state.setup.model = configuredModels[0].id;
+  }
+
+  function setupModels(provider = setupProvider()) {
+    const upstreams = new Set(provider?.configured_upstreams || []);
+    if (provider?.id) upstreams.add(provider.id);
+    return (state.data.models?.models || []).filter((model) =>
+      (model.targets || []).some((target) => upstreams.has(target.provider)));
+  }
+
+  function setupQuery() {
+    const query = new URLSearchParams({
+      provider: state.setup.provider,
+      auth: state.setup.auth,
+      account: state.setup.account,
+      model: state.setup.model,
+      client: state.setup.client,
+    });
+    return query.toString();
+  }
+
+  function setupReadyForStep(step) {
+    if (step === 1) return Boolean(state.setup.provider);
+    if (step === 2) return Boolean(state.setup.auth && /^[A-Za-z0-9_.-]{1,128}$/.test(state.setup.account));
+    if (step === 3) return Boolean(state.setup.model && state.setup.model.length <= 256 && !/[\u0000-\u001F\u007F]/u.test(state.setup.model));
+    if (step === 4) return Boolean(state.setup.client);
+    return true;
+  }
+
+  function setupAuthInstructions(provider) {
+    const method = (provider?.authentication || []).find((item) => item.method === state.setup.auth);
+    if (!provider || !method) return `<p class="empty-description">Select a supported authentication method.</p>`;
+    const commandMethod = state.setup.auth === "authorization_code_pkce" ? "" : ` --method ${esc(state.setup.auth.replaceAll("_", "-"))}`;
+    const command = `pooler --config pooler.setup.yaml --credential-key-ref env:POOLER_STORE_KEY auth login ${esc(provider.id)} --account ${esc(state.setup.account)}${commandMethod}`;
+    const environments = provider.credential_environment_variables || [];
+    const secretGuidance = state.setup.auth === "api_key"
+      ? `<p>Set the provider key outside the browser using one of these documented environment names: ${environments.length ? environments.map((name) => `<code class="mono">${esc(name)}</code>`).join(", ") : "no built-in environment variable is documented"}.</p>`
+      : `<p>Run the command from a trusted terminal. Browser/device tokens are written only to Pooler's encrypted credential store.</p>`;
+    const warning = method.support === "requires_explicit_configuration"
+      ? `<div class="callout callout-warning"><strong>Explicit provider registration required.</strong> ${esc(method.note || "Supply operator-owned OAuth registration details; Pooler does not invent them.")}</div>`
+      : "";
+    return `${warning}${secretGuidance}<pre class="code-block"><code>${command}</code></pre><p class="muted">No credential value is accepted, retained, or placed in a URL by this dashboard.</p>`;
+  }
+
+  function setupClientInstructions() {
+    const addresses = { factory: "http://127.0.0.1:18474", devin: "http://127.0.0.1:18473" };
+    const base = addresses[state.setup.client] || "http://127.0.0.1:8319";
+    if (["openai", "codex", "cursor", "droid"].includes(state.setup.client)) {
+      return `Set the client's OpenAI-compatible base URL to <code class="mono">${base}/v1</code>. Use a non-secret local placeholder only if the client requires an API-key field; Pooler resolves the upstream credential server-side.`;
+    }
+    if (state.setup.client === "anthropic") return `Set the Anthropic SDK base URL to <code class="mono">${base}</code>. Pooler supplies the upstream <code class="mono">x-api-key</code> header server-side.`;
+    if (state.setup.client === "gemini") return `Set the Gemini client base URL to <code class="mono">${base}</code>. Pooler supplies the upstream Google credential server-side.`;
+    return `Point the selected client at <code class="mono">${base}</code>. The generated route preserves the selected provider's request dialect.`;
+  }
+
+  function renderSetup(root) {
+    setupDefaults();
+    const provider = setupProvider();
+    const methods = (provider?.authentication || []).filter((method) => method.support === "supported");
+    const unavailableMethods = (provider?.authentication || []).filter((method) => method.support !== "supported");
+    const models = setupModels(provider);
+    const clients = state.data.setupOptions?.clients || [];
+    const compatibleClients = new Set(provider?.clients || []);
+    const steps = ["Provider", "Account", "Model", "Client", "Verify"];
+    const stepNav = steps.map((label, index) => {
+      const number = index + 1;
+      const current = number === state.setup.step;
+      return `<li class="setup-step${current ? " active" : ""}${number < state.setup.step ? " complete" : ""}"${current ? ' aria-current="step"' : ""}><span>${number}</span>${esc(label)}</li>`;
+    }).join("");
+    let body = "";
+    if (state.setup.step === 1) {
+      body = `
+        <fieldset class="wizard-fieldset"><legend>Choose a provider</legend>
+          <label class="field"><span class="field-label">Provider</span><select id="setup-provider" data-setup-field="provider">
+            ${(state.data.setupOptions?.providers || []).map((item) => `<option value="${esc(item.id)}"${item.id === state.setup.provider ? " selected" : ""}>${esc(item.name)} · ${esc(item.id)}</option>`).join("")}
+          </select></label>
+          ${provider ? `<div class="setup-facts"><span class="badge badge-neutral">${esc(provider.request_dialect)} dialect</span><span class="badge badge-neutral">${esc(provider.native_kind)}</span>${(provider.capabilities || []).map((capability) => `<span class="badge badge-neutral">${esc(capability)}</span>`).join("")}</div><p class="muted">${provider.discovery?.available ? "Bounded model discovery is documented for this provider." : "This provider has no catalog discovery contract; enter a documented model ID manually."}</p>` : ""}
+        </fieldset>`;
+    } else if (state.setup.step === 2) {
+      body = `
+        <fieldset class="wizard-fieldset"><legend>Connect an account</legend>
+          <label class="field"><span class="field-label">Authentication method</span><select id="setup-auth" data-setup-field="auth">
+            ${methods.map((method) => `<option value="${esc(method.method)}"${method.method === state.setup.auth ? " selected" : ""}>${esc(method.method.replaceAll("_", " "))} · ${esc(method.support.replaceAll("_", " "))}</option>`).join("")}
+          </select></label>
+          <label class="field"><span class="field-label">Account ID</span><input id="setup-account" data-setup-field="account" value="${esc(state.setup.account)}" maxlength="128" pattern="[A-Za-z0-9_.-]+" autocomplete="off" spellcheck="false"></label>
+          <div class="callout">${setupAuthInstructions(provider)}</div>
+          ${unavailableMethods.length ? `<div class="callout callout-warning"><strong>Methods not offered by this wizard</strong><ul class="check-list">${unavailableMethods.map((method) => `<li><span class="mono">${esc(method.method.replaceAll("_", " "))}</span> — ${esc(method.note || method.support.replaceAll("_", " "))}</li>`).join("")}</ul></div>` : ""}
+        </fieldset>`;
+    } else if (state.setup.step === 3) {
+      body = `
+        <fieldset class="wizard-fieldset"><legend>Select a model</legend>
+          <label class="field"><span class="field-label">Published or documented model ID</span><input id="setup-model" data-setup-field="model" list="setup-models" value="${esc(state.setup.model)}" maxlength="256" autocomplete="off" spellcheck="false"><datalist id="setup-models">${models.map((model) => `<option value="${esc(model.id)}"></option>`).join("")}</datalist></label>
+          <p class="muted">${models.length ? `${fmtInt(models.length)} active model mapping${models.length === 1 ? "" : "s"} match this provider.` : provider?.discovery?.available ? "No active model mapping matches yet. Enter a provider-documented ID; the generated configuration enables bounded discovery." : "No active model mapping matches yet. Enter a provider-documented ID; the generated configuration adds an explicit mapping."}</p>
+        </fieldset>`;
+    } else if (state.setup.step === 4) {
+      body = `
+        <fieldset class="wizard-fieldset"><legend>Choose a client</legend>
+          <label class="field"><span class="field-label">Client or protocol</span><select id="setup-client" data-setup-field="client">
+            ${clients.filter((client) => compatibleClients.has(client.id)).map((client) => `<option value="${esc(client.id)}"${client.id === state.setup.client ? " selected" : ""}>${esc(client.name)}</option>`).join("")}
+          </select></label>
+          <div class="callout">${setupClientInstructions()}</div>
+        </fieldset>`;
+    } else {
+      const test = state.setup.testResult;
+      const checks = test?.checks || [];
+      body = `
+        <section aria-labelledby="setup-review-title"><h2 id="setup-review-title" class="section-title">Review and verify</h2>
+          <dl class="detail-grid"><div><dt>Provider</dt><dd>${esc(provider?.name || state.setup.provider)}</dd></div><div><dt>Account</dt><dd class="mono">${esc(state.setup.account)}</dd></div><div><dt>Model</dt><dd class="mono">${esc(state.setup.model)}</dd></div><div><dt>Client</dt><dd>${esc(clients.find((client) => client.id === state.setup.client)?.name || state.setup.client)}</dd></div></dl>
+          <div class="callout callout-warning"><strong>Review before applying.</strong> Pooler validates this sidecar but does not overwrite your hand-written YAML. Download it, set the referenced environment secrets, then run <code class="mono">pooler check --config pooler.setup.yaml</code> and <code class="mono">pooler serve --config pooler.setup.yaml</code>.</div>
+          <div class="button-row"><button class="btn btn-outline btn-sm" type="button" data-setup-action="generate"${state.setup.busy ? " disabled" : ""}>Generate configuration</button>${state.setup.configuration ? '<button class="btn btn-outline btn-sm" type="button" data-setup-action="copy">Copy YAML</button><button class="btn btn-outline btn-sm" type="button" data-setup-action="download">Download sidecar</button>' : ""}<button class="btn btn-primary btn-sm" type="button" data-setup-action="test"${state.setup.busy || !state.setup.configuration ? " disabled" : ""}>${state.setup.busy ? "Checking…" : "Test active connection"}</button>${test?.ready ? '<a class="btn btn-primary btn-sm" href="#/overview">Finish setup</a>' : ""}</div>
+          ${state.setup.configuration ? `<pre class="code-block setup-config"><code>${esc(state.setup.configuration)}</code></pre>` : '<div class="empty-state"><p class="empty-title">Configuration not generated</p><p class="empty-description">Generate a compiler-validated, secret-reference-only sidecar to continue.</p></div>'}
+          ${test ? `<div class="callout ${test.ready ? "callout-success" : "callout-warning"}" role="status"><strong>${test.ready ? "Connection evidence verified" : "Setup is not verified yet"}</strong><p>${test.connection === "verified" ? "A successful bounded model-discovery observation exists for this provider and account." : "No outbound catalog observation has succeeded for this provider and account. Pooler did not send a billable inference request."}</p><ul class="check-list">${checks.map((check) => `<li><span class="badge ${check.status === "passed" ? "badge-success" : "badge-neutral"}">${esc(check.status)}</span> <strong>${esc(check.id.replaceAll("_", " "))}</strong> — ${esc(check.detail)}</li>`).join("")}</ul></div>` : ""}
+        </section>`;
+    }
+    const nextDisabled = !setupReadyForStep(state.setup.step) || state.setup.busy;
+    root.innerHTML = `
+      ${viewHeader("First-run setup", "No credentials are entered in or retained by this dashboard.")}
+      <ol class="setup-progress" aria-label="Setup progress">${stepNav}</ol>
+      <div class="panel wizard-panel">${body}<div class="wizard-actions">${state.setup.step > 1 ? `<button class="btn btn-outline" type="button" data-setup-action="back"${state.setup.busy ? " disabled" : ""}>Back</button>` : ""}${state.setup.step < 5 ? `<button class="btn btn-primary" type="button" data-setup-action="next"${nextDisabled ? " disabled" : ""}>Continue</button>` : ""}</div></div>`;
+  }
+
+  async function generateSetupConfiguration() {
+    const setupGeneration = state.setup.generation;
+    state.setup.busy = true;
+    renderSetup($("#view"));
+    const sessionGeneration = state.sessionGeneration;
+    try {
+      const result = await readJson(`/setup/config?${setupQuery()}`);
+      if (sessionGeneration !== state.sessionGeneration || setupGeneration !== state.setup.generation) return;
+      state.setup.configuration = result.configuration || "";
+      state.setup.testResult = null;
+    } catch (error) {
+      if (sessionGeneration !== state.sessionGeneration || setupGeneration !== state.setup.generation) return;
+      if (error.status === 401) authRequired();
+      else notify("error", esc(error.message));
+    } finally {
+      if (sessionGeneration === state.sessionGeneration && setupGeneration === state.setup.generation) {
+        state.setup.busy = false;
+        if (state.route === "setup") renderSetup($("#view"));
+      }
+    }
+  }
+
+  async function waitForSetupReload(requestId, sessionGeneration) {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      if (sessionGeneration !== state.sessionGeneration) return null;
+      const reloads = await readJson("/reloads");
+      const record = (reloads.reloads || []).find((item) => item.request_id === requestId);
+      if (record && record.status !== "pending") return record;
+    }
+    return null;
+  }
+
+  async function runSetupConnectionTest() {
+    const setupGeneration = state.setup.generation;
+    state.setup.busy = true;
+    state.setup.testResult = null;
+    renderSetup($("#view"));
+    const sessionGeneration = state.sessionGeneration;
+    try {
+      if (state.data.health?.management?.mutations && state.authState === "authenticated") {
+        const request = await mutate("/models/reload");
+        const result = await waitForSetupReload(request.request_id, sessionGeneration);
+        if (result?.status === "failed") notify("warning", `Catalog refresh failed: ${esc(result.detail || "see reload history")}`);
+      }
+      if (sessionGeneration !== state.sessionGeneration || setupGeneration !== state.setup.generation) return;
+      const testResult = await readJson(`/setup/test?${setupQuery()}`);
+      if (sessionGeneration !== state.sessionGeneration || setupGeneration !== state.setup.generation) return;
+      state.setup.testResult = testResult;
+    } catch (error) {
+      if (sessionGeneration !== state.sessionGeneration || setupGeneration !== state.setup.generation) return;
+      if (error.status === 401) authRequired();
+      else notify("error", esc(error.message));
+    } finally {
+      if (sessionGeneration === state.sessionGeneration && setupGeneration === state.setup.generation) {
+        state.setup.busy = false;
+        if (state.route === "setup") renderSetup($("#view"));
+      }
+    }
+  }
+
+  function downloadSetupConfiguration() {
+    const blob = new Blob([state.setup.configuration], { type: "application/yaml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "pooler.setup.yaml";
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function setupAction(action) {
+    if (action === "back") { state.setup.step = Math.max(1, state.setup.step - 1); renderSetup($("#view")); return; }
+    if (action === "next") {
+      if (!setupReadyForStep(state.setup.step)) return;
+      state.setup.step = Math.min(5, state.setup.step + 1);
+      renderSetup($("#view"));
+      if (state.setup.step === 5 && !state.setup.configuration) await generateSetupConfiguration();
+      return;
+    }
+    if (action === "generate") await generateSetupConfiguration();
+    else if (action === "test") await runSetupConnectionTest();
+    else if (action === "copy") {
+      try { await navigator.clipboard.writeText(state.setup.configuration); notify("success", "Configuration copied."); }
+      catch { notify("warning", "Clipboard access was unavailable. Select the YAML manually."); }
+    } else if (action === "download") downloadSetupConfiguration();
+  }
+
+  function updateSetupField(field, value) {
+    if (!Object.prototype.hasOwnProperty.call(state.setup, field)) return;
+    const changed = state.setup[field] !== value;
+    state.setup[field] = value;
+    if (!changed) return;
+    state.setup.generation += 1;
+    state.setup.busy = false;
+    state.setup.configuration = "";
+    state.setup.testResult = null;
+    if (field === "provider") {
+      state.setup.auth = "";
+      state.setup.client = "";
+      state.setup.account = `${value}-primary`;
+      state.setup.model = "";
+      setupDefaults();
+    }
+  }
+
 
   function renderOverview(root) {
     const health = state.data.health || {};
@@ -1278,6 +1559,7 @@
     $("#token-apply").addEventListener("click", () => {
       state.sessionGeneration += 1;
       state.pending.clear();
+      clearSetupResults();
       invalidateReads({ clearData: true });
       state.token = $("#token-input").value.trim();
       state.authState = state.token ? "checking" : "anonymous";
@@ -1293,6 +1575,7 @@
     $("#token-clear").addEventListener("click", () => {
       state.sessionGeneration += 1;
       state.pending.clear();
+      clearSetupResults();
       invalidateReads({ clearData: true });
       state.token = "";
       state.authState = "anonymous";
@@ -1316,6 +1599,9 @@
     $("#view").addEventListener("click", (event) => {
       const openSession = event.target.closest("[data-open-session]");
       if (openSession) { openSessionDialog(); return; }
+
+      const setupButton = event.target.closest("[data-setup-action]");
+      if (setupButton) { setupAction(setupButton.dataset.setupAction); return; }
 
       const accountButton = event.target.closest("[data-account-action]");
       if (accountButton) {
@@ -1344,6 +1630,21 @@
         const replacement = Array.from(root.querySelectorAll("[data-expand]")).find((button) => button.dataset.expand === key);
         replacement?.focus();
       }
+    });
+
+    $("#view").addEventListener("input", (event) => {
+      const field = event.target.closest("[data-setup-field]");
+      if (!field || state.route !== "setup") return;
+      updateSetupField(field.dataset.setupField, field.value);
+      const next = $("[data-setup-action=\"next\"]", $("#view"));
+      if (next) next.disabled = !setupReadyForStep(state.setup.step);
+    });
+    $("#view").addEventListener("change", (event) => {
+      const field = event.target.closest("[data-setup-field]");
+      if (!field || state.route !== "setup" || field.tagName !== "SELECT") return;
+      updateSetupField(field.dataset.setupField, field.value);
+      renderSetup($("#view"));
+      $(`#setup-${field.dataset.setupField}`)?.focus();
     });
 
     $("#banner-area").addEventListener("click", (event) => {

@@ -838,6 +838,7 @@ fn catalog_source_value(plan: &ModelCatalogSourcePlan, snapshot: &CatalogSnapsho
         "parser": plan.parser(),
         "path": plan.path(),
         "max_response_bytes": plan.max_response_bytes(),
+        "account": plan.account(),
         "account_configured": plan.account().is_some(),
         "prefix": source.prefix(),
         "priority": source.priority(),

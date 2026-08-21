@@ -1414,7 +1414,13 @@ pub static BUILTIN_PROVIDER_LOGIN_DEFINITIONS: [ProviderLoginDefinition; 5] = [
         "Kimi",
         "https://www.kimi.com/resources/kimi-code-introduction",
     )
-    .with_aliases(&["moonshot", "moonshot-ai"])
+    .with_aliases(&[
+        "moonshot",
+        "moonshot-ai",
+        "moonshotai",
+        "moonshotai-cn",
+        "kimi-for-coding",
+    ])
     .with_oauth_host_suffixes(&["kimi.com", "moonshot.cn"])
     .with_capabilities(KIMI_CAPABILITIES),
 ];
@@ -1462,6 +1468,9 @@ mod tests {
             ("Gemini", "google"),
             ("grok", "xai"),
             ("moonshot-ai", "kimi"),
+            ("moonshotai", "kimi"),
+            ("moonshotai-cn", "kimi"),
+            ("kimi-for-coding", "kimi"),
         ] {
             assert_eq!(registry.require(alias).expect("provider").id(), expected);
         }

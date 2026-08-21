@@ -47,6 +47,7 @@ version: 1
 management: {bind: 127.0.0.1:0}
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {provider-a: {url: http://127.0.0.1:1}}
+accounts: {catalog-account: {provider: provider-a, secret: env:POOLER_TEST_CATALOG_KEY}}
 models:
   - id: configured-only
     targets: [{provider: provider-a, upstream_model: configured-upstream, capabilities: [text]}]
@@ -56,6 +57,7 @@ catalog:
     - id: provider-a.primary
       provider: provider-a
       parser: kimi
+      account: catalog-account
       prefix: team
       included_models: ['model-*']
       excluded_models: ['*-old']
@@ -324,6 +326,7 @@ async fn fake_provider_snapshot_drives_cli_management_shape_and_retains_last_goo
     let catalog_text = String::from_utf8(catalog.body).expect("catalog UTF-8");
     assert!(catalog_text.contains("\"prefix\":\"team\""));
     assert!(catalog_text.contains("\"alias\":\"best\""));
+    assert!(catalog_text.contains("\"account\":\"catalog-account\""));
     assert!(catalog_text.contains("\"included_models\":[\"model-*\"]"));
     assert!(catalog_text.contains("\"excluded_models\":[\"*-old\"]"));
     assert!(!catalog_text.contains(SECRET_SENTINEL));
