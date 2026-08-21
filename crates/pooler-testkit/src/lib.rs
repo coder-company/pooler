@@ -20,6 +20,7 @@ mod clock;
 mod compatibility;
 mod counters;
 mod fixture;
+mod strict_provider;
 mod upstream;
 
 pub use capture::{
@@ -42,6 +43,9 @@ pub use fixture::{
     normalize_headers, normalize_json, normalize_json_value, normalize_request, ConversionReport,
     Equivalence, EquivalenceKind, EquivalenceReport, ExpectedHealthMutation, Fixture,
     FixtureEquivalence, FixtureMetadata, HealthMutation, NormalizationError,
+};
+pub use strict_provider::{
+    AcceptedRequest, ProviderContract, ProviderLog, ProviderRoute, StrictProvider,
 };
 pub use upstream::{
     CallOutcome, ConnectChunk, Header, RecordedCall, ScriptedChunk, ScriptedError, ScriptedOutcome,
