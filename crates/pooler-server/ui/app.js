@@ -614,16 +614,18 @@
   function setupAuthInstructions(provider) {
     const method = (provider?.authentication || []).find((item) => item.method === state.setup.auth);
     if (!provider || !method) return `<p class="empty-description">Select a supported authentication method.</p>`;
-    const commandMethod = state.setup.auth === "authorization_code_pkce" ? "" : ` --method ${esc(state.setup.auth.replaceAll("_", "-"))}`;
-    const command = `pooler --config pooler.setup.yaml --credential-key-ref env:POOLER_STORE_KEY auth login ${esc(provider.id)} --account ${esc(state.setup.account)}${commandMethod}`;
     const environments = provider.credential_environment_variables || [];
     const secretGuidance = state.setup.auth === "api_key"
-      ? `<p>Set the provider key outside the browser using one of these documented environment names: ${environments.length ? environments.map((name) => `<code class="mono">${esc(name)}</code>`).join(", ") : "no built-in environment variable is documented"}.</p>`
-      : `<p>Run the command from a trusted terminal. Browser/device tokens are written only to Pooler's encrypted credential store.</p>`;
-    const warning = method.support === "requires_explicit_configuration"
-      ? `<div class="callout callout-warning"><strong>Explicit provider registration required.</strong> ${esc(method.note || "Supply operator-owned OAuth registration details; Pooler does not invent them.")}</div>`
-      : "";
-    return `${warning}${secretGuidance}<pre class="code-block"><code>${command}</code></pre><p class="muted">No credential value is accepted, retained, or placed in a URL by this dashboard.</p>`;
+      ? `<p>After generating and downloading the sidecar, set the provider key outside the browser using one of these documented environment names: ${environments.length ? environments.map((name) => `<code class="mono">${esc(name)}</code>`).join(", ") : "no built-in environment variable is documented"}.</p>`
+      : `<p>Authentication happens from a trusted terminal after the sidecar has been generated and downloaded. Browser/device tokens are written only to Pooler's encrypted credential store.</p>`;
+    return `${secretGuidance}<p class="muted">No credential value is accepted, retained, or placed in a URL by this dashboard.</p>`;
+  }
+
+  function setupActivationInstructions(provider) {
+    const methodName = { authorization_code_pkce: "oauth", device_code: "device-code", api_key: "api-key" }[state.setup.auth];
+    const login = ["pooler", "--config", "pooler.setup.yaml", "--credential-key-ref", "env:POOLER_STORE_KEY", "auth", "login", provider?.id || state.setup.provider, "--account", state.setup.account, "--method", methodName].map(shellArg).join(" ");
+    const serve = ["pooler", "--config", "pooler.setup.yaml", "--credential-key-ref", "env:POOLER_STORE_KEY", "serve"].map(shellArg).join(" ");
+    return `<ol class="check-list"><li>Download <code class="mono">pooler.setup.yaml</code> and set the referenced environment secrets, including <code class="mono">POOLER_STORE_KEY</code> and <code class="mono">POOLER_MANAGEMENT_TOKEN</code>.</li><li>Validate it: <code class="mono">pooler check --config pooler.setup.yaml</code>.</li><li>Complete provider authentication: <code class="mono">${esc(login)}</code>.</li><li>Start Pooler with the same credential-store key: <code class="mono">${esc(serve)}</code>.</li><li>Reopen or reconnect this dashboard, then verify the newly running instance.</li></ol>`;
   }
 
   function setupClientInstructions() {
@@ -645,7 +647,7 @@
     const models = setupModels(provider);
     const clients = state.data.setupOptions?.clients || [];
     const compatibleClients = new Set(provider?.clients || []);
-    const steps = ["Provider", "Account", "Model", "Client", "Verify"];
+    const steps = ["Provider", "Account", "Model", "Client", "Activate & verify"];
     const stepNav = steps.map((label, index) => {
       const number = index + 1;
       const current = number === state.setup.step;
@@ -690,9 +692,9 @@
       body = `
         <section aria-labelledby="setup-review-title"><h2 id="setup-review-title" class="section-title">Review and verify</h2>
           <dl class="detail-grid"><div><dt>Provider</dt><dd>${esc(provider?.name || state.setup.provider)}</dd></div><div><dt>Account</dt><dd class="mono">${esc(state.setup.account)}</dd></div><div><dt>Model</dt><dd class="mono">${esc(state.setup.model)}</dd></div><div><dt>Client</dt><dd>${esc(clients.find((client) => client.id === state.setup.client)?.name || state.setup.client)}</dd></div></dl>
-          <div class="callout callout-warning"><strong>Review before applying.</strong> Pooler validates this sidecar but does not overwrite your hand-written YAML. Download it, set the referenced environment secrets, then run <code class="mono">pooler check --config pooler.setup.yaml</code> and <code class="mono">pooler serve --config pooler.setup.yaml</code>.</div>
-          <div class="button-row"><button class="btn btn-outline btn-sm" type="button" data-setup-action="generate"${state.setup.busy ? " disabled" : ""}>Generate configuration</button>${state.setup.configuration ? '<button class="btn btn-outline btn-sm" type="button" data-setup-action="copy">Copy YAML</button><button class="btn btn-outline btn-sm" type="button" data-setup-action="download">Download sidecar</button>' : ""}<button class="btn btn-primary btn-sm" type="button" data-setup-action="test"${state.setup.busy || !state.setup.configuration ? " disabled" : ""}>${state.setup.busy ? "Checking…" : "Test active connection"}</button>${test?.ready ? '<a class="btn btn-primary btn-sm" href="#/overview">Finish setup</a>' : ""}</div>
-          ${state.setup.configuration ? `<pre class="code-block setup-config"><code>${esc(state.setup.configuration)}</code></pre>` : '<div class="empty-state"><p class="empty-title">Configuration not generated</p><p class="empty-description">Generate a compiler-validated, secret-reference-only sidecar to continue.</p></div>'}
+          <div class="callout callout-warning"><strong>Generate before authenticating.</strong> Pooler validates this sidecar but does not overwrite your hand-written YAML. The verification action checks the currently running process, so start that generated configuration and reconnect this dashboard before verifying.</div>
+          <div class="button-row"><button class="btn btn-outline btn-sm" type="button" data-setup-action="generate"${state.setup.busy ? " disabled" : ""}>Generate configuration</button>${state.setup.configuration ? '<button class="btn btn-outline btn-sm" type="button" data-setup-action="copy">Copy YAML</button><button class="btn btn-outline btn-sm" type="button" data-setup-action="download">Download sidecar</button>' : ""}<button class="btn btn-primary btn-sm" type="button" data-setup-action="test"${state.setup.busy || !state.setup.configuration ? " disabled" : ""}>${state.setup.busy ? "Checking…" : "Verify running instance"}</button>${test?.ready ? '<a class="btn btn-primary btn-sm" href="#/overview">Finish setup</a>' : ""}</div>
+          ${state.setup.configuration ? `${setupActivationInstructions(provider)}<pre class="code-block setup-config"><code>${esc(state.setup.configuration)}</code></pre>` : '<div class="empty-state"><p class="empty-title">Configuration not generated</p><p class="empty-description">Generate a compiler-validated, secret-reference-only sidecar before setting secrets or running provider login.</p></div>'}
           ${test ? `<div class="callout ${test.ready ? "callout-success" : "callout-warning"}" role="status"><strong>${test.ready ? "Connection evidence verified" : "Setup is not verified yet"}</strong><p>${test.connection === "verified" ? "A successful bounded model-discovery observation exists for this provider and account." : "No outbound catalog observation has succeeded for this provider and account. Pooler did not send a billable inference request."}</p><ul class="check-list">${checks.map((check) => `<li><span class="badge ${check.status === "passed" ? "badge-success" : "badge-neutral"}">${esc(check.status)}</span> <strong>${esc(check.id.replaceAll("_", " "))}</strong> — ${esc(check.detail)}</li>`).join("")}</ul></div>` : ""}
         </section>`;
     }
@@ -743,13 +745,22 @@
     renderSetup($("#view"));
     const sessionGeneration = state.sessionGeneration;
     try {
-      if (state.data.health?.management?.mutations && state.authState === "authenticated") {
-        const request = await mutate("/models/reload");
-        const result = await waitForSetupReload(request.request_id, sessionGeneration);
-        if (result?.status === "failed") notify("warning", `Catalog refresh failed: ${esc(result.detail || "see reload history")}`);
+      if (!state.data.health?.management?.mutations || state.authState !== "authenticated") {
+        throw new Error("Verification requires an authenticated running instance with catalog reload enabled.");
       }
+      const request = await mutate("/models/reload");
+      const result = await waitForSetupReload(request.request_id, sessionGeneration);
       if (sessionGeneration !== state.sessionGeneration || setupGeneration !== state.setup.generation) return;
-      const testResult = await readJson(`/setup/test?${setupQuery()}`);
+      if (!result || result.status !== "succeeded") {
+        state.setup.testResult = {
+          ready: false,
+          connection: "not_probed",
+          checks: [{ id: "catalog_reload", status: "failed", detail: result?.detail || "The correlated catalog reload did not succeed." }],
+        };
+        return;
+      }
+      const query = `${setupQuery()}&reload_request_id=${encodeURIComponent(request.request_id)}`;
+      const testResult = await readJson(`/setup/test?${query}`);
       if (sessionGeneration !== state.sessionGeneration || setupGeneration !== state.setup.generation) return;
       state.setup.testResult = testResult;
     } catch (error) {
@@ -1056,9 +1067,9 @@
     const unavailable = (provider?.authentication || []).filter((method) => expectedMethod.has(method.method) && method.support !== "supported");
     const commands = methods.map((method) => {
       const methodName = { authorization_code_pkce: "oauth", device_code: "device-code", api_key: "api-key" }[method.method];
-      const args = ["pooler", "--credential-key-ref", "env:POOLER_STORE_KEY", "auth", "login", account.id];
+      const args = ["pooler", "--credential-key-ref", "env:POOLER_STORE_KEY", "auth", "login", account.provider];
       if (provider?.id) args.push("--profile", provider.id);
-      args.push("--method", methodName);
+      args.push("--account", account.id, "--method", methodName);
       return `<div><strong>${esc(method.method.replaceAll("_", " "))}</strong><pre class="code-block"><code>${esc(args.map(shellArg).join(" "))}</code></pre><p class="muted">${esc(method.note)}</p></div>`;
     }).join("");
     const environments = provider?.credential_environment_variables || [];

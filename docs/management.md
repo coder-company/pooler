@@ -41,17 +41,24 @@ Send the token as `Authorization: Bearer ...`.
 
 ## First-run setup
 
-The dashboard&rsquo;s **Setup** view is a five-stage wizard: provider, account authentication, model, client, and verification. Its choices come from Pooler&rsquo;s built-in provider-login and provider-catalog registries plus the active redacted account and model views. Unsupported provider/client dialect combinations are not offered.
+The dashboard&rsquo;s **Setup** view is a five-stage wizard: provider, account authentication, model, client, and activation/verification. Its choices come from Pooler&rsquo;s built-in provider-login and provider-catalog registries plus the active redacted account and model views. Unsupported provider/client dialect combinations are not offered. Google browser OAuth is intentionally marked as requiring explicit configuration because Pooler cannot safely invent operator-owned OAuth registration details.
 
-The browser never accepts a provider API key, OAuth client secret, or token. It displays a trusted-terminal `pooler auth login` command and generates YAML containing only documented `env:` references. OAuth methods that require operator-owned registration details are explained but not offered by the wizard. `/setup/config` compiles the generated YAML before returning it. The result is a managed sidecar candidate: download and review it separately, run `pooler check --config pooler.setup.yaml`, then start it with `pooler serve --config pooler.setup.yaml`. Pooler does not rewrite the operator's hand-written YAML or comments.
+The browser never accepts a provider API key, OAuth client secret, or token. `/setup/config` compiles the generated YAML before returning it. The result is a managed sidecar candidate; Pooler does not rewrite the operator's hand-written YAML or comments. Complete setup in this order:
 
-**Test active connection** requests a catalog-only reload when authenticated mutations are available, waits for the correlated reload result, and then reads `/setup/test`. A connection is reported as `verified` only when the active generation contains the selected provider/account/model and has a successful bounded model-discovery observation. Static configuration or a non-cooling provider alone is reported as `not_probed`; the wizard does not send a potentially billable inference request and does not call that state healthy.
+1. Generate and download `pooler.setup.yaml`.
+2. Set its referenced environment secrets, including `POOLER_STORE_KEY` and `POOLER_MANAGEMENT_TOKEN`.
+3. Run `pooler check --config pooler.setup.yaml`.
+4. Run `pooler --config pooler.setup.yaml --credential-key-ref env:POOLER_STORE_KEY auth login <provider> --account <account> --method <method>`.
+5. Start the generated configuration with `pooler --config pooler.setup.yaml --credential-key-ref env:POOLER_STORE_KEY serve`.
+6. Reopen or reconnect the dashboard and verify that running instance.
+
+**Verify running instance** requests a catalog-only reload, requires that correlated request to succeed, and then reads `/setup/test` with the reload request ID. A connection is reported as `verified` only when the active provider/account/model match, the configuration and catalog generations match the completed reload, and a matching discovery observation is newer than the reload request. Retained last-good discovery is never fresh verification. The wizard does not send a potentially billable inference request.
 
 Setup selections may appear in same-origin query strings, but credential values never do. Generated sidecars and downloads use authenticated `fetch` and remain local to the current browser action.
 
 ## Connecting configured accounts
 
-The **Accounts** view combines the redacted `/accounts` state with the catalog-derived `/setup/options` authentication facts. **Connect** shows an exact `pooler auth login` command for supported methods and explains methods that require operator-owned registration instead of presenting a control that cannot work safely.
+The **Accounts** view combines the redacted `/accounts` state with the catalog-derived `/setup/options` authentication facts. **Connect** shows an exact `pooler auth login <configured-upstream> --profile <provider-profile> --account <account-id>` command for supported methods. The configured upstream is the positional selector; the account is always passed with `--account`. Methods that require operator-owned registration are explained instead of being presented as controls that cannot work safely.
 
 Connection remains terminal-only. API keys stay in environment variables or another protected reference, while OAuth codes and tokens stay in Pooler's encrypted credential store. The dashboard has no credential field and does not place credentials in URLs, request bodies, browser storage, or generated configuration. **Check redacted account status** performs authenticated reads only; it does not send inference traffic and an `available` local credential is not labelled as verified provider connectivity.
 

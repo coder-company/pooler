@@ -40,10 +40,12 @@ class MockState:
         self.models_started = threading.Event()
         self.reload_request_id = 1
         self.reload_status = "succeeded"
+        self.reload_outcome = "succeeded"
         self.posts: dict[str, int] = {}
         self.post_bodies: dict[str, bytes] = {}
         self.post_transfer_encoding: dict[str, str | None] = {}
         self.get_authorization: dict[str, str | None] = {}
+        self.get_targets: list[str] = []
 
 STATE = MockState()
 
@@ -64,7 +66,7 @@ def payload(path: str) -> dict:
                     {"method": "device_code", "support": "requires_explicit_configuration", "note": "Operator registration is required."},
                 ],
                 "discovery": {"available": True, "parser": "openai", "path": "/v1/models"},
-                "configured_upstreams": ["openai"],
+                "configured_upstreams": ["openai-upstream"],
                 "clients": ["native", "openai", "codex", "cursor", "droid", "factory", "devin"],
             }],
             "clients": [
@@ -94,7 +96,7 @@ def payload(path: str) -> dict:
         "/management/health": {**generation, "status": "ok", "management": {"mutations": True}, "credential_health_entries": 1, "cooling_provider_entries": 0},
         "/management/active": {"active": 1, "by_listener": {"main": 1}},
         "/management/health/providers": {**generation, "providers": [{"id": "openai", "transport": "http", "native": "openai", "auth_configured": True, "status": "not_cooling"}]},
-        "/management/accounts": {**generation, "mutation_capable": True, "accounts": [{"id": "primary", "provider": "openai", "enabled": True, "selected": False, "auth_kind": "oauth", "available_actions": ["switch", "disable", "refresh", "revoke"], "status": "available", "failure_count": 0, "cooldown_until": None}]},
+        "/management/accounts": {**generation, "mutation_capable": True, "accounts": [{"id": "primary", "provider": "openai-upstream", "enabled": True, "selected": False, "auth_kind": "oauth", "available_actions": ["switch", "disable", "refresh", "revoke"], "status": "available", "failure_count": 0, "cooldown_until": None}]},
         "/management/quota": {**generation, "windows": [], "cooldowns": []},
         "/management/models": {**generation, "mutation_capable": True, "models": [{"id": "gpt-test", "selection_origin": "configured", "enabled": True, "targets": [{"provider": "openai", "upstream_model": "gpt-test", "capabilities": ["text"]}]}], "catalog_sources": [], "model_overrides": {}},
         "/management/catalog": {"catalog_generation": 2, "sources": []},
@@ -104,7 +106,7 @@ def payload(path: str) -> dict:
         "/management/decisions": {"decisions": [{"id": "decision-1", "recorded_at": 1, "request_id": "request-123456", "route_id": "route", "model": "gpt-test", "selected_provider": "openai", "selected_credential": "primary", "attempt": 1, "reason": "selected", "candidates": [{"provider_id": "openai", "credential_id": "primary", "score": 10, "eligible": True, "reason": "healthy"}]}]},
         "/management/traces": {"traces": [], "dropped": 0},
         "/management/audit": {"events": []},
-        "/management/reloads": {**generation, "reloads": [{"request_id": STATE.reload_request_id, "kind": "configuration", "status": STATE.reload_status, "requested_at_ms": 1, "completed_at_ms": 2, "accepted_configuration_generation": 7, "catalog_generation": 2}]},
+        "/management/reloads": {**generation, "reloads": [{"request_id": STATE.reload_request_id, "kind": "catalog", "status": STATE.reload_status, "requested_at_ms": 1, "completed_at_ms": 2, "accepted_configuration_generation": 7, "configuration_generation": 7, "catalog_generation": 2}]},
     }
     return responses.get(path, generation)
 
@@ -129,6 +131,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         route = urlsplit(self.path).path
+        STATE.get_targets.append(self.path)
         static = {
             "/": UI / "index.html",
             "/management/ui/": UI / "index.html",
@@ -182,9 +185,10 @@ class Handler(BaseHTTPRequestHandler):
         STATE.posts[route] = STATE.posts.get(route, 0) + 1
         time.sleep(0.25)
         if route in {"/management/reload", "/management/models/reload"}:
-            STATE.reload_request_id = 2
-            STATE.reload_status = "succeeded"
-            self.send_bytes(202, b'{"status":"pending","request_id":2}', "application/json")
+            STATE.reload_request_id += 1
+            STATE.reload_status = STATE.reload_outcome
+            body = json.dumps({"status": "pending", "request_id": STATE.reload_request_id}).encode()
+            self.send_bytes(202, body, "application/json")
         else:
             self.send_bytes(200, b'{"status":"accepted"}', "application/json")
 
@@ -248,6 +252,7 @@ def run_browser(playwright) -> None:
         page.locator('[data-setup-action="next"]').click()
         expect(not page.locator('#setup-auth option[value="device_code"]').count(), "explicit-registration flow was offered as runnable")
         expect("Operator registration is required" in page.locator(".view-setup").inner_text(), "unavailable authentication method lacks an accessible explanation")
+        expect("pooler.setup.yaml" not in page.locator(".view-setup").inner_text(), "account step references a sidecar before it can be generated")
         page.locator("#setup-account").fill("primary")
         page.locator('[data-setup-action="next"]').click()
         expect(page.locator("#setup-model").input_value() == "gpt-test", "setup did not reuse active model facts")
@@ -260,12 +265,22 @@ def run_browser(playwright) -> None:
         expect("sk-" not in setup_yaml and "Bearer " not in setup_yaml, "generated setup exposed a credential value")
         expect(STATE.get_authorization.get("/management/setup/config") == "Bearer good-token", "setup configuration did not use authenticated fetch")
         expect(page.get_by_role("link", name="Finish setup").count() == 0, "setup could finish before connection evidence")
+        activation_text = page.locator(".view-setup").inner_text()
+        expect("pooler --config pooler.setup.yaml --credential-key-ref env:POOLER_STORE_KEY serve" in activation_text, "serve instructions omit the OAuth credential-store key")
+        expect("Reopen or reconnect this dashboard" in activation_text, "setup does not explain that verification targets the newly running instance")
+        STATE.reload_outcome = "failed"
+        page.locator('[data-setup-action="test"]').click()
+        page.wait_for_selector("text=Setup is not verified yet")
+        expect(not any(target.startswith("/management/setup/test?") for target in STATE.get_targets), "failed catalog reload still called setup verification")
+        expect(page.get_by_role("link", name="Finish setup").count() == 0, "failed catalog reload allowed setup completion")
+        STATE.reload_outcome = "succeeded"
         page.locator('[data-setup-action="test"]').click()
         page.wait_for_selector("text=Connection evidence verified")
         expect(page.get_by_role("link", name="Finish setup").count() == 1, "verified setup has no finish action")
-        expect(STATE.posts.get("/management/models/reload") == 1, "setup connection test did not request model discovery")
+        expect(STATE.posts.get("/management/models/reload") == 2, "setup verification did not isolate failed and successful catalog reloads")
         expect(STATE.post_bodies.get("/management/models/reload") == b"", "setup connection test mutation sent a body")
         expect(STATE.get_authorization.get("/management/setup/test") == "Bearer good-token", "setup connection test did not use authenticated fetch")
+        expect(any("reload_request_id=3" in target for target in STATE.get_targets if target.startswith("/management/setup/test?")), "setup verification was not correlated to its successful catalog reload")
         expect(page.evaluate("localStorage.length === 0 && sessionStorage.length === 0"), "setup state was persisted in browser storage")
         STATE.reject_all = True
         page.locator("#refresh-now").click()
@@ -320,7 +335,7 @@ def run_browser(playwright) -> None:
         page.locator('[data-account-connect="primary"]').click()
         page.wait_for_selector(".connection-panel")
         connection_text = page.locator(".connection-panel").inner_text()
-        expect("auth login primary --profile openai --method oauth" in connection_text, "account connection guide omitted the exact trusted-terminal command")
+        expect("auth login openai-upstream --profile openai --account primary --method oauth" in connection_text, "account connection guide did not separate the configured upstream from the account ID")
         expect(not page.locator('.connection-panel input[type="password"]').count(), "account connection flow accepts credentials in the browser")
         expect("refresh token" in connection_text and "never receives" in connection_text, "account connection guide omits credential-boundary disclosure")
         expect("device code" in connection_text and "Operator registration is required" in connection_text, "unavailable account login method is not explained")
@@ -356,13 +371,14 @@ def run_browser(playwright) -> None:
         page.locator('[data-action="reload-config"]').click()
         page.locator("#confirm-accept").click()
         page.wait_for_selector(".banner-info")
-        expect("Reload request 2 accepted" in page.locator(".banner-info").last.inner_text(), "accepted reload was not correlated in the UI")
+        expect("Reload request 4 accepted" in page.locator(".banner-info").last.inner_text(), "accepted reload was not correlated in the UI")
         expect(STATE.posts.get("/management/reload") == 1, "configuration reload mutation was not sent exactly once")
         expect(STATE.post_bodies.get("/management/reload") == b"", "management mutation unexpectedly sent a body")
         expect(STATE.post_transfer_encoding.get("/management/reload") is None, "management mutation unexpectedly used Transfer-Encoding")
-        page.wait_for_selector("text=succeeded")
+        page.wait_for_function("""() => [...document.querySelectorAll('.section')].some((section) => section.textContent.includes('Reload history') && section.textContent.includes('4') && section.textContent.includes('succeeded'))""")
         reload_history = page.locator(".section").filter(has_text="Reload history").first
-        expect("2" in reload_history.inner_text() and "succeeded" in reload_history.inner_text(), "reload final outcome was not correlated to request 2")
+        reload_history_text = reload_history.inner_text()
+        expect("4" in reload_history_text and "succeeded" in reload_history_text, f"reload final outcome was not correlated to request 4: {reload_history_text!r}")
 
         page.locator('[data-route="overview"]').click()
         page.wait_for_selector("text=openai")

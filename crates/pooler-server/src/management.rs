@@ -366,6 +366,21 @@ fn setup_route_yaml(client: &str, dialect: &str, provider: &str) -> Result<Strin
     Ok(route)
 }
 
+fn setup_discovery_is_fresh(
+    source: &Value,
+    upstream_ids: &[&str],
+    account_id: &str,
+    reload_requested_at: u64,
+) -> bool {
+    source["provider"]
+        .as_str()
+        .is_some_and(|provider| upstream_ids.contains(&provider))
+        && source["account"].as_str() == Some(account_id)
+        && source["state"]["observed_at_unix_ms"]
+            .as_u64()
+            .is_some_and(|observed_at| observed_at > reload_requested_at)
+}
+
 fn generate_setup_config(
     provider_id: &str,
     auth_method: &str,
@@ -394,6 +409,11 @@ fn generate_setup_config(
             false
         }
         "authorization_code_pkce" => {
+            if provider_id == "google" {
+                return Err(
+                    "browser OAuth requires operator-owned registration details that this wizard cannot collect",
+                );
+            }
             let definition = login.ok_or("selected provider has no OAuth login profile")?;
             match definition.support(ProviderLoginMethod::AuthorizationCodePkce) {
                 ProviderLoginSupport::Supported => {}
@@ -1491,10 +1511,21 @@ impl ManagementApi {
                         .capabilities()
                         .iter()
                         .map(|capability| {
+                            let method = capability.method().to_string();
+                            let registration_required =
+                                id == "google" && method == "authorization_code_pkce";
                             json!({
-                                "method": capability.method().to_string(),
-                                "support": setup_support_name(capability.support()),
-                                "note": capability.note(),
+                                "method": method,
+                                "support": if registration_required {
+                                    "requires_explicit_configuration"
+                                } else {
+                                    setup_support_name(capability.support())
+                                },
+                                "note": if registration_required {
+                                    "Google browser OAuth requires operator-owned upstream registration details that this wizard cannot collect."
+                                } else {
+                                    capability.note()
+                                },
                             })
                         })
                         .collect::<Vec<_>>()
@@ -1610,6 +1641,34 @@ impl ManagementApi {
                 false,
             );
         }
+        let Some(reload_request_id) = management_query_value(query, "reload_request_id")
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return ManagementResponse::json(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "setup verification requires a correlated catalog reload request"}),
+                false,
+            );
+        };
+        let (reload_record, latest_catalog_reload_id) = {
+            let reload = self
+                .reload
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let record = reload
+                .records
+                .iter()
+                .find(|record| record["request_id"].as_u64() == Some(reload_request_id))
+                .cloned();
+            let latest = reload
+                .records
+                .iter()
+                .rev()
+                .find(|record| record["kind"].as_str() == Some("catalog"))
+                .and_then(|record| record["request_id"].as_u64());
+            (record, latest)
+        };
         let upstream_ids = snapshot
             .config()
             .upstreams()
@@ -1656,16 +1715,32 @@ impl ManagementApi {
                 })
         });
         let catalog_view = merged_model_catalog_value(snapshot.config(), catalog);
-        let discovery_verified =
-            catalog_view["catalog_sources"]
+        let catalog_generation = catalog_view["catalog_generation"].as_u64().unwrap_or(0);
+        let reload_requested_at = reload_record
+            .as_ref()
+            .and_then(|record| record["requested_at_ms"].as_u64())
+            .unwrap_or(u64::MAX);
+        let reload_verified = reload_record.as_ref().is_some_and(|record| {
+            latest_catalog_reload_id == Some(reload_request_id)
+                && record["kind"].as_str() == Some("catalog")
+                && record["status"].as_str() == Some("succeeded")
+                && record["accepted_configuration_generation"].as_u64()
+                    == Some(snapshot.generation().value())
+                && record["configuration_generation"].as_u64()
+                    == Some(snapshot.generation().value())
+                && record["catalog_generation"].as_u64() == Some(catalog_generation)
+        });
+        let discovery_verified = reload_verified
+            && catalog_view["catalog_sources"]
                 .as_array()
                 .is_some_and(|sources| {
                     sources.iter().any(|source| {
-                        source["provider"]
-                            .as_str()
-                            .is_some_and(|provider| upstream_ids.contains(&provider))
-                            && source["account"].as_str() == Some(account_id.as_str())
-                            && !source["state"].is_null()
+                        setup_discovery_is_fresh(
+                            source,
+                            &upstream_ids,
+                            &account_id,
+                            reload_requested_at,
+                        )
                     })
                 });
         let all_ready = provider_configured
@@ -1685,7 +1760,8 @@ impl ManagementApi {
                     {"id": "provider", "status": if provider_configured {"passed"} else {"pending"}, "detail": if provider_configured {"Provider is present in the active generation."} else {"Apply the generated configuration and reload Pooler."}},
                     {"id": "account", "status": if account_configured && account_available {"passed"} else {"pending"}, "detail": if account_configured && account_available {"The selected account is enabled in the active generation."} else {"Configure the account and complete its credential flow."}},
                     {"id": "model", "status": if model_available {"passed"} else {"pending"}, "detail": if model_available {"The selected model is published for this provider."} else {"Reload model discovery or apply the generated static model mapping."}},
-                    {"id": "connectivity", "status": if discovery_verified {"passed"} else {"not_run"}, "detail": if discovery_verified {"A successful bounded model-discovery observation exists for this provider and account."} else {"No successful outbound catalog observation exists for this provider and account. This check does not send a billable inference request."}},
+                    {"id": "catalog_reload", "status": if reload_verified {"passed"} else {"failed"}, "detail": if reload_verified {"The correlated catalog reload succeeded for the active configuration and catalog generations."} else {"The correlated catalog reload did not succeed for the active configuration and catalog generations."}},
+                    {"id": "connectivity", "status": if discovery_verified {"passed"} else {"not_run"}, "detail": if discovery_verified {"A matching model-discovery observation was recorded after the correlated reload request."} else {"No fresh matching discovery observation followed the correlated reload request; retained last-good state is not accepted. This check does not send a billable inference request."}},
                 ],
             }),
             false,
@@ -3714,6 +3790,16 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         assert!(openai["authentication"]
             .as_array()
             .is_some_and(|methods| methods.iter().any(|method| method["method"] == "api_key")));
+        let google = value["providers"]
+            .as_array()
+            .and_then(|providers| providers.iter().find(|provider| provider["id"] == "google"))
+            .expect("built-in Google provider");
+        assert!(google["authentication"]
+            .as_array()
+            .is_some_and(|methods| methods.iter().any(|method| {
+                method["method"] == "authorization_code_pkce"
+                    && method["support"] == "requires_explicit_configuration"
+            })));
         let moonshot = value["providers"]
             .as_array()
             .and_then(|providers| {
@@ -3769,6 +3855,17 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         let oauth = generate_setup_config("openai", "device_code", "personal", "gpt-5", "codex")
             .expect("supported device-code setup compiles");
         assert!(oauth.contains("auth_kind: oauth"));
+        assert_eq!(
+            generate_setup_config(
+                "google",
+                "authorization_code_pkce",
+                "primary",
+                "gemini-2.5-pro",
+                "gemini",
+            )
+            .expect_err("Google PKCE requires explicit upstream OAuth registration"),
+            "browser OAuth requires operator-owned registration details that this wizard cannot collect"
+        );
         assert!(!oauth.contains("OPENAI_API_KEY"));
         assert_eq!(
             generate_setup_config(
@@ -3803,11 +3900,71 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             "/setup/test?provider=openai&auth=api_key&account=primary&model=gpt-5&client=openai",
             &loopback_headers(),
         );
-        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
         let value: Value = serde_json::from_slice(&response.body).expect("setup test json");
-        assert_eq!(value["ready"], false);
-        assert_eq!(value["connection"], "not_probed");
-        assert_eq!(value["checks"][4]["status"], "not_run");
+        assert_eq!(
+            value["error"],
+            "setup verification requires a correlated catalog reload request"
+        );
+    }
+
+    #[test]
+    fn setup_discovery_must_be_newer_than_verification_reload() {
+        let stale = json!({
+            "provider": "openai",
+            "account": "primary",
+            "state": {"observed_at_unix_ms": 100},
+        });
+        let fresh = json!({
+            "provider": "openai",
+            "account": "primary",
+            "state": {"observed_at_unix_ms": 101},
+        });
+        assert!(!setup_discovery_is_fresh(
+            &stale,
+            &["openai"],
+            "primary",
+            100
+        ));
+        assert!(setup_discovery_is_fresh(
+            &fresh,
+            &["openai"],
+            "primary",
+            100
+        ));
+    }
+
+    #[test]
+    fn setup_verification_requires_latest_successful_generation_matched_reload() {
+        let api = api();
+        let generation = api.state.load().config.generation().value();
+        let first = api
+            .enqueue_reload(ManagementReloadKind::Catalog, generation)
+            .expect("first catalog reload queued");
+        api.complete_reload(first.id, "succeeded", generation, Some(0));
+        let path = format!(
+            "/setup/test?provider=openai&auth=api_key&account=primary&model=gpt-5&client=openai&reload_request_id={}",
+            first.id
+        );
+        let response = api.handle(&Method::GET, &path, &loopback_headers());
+        assert_eq!(response.status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&response.body).expect("setup test JSON");
+        assert_eq!(value["checks"][4]["status"], "passed");
+        assert_eq!(
+            value["ready"], false,
+            "reload success alone is not discovery"
+        );
+
+        let second = api
+            .enqueue_reload(ManagementReloadKind::Catalog, generation)
+            .expect("second catalog reload queued");
+        api.complete_reload(second.id, "failed", generation, Some(0));
+        let stale = api.handle(&Method::GET, &path, &loopback_headers());
+        let stale: Value = serde_json::from_slice(&stale.body).expect("stale setup JSON");
+        assert_eq!(
+            stale["checks"][4]["status"], "failed",
+            "an older successful reload must not bypass a newer failed reload"
+        );
     }
 
     #[tokio::test]
