@@ -1989,6 +1989,27 @@ async fn read_management_header_prefix<I: AsyncRead + Unpin>(
     }
 }
 
+fn raw_management_path(request_target: &str) -> Option<String> {
+    let request_path = if request_target.starts_with('/') {
+        request_target
+            .split('?')
+            .next()
+            .unwrap_or(request_target)
+            .to_owned()
+    } else {
+        let uri = request_target.parse::<http::Uri>().ok()?;
+        if uri.scheme().is_none() || uri.authority().is_none() {
+            return None;
+        }
+        uri.path().to_owned()
+    };
+    let management_path = request_path
+        .strip_prefix("/management")
+        .filter(|path| path.is_empty() || path.starts_with('/'))
+        .unwrap_or(&request_path);
+    Some(management_path.to_owned())
+}
+
 fn raw_is_management_mutation(prefix: &[u8]) -> bool {
     let Some(header_end) = prefix.windows(4).position(|window| window == b"\r\n\r\n") else {
         return false;
@@ -2006,12 +2027,10 @@ fn raw_is_management_mutation(prefix: &[u8]) -> bool {
     let Some(request_target) = request.next() else {
         return false;
     };
-    let request_path = request_target.split('?').next().unwrap_or(request_target);
-    let management_path = request_path
-        .strip_prefix("/management")
-        .filter(|path| path.is_empty() || path.starts_with('/'))
-        .unwrap_or(request_path);
-    is_management_mutation(&Method::POST, management_path)
+    let Some(management_path) = raw_management_path(request_target) else {
+        return false;
+    };
+    is_management_mutation(&Method::POST, &management_path)
 }
 
 fn raw_mutation_body_rejection(prefix: &[u8]) -> Option<(StatusCode, &'static str)> {
@@ -2023,12 +2042,8 @@ fn raw_mutation_body_rejection(prefix: &[u8]) -> Option<(StatusCode, &'static st
         return None;
     }
     let request_target = request.next()?;
-    let request_path = request_target.split('?').next().unwrap_or(request_target);
-    let management_path = request_path
-        .strip_prefix("/management")
-        .filter(|path| path.is_empty() || path.starts_with('/'))
-        .unwrap_or(request_path);
-    if !is_management_mutation(&Method::POST, management_path) {
+    let management_path = raw_management_path(request_target)?;
+    if !is_management_mutation(&Method::POST, &management_path) {
         return None;
     }
 
@@ -3185,7 +3200,9 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             .await
             .expect("delayed management connection");
         delayed
-            .write_all(b"POST /reload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(
+                b"POST http://localhost/reload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
             .await
             .expect("delayed management headers write");
         tokio::time::sleep(Duration::from_millis(10)).await;
