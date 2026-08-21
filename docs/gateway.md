@@ -49,15 +49,15 @@ absent rather than present and broken.
 
 | Route | Method and path | Family | Mode |
 | --- | --- | --- | --- |
-| `models` | `GET /v1/models` | `models` | opaque |
+| `models` | `GET /v1/models` | `models` | served by Pooler |
 | `chat-completions` | `POST /v1/chat/completions` | `chat_completions` | patch |
 | `responses` | `POST /v1/responses` | `responses` | patch |
 | `responses-compact` | `POST /v1/responses/compact` | `responses` | patch |
 | `responses-websocket` | `GET /v1/responses` (upgrade) | `responses` | opaque tunnel |
 | `messages` | `POST /v1/messages` | `messages` | patch |
 | `messages-count-tokens` | `POST /v1/messages/count_tokens` | `messages` | patch |
-| `gemini-models` | `GET /v1beta/models` | `models` | opaque |
-| `gemini-model-actions` | `/v1beta/models/*` including `:generateContent`, `:streamGenerateContent`, and `:countTokens` | `generate_content` | opaque |
+| `gemini-models` | `GET /v1beta/models` | `models` | opaque (forwarded) |
+| `gemini-model-actions` | `/v1beta/models/*` including `:generateContent`, `:streamGenerateContent`, and `:countTokens` | `generate_content` | opaque (forwarded) |
 
 The `models` routes are told apart by the provider's documented discovery path
 rather than by dialect, so Anthropic keeps its OpenAI-shaped `/v1/models` list
@@ -83,6 +83,37 @@ provider `openai` does not document the `messages` endpoint family
 An upstream configured by URL has no documented family list, so the operator's
 declaration stands.
 
+## The served model view
+
+`GET /v1/models` is answered by Pooler, not forwarded. The route declares
+`serve: model_catalog`, so no upstream request is made and no credential is
+materialized for it. The route's target still matters: it scopes which
+provider's models are published and which capabilities they must satisfy.
+
+The published list is the set of models this deployment will actually serve. It
+applies the catalog's public aliases and exclusions, drops models an operator
+has disabled at runtime, keeps only models whose target satisfies the route's
+required capabilities, and keeps only models with at least one target whose
+credential is enabled and not cooling down. A model nothing can serve is not
+advertised, even when the upstream still lists it.
+
+The response is the stable OpenAI list shape plus the configuration and catalog
+generations:
+
+```json
+{
+  "object": "list",
+  "data": [{"id": "gpt-4o", "object": "model", "owned_by": "pooler"}],
+  "configuration_generation": 1,
+  "catalog_generation": 1
+}
+```
+
+Provider IDs, upstream model names, account IDs, secret references, and
+upstream endpoints are absent by construction, because only public model IDs
+reach the response. `owned_by` is the constant `pooler` rather than the
+provider, since naming the provider would disclose routing.
+
 ## What the two modes claim
 
 `patch` parses the caller's JSON, rewrites only the `/model` pointer to the
@@ -103,6 +134,15 @@ explicitly with a decoder and an encoder, and their compatibility claims live in
 Gemini carries the model and the action in the request path rather than in a
 body field, so those routes forward opaquely instead of pretending a body
 inspector can select a target.
+
+**These Gemini routes forward; they do not yet resolve.** A public alias in the
+path is not rewritten to the upstream model, and no per-model account selection
+or capability filtering happens for them. `adapter-gemini` implements strict
+path parsing, alias-aware upstream model rewriting, and query preservation for
+`:generateContent` and `:streamGenerateContent` on semantic routes, but the
+preset does not yet mount those semantic routes; `:countTokens`, model GET, and
+Interactions have no semantic implementation at all. Configure a semantic
+Gemini route explicitly when you need resolution rather than forwarding.
 
 ## Where the model list comes from
 
@@ -127,8 +167,30 @@ routes additionally bound frame size, event size, queue bytes, and queue items.
 
 ## Evidence
 
-- `crates/pooler-config/tests/gateway_preset.rs` covers expansion, alias
-  isolation, parameter rejection, and secret redaction.
-- `crates/pooler-server/tests/gateway_preset.rs` drives every mounted family
-  through a real `HttpProxyServer` against a loopback upstream, including the
-  WebSocket upgrade and caller-body preservation.
+Each claim above is backed by an executable test.
+
+| Claim | Test |
+| --- | --- |
+| Preset expansion, alias isolation, parameter rejection, secret redaction | `crates/pooler-config/tests/gateway_preset.rs` |
+| Each provider mounts only its documented families | `gateway_preset.rs::each_provider_mounts_only_its_documented_endpoint_families` |
+| An undocumented family is refused at compile time | `gateway_preset.rs::an_undocumented_endpoint_family_is_rejected_at_compile_time` |
+| Each provider receives only its documented credential placement | `crates/pooler-server/tests/gateway_provider_auth.rs` |
+| Caller credential headers never reach a provider | `gateway_provider_auth.rs::client_supplied_credential_headers_never_reach_any_provider` |
+| The credential reaches no management surface | `gateway_provider_auth.rs::the_upstream_credential_never_reaches_a_management_surface` |
+| `/v1/models` serves the active view and hides routing | `crates/pooler-server/tests/gateway_models.rs` |
+| A disabled or capability-mismatched model is not advertised | `gateway_models.rs::an_operator_disabled_model_leaves_the_published_view`, `::a_model_lacking_a_required_capability_is_not_published` |
+| Caller body preservation and the WebSocket tunnel | `crates/pooler-server/tests/gateway_preset.rs` |
+
+Provider traffic is judged by `pooler_testkit::StrictProvider`, which enforces
+path, method, credential placement, required headers, query shape, content
+type, and body shape, and refuses anything else with the status the real
+endpoint would use. `gateway_provider_auth.rs::the_strict_provider_refuses_a_request_the_endpoint_does_not_serve`
+proves that fake is genuinely strict, so the other tests cannot pass because it
+was generous.
+
+## Not yet claimed
+
+The Responses WebSocket route is an opaque tunnel, not a semantic
+implementation. The Gemini routes forward rather than resolve, as described
+above. Live-provider conformance for the preset is a separate gate and has not
+been run.

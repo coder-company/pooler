@@ -68,20 +68,34 @@ name or advertised without conformance evidence.
   are wired. The hardened three-run benchmark and 15-minute stress rerun for
   implementation commit `47f68b2` passed every enforced invariant. Native
   cross-platform CI and signed release artifacts remain publication gates.
-- Turnkey gateway preset: implemented and locally verified. The `gateway` preset
-  mounts sixteen routes covering models, chat completions, completions,
-  responses, responses compact, the responses WebSocket, embeddings, messages,
-  message token counting, images, audio, files, batches, and the Gemini models,
-  model-action, and interactions surfaces. Its upstream is declared with
-  `known_provider`, so the shipped provider catalog supplies the base URL,
-  discovery parser, aliases, and exclusions, and Pooler derives a catalog source
-  automatically. Model-bearing JSON routes select through that catalog and
-  reject an unknown model before any upstream call; every other surface
-  forwards opaquely under explicit bounds. Opaque forwarding is recorded as
-  forwarding, not as provider-native semantic compatibility. Evidence is
-  `crates/pooler-config/tests/gateway_preset.rs` and the mounted
-  `HttpProxyServer` coverage in `crates/pooler-server/tests/gateway_preset.rs`.
-  Live-provider conformance for the preset remains a separate gate.
+- Turnkey gateway preset: implemented and locally verified, and deliberately
+  provider-aware rather than universal. The `gateway` preset mounts only the
+  endpoint families the selected provider's shipped integration documents and
+  whose wire surface it serves, so OpenAI and xAI receive models, chat
+  completions, responses, responses compact and the responses WebSocket,
+  Anthropic receives models, messages and message token counting, and Gemini
+  receives its models and model-action surfaces. A route declaring an endpoint
+  family the target provider does not document is refused during compilation.
+  Legacy completions, embeddings, images, audio, files, batches and Gemini
+  Interactions are not mounted because no shipped integration documents them.
+  A preset supplies only the protected credential reference; the provider's
+  documented authentication kind, header and value prefix are preserved, so
+  Anthropic receives `x-api-key` and Gemini its documented Google key
+  placement. Any route Pooler authenticates strips caller-supplied credential
+  headers, so an opaque, inspect or patch route can no longer forward one.
+  `GET /v1/models` is answered from Pooler's active model view rather than
+  forwarded: aliases, exclusions, runtime enablement, capability requirements
+  and credential health all apply, and provider, upstream, account, secret and
+  endpoint detail never appear. Evidence is
+  `crates/pooler-config/tests/gateway_preset.rs`, and the mounted
+  `HttpProxyServer` coverage in `crates/pooler-server/tests/{gateway_preset,
+  gateway_provider_auth, gateway_models}.rs`, where provider traffic is judged
+  by strict OpenAI, Anthropic and Gemini fakes that refuse wrong paths,
+  methods, credential placement, headers, queries, content types and body
+  shapes. The Responses WebSocket route remains an opaque tunnel rather than a
+  semantic implementation, the Gemini routes forward rather than resolve
+  aliases, and live-provider conformance for the preset remains a separate
+  gate.
 - First useful release acceptance: pending; the authoritative checklist is
   [`docs/release-acceptance.md`](docs/release-acceptance.md).
 
