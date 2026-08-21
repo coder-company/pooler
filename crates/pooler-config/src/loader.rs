@@ -70,6 +70,13 @@ impl LoadedConfig {
 /// Default maximum nested import depth.
 pub const DEFAULT_MAX_IMPORT_DEPTH: usize = 16;
 
+/// Every preset `expand_preset` accepts, in the order the error message lists
+/// them. The configuration schema publishes this same list, so a preset can
+/// never be loadable but unrepresentable in the schema, or the reverse.
+pub(crate) const SUPPORTED_PRESETS: [&str; 7] = [
+    "cursor", "devin", "factory", "fx", "gateway", "media", "xai",
+];
+
 /// Loads and resolves configuration files.
 #[derive(Clone, Debug)]
 pub struct ConfigLoader {

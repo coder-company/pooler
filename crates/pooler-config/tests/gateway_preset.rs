@@ -232,3 +232,65 @@ fn the_rendered_gateway_preset_never_contains_a_secret_value() {
     assert!(rendered.contains("env:POOLER_GATEWAY_KEY"));
     assert!(!rendered.contains("bearer_secret\n      secret: sk-"));
 }
+
+/// The loader and the published schema must agree on the preset list.
+///
+/// Regression: `gateway` was accepted by the loader while the schema's preset
+/// enum still listed six names, so a config the runtime loads happily would be
+/// rejected by any editor or CI step validating against the artifact. The
+/// schema-check script could not catch it because both sides were generated
+/// from the same stale literal.
+#[test]
+fn the_schema_preset_enum_matches_every_preset_the_loader_accepts() {
+    let schema: serde_json::Value = serde_json::from_str(&pooler_config::render_config_schema())
+        .expect("the rendered schema is JSON");
+    let published = find_preset_enum(&schema).expect("the schema publishes a preset enum");
+
+    for preset in [
+        "cursor", "devin", "factory", "fx", "gateway", "media", "xai",
+    ] {
+        assert!(
+            published.iter().any(|value| value == preset),
+            "the schema must publish the `{preset}` preset; it lists {published:?}"
+        );
+        // And the loader must actually accept it, so neither side can drift
+        // ahead of the other.
+        let directory = TempDir::new().expect("config directory");
+        let path = directory.path().join("preset.yaml");
+        std::fs::write(
+            &path,
+            format!("imports:\n  - preset: {preset}\n\nversion: 1\n"),
+        )
+        .expect("config contents");
+        let error = load_path(&path).err().map(|error| error.to_string());
+        assert!(
+            !error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown preset")),
+            "the loader must accept the `{preset}` preset the schema publishes: {error:?}"
+        );
+    }
+    assert_eq!(published.len(), 7, "{published:?}");
+}
+
+/// Return the `imports[].preset` enum values from the rendered schema.
+fn find_preset_enum(schema: &serde_json::Value) -> Option<Vec<String>> {
+    fn walk(value: &serde_json::Value) -> Option<Vec<String>> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(preset) = map.get("preset").and_then(|preset| preset.get("enum")) {
+                    return preset.as_array().map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_owned))
+                            .collect()
+                    });
+                }
+                map.values().find_map(walk)
+            }
+            serde_json::Value::Array(values) => values.iter().find_map(walk),
+            _ => None,
+        }
+    }
+    walk(schema)
+}

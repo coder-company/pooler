@@ -13,6 +13,8 @@ use serde_json::{Map, Value};
 
 use pooler_core::Capability;
 
+use crate::loader::SUPPORTED_PRESETS;
+
 /// Version of the generated JSON Schema document.
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 
@@ -563,10 +565,7 @@ fn import_schema() -> Value {
     );
     let preset = object_schema(
         properties([
-            (
-                "preset",
-                string_enum(["cursor", "devin", "factory", "fx", "media", "xai"]),
-            ),
+            ("preset", string_enum(SUPPORTED_PRESETS)),
             ("as", string_pattern(r"^[A-Za-z0-9._-]{1,128}$")),
             ("with", string_map_schema()),
         ]),
