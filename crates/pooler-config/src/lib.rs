@@ -3788,28 +3788,63 @@ fn compile_upstream(
     ))
 }
 
+/// Resolve one upstream's outbound credential placement.
+///
+/// A known provider documents where its credential belongs: the authentication
+/// kind, and for header credentials the header name and non-secret value
+/// prefix. Those facts are the provider's, not the operator's, so supplying a
+/// credential reference must not silently relocate the credential.
+///
+/// An `auth` block that names any placement field takes ownership of the whole
+/// placement. An `auth` block that supplies only a secret overrides just the
+/// protected credential reference and keeps the provider's documented
+/// placement, so a preset can point a provider at an operator-chosen secret
+/// without turning an `x-api-key` provider into a bearer one.
 fn compile_upstream_auth(
     declaration: &UpstreamConfig,
     known: Option<&KnownProvider>,
     label: &SourceLabel,
 ) -> Result<Option<AuthPlan>, ConfigError> {
-    if declaration.auth.is_some() || declaration.oauth.is_some() {
+    // Explicit OAuth never inherits API-key authentication.
+    if declaration.oauth.is_some() {
         return compile_auth(declaration.auth.as_ref(), label);
     }
     let Some(provider) = known else {
-        return Ok(None);
+        return compile_auth(declaration.auth.as_ref(), label);
     };
-    let Some(environment) = provider.env.first() else {
-        return Ok(None);
+    let declared = declaration.auth.as_ref();
+    let documented_secret = provider
+        .env
+        .first()
+        .map(|name| SecretRef::Env(Arc::from(name.as_str())));
+    let Some(secret) = declared
+        .and_then(|auth| auth.secret.clone())
+        .or(documented_secret)
+    else {
+        // Keep the existing diagnostic for an auth block with no reachable
+        // secret, and keep an undocumented provider unauthenticated.
+        return compile_auth(declared, label);
     };
+    let declares_placement = declared.is_some_and(|auth| {
+        auth.kind.is_some() || auth.header.is_some() || auth.value_prefix.is_some()
+    });
     let integration = &provider.integration;
-    let generated = AuthConfig {
-        kind: Some(integration.auth_kind.clone()),
-        secret: Some(SecretRef::Env(Arc::from(environment.as_str()))),
-        header: integration.auth_header.clone(),
-        value_prefix: integration.auth_value_prefix.clone(),
+    let resolved = if declares_placement {
+        AuthConfig {
+            kind: declared.and_then(|auth| auth.kind.clone()),
+            secret: Some(secret),
+            header: declared.and_then(|auth| auth.header.clone()),
+            value_prefix: declared.and_then(|auth| auth.value_prefix.clone()),
+        }
+    } else {
+        AuthConfig {
+            kind: Some(integration.auth_kind.clone()),
+            secret: Some(secret),
+            header: integration.auth_header.clone(),
+            value_prefix: integration.auth_value_prefix.clone(),
+        }
     };
-    compile_auth(Some(&generated), label)
+    compile_auth(Some(&resolved), label)
 }
 
 fn compile_provider_auth(
@@ -4092,6 +4127,12 @@ fn compile_catalog(
             let Some(provider_id) = upstream.known_provider() else {
                 continue;
             };
+            // Model discovery is an HTTP request. A WebSocket upstream names
+            // the same provider so it authenticates the same documented way,
+            // but its base URL cannot address a discovery endpoint.
+            if matches!(upstream.url().scheme(), "ws" | "wss") {
+                continue;
+            }
             let provider = ProviderCatalog::builtin()
                 .get(provider_id)
                 .ok_or_else(|| invalid(&catalog_label, "known provider integration is missing"))?;

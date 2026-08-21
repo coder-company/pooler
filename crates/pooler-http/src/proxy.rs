@@ -869,6 +869,12 @@ where
             ))
             .await
             .map_err(native_error)?;
+        strip_caller_credentials_when_authenticating(
+            &mut headers,
+            native_auth.is_some(),
+            &selection,
+            upstream,
+        );
         if let Some(native_auth) = native_auth {
             native_auth.apply_once(&mut headers).map_err(native_error)?;
         } else if selection.account_secret().is_some() {
@@ -1721,6 +1727,12 @@ where
             started,
         } = request;
         let mut headers = request_headers.clone();
+        strip_caller_credentials_when_authenticating(
+            &mut headers,
+            native_auth.is_some(),
+            selection,
+            upstream,
+        );
         if let Some(native_auth) = native_auth {
             native_auth.apply_once(&mut headers).map_err(native_error)?;
         } else if selection.account_secret().is_some() {
@@ -1822,6 +1834,12 @@ where
             started,
         } = request;
         let mut headers = request_headers.clone();
+        strip_caller_credentials_when_authenticating(
+            &mut headers,
+            native_auth.is_some(),
+            selection,
+            upstream,
+        );
         if let Some(native_auth) = native_auth {
             native_auth.apply_once(&mut headers).map_err(native_error)?;
         } else if selection.account_secret().is_some() {
@@ -3753,6 +3771,26 @@ pub fn apply_configured_upstream_auth(
         .map_err(|_| ProxyError::SecretUnavailable)?;
     authorization.apply_to(headers);
     Ok(())
+}
+
+/// Remove caller-supplied provider credential headers when Pooler supplies its
+/// own credential for this attempt.
+///
+/// Without this a downstream caller could attach `authorization`, `x-api-key`,
+/// or `x-goog-api-key` and have it forwarded to the provider alongside — or
+/// instead of — Pooler's credential. Only the semantic body mode stripped them
+/// before, so every opaque, inspect, and patch route was a credential
+/// smuggling path. When Pooler supplies no credential the route is a pure
+/// tunnel and the caller's headers remain its own business.
+fn strip_caller_credentials_when_authenticating(
+    headers: &mut HeaderMap,
+    native: bool,
+    selection: &PoolSelection,
+    upstream: &UpstreamPlan,
+) {
+    if native || selection.account_secret().is_some() || upstream.auth().is_some() {
+        strip_provider_credential_headers(headers);
+    }
 }
 
 fn strip_provider_credential_headers(headers: &mut HeaderMap) {

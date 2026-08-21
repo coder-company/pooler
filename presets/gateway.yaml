@@ -37,16 +37,20 @@ listeners:
 upstreams:
   gateway:
     known_provider: openai
+    # Only the protected credential reference is overridden here. The
+    # authentication kind, header name, and value prefix stay with the
+    # provider, so pointing this preset at Anthropic or Gemini sends
+    # `x-api-key` or the documented Google key placement rather than a bearer
+    # token.
     auth:
-      kind: bearer_secret
       secret: env:POOLER_GATEWAY_KEY
   # A WebSocket route requires an explicit ws/wss transport, so this upstream
   # cannot be derived from `known_provider`. Set the preset's `websocket_url`
   # parameter whenever `provider` is not `openai`.
   gateway-websocket:
+    known_provider: openai
     url: wss://api.openai.com
     auth:
-      kind: bearer_secret
       secret: env:POOLER_GATEWAY_KEY
 
 routes:

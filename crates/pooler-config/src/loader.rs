@@ -762,15 +762,20 @@ fn expand_gateway_preset(import: &ImportSpec, path: &Path) -> Result<Value, Conf
             path,
         )?;
     }
+    // Both upstreams carry the provider identity so the WebSocket route
+    // authenticates with the same documented placement as the REST routes.
     if let Some(value) = import.parameters.get("provider") {
-        set_named_field(
-            &mut preset,
-            "upstreams",
-            alias,
-            "known_provider",
-            string_value(value, path, "gateway")?,
-            path,
-        )?;
+        let provider = string_value(value, path, "gateway")?;
+        for upstream_id in [alias, websocket_alias.as_str()] {
+            set_named_field(
+                &mut preset,
+                "upstreams",
+                upstream_id,
+                "known_provider",
+                provider.clone(),
+                path,
+            )?;
+        }
     }
     // An explicit URL outranks the shipped provider base URL, which is what a
     // private deployment or a loopback test needs.

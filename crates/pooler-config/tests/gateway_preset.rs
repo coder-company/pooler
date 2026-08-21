@@ -294,3 +294,96 @@ fn find_preset_enum(schema: &serde_json::Value) -> Option<Vec<String>> {
     }
     walk(schema)
 }
+
+/// A preset must override only the protected credential reference.
+///
+/// Regression: the gateway preset used to declare `kind: bearer_secret`
+/// alongside its secret, which overrode the `known_provider` placement. Pointing
+/// it at Anthropic or Gemini then sent a bearer token instead of the documented
+/// `x-api-key` / `x-goog-api-key` credential header.
+#[test]
+fn a_gateway_alias_keeps_each_providers_documented_credential_placement() {
+    // (preset provider, expected auth kind, expected credential header)
+    let providers: [(&str, &str, Option<&str>); 3] = [
+        ("openai", "bearer_secret", None),
+        ("anthropic", "header", Some("x-api-key")),
+        ("google", "header", Some("x-goog-api-key")),
+    ];
+
+    for (provider, expected_kind, expected_header) in providers {
+        let directory = TempDir::new().expect("config directory");
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "imports:\n  - preset: gateway\n    as: gw\n    with: {{bind: 127.0.0.1:0, provider: {provider}, secret: 'env:OPERATOR_KEY'}}\n\nversion: 1\n"
+            ),
+        )
+        .expect("config contents");
+
+        let config = load_path(&path)
+            .expect("gateway loads")
+            .compile()
+            .expect("gateway compiles");
+
+        // Both upstreams must authenticate the same documented way.
+        for upstream in ["gw", "gw-websocket"] {
+            let auth = config.upstreams()[upstream]
+                .auth()
+                .unwrap_or_else(|| panic!("{provider}/{upstream} auth"));
+            assert_eq!(auth.kind(), expected_kind, "{provider}/{upstream}");
+            assert_eq!(auth.header(), expected_header, "{provider}/{upstream}");
+            // The operator's credential reference still wins.
+            assert_eq!(
+                auth.secret().redacted(),
+                "env:OPERATOR_KEY",
+                "{provider}/{upstream}"
+            );
+        }
+    }
+}
+
+/// Naming any placement field takes ownership of the whole placement, so an
+/// operator who really wants a different header still gets exactly that.
+#[test]
+fn an_explicit_placement_still_outranks_the_provider_default() {
+    let directory = TempDir::new().expect("config directory");
+    let path = directory.path().join("explicit.yaml");
+    std::fs::write(
+        &path,
+        "version: 1\nupstreams:\n  private:\n    known_provider: anthropic\n    auth:\n      kind: header\n      header: x-private-key\n      value_prefix: 'Token '\n      secret: env:PRIVATE_KEY\n",
+    )
+    .expect("config contents");
+
+    let config = load_path(&path)
+        .expect("explicit auth loads")
+        .compile()
+        .expect("explicit auth compiles");
+    let auth = config.upstreams()["private"].auth().expect("auth");
+    assert_eq!(auth.kind(), "header");
+    assert_eq!(auth.header(), Some("x-private-key"));
+    assert_eq!(auth.value_prefix(), Some("Token "));
+    assert_eq!(auth.secret().redacted(), "env:PRIVATE_KEY");
+}
+
+/// With no `auth` block at all the provider's documented environment variable
+/// remains the credential reference.
+#[test]
+fn a_known_provider_without_an_auth_block_keeps_its_documented_reference() {
+    let directory = TempDir::new().expect("config directory");
+    let path = directory.path().join("documented.yaml");
+    std::fs::write(
+        &path,
+        "version: 1\nupstreams:\n  anthropic:\n    known_provider: anthropic\n",
+    )
+    .expect("config contents");
+
+    let config = load_path(&path)
+        .expect("documented auth loads")
+        .compile()
+        .expect("documented auth compiles");
+    let auth = config.upstreams()["anthropic"].auth().expect("auth");
+    assert_eq!(auth.kind(), "header");
+    assert_eq!(auth.header(), Some("x-api-key"));
+    assert_eq!(auth.secret().redacted(), "env:ANTHROPIC_API_KEY");
+}
