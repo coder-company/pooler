@@ -35,10 +35,15 @@ const GEMINI_NAMESPACE: &str = "google.gemini.generate-content";
 const REQUEST_FIELDS_EXTENSION: &str = "request-fields";
 const GENERATION_CONFIG_EXTENSION: &str = "generation-config";
 const PROVIDER_TOOLS_EXTENSION: &str = "provider-tools";
+const TOOL_LAYOUT_EXTENSION: &str = "tool-layout";
 const TOOL_CONFIG_EXTENSION: &str = "tool-config";
 const CONTENT_FIELDS_EXTENSION: &str = "content-fields";
 const PART_METADATA_EXTENSION: &str = "part-metadata";
+const PART_FIELDS_EXTENSION: &str = "part-fields";
+const VIDEO_METADATA_EXTENSION: &str = "video-metadata";
 const CANDIDATE_FIELDS_EXTENSION: &str = "candidate-fields";
+const SAFETY_RATINGS_EXTENSION: &str = "safety-ratings";
+const GROUNDING_METADATA_EXTENSION: &str = "grounding-metadata";
 const TOOL_FIELDS_EXTENSION: &str = "tool-fields";
 const FUNCTION_NAME_EXTENSION: &str = "function-name";
 const FUNCTION_ID_ABSENT_EXTENSION: &str = "function-id-absent";
@@ -647,13 +652,13 @@ fn decode_tools(
     report: &mut ConversionReport,
 ) -> Result<(), GeminiError> {
     let tools = as_array(value, "tools")?;
-    let mut provider_tools = Vec::new();
+    let mut layout = Vec::with_capacity(tools.len());
     for (tool_index, tool) in tools.iter().enumerate() {
         let mut object = tool
             .as_object()
             .cloned()
             .ok_or_else(|| invalid_shape(&format!("tools[{tool_index}]"), "an object"))?;
-        if let Some(declarations) = object.remove("functionDeclarations") {
+        let declaration_count = if let Some(declarations) = object.remove("functionDeclarations") {
             let declarations = as_array(
                 &declarations,
                 &format!("tools[{tool_index}].functionDeclarations"),
@@ -665,16 +670,20 @@ fn decode_tools(
                     report,
                 )?);
             }
-        }
-        if !object.is_empty() {
-            provider_tools.push(Value::Object(object));
-        }
+            declarations.len()
+        } else {
+            0
+        };
+        layout.push(serde_json::json!({
+            "functionDeclarationCount": declaration_count,
+            "providerFields": object,
+        }));
     }
-    if !provider_tools.is_empty() {
+    if !layout.is_empty() {
         preserve_json_extension(
             &mut request.extensions,
-            PROVIDER_TOOLS_EXTENSION,
-            Value::Array(provider_tools),
+            TOOL_LAYOUT_EXTENSION,
+            Value::Array(layout),
             report,
         )?;
     }
@@ -1038,6 +1047,7 @@ pub fn encode_generate_content_request(
             REQUEST_FIELDS_EXTENSION,
             GENERATION_CONFIG_EXTENSION,
             PROVIDER_TOOLS_EXTENSION,
+            TOOL_LAYOUT_EXTENSION,
             TOOL_CONFIG_EXTENSION,
         ],
         &mut report,
@@ -1357,52 +1367,129 @@ fn encode_tools(
     object: &mut Map<String, Value>,
     report: &mut ConversionReport,
 ) -> Result<(), GeminiError> {
-    let mut tools = extension_value(&request.extensions, PROVIDER_TOOLS_EXTENSION)?
-        .map(|value| {
-            value
-                .as_array()
-                .cloned()
-                .ok_or_else(|| invalid_shape("request.extensions.provider-tools", "an array"))
-        })
-        .transpose()?
-        .unwrap_or_default();
-    if !request.tools.is_empty() {
-        let mut declarations = Vec::with_capacity(request.tools.len());
-        for definition in &request.tools {
-            let mut declaration = extension_value(&definition.extensions, TOOL_FIELDS_EXTENSION)?
-                .map(|value| into_object(value, "tool.extensions.tool-fields"))
-                .transpose()?
-                .unwrap_or_default();
-            declaration.insert("name".to_owned(), Value::String(definition.name.clone()));
-            if let Some(description) = &definition.description {
-                declaration.insert("description".to_owned(), Value::String(description.clone()));
-            }
-            if let Some(parameters) = &definition.parameters {
-                declaration.insert(
-                    "parametersJsonSchema".to_owned(),
-                    parameters.value().clone(),
-                );
-            }
-            if definition.strict.is_some() {
-                report.drop_optional(
-                    format!("tools.{}.strict", definition.name),
-                    "Gemini function declarations have no strict toggle",
-                );
-            }
-            report_unhandled_extensions(
-                "tool.extensions",
-                &definition.extensions,
-                &[TOOL_FIELDS_EXTENSION],
-                report,
-            );
-            declarations.push(Value::Object(declaration));
-        }
-        tools.insert(0, serde_json::json!({"functionDeclarations":declarations}));
+    let mut declarations = Vec::with_capacity(request.tools.len());
+    for definition in &request.tools {
+        declarations.push(encode_tool_definition(definition, report)?);
     }
+
+    let tools = if let Some(layout) = extension_value(&request.extensions, TOOL_LAYOUT_EXTENSION)? {
+        let layout = layout
+            .as_array()
+            .ok_or_else(|| invalid_shape("request.extensions.tool-layout", "an array"))?;
+        let mut tools = Vec::with_capacity(layout.len());
+        let mut declaration_index = 0usize;
+        for (layout_index, entry) in layout.iter().enumerate() {
+            let entry = as_object(
+                entry,
+                &format!("request.extensions.tool-layout[{layout_index}]"),
+            )?;
+            let count = entry
+                .get("functionDeclarationCount")
+                .ok_or_else(|| {
+                    missing(format!(
+                        "request.extensions.tool-layout[{layout_index}].functionDeclarationCount"
+                    ))
+                })
+                .and_then(|value| {
+                    as_u64(
+                        value,
+                        &format!(
+                            "request.extensions.tool-layout[{layout_index}].functionDeclarationCount"
+                        ),
+                    )
+                })? as usize;
+            let mut tool = entry
+                .get("providerFields")
+                .ok_or_else(|| {
+                    missing(format!(
+                        "request.extensions.tool-layout[{layout_index}].providerFields"
+                    ))
+                })
+                .and_then(|value| {
+                    value.as_object().cloned().ok_or_else(|| {
+                        invalid_shape(
+                            &format!(
+                                "request.extensions.tool-layout[{layout_index}].providerFields"
+                            ),
+                            "an object",
+                        )
+                    })
+                })?;
+            let end = declaration_index.saturating_add(count);
+            if end > declarations.len() {
+                return Err(invalid_value(
+                    "request.extensions.tool-layout",
+                    "function declaration counts exceed semantic tools",
+                ));
+            }
+            if count > 0 {
+                tool.insert(
+                    "functionDeclarations".to_owned(),
+                    Value::Array(declarations[declaration_index..end].to_vec()),
+                );
+            }
+            declaration_index = end;
+            tools.push(Value::Object(tool));
+        }
+        if declaration_index != declarations.len() {
+            return Err(invalid_value(
+                "request.extensions.tool-layout",
+                "function declaration counts do not cover semantic tools",
+            ));
+        }
+        tools
+    } else {
+        let mut tools = extension_value(&request.extensions, PROVIDER_TOOLS_EXTENSION)?
+            .map(|value| {
+                value
+                    .as_array()
+                    .cloned()
+                    .ok_or_else(|| invalid_shape("request.extensions.provider-tools", "an array"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if !declarations.is_empty() {
+            tools.insert(0, serde_json::json!({"functionDeclarations":declarations}));
+        }
+        tools
+    };
     if !tools.is_empty() {
         object.insert("tools".to_owned(), Value::Array(tools));
     }
     Ok(())
+}
+
+fn encode_tool_definition(
+    definition: &ToolDefinition,
+    report: &mut ConversionReport,
+) -> Result<Value, GeminiError> {
+    let mut declaration = extension_value(&definition.extensions, TOOL_FIELDS_EXTENSION)?
+        .map(|value| into_object(value, "tool.extensions.tool-fields"))
+        .transpose()?
+        .unwrap_or_default();
+    declaration.insert("name".to_owned(), Value::String(definition.name.clone()));
+    if let Some(description) = &definition.description {
+        declaration.insert("description".to_owned(), Value::String(description.clone()));
+    }
+    if let Some(parameters) = &definition.parameters {
+        declaration.insert(
+            "parametersJsonSchema".to_owned(),
+            parameters.value().clone(),
+        );
+    }
+    if definition.strict.is_some() {
+        report.drop_optional(
+            format!("tools.{}.strict", definition.name),
+            "Gemini function declarations have no strict toggle",
+        );
+    }
+    report_unhandled_extensions(
+        "tool.extensions",
+        &definition.extensions,
+        &[TOOL_FIELDS_EXTENSION],
+        report,
+    );
+    Ok(Value::Object(declaration))
 }
 
 fn encode_tool_config(
@@ -1897,14 +1984,18 @@ impl GeminiEventDecoder {
         if let Some(data) = object.get("inlineData") {
             let part = decode_inline_data(data, "part.inlineData")?;
             if let Some((media_type, source)) = semantic_media(part) {
-                events.push(self.event(StreamEventKind::Media { media_type, source }));
+                let mut event = self.event(StreamEventKind::Media { media_type, source });
+                attach_response_part_fields(&mut event.extensions, object, "inlineData")?;
+                events.push(event);
             }
             return Ok(());
         }
         if let Some(data) = object.get("fileData") {
             let part = decode_file_data(data, "part.fileData")?;
             if let Some((media_type, source)) = semantic_media(part) {
-                events.push(self.event(StreamEventKind::Media { media_type, source }));
+                let mut event = self.event(StreamEventKind::Media { media_type, source });
+                attach_response_part_fields(&mut event.extensions, object, "fileData")?;
+                events.push(event);
             }
             return Ok(());
         }
@@ -2236,7 +2327,21 @@ impl GeminiEventEncoder {
                 Some(self.part_response(Value::Object(part)))
             }
             StreamEventKind::Media { media_type, source } => {
-                Some(self.part_response(encode_media(media_type, source)?))
+                let mut part =
+                    into_object(encode_media(media_type, source)?, "encoded media part")?;
+                if let Some(video_metadata) =
+                    extension_value(&event.extensions, VIDEO_METADATA_EXTENSION)?
+                {
+                    part.insert("videoMetadata".to_owned(), video_metadata);
+                }
+                if let Some(fields) = extension_value(&event.extensions, PART_FIELDS_EXTENSION)? {
+                    merge_fields(
+                        &mut part,
+                        &into_object(fields, "event.extensions.part-fields")?,
+                        "event.extensions.part-fields",
+                    )?;
+                }
+                Some(self.part_response(Value::Object(part)))
             }
             StreamEventKind::Usage { usage } => {
                 let mut response = self.base_response();
@@ -2319,10 +2424,24 @@ impl GeminiEventEncoder {
                 None
             }
         };
+        let mut handled_extensions = vec![THOUGHT_SIGNATURE_EXTENSION];
+        match event.kind {
+            StreamEventKind::Media { .. } => {
+                handled_extensions.extend([PART_FIELDS_EXTENSION, VIDEO_METADATA_EXTENSION]);
+            }
+            StreamEventKind::Completion { .. } | StreamEventKind::Metadata { .. } => {
+                handled_extensions.extend([
+                    CANDIDATE_FIELDS_EXTENSION,
+                    SAFETY_RATINGS_EXTENSION,
+                    GROUNDING_METADATA_EXTENSION,
+                ]);
+            }
+            _ => {}
+        }
         report_unhandled_extensions(
             "event.extensions",
             &event.extensions,
-            &[THOUGHT_SIGNATURE_EXTENSION, CANDIDATE_FIELDS_EXTENSION],
+            &handled_extensions,
             &mut report,
         );
         report.validate(policy)?;
@@ -2578,19 +2697,49 @@ fn attach_signature(extensions: &mut Extensions, signature: &[u8]) -> Result<(),
 
 fn attach_candidate_fields(
     extensions: &mut Extensions,
-    fields: Map<String, Value>,
+    mut fields: Map<String, Value>,
 ) -> Result<(), GeminiError> {
-    if fields.is_empty() {
-        return Ok(());
+    if let Some(safety_ratings) = fields.remove("safetyRatings") {
+        attach_json_extension(extensions, SAFETY_RATINGS_EXTENSION, safety_ratings)?;
     }
-    extensions.insert(
-        OpaqueExtension::new(
-            GEMINI_NAMESPACE,
+    if let Some(grounding_metadata) = fields.remove("groundingMetadata") {
+        attach_json_extension(extensions, GROUNDING_METADATA_EXTENSION, grounding_metadata)?;
+    }
+    if !fields.is_empty() {
+        attach_json_extension(
+            extensions,
             CANDIDATE_FIELDS_EXTENSION,
-            serde_json::to_vec(&Value::Object(fields))?,
-        )?
-        .with_media_type(GEMINI_JSON_CONTENT_TYPE)?
-        .with_replay_policy(ReplayPolicy::IfSafe),
+            Value::Object(fields),
+        )?;
+    }
+    Ok(())
+}
+
+fn attach_response_part_fields(
+    extensions: &mut Extensions,
+    part: &Map<String, Value>,
+    data_field: &str,
+) -> Result<(), GeminiError> {
+    let mut fields = part.clone();
+    fields.remove(data_field);
+    if let Some(video_metadata) = fields.remove("videoMetadata") {
+        attach_json_extension(extensions, VIDEO_METADATA_EXTENSION, video_metadata)?;
+    }
+    if !fields.is_empty() {
+        attach_json_extension(extensions, PART_FIELDS_EXTENSION, Value::Object(fields))?;
+    }
+    Ok(())
+}
+
+fn attach_json_extension(
+    extensions: &mut Extensions,
+    name: &str,
+    value: Value,
+) -> Result<(), GeminiError> {
+    extensions.insert(
+        OpaqueExtension::new(GEMINI_NAMESPACE, name, serde_json::to_vec(&value)?)?
+            .with_media_type(GEMINI_JSON_CONTENT_TYPE)?
+            .with_replay_policy(ReplayPolicy::IfSafe),
     );
     Ok(())
 }
@@ -2630,9 +2779,24 @@ fn extension_value(extensions: &Extensions, name: &str) -> Result<Option<Value>,
 fn candidate_extension_object(
     extensions: &Extensions,
 ) -> Result<Option<Map<String, Value>>, GeminiError> {
-    extension_value(extensions, CANDIDATE_FIELDS_EXTENSION)?
+    let mut fields = extension_value(extensions, CANDIDATE_FIELDS_EXTENSION)?
         .map(|value| into_object(value, "event.extensions.candidate-fields"))
-        .transpose()
+        .transpose()?
+        .unwrap_or_default();
+    for (wire_name, extension_name) in [
+        ("safetyRatings", SAFETY_RATINGS_EXTENSION),
+        ("groundingMetadata", GROUNDING_METADATA_EXTENSION),
+    ] {
+        if let Some(value) = extension_value(extensions, extension_name)? {
+            if fields.insert(wire_name.to_owned(), value).is_some() {
+                return Err(invalid_value(
+                    "event.extensions",
+                    format!("duplicate Gemini candidate field `{wire_name}`"),
+                ));
+            }
+        }
+    }
+    Ok((!fields.is_empty()).then_some(fields))
 }
 
 fn request_extension_object(

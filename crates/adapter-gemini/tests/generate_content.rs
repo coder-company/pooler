@@ -112,7 +112,9 @@ fn request_round_trip_keeps_tools_signatures_thinking_and_provider_fields() {
         );
         assert_eq!(value["generationConfig"]["topK"], 20);
         assert!(value["safetySettings"].is_array());
-        assert_eq!(value["tools"].as_array().expect("tools").len(), 2);
+        assert_eq!(value["tools"].as_array().expect("tools").len(), 1);
+        assert!(value["tools"][0]["functionDeclarations"].is_array());
+        assert!(value["tools"][0]["codeExecution"].is_object());
     }
 }
 
@@ -256,7 +258,22 @@ fn candidate_metadata_round_trips_under_every_loss_policy() {
     let events = GeminiGenerateContentCodec::decode_response(UNARY_CANDIDATE_METADATA)
         .expect("decode candidate metadata");
     let completion = events.last().expect("completion");
-    assert!(!completion.extensions.is_empty());
+    assert!(completion
+        .extensions
+        .get_str("google.gemini.generate-content.safety-ratings")
+        .is_some());
+    assert!(completion
+        .extensions
+        .get_str("google.gemini.generate-content.grounding-metadata")
+        .is_some());
+    let unknown_fields = completion
+        .extensions
+        .get_str("google.gemini.generate-content.candidate-fields")
+        .expect("bounded unknown candidate fields");
+    let unknown_fields: Value =
+        serde_json::from_slice(unknown_fields.as_bytes()).expect("candidate fields JSON");
+    assert!(unknown_fields.get("safetyRatings").is_none());
+    assert!(unknown_fields.get("groundingMetadata").is_none());
 
     for policy in LOSS_POLICIES {
         let encoded = GeminiGenerateContentCodec::encode_response(&events, policy)
@@ -343,6 +360,87 @@ fn multi_name_function_calling_config_round_trips_exactly() {
             "allowedFunctionNames":["read","search"]
         })
     );
+}
+
+#[test]
+fn mixed_tool_objects_keep_their_order_and_function_grouping() {
+    let input = br#"{
+      "contents":[{"role":"user","parts":[{"text":"Use tools"}]}],
+      "tools":[
+        {"googleSearch":{}},
+        {"functionDeclarations":[{"name":"first"}]},
+        {"codeExecution":{}},
+        {
+          "functionDeclarations":[{"name":"second"},{"name":"third"}],
+          "googleMaps":{"enableWidget":true}
+        }
+      ]
+    }"#;
+
+    let decoded = GeminiGenerateContentCodec::decode_request_with_report(input, "gemini-test")
+        .expect("decode mixed tools");
+    assert_eq!(
+        decoded
+            .request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second", "third"]
+    );
+
+    for policy in LOSS_POLICIES {
+        let encoded = GeminiGenerateContentCodec::encode_request(&decoded.request, policy)
+            .expect("encode mixed tools losslessly");
+        assert!(encoded.report.is_lossless());
+        let output: Value = serde_json::from_slice(&encoded.body).expect("encoded JSON");
+        let expected: Value = serde_json::from_slice(input).expect("input JSON");
+        assert_eq!(output["tools"], expected["tools"]);
+    }
+}
+
+#[test]
+fn video_metadata_and_unknown_part_fields_stay_bounded_provider_evidence() {
+    let input = br#"{
+      "candidates":[{
+        "index":0,
+        "content":{"role":"model","parts":[{
+          "inlineData":{"mimeType":"video/mp4","data":"AQID"},
+          "videoMetadata":{"startOffset":"1s","endOffset":"2s","fps":24},
+          "providerPartMarker":{"kind":"camera"}
+        }]},
+        "finishReason":"STOP"
+      }]
+    }"#;
+
+    let events = GeminiGenerateContentCodec::decode_response(input).expect("decode video");
+    let media = events
+        .iter()
+        .find(|event| matches!(event.kind, StreamEventKind::Media { .. }))
+        .expect("media event");
+    assert!(media
+        .extensions
+        .get_str("google.gemini.generate-content.video-metadata")
+        .is_some());
+    let unknown_fields = media
+        .extensions
+        .get_str("google.gemini.generate-content.part-fields")
+        .expect("bounded unknown part fields");
+    let unknown_fields: Value =
+        serde_json::from_slice(unknown_fields.as_bytes()).expect("part fields JSON");
+    assert_eq!(unknown_fields["providerPartMarker"]["kind"], "camera");
+    assert!(unknown_fields.get("videoMetadata").is_none());
+
+    for policy in LOSS_POLICIES {
+        let encoded = GeminiGenerateContentCodec::encode_response(&events, policy)
+            .expect("encode video evidence losslessly");
+        assert!(encoded.report.is_lossless());
+        let output: Value = serde_json::from_slice(&encoded.body).expect("encoded JSON");
+        let part = &output["candidates"][0]["content"]["parts"][0];
+        assert_eq!(part["videoMetadata"]["fps"], 24);
+        assert_eq!(part["providerPartMarker"]["kind"], "camera");
+        assert!(output["candidates"][0].get("videoMetadata").is_none());
+    }
 }
 
 #[test]
