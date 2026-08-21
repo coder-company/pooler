@@ -17,6 +17,8 @@ const TOOL_CHOICE: &str = "tool_choice";
 const CONTENT_EXTRAS: &str = "content_extras";
 const MESSAGE_EXTRAS: &str = "message_extras";
 const TOOL_EXTRAS: &str = "tool_extras";
+const TOOL_LAYOUT: &str = "tool_layout";
+const TOOL_RESULT_CONTENT_EXTRAS: &str = "tool_result_content_extras";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_THINKING_BUDGET: u64 = 1024;
 
@@ -160,7 +162,11 @@ fn decode_request(input: &[u8]) -> Result<DecodedAnthropicRequest, AnthropicRequ
     }
 
     if let Some(tools) = object.remove("tools") {
-        request.tools = parse_tools(&tools, &mut report)?;
+        let (tools, layout) = parse_tools(&tools, &mut report)?;
+        request.tools = tools;
+        if let Some(layout) = layout {
+            preserve_json(&mut request.extensions, TOOL_LAYOUT, &layout, &mut report)?;
+        }
     }
     if let Some(choice) = object.remove("tool_choice") {
         request.tool_choice = Some(parse_tool_choice(&choice)?);
@@ -333,9 +339,10 @@ fn parse_content_part(
             ))
         }
         "tool_result" => {
+            let mut extensions = Extensions::default();
             let content = object
                 .get("content")
-                .map(|content| parse_tool_result_content(content, field, report))
+                .map(|content| parse_tool_result_content(content, field, &mut extensions, report))
                 .transpose()?
                 .unwrap_or_default();
             Ok((
@@ -349,7 +356,7 @@ fn parse_content_part(
                     content,
                     is_error: optional_bool(object, "is_error", &format!("{field}.is_error"))?
                         .unwrap_or(false),
-                    extensions: Extensions::default(),
+                    extensions,
                 }),
                 unknown_fields(object, &["type", "tool_use_id", "content", "is_error"]),
             ))
@@ -371,6 +378,7 @@ fn parse_content_part(
 fn parse_tool_result_content(
     value: &Value,
     field: &str,
+    extensions: &mut Extensions,
     report: &mut ConversionReport,
 ) -> Result<Vec<ContentPart>, AnthropicRequestError> {
     if let Some(text) = value.as_str() {
@@ -379,21 +387,25 @@ fn parse_tool_result_content(
     let values = value
         .as_array()
         .ok_or_else(|| invalid_shape(&format!("{field}.content"), "a string or an array"))?;
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, part)| {
-            let part_field = format!("{field}.content[{index}]");
-            let (part, extras) = parse_content_part(part, &part_field, report)?;
-            if !extras.is_empty() {
-                report.drop_optional(
-                    format!("{part_field}.provider_fields"),
-                    "nested tool-result content attributes have no semantic attachment point",
-                );
-            }
-            Ok(part)
-        })
-        .collect()
+    let mut parts = Vec::with_capacity(values.len());
+    let mut extras = Vec::with_capacity(values.len());
+    let mut has_extras = false;
+    for (index, value) in values.iter().enumerate() {
+        let part_field = format!("{field}.content[{index}]");
+        let (part, extra) = parse_content_part(value, &part_field, report)?;
+        has_extras |= !extra.is_empty();
+        extras.push(Value::Object(extra));
+        parts.push(part);
+    }
+    if has_extras {
+        preserve_json(
+            extensions,
+            TOOL_RESULT_CONTENT_EXTRAS,
+            &Value::Array(extras),
+            report,
+        )?;
+    }
+    Ok(parts)
 }
 
 fn parse_image(
@@ -482,38 +494,47 @@ fn parse_document(
 fn parse_tools(
     value: &Value,
     report: &mut ConversionReport,
-) -> Result<Vec<ToolDefinition>, AnthropicRequestError> {
+) -> Result<(Vec<ToolDefinition>, Option<Value>), AnthropicRequestError> {
     let tools = value
         .as_array()
         .ok_or_else(|| invalid_shape("tools", "an array"))?;
-    tools
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let field = format!("tools[{index}]");
-            let object = value
-                .as_object()
-                .ok_or_else(|| invalid_shape(&field, "an object"))?;
-            let name = required_string(object, "name", &format!("{field}.name"))?;
-            let parameters = object
-                .get("input_schema")
-                .map(|value| PreservedJson::from_value(value.clone()))
-                .transpose()?;
-            let mut tool = ToolDefinition::new(name, parameters);
-            tool.description =
-                optional_string(object, "description", &format!("{field}.description"))?;
-            let extras = unknown_fields(object, &["name", "description", "input_schema"]);
-            if !extras.is_empty() {
-                preserve_json(
-                    &mut tool.extensions,
-                    TOOL_EXTRAS,
-                    &Value::Object(extras),
-                    report,
-                )?;
+    let mut definitions = Vec::with_capacity(tools.len());
+    let mut layout = Vec::with_capacity(tools.len());
+    let mut has_server_tool = false;
+    for (index, value) in tools.iter().enumerate() {
+        let field = format!("tools[{index}]");
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid_shape(&field, "an object"))?;
+        if let Some(kind) = object.get("type") {
+            if !kind.is_string() {
+                return Err(invalid_shape(&format!("{field}.type"), "a string"));
             }
-            Ok(tool)
-        })
-        .collect()
+            has_server_tool = true;
+            layout.push(value.clone());
+            continue;
+        }
+
+        layout.push(Value::Null);
+        let name = required_string(object, "name", &format!("{field}.name"))?;
+        let parameters = object
+            .get("input_schema")
+            .map(|value| PreservedJson::from_value(value.clone()))
+            .transpose()?;
+        let mut tool = ToolDefinition::new(name, parameters);
+        tool.description = optional_string(object, "description", &format!("{field}.description"))?;
+        let extras = unknown_fields(object, &["name", "description", "input_schema"]);
+        if !extras.is_empty() {
+            preserve_json(
+                &mut tool.extensions,
+                TOOL_EXTRAS,
+                &Value::Object(extras),
+                report,
+            )?;
+        }
+        definitions.push(tool);
+    }
+    Ok((definitions, has_server_tool.then_some(Value::Array(layout))))
 }
 
 fn parse_tool_choice(value: &Value) -> Result<ToolChoice, AnthropicRequestError> {
@@ -657,17 +678,17 @@ fn encode_request(
     }
     object.insert("messages".to_owned(), Value::Array(messages));
 
-    if !request.tools.is_empty() {
-        object.insert(
-            "tools".to_owned(),
-            Value::Array(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| encode_tool(tool, &mut report))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-        );
+    let mut tools = request
+        .tools
+        .iter()
+        .map(|tool| encode_tool(tool, &mut report))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(layout) = extension_value(&request.extensions, TOOL_LAYOUT)? {
+        tools = apply_tool_layout(tools, &layout)?;
+        preserve_known_extension(&request.extensions, TOOL_LAYOUT, &mut report);
+    }
+    if !tools.is_empty() {
+        object.insert("tools".to_owned(), Value::Array(tools));
     }
     if let Some(choice) = request.tool_choice.as_ref() {
         object.insert(
@@ -743,7 +764,7 @@ fn encode_request(
     merge_unknown_request_fields(&mut object, &request.extensions, &mut report)?;
     report_unknown_extensions(
         &request.extensions,
-        &[UNKNOWN_REQUEST_FIELDS, STREAM, TOOL_CHOICE],
+        &[UNKNOWN_REQUEST_FIELDS, STREAM, TOOL_CHOICE, TOOL_LAYOUT],
         &mut report,
     );
     report.validate(policy)?;
@@ -978,18 +999,47 @@ fn encode_tool_result(
     result: &ToolResult,
     report: &mut ConversionReport,
 ) -> Result<Value, AnthropicRequestError> {
-    report_unknown_extensions(&result.extensions, &[], report);
-    let content = if let [ContentPart::Text { text }] = result.content.as_slice() {
-        Value::String(text.clone())
+    let content_extras = extension_value(&result.extensions, TOOL_RESULT_CONTENT_EXTRAS)?;
+    let content = if content_extras.is_none() {
+        if let [ContentPart::Text { text }] = result.content.as_slice() {
+            Value::String(text.clone())
+        } else {
+            Value::Array(
+                result
+                    .content
+                    .iter()
+                    .map(|part| encode_content_part(part, report))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        }
     } else {
-        Value::Array(
-            result
-                .content
-                .iter()
-                .map(|part| encode_content_part(part, report))
-                .collect::<Result<Vec<_>, _>>()?,
-        )
+        let mut parts = result
+            .content
+            .iter()
+            .map(|part| encode_content_part(part, report))
+            .collect::<Result<Vec<_>, _>>()?;
+        let extras = content_extras
+            .as_ref()
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                invalid_shape(
+                    "tool_result.extensions.tool_result_content_extras",
+                    "an array",
+                )
+            })?;
+        if extras.len() != parts.len() {
+            return Err(invalid_value(
+                "tool_result.extensions.tool_result_content_extras",
+                "must have one entry per content part",
+            ));
+        }
+        for (part, extra) in parts.iter_mut().zip(extras) {
+            merge_object(part, extra.clone(), report, "tool_result.content")?;
+        }
+        preserve_known_extension(&result.extensions, TOOL_RESULT_CONTENT_EXTRAS, report);
+        Value::Array(parts)
     };
+    report_unknown_extensions(&result.extensions, &[TOOL_RESULT_CONTENT_EXTRAS], report);
     Ok(serde_json::json!({
         "type":"tool_result",
         "tool_use_id":result.tool_call_id,
@@ -1026,6 +1076,37 @@ fn encode_tool(
     }
     report_unknown_extensions(&tool.extensions, &[TOOL_EXTRAS], report);
     Ok(Value::Object(object))
+}
+
+fn apply_tool_layout(
+    tools: Vec<Value>,
+    layout: &Value,
+) -> Result<Vec<Value>, AnthropicRequestError> {
+    let layout = layout
+        .as_array()
+        .ok_or_else(|| invalid_shape("extensions.tool_layout", "an array"))?;
+    let mut tools = tools.into_iter();
+    let mut encoded = Vec::with_capacity(layout.len());
+    for (index, entry) in layout.iter().enumerate() {
+        if entry.is_null() {
+            if let Some(tool) = tools.next() {
+                encoded.push(tool);
+            }
+            continue;
+        }
+        let server_tool = entry
+            .as_object()
+            .filter(|object| object.get("type").is_some_and(Value::is_string))
+            .ok_or_else(|| {
+                invalid_value(
+                    format!("extensions.tool_layout[{index}]"),
+                    "server tool entries must be objects with a string type",
+                )
+            })?;
+        encoded.push(Value::Object(server_tool.clone()));
+    }
+    encoded.extend(tools);
+    Ok(encoded)
 }
 
 fn encode_tool_choice(choice: &ToolChoice) -> Value {
@@ -1416,6 +1497,80 @@ mod tests {
         assert_eq!(value["tool_choice"]["disable_parallel_tool_use"], true);
         assert_eq!(value["messages"][0]["content"][0]["signature"], "sig-local");
         assert_eq!(value["messages"][1]["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn server_tool_definitions_stay_opaque_and_keep_their_layout() {
+        let body = br#"{
+          "model":"claude-test",
+          "max_tokens":1024,
+          "tools":[
+            {"type":"web_search_20250305","name":"web_search","max_uses":3,"cache_control":{"type":"ephemeral","ttl":"1h"}},
+            {"name":"Read","description":"Read a file","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}},
+            {"type":"code_execution_20250522","name":"code_execution","cache_control":{"type":"ephemeral"}}
+          ],
+          "messages":[{"role":"user","content":"research this"}]
+        }"#;
+        let original: Value = serde_json::from_slice(body).expect("input JSON");
+        let decoded = AnthropicMessagesCodec::decode_request_with_report(body).expect("decode");
+
+        assert!(decoded.report.is_lossless());
+        assert_eq!(decoded.request.tools.len(), 1);
+        assert_eq!(decoded.request.tools[0].name, "Read");
+        assert_eq!(decoded.request.extensions.len(), 1);
+        assert!(decoded
+            .request
+            .extensions
+            .get_str("anthropic.messages.tool_layout")
+            .is_some());
+
+        let encoded = AnthropicMessagesCodec::encode_request(&decoded.request, LossPolicy::Reject)
+            .expect("lossless re-encode");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("encoded JSON");
+        assert_eq!(value["tools"], original["tools"]);
+        assert!(value["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter(|tool| tool.get("type").is_some())
+            .all(|tool| tool.get("input_schema").is_none()));
+    }
+
+    #[test]
+    fn nested_tool_result_cache_control_keeps_its_block_position() {
+        let body = br#"{
+          "model":"claude-test",
+          "max_tokens":1024,
+          "messages":[{"role":"user","content":[{
+            "type":"tool_result",
+            "tool_use_id":"toolu_1",
+            "content":[
+              {"type":"text","text":"cached","cache_control":{"type":"ephemeral"}},
+              {"type":"text","text":"not cached"}
+            ],
+            "is_error":false,
+            "cache_control":{"type":"ephemeral","ttl":"5m"}
+          }]}]
+        }"#;
+        let original: Value = serde_json::from_slice(body).expect("input JSON");
+        let decoded = AnthropicMessagesCodec::decode_request_with_report(body).expect("decode");
+        let result = match &decoded.request.input[0] {
+            InputItem::Message(message) => match &message.content[0] {
+                ContentPart::ToolResult(result) => result,
+                other => panic!("expected tool result, got {other:?}"),
+            },
+            other => panic!("expected message, got {other:?}"),
+        };
+        assert_eq!(result.extensions.len(), 1);
+        assert!(result
+            .extensions
+            .get_str("anthropic.messages.tool_result_content_extras")
+            .is_some());
+
+        let encoded = AnthropicMessagesCodec::encode_request(&decoded.request, LossPolicy::Reject)
+            .expect("lossless re-encode");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("encoded JSON");
+        assert_eq!(value["messages"], original["messages"]);
     }
 
     #[test]
