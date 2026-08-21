@@ -935,6 +935,18 @@ pub struct RouteConfig {
     pub loss_policy: Option<LossPolicy>,
     /// Explicit precedence override.
     pub priority: Option<i32>,
+    /// Serve this route from Pooler itself instead of an upstream.
+    ///
+    /// The only supported value is `model_catalog`, which answers with the
+    /// active public model view. A served route takes no target.
+    pub serve: Option<String>,
+}
+
+/// What a route serves from Pooler itself rather than from an upstream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServedResource {
+    /// The active public model view in the OpenAI list shape.
+    ModelCatalog,
 }
 
 /// Optional bounded cache and in-flight coalescing policy for one route.
@@ -2491,10 +2503,21 @@ pub struct RoutePlan {
     loss_policy: LossPolicy,
     priority: i32,
     order: usize,
+    served: Option<ServedResource>,
     source: SourceLabel,
 }
 
 impl RoutePlan {
+    /// What Pooler answers itself for this route, if anything.
+    ///
+    /// A served route still declares a target: it scopes which provider and
+    /// capabilities the answer is filtered by, even though no upstream request
+    /// is made.
+    #[must_use]
+    pub const fn served(&self) -> Option<ServedResource> {
+        self.served
+    }
+
     /// Route ID.
     #[must_use]
     pub fn id(&self) -> &str {
@@ -3031,6 +3054,24 @@ fn compile_config(
         } else {
             LossPolicy::Reject
         };
+        // A served route answers from Pooler itself. It still declares a
+        // target, which scopes the answer, but it never reaches an upstream, so
+        // a body-converting ingress would describe work that never happens.
+        let served = match declaration.serve.as_deref().map(str::trim) {
+            None => None,
+            Some("model_catalog") => {
+                if ingress.mode().is_semantic() || response.mode().is_semantic() {
+                    return Err(invalid(
+                        &label,
+                        "a served route cannot declare semantic ingress or response",
+                    ));
+                }
+                Some(ServedResource::ModelCatalog)
+            }
+            Some(_) => {
+                return Err(invalid(&label, "route serve must be model_catalog"));
+            }
+        };
         routes.push(RoutePlan {
             id: Arc::from(declaration.id.as_str()),
             listener: Arc::from(listener),
@@ -3046,6 +3087,7 @@ fn compile_config(
             loss_policy: declaration.loss_policy.unwrap_or(default_loss_policy),
             priority: declaration.priority.unwrap_or(0),
             order,
+            served,
             source: label,
         });
     }

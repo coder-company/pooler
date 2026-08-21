@@ -663,6 +663,81 @@ impl PoolingCoordinator {
             .map_err(|_| PoolError::Selection)
     }
 
+    /// Public model IDs this deployment will actually serve right now.
+    ///
+    /// This is the active model view, not the upstream's list. It applies the
+    /// catalog's public aliases and exclusions, drops models an operator has
+    /// disabled at runtime, keeps only models with a target whose capabilities
+    /// satisfy `required`, and keeps only models with at least one target whose
+    /// credential is enabled and not cooling down. A model nothing can serve is
+    /// not advertised.
+    ///
+    /// Provider IDs, upstream model names, account IDs, secret references, and
+    /// upstream endpoints are deliberately absent from the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError`] when runtime enablement or health state cannot be
+    /// read.
+    pub fn published_models(
+        &self,
+        config: &CompiledConfig,
+        required: CapabilitySet,
+    ) -> Result<PublishedModels, PoolError> {
+        let snapshot = self.catalog.as_ref().map(|catalog| catalog.snapshot());
+        let now = timestamp_now();
+        let cooling: BTreeSet<String> = self
+            .cooldowns()?
+            .into_iter()
+            .filter(|cooldown| cooldown.until > now)
+            .map(|cooldown| cooldown.key)
+            .collect();
+        let unusable_providers: BTreeSet<String> = self
+            .credential_states()?
+            .into_iter()
+            .filter(|state| !state.enabled)
+            .map(|state| state.provider_id)
+            .collect();
+
+        // A provider is usable when it is not cooling down and at least one of
+        // its credentials is still enabled. A deployment with no credential
+        // state at all has nothing to contradict, so configuration stands.
+        let provider_is_usable =
+            |provider: &str| !cooling.contains(provider) && !unusable_providers.contains(provider);
+
+        let mut published = BTreeSet::new();
+        for (id, model) in config.models() {
+            if !self.model_enabled(id)? {
+                continue;
+            }
+            if model.targets().iter().any(|target| {
+                target.capabilities().contains_all(required)
+                    && provider_is_usable(target.provider())
+            }) {
+                published.insert(id.to_string());
+            }
+        }
+        if let Some(snapshot) = snapshot.as_deref() {
+            for (id, model) in snapshot.models() {
+                let id = id.as_str();
+                if !self.model_enabled(id)? {
+                    continue;
+                }
+                if model.targets().iter().any(|target| {
+                    target.capabilities().contains_all(required)
+                        && provider_is_usable(target.provider().as_str())
+                }) {
+                    published.insert(id.to_owned());
+                }
+            }
+        }
+        Ok(PublishedModels {
+            models: published.into_iter().collect(),
+            configuration_generation: config.generation(),
+            catalog_generation: snapshot.as_deref().map(CatalogSnapshot::generation),
+        })
+    }
+
     /// Select one target. The returned lease must remain alive until the
     /// response body is complete; callers may explicitly drop it on retry.
     pub fn select(
@@ -2829,5 +2904,33 @@ routes:
             .as_deref()
             .is_some_and(|reason| reason.starts_with("no_eligible:")));
         assert!(!decisions[0].candidates.is_empty());
+    }
+}
+
+/// The active public model view for one route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedModels {
+    models: Vec<String>,
+    configuration_generation: u64,
+    catalog_generation: Option<u64>,
+}
+
+impl PublishedModels {
+    /// Public model IDs in deterministic order.
+    #[must_use]
+    pub fn models(&self) -> &[String] {
+        &self.models
+    }
+
+    /// Configuration generation this view was built from.
+    #[must_use]
+    pub const fn configuration_generation(&self) -> u64 {
+        self.configuration_generation
+    }
+
+    /// Catalog generation this view was built from, when discovery is enabled.
+    #[must_use]
+    pub const fn catalog_generation(&self) -> Option<u64> {
+        self.catalog_generation
     }
 }

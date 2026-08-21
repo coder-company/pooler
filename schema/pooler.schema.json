@@ -1366,6 +1366,12 @@
         "response": {
           "$ref": "#/$defs/body"
         },
+        "serve": {
+          "enum": [
+            "model_catalog"
+          ],
+          "type": "string"
+        },
         "target": {
           "oneOf": [
             {

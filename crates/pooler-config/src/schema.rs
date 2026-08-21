@@ -869,6 +869,7 @@ fn route_schema() -> Value {
                 "priority",
                 optional(signed_integer_schema(i32::MIN, i32::MAX)),
             ),
+            ("serve", optional(string_enum(["model_catalog"]))),
         ]),
         &["id"],
         true,

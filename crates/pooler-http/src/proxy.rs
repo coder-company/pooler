@@ -30,7 +30,7 @@ use hyper_util::{
 use pooler_auth::{constant_time_eq, SecretRef as AuthSecretRef, SecretValue};
 use pooler_config::{
     CompiledConfig, ModelSource, RequestTransform, RouteMatchError, RoutePlan, RouteRequest,
-    SecretRef, UpstreamPlan,
+    SecretRef, ServedResource, UpstreamPlan,
 };
 use pooler_core::{BodyMode, ErrorClass, RouteLimits};
 use pooler_extension::{ExtensionInput, ExtensionRegistry};
@@ -632,6 +632,59 @@ where
         self.drain.clone()
     }
 
+    /// Answer `/v1/models` from the active public model view.
+    ///
+    /// The shape is the stable OpenAI list. Provider IDs, upstream model names,
+    /// account IDs, secret references, and upstream endpoints are absent by
+    /// construction: only public model IDs reach this response.
+    fn serve_model_catalog(&self, route: &RoutePlan) -> Response<ProxyBody> {
+        let published = match self
+            .pooling
+            .published_models(&self.config, route.target().capabilities())
+        {
+            Ok(published) => published,
+            Err(_) => {
+                return plain_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "model view is unavailable",
+                );
+            }
+        };
+        let data = published
+            .models()
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "object": "model",
+                    "owned_by": "pooler",
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut body = serde_json::json!({
+            "object": "list",
+            "data": data,
+            "configuration_generation": published.configuration_generation(),
+        });
+        if let Some(generation) = published.catalog_generation() {
+            body["catalog_generation"] = serde_json::json!(generation);
+        }
+        let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec()));
+        let body = Full::new(bytes)
+            .map_err(|never: Infallible| match never {})
+            .boxed();
+        let mut response = Response::new(body);
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+    }
+
     /// Handle one downstream request and stream the opaque upstream response.
     pub async fn handle(&self, request: Request<Incoming>) -> Response<ProxyBody> {
         let Some(guard) = self.drain.try_acquire() else {
@@ -698,6 +751,19 @@ where
                 .route(route.id())
                 .outcome("accepted"),
         );
+        // A served route is answered from Pooler's own state. No upstream
+        // request is made, so no credential is materialized and nothing can be
+        // forwarded to a provider.
+        if let Some(ServedResource::ModelCatalog) = route.served() {
+            drop(guard);
+            let response = self.serve_model_catalog(route);
+            let class = if response.status().is_success() {
+                CompletionClass::Success
+            } else {
+                CompletionClass::InternalError
+            };
+            return observe_response(response, observation.take(), class);
+        }
         let is_websocket = route.matcher().websocket() == Some(true);
         let result = if is_websocket {
             self.forward_websocket(route, request, guard, &mut observation)

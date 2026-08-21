@@ -62,6 +62,10 @@ routes:
       path: /v1/models
     limits:
       max_request_body_bytes: 65536
+    # Pooler answers this from its own active model view rather than forwarding
+    # the upstream list, so aliases, exclusions, runtime enablement, account
+    # eligibility, and provider health all apply. The target scopes the view.
+    serve: model_catalog
     ingress:
       mode: opaque
     target:
