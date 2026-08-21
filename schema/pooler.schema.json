@@ -1553,6 +1553,9 @@
           "minItems": 0,
           "type": "array"
         },
+        "endpoint_family": {
+          "type": "string"
+        },
         "model_from": {
           "type": "string"
         },

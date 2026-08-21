@@ -209,7 +209,10 @@ async fn call(
     String::from_utf8_lossy(&response).to_string()
 }
 
-/// Every REST endpoint family the preset mounts, with a representative call.
+/// Every REST endpoint family the preset mounts for OpenAI, whose integration
+/// documents `chat_completions`, `responses`, and `models`. The Anthropic and
+/// Gemini surfaces belong to those providers and are covered by
+/// `gateway_provider_auth.rs`.
 const REST_FAMILIES: &[(&str, &str, Option<&str>, &str)] = &[
     ("GET", "/v1/models", None, ""),
     (
@@ -217,12 +220,6 @@ const REST_FAMILIES: &[(&str, &str, Option<&str>, &str)] = &[
         "/v1/chat/completions",
         Some("application/json"),
         r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
-    ),
-    (
-        "POST",
-        "/v1/completions",
-        Some("application/json"),
-        r#"{"model":"gpt-4o","prompt":"hi"}"#,
     ),
     (
         "POST",
@@ -235,63 +232,6 @@ const REST_FAMILIES: &[(&str, &str, Option<&str>, &str)] = &[
         "/v1/responses/compact",
         Some("application/json"),
         r#"{"model":"gpt-4o","response_id":"resp_1"}"#,
-    ),
-    (
-        "POST",
-        "/v1/embeddings",
-        Some("application/json"),
-        r#"{"model":"text-embedding-3-small","input":"hi"}"#,
-    ),
-    (
-        "POST",
-        "/v1/messages",
-        Some("application/json"),
-        r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}"#,
-    ),
-    (
-        "POST",
-        "/v1/messages/count_tokens",
-        Some("application/json"),
-        r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}"#,
-    ),
-    (
-        "POST",
-        "/v1/images/generations",
-        Some("application/json"),
-        r#"{"model":"gpt-image-1","prompt":"a cat"}"#,
-    ),
-    (
-        "POST",
-        "/v1/audio/transcriptions",
-        Some("multipart/form-data; boundary=x"),
-        "--x\r\n\r\naudio\r\n--x--\r\n",
-    ),
-    ("GET", "/v1/files", None, ""),
-    ("GET", "/v1/batches", None, ""),
-    ("GET", "/v1beta/models", None, ""),
-    (
-        "POST",
-        "/v1beta/models/gemini-2.5-pro:generateContent",
-        Some("application/json"),
-        r#"{"contents":[{"parts":[{"text":"hi"}]}]}"#,
-    ),
-    (
-        "POST",
-        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
-        Some("application/json"),
-        r#"{"contents":[{"parts":[{"text":"hi"}]}]}"#,
-    ),
-    (
-        "POST",
-        "/v1beta/models/gemini-2.5-pro:countTokens",
-        Some("application/json"),
-        r#"{"contents":[{"parts":[{"text":"hi"}]}]}"#,
-    ),
-    (
-        "POST",
-        "/v1beta/interactions",
-        Some("application/json"),
-        r#"{"model":"gemini-2.5-pro"}"#,
     ),
 ];
 

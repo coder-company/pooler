@@ -17,24 +17,15 @@ fn example_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/gateway.example.yaml")
 }
 
-/// Every endpoint family the preset promises, as `(route id, method, path)`.
+/// The routes the shipped example mounts. The example selects OpenAI, whose
+/// integration documents `chat_completions`, `responses`, and `models`, so the
+/// Anthropic and Gemini surfaces are deliberately absent.
 const MOUNTED_ROUTES: &[&str] = &[
     "gateway-models",
     "gateway-chat-completions",
-    "gateway-completions",
     "gateway-responses",
     "gateway-responses-compact",
     "gateway-responses-websocket",
-    "gateway-embeddings",
-    "gateway-messages",
-    "gateway-messages-count-tokens",
-    "gateway-images",
-    "gateway-audio",
-    "gateway-files",
-    "gateway-batches",
-    "gateway-gemini-models",
-    "gateway-gemini-model-actions",
-    "gateway-gemini-interactions",
 ];
 
 #[test]
@@ -72,43 +63,12 @@ fn the_gateway_preset_selects_models_through_the_catalog_and_preserves_other_bod
     assert_eq!(chat.ingress().mode(), BodyMode::Patch);
     assert_eq!(chat.target().model_source(), Some(ModelSource::Request));
     assert!(chat.response().mode().preserves_original());
+    assert_eq!(chat.limits().max_request_body_bytes, 8 * 1024 * 1024);
 
-    // Media and file surfaces never decode, so provider-specific fields and
-    // upload bytes survive exactly.
-    for id in [
-        "gateway-images",
-        "gateway-audio",
-        "gateway-files",
-        "gateway-batches",
-    ] {
-        let route = config.route(id).expect("opaque route");
-        assert!(
-            route.ingress().mode().preserves_original(),
-            "{id} must not decode"
-        );
-        assert_eq!(route.limits().max_request_body_bytes, 32 * 1024 * 1024);
-    }
-    assert!(config
-        .route("gateway-images")
-        .expect("image route")
-        .target()
-        .capabilities()
-        .contains(Capability::Images));
-
-    // Gemini carries the model in the path, so those routes stay opaque rather
-    // than pretending a body inspector can select a target.
-    for id in [
-        "gateway-gemini-models",
-        "gateway-gemini-model-actions",
-        "gateway-gemini-interactions",
-    ] {
-        let route = config.route(id).expect("gemini route");
-        assert!(
-            route.ingress().mode().preserves_original(),
-            "{id} must not decode"
-        );
-        assert!(route.target().model_source().is_none(), "{id}");
-    }
+    // Discovery stays opaque and selects no model.
+    let models = config.route("gateway-models").expect("models route");
+    assert!(models.ingress().mode().preserves_original());
+    assert!(models.target().model_source().is_none());
 }
 
 #[test]
@@ -173,7 +133,6 @@ fn two_gateway_aliases_stay_isolated() {
         .compile()
         .expect("two gateways compile");
 
-    assert_eq!(config.routes().len(), MOUNTED_ROUTES.len() * 2);
     assert_eq!(config.listeners()["first"].bind(), "127.0.0.1:18601");
     assert_eq!(config.listeners()["second"].bind(), "127.0.0.1:18602");
     assert_eq!(config.upstreams()["first"].known_provider(), Some("openai"));
@@ -181,30 +140,112 @@ fn two_gateway_aliases_stay_isolated() {
         config.upstreams()["second"].known_provider(),
         Some("anthropic")
     );
-    assert_eq!(
-        config.upstreams()["first"]
-            .auth()
-            .expect("first auth")
-            .secret()
-            .redacted(),
-        "env:FIRST_KEY"
+
+    // Each alias mounts only the surface its own provider documents.
+    for id in MOUNTED_ROUTES {
+        assert!(
+            config
+                .route(id.replace("gateway-", "first-").as_str())
+                .is_some(),
+            "{id}"
+        );
+    }
+    assert!(config.route("second-messages").is_some());
+    assert!(config.route("second-models").is_some());
+    assert!(
+        config.route("second-chat-completions").is_none(),
+        "Anthropic does not document chat_completions"
     );
-    assert_eq!(
-        config.upstreams()["second"]
-            .auth()
-            .expect("second auth")
-            .secret()
-            .redacted(),
-        "env:SECOND_KEY"
+    assert!(
+        config.route("first-messages").is_none(),
+        "OpenAI does not document messages"
     );
-    assert_eq!(
-        config
-            .route("second-responses-websocket")
-            .expect("second websocket route")
-            .target()
-            .upstream(),
-        "second-websocket"
+}
+
+/// A provider is served only the endpoint families it documents.
+#[test]
+fn each_provider_mounts_only_its_documented_endpoint_families() {
+    let expected: [(&str, &[&str]); 3] = [
+        (
+            "openai",
+            &[
+                "gw-models",
+                "gw-chat-completions",
+                "gw-responses",
+                "gw-responses-compact",
+                "gw-responses-websocket",
+            ],
+        ),
+        (
+            "anthropic",
+            &["gw-models", "gw-messages", "gw-messages-count-tokens"],
+        ),
+        ("google", &["gw-gemini-models", "gw-gemini-model-actions"]),
+    ];
+
+    for (provider, routes) in expected {
+        let directory = TempDir::new().expect("config directory");
+        let path = directory.path().join("gateway.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "imports:\n  - preset: gateway\n    as: gw\n    with: {{bind: 127.0.0.1:0, provider: {provider}, secret: 'env:K'}}\n\nversion: 1\n"
+            ),
+        )
+        .expect("config contents");
+        let config = load_path(&path)
+            .expect("gateway loads")
+            .compile()
+            .expect("gateway compiles");
+
+        let mounted: Vec<&str> = config.routes().iter().map(|route| route.id()).collect();
+        assert_eq!(mounted.len(), routes.len(), "{provider}: {mounted:?}");
+        for route in routes {
+            assert!(mounted.contains(route), "{provider} must mount {route}");
+        }
+    }
+}
+
+/// An endpoint family the provider does not document is a configuration error,
+/// not a runtime surprise.
+#[test]
+fn an_undocumented_endpoint_family_is_rejected_at_compile_time() {
+    let directory = TempDir::new().expect("config directory");
+    let path = directory.path().join("bad.yaml");
+    std::fs::write(
+        &path,
+        "version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  openai:\n    known_provider: openai\n    auth: {secret: env:K}\nroutes:\n  - id: anthropic-on-openai\n    listen: local\n    match: {methods: [POST], path: /v1/messages}\n    ingress: {mode: opaque}\n    target: {provider: openai, endpoint_family: messages}\n    response: {mode: opaque}\n",
+    )
+    .expect("config contents");
+
+    let error = load_path(&path)
+        .expect("config loads")
+        .compile()
+        .expect_err("an undocumented family is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("does not document the `messages` endpoint family"),
+        "{error}"
     );
+}
+
+/// An upstream the operator configured by URL has no documented family list, so
+/// their declaration stands.
+#[test]
+fn an_operator_configured_upstream_keeps_its_declared_family() {
+    let directory = TempDir::new().expect("config directory");
+    let path = directory.path().join("private.yaml");
+    std::fs::write(
+        &path,
+        "version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams: {private: {url: 'http://127.0.0.1:9', auth: {secret: env:K}}}\nroutes:\n  - id: anything\n    listen: local\n    match: {methods: [POST], path: /v1/messages}\n    ingress: {mode: opaque}\n    target: {provider: private, endpoint_family: messages}\n    response: {mode: opaque}\n",
+    )
+    .expect("config contents");
+
+    load_path(&path)
+        .expect("config loads")
+        .compile()
+        .expect("an operator-configured upstream is not second-guessed");
 }
 
 #[test]

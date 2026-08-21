@@ -3162,6 +3162,7 @@
         "quota_classifier": "openai",
         "endpoint_families": [
           "chat_completions",
+          "responses",
           "models"
         ],
         "required_headers": {},

@@ -1,7 +1,9 @@
 # Universal turnkey gateway
 
-The `gateway` preset mounts the endpoint families a general OpenAI, Anthropic,
-or Gemini client expects, without hand-authoring a route plan.
+The `gateway` preset mounts the endpoint families the selected provider
+documents, without hand-authoring a route plan. It is provider-aware: pointing
+it at OpenAI, Anthropic, or Gemini mounts that provider's surface and nothing
+else.
 
 ```yaml
 imports:
@@ -26,32 +28,60 @@ POOLER_GATEWAY_KEY=... pooler serve --config config/gateway.example.yaml
 | `bind` | `127.0.0.1:8400` | Listener address. |
 | `provider` | `openai` | A provider this build ships an endpoint for. Run `pooler providers` for the list. |
 | `upstream_url` | shipped provider base URL | Overrides the base URL for a private deployment or a test loopback. |
-| `websocket_url` | `wss://api.openai.com` | `ws`/`wss` upstream for the Responses WebSocket route. Set this whenever `provider` is not `openai`; `provider` selects the REST base URL only, and a WebSocket route requires an explicit `ws`/`wss` transport. |
-| `secret` | `env:POOLER_GATEWAY_KEY` | Secret reference for both upstreams. A reference only; never a literal. |
+| `websocket_url` | `wss://api.openai.com` | `ws`/`wss` upstream for the Responses WebSocket route, which is mounted only for providers documenting the `responses` family. Set this whenever that route is mounted and `provider` is not `openai`; `provider` selects the REST base URL only, and a WebSocket route requires an explicit `ws`/`wss` transport. |
+| `secret` | `env:POOLER_GATEWAY_KEY` | Secret reference for both upstreams. A reference only; never a literal. Only the reference is overridden: the provider's documented authentication kind, header name, and value prefix are preserved, so Anthropic receives `x-api-key` and Gemini receives `x-goog-api-key` rather than a bearer token. |
 
 `as:` namespaces every listener, upstream, and route, so several gateways can
 run in one process without colliding.
 
 ## What is mounted
 
-| Route | Method and path | Mode |
-| --- | --- | --- |
-| `models` | `GET /v1/models` | opaque |
-| `chat-completions` | `POST /v1/chat/completions` | patch |
-| `completions` | `POST /v1/completions` | patch |
-| `responses` | `POST /v1/responses` | patch |
-| `responses-compact` | `POST /v1/responses/compact` | patch |
-| `responses-websocket` | `GET /v1/responses` (upgrade) | opaque tunnel |
-| `embeddings` | `POST /v1/embeddings` | patch |
-| `messages` | `POST /v1/messages` | patch |
-| `messages-count-tokens` | `POST /v1/messages/count_tokens` | patch |
-| `images` | `/v1/images/*` | opaque |
-| `audio` | `/v1/audio/*` | opaque |
-| `files` | `/v1/files/*` | opaque |
-| `batches` | `/v1/batches/*` | opaque |
-| `gemini-models` | `GET /v1beta/models` | opaque |
-| `gemini-model-actions` | `/v1beta/models/*` including `:generateContent`, `:streamGenerateContent`, and `:countTokens` | opaque |
-| `gemini-interactions` | `/v1beta/interactions/*` | opaque |
+The preset mounts a route only when the selected provider's shipped integration
+documents that endpoint family **and** serves that wire surface. Mounting a path
+a provider does not implement is not compatibility, so those routes are simply
+absent rather than present and broken.
+
+| Provider | Routes mounted |
+| --- | --- |
+| `openai`, `xai` | `models`, `chat-completions`, `responses`, `responses-compact`, `responses-websocket` |
+| `anthropic` | `models`, `messages`, `messages-count-tokens` |
+| `google` | `gemini-models`, `gemini-model-actions` |
+
+| Route | Method and path | Family | Mode |
+| --- | --- | --- | --- |
+| `models` | `GET /v1/models` | `models` | opaque |
+| `chat-completions` | `POST /v1/chat/completions` | `chat_completions` | patch |
+| `responses` | `POST /v1/responses` | `responses` | patch |
+| `responses-compact` | `POST /v1/responses/compact` | `responses` | patch |
+| `responses-websocket` | `GET /v1/responses` (upgrade) | `responses` | opaque tunnel |
+| `messages` | `POST /v1/messages` | `messages` | patch |
+| `messages-count-tokens` | `POST /v1/messages/count_tokens` | `messages` | patch |
+| `gemini-models` | `GET /v1beta/models` | `models` | opaque |
+| `gemini-model-actions` | `/v1beta/models/*` including `:generateContent`, `:streamGenerateContent`, and `:countTokens` | `generate_content` | opaque |
+
+The `models` routes are told apart by the provider's documented discovery path
+rather than by dialect, so Anthropic keeps its OpenAI-shaped `/v1/models` list
+while Gemini gets `/v1beta/models`.
+
+Embeddings, images, audio, files, batches, legacy completions, and Gemini
+Interactions are **not** mounted: no shipped provider integration documents
+those endpoint families, so the preset cannot honestly claim them. They remain
+available to hand-authored routes, where the operator asserts the endpoint
+exists.
+
+### Rejecting an unsupported combination
+
+`target.endpoint_family` declares the family a route speaks. When the target
+upstream names a `known_provider`, compilation rejects a family that provider
+does not document:
+
+```text
+error: invalid configuration at gateway.yaml (routes[0]):
+provider `openai` does not document the `messages` endpoint family
+```
+
+An upstream configured by URL has no documented family list, so the operator's
+declaration stands.
 
 ## What the two modes claim
 

@@ -966,6 +966,7 @@ fn target_schema() -> Value {
                 ),
             ),
             ("codecs", array_schema(string_schema(), Some(0), None)),
+            ("endpoint_family", optional_string()),
         ]),
         &[],
         false,

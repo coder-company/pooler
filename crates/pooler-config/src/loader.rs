@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use pooler_model_catalog::ProviderCatalog;
 use serde::Deserialize;
 use serde_yml::{Mapping, Value};
 
@@ -721,6 +722,118 @@ fn rewrite_fx_routes(root: &mut Value, alias: &str, path: &Path) -> Result<(), C
 /// WebSocket route requires a `ws`/`wss` transport, exactly like the xAI
 /// preset. Every route it carries is renamed under the alias so several
 /// gateways can coexist on one deployment.
+/// How one gateway route decides whether a provider can serve it.
+enum GatewaySurface {
+    /// The provider must speak this request dialect on the wire.
+    Dialect(&'static str),
+    /// The provider's documented model-discovery path must match, which is how
+    /// an OpenAI-shaped `/v1/models` list is told apart from Gemini's
+    /// `/v1beta/models` without guessing from the dialect.
+    Discovery(&'static str),
+}
+
+/// Each gateway route's surface and the provider endpoint family it speaks.
+///
+/// A route is mounted only when the selected provider documents that family
+/// and satisfies the surface, so a Gemini path is never mounted against an
+/// Anthropic upstream merely because both document `models`.
+const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 9] = [
+    ("models", GatewaySurface::Discovery("/v1/models"), "models"),
+    (
+        "chat-completions",
+        GatewaySurface::Dialect("openai"),
+        "chat_completions",
+    ),
+    ("responses", GatewaySurface::Dialect("openai"), "responses"),
+    (
+        "responses-compact",
+        GatewaySurface::Dialect("openai"),
+        "responses",
+    ),
+    (
+        "responses-websocket",
+        GatewaySurface::Dialect("openai"),
+        "responses",
+    ),
+    ("messages", GatewaySurface::Dialect("anthropic"), "messages"),
+    (
+        "messages-count-tokens",
+        GatewaySurface::Dialect("anthropic"),
+        "messages",
+    ),
+    (
+        "gemini-models",
+        GatewaySurface::Discovery("/v1beta/models"),
+        "models",
+    ),
+    (
+        "gemini-model-actions",
+        GatewaySurface::Dialect("gemini"),
+        "generate_content",
+    ),
+];
+
+/// Remove every gateway route the selected provider does not document.
+fn retain_supported_gateway_routes(
+    root: &mut Value,
+    provider_id: &str,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    let provider = ProviderCatalog::builtin().get(provider_id).ok_or_else(|| {
+        load_error(
+            path,
+            &format!("gateway preset provider `{provider_id}` is not a provider Pooler ships an endpoint for"),
+        )
+    })?;
+    let integration = &provider.integration;
+    let routes = root
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(Value::String("routes".to_owned())))
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| load_error(path, "gateway preset routes are invalid"))?;
+    let mut failure = None;
+    routes.retain(|route| {
+        let Some(id) = route
+            .as_mapping()
+            .and_then(|route| route.get(Value::String("id".to_owned())))
+            .and_then(Value::as_str)
+        else {
+            failure = Some("gateway preset route ID is missing");
+            return true;
+        };
+        let Some((_, surface, family)) = GATEWAY_ROUTE_SURFACE
+            .iter()
+            .find(|(route_id, _, _)| *route_id == id)
+        else {
+            failure = Some("gateway preset route is not classified");
+            return true;
+        };
+        let serves_surface = match surface {
+            GatewaySurface::Dialect(dialect) => *dialect == integration.request_dialect,
+            GatewaySurface::Discovery(discovery) => {
+                integration.discovery_path.as_deref() == Some(*discovery)
+            }
+        };
+        serves_surface
+            && integration
+                .endpoint_families
+                .iter()
+                .any(|documented| documented == family)
+    });
+    if let Some(message) = failure {
+        return Err(load_error(path, message));
+    }
+    if routes.is_empty() {
+        return Err(load_error(
+            path,
+            &format!(
+                "gateway preset provider `{provider_id}` documents no mountable endpoint family"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn expand_gateway_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
     for key in import.parameters.keys() {
         if !matches!(
@@ -740,6 +853,13 @@ fn expand_gateway_preset(import: &ImportSpec, path: &Path) -> Result<Value, Conf
     }
     let mut preset: Value = serde_yml::from_str(include_str!("../../../presets/gateway.yaml"))
         .map_err(|error| load_error(path, &format!("invalid built-in gateway preset: {error}")))?;
+    let provider_id = import
+        .parameters
+        .get("provider")
+        .map(|value| string_value(value, path, "gateway"))
+        .transpose()?
+        .unwrap_or_else(|| "openai".to_owned());
+    retain_supported_gateway_routes(&mut preset, &provider_id, path)?;
     let websocket_alias = format!("{alias}-websocket");
     rename_named_key(&mut preset, "listeners", "gateway", alias, path)?;
     rename_named_key(

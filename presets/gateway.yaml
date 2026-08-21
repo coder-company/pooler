@@ -65,6 +65,7 @@ routes:
     ingress:
       mode: opaque
     target:
+      endpoint_family: models
       provider: gateway
     response:
       mode: opaque
@@ -86,27 +87,7 @@ routes:
       mode: patch
       inspectors: [inspect.openai.model]
     target:
-      provider: gateway
-      model_from: request.model
-    response:
-      mode: opaque
-
-  - id: completions
-    listen: gateway
-    match:
-      methods: [POST]
-      path: /v1/completions
-      content_types: [application/json]
-    limits:
-      max_request_body_bytes: 8388608
-      max_frame_bytes: 8388608
-      max_event_bytes: 8388608
-      max_queue_bytes: 8388608
-      max_queue_items: 256
-    ingress:
-      mode: patch
-      inspectors: [inspect.openai.model]
-    target:
+      endpoint_family: chat_completions
       provider: gateway
       model_from: request.model
     response:
@@ -128,6 +109,7 @@ routes:
       mode: patch
       inspectors: [inspect.openai.model]
     target:
+      endpoint_family: responses
       provider: gateway
       model_from: request.model
     response:
@@ -146,6 +128,7 @@ routes:
       mode: patch
       inspectors: [inspect.openai.model]
     target:
+      endpoint_family: responses
       provider: gateway
       model_from: request.model
     response:
@@ -167,30 +150,12 @@ routes:
     ingress:
       mode: opaque
     target:
+      endpoint_family: responses
       provider: gateway-websocket
       capabilities: [web_socket]
     response:
       mode: opaque
 
-  - id: embeddings
-    listen: gateway
-    match:
-      methods: [POST]
-      path: /v1/embeddings
-      content_types: [application/json]
-    limits:
-      max_request_body_bytes: 8388608
-      max_frame_bytes: 8388608
-    ingress:
-      mode: patch
-      inspectors: [inspect.openai.model]
-    target:
-      provider: gateway
-      model_from: request.model
-    response:
-      mode: opaque
-
-  # ---------------------------------------------------- Anthropic text family
   - id: messages
     listen: gateway
     match:
@@ -207,6 +172,7 @@ routes:
       mode: patch
       inspectors: [inspect.openai.model]
     target:
+      endpoint_family: messages
       provider: gateway
       model_from: request.model
     response:
@@ -225,6 +191,7 @@ routes:
       mode: patch
       inspectors: [inspect.openai.model]
     target:
+      endpoint_family: messages
       provider: gateway
       model_from: request.model
     response:
@@ -233,74 +200,6 @@ routes:
   # ------------------------------------------------------------- media family
   # These surfaces stay opaque so multipart parts, binary payloads, and
   # provider-specific fields survive byte for byte.
-  - id: images
-    listen: gateway
-    match:
-      methods: [GET, POST, DELETE]
-      path_prefix: /v1/images
-    limits:
-      max_request_body_bytes: 33554432
-      max_frame_bytes: 33554432
-    ingress:
-      mode: opaque
-    target:
-      provider: gateway
-      capabilities: [images]
-    response:
-      mode: opaque
-
-  - id: audio
-    listen: gateway
-    match:
-      methods: [GET, POST, DELETE]
-      path_prefix: /v1/audio
-    limits:
-      max_request_body_bytes: 33554432
-      max_frame_bytes: 33554432
-    ingress:
-      mode: opaque
-    target:
-      provider: gateway
-      capabilities: [audio]
-    response:
-      mode: opaque
-
-  - id: files
-    listen: gateway
-    match:
-      methods: [GET, POST, DELETE]
-      path_prefix: /v1/files
-    limits:
-      max_request_body_bytes: 33554432
-      max_frame_bytes: 33554432
-    ingress:
-      mode: opaque
-    target:
-      provider: gateway
-      capabilities: [files]
-    response:
-      mode: opaque
-
-  - id: batches
-    listen: gateway
-    match:
-      methods: [GET, POST, DELETE]
-      path_prefix: /v1/batches
-    limits:
-      max_request_body_bytes: 33554432
-      max_frame_bytes: 33554432
-    ingress:
-      mode: opaque
-    target:
-      provider: gateway
-      capabilities: [batch]
-    response:
-      mode: opaque
-
-  # ------------------------------------------------------------ Gemini family
-  # Gemini carries the model and the action in the request path rather than in
-  # a body field, so these routes forward opaquely instead of pretending a body
-  # inspector can select a target.
   - id: gemini-models
     listen: gateway
     match:
@@ -311,6 +210,7 @@ routes:
     ingress:
       mode: opaque
     target:
+      endpoint_family: models
       provider: gateway
     response:
       mode: opaque
@@ -329,24 +229,7 @@ routes:
     ingress:
       mode: opaque
     target:
-      provider: gateway
-    response:
-      mode: opaque
-
-  - id: gemini-interactions
-    listen: gateway
-    match:
-      methods: [GET, POST]
-      path_prefix: /v1beta/interactions
-    limits:
-      max_request_body_bytes: 33554432
-      max_frame_bytes: 33554432
-      max_event_bytes: 8388608
-      max_queue_bytes: 8388608
-      max_queue_items: 256
-    ingress:
-      mode: opaque
-    target:
+      endpoint_family: generate_content
       provider: gateway
     response:
       mode: opaque

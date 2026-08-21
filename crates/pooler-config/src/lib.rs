@@ -1063,6 +1063,13 @@ pub struct TargetConfig {
     pub capabilities: Vec<String>,
     /// Semantic codecs advertised by this route target.
     pub codecs: Vec<String>,
+    /// Provider endpoint family this route speaks on the wire.
+    ///
+    /// When the target upstream names a known provider, compilation rejects a
+    /// route whose family that provider does not document. This is what stops
+    /// a gateway from mounting an Anthropic path against an OpenAI upstream
+    /// and calling the result compatibility.
+    pub endpoint_family: Option<String>,
 }
 
 /// Immutable listener plan.
@@ -5077,32 +5084,36 @@ fn compile_target(
     policies: &BTreeMap<Arc<str>, PolicyPlan>,
 ) -> Result<TargetPlan, ConfigError> {
     let target = declaration.target.as_ref();
-    let (upstream, path, model_from, target_policy, capabilities, codecs) = match target {
-        Some(TargetValue::Name(name)) => (
-            Some(name.as_str()),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-        ),
-        Some(TargetValue::Config(config)) => (
-            config.upstream.as_deref(),
-            config.path.as_deref(),
-            config.model_from.as_deref(),
-            config.policy.as_deref(),
-            config.capabilities.clone(),
-            config.codecs.clone(),
-        ),
-        None => (
-            declaration.upstream.as_deref(),
-            None,
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-        ),
-    };
+    let (upstream, path, model_from, target_policy, capabilities, codecs, endpoint_family) =
+        match target {
+            Some(TargetValue::Name(name)) => (
+                Some(name.as_str()),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            Some(TargetValue::Config(config)) => (
+                config.upstream.as_deref(),
+                config.path.as_deref(),
+                config.model_from.as_deref(),
+                config.policy.as_deref(),
+                config.capabilities.clone(),
+                config.codecs.clone(),
+                config.endpoint_family.as_deref(),
+            ),
+            None => (
+                declaration.upstream.as_deref(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+        };
     let upstream = upstream
         .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| invalid(label, "route requires target upstream/provider"))?;
@@ -5112,6 +5123,9 @@ fn compile_target(
             name: upstream.to_owned(),
             label: label.clone(),
         });
+    }
+    if let Some(family) = endpoint_family {
+        validate_endpoint_family(family, upstream, upstreams, label)?;
     }
     let path = path
         .map(|value| valid_path(value.to_owned(), label))
@@ -5165,6 +5179,46 @@ fn compile_target(
         capabilities,
         codecs,
     })
+}
+
+/// Reject a route whose endpoint family the target provider does not document.
+///
+/// Mounting a path is not compatibility. A gateway that sends `/v1/messages` to
+/// an OpenAI upstream produces a 404 at best, so an unsupported combination is
+/// a configuration error rather than a runtime surprise. An upstream the
+/// operator configured by URL has no documented family list, so their
+/// declaration stands.
+fn validate_endpoint_family(
+    family: &str,
+    upstream_id: &str,
+    upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
+    label: &SourceLabel,
+) -> Result<(), ConfigError> {
+    let family = family.trim();
+    if family.is_empty() {
+        return Err(invalid(label, "target endpoint_family must not be empty"));
+    }
+    let Some(provider_id) = upstreams
+        .get(upstream_id)
+        .and_then(UpstreamPlan::known_provider)
+    else {
+        return Ok(());
+    };
+    let provider = ProviderCatalog::builtin()
+        .get(provider_id)
+        .ok_or_else(|| invalid(label, "known provider integration is missing"))?;
+    if provider
+        .integration
+        .endpoint_families
+        .iter()
+        .any(|documented| documented == family)
+    {
+        return Ok(());
+    }
+    Err(invalid(
+        label,
+        &format!("provider `{provider_id}` does not document the `{family}` endpoint family"),
+    ))
 }
 
 fn detect_conflicts(routes: &[RoutePlan]) -> Result<(), ConfigError> {
