@@ -2070,6 +2070,20 @@ routes:
         assert!(html_body.contains("Listeners"));
         assert!(html_body.contains("Quota &amp; cooldowns"));
         assert!(!html_body.contains("type=\"submit\""));
+        for endpoint in [
+            "listeners",
+            "health/providers",
+            "routes",
+            "models",
+            "accounts",
+            "quota",
+            "metrics",
+            "export",
+            "traces",
+            "audit",
+        ] {
+            assert!(!html_body.contains(&format!("href=\"/management/{endpoint}")));
+        }
         assert_eq!(
             html.headers.get(header::CONTENT_SECURITY_POLICY),
             Some(&header::HeaderValue::from_static(
@@ -2098,6 +2112,8 @@ routes:
         assert!(js_body.contains("cache: \"no-store\""));
         assert!(js_body.contains("method: \"POST\""));
         assert!(js_body.contains("Authorization"));
+        assert!(js_body.contains("downloadExport"));
+        assert!(js_body.contains("/management/export"));
         assert!(!js_body.contains("localStorage"));
         assert!(!js_body.contains("sessionStorage"));
         assert!(!js_body.contains("?token="));

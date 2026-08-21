@@ -32,10 +32,10 @@ Send the token as `Authorization: Bearer ...`.
 | `/metrics`, `/metrics/prometheus` | Bounded route/provider/model token usage and provider-reported cost ticks |
 | `/decisions` | Recent redacted routing decisions |
 | `/traces` | Bounded redacted runtime traces shared by listeners and reload generations |
-| `/audit` | Bounded management mutation audit events |
+| `/audit` | Bounded process-local management mutation audit events |
 | `/export` | Versioned redacted diagnostic export |
 
-`/export` is a diagnostic backup, not a credential backup. It intentionally cannot restore tokens or secret references.
+`/export` is a diagnostic backup, not a credential backup. It intentionally cannot restore tokens or secret references. Audit and trace retention is process-local and resets when the process restarts.
 
 ## Mutations
 

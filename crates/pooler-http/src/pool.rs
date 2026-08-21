@@ -60,14 +60,17 @@ pub struct SelectionContext {
 #[derive(Clone, Copy, Debug)]
 pub struct SelectionTiming {
     attempt: u32,
-    started: Instant,
+    _request_started: Instant,
 }
 
 impl SelectionTiming {
     /// Construct request timing metadata.
     #[must_use]
-    pub const fn new(attempt: u32, started: Instant) -> Self {
-        Self { attempt, started }
+    pub const fn new(attempt: u32, request_started: Instant) -> Self {
+        Self {
+            attempt,
+            _request_started: request_started,
+        }
     }
 }
 
@@ -778,7 +781,9 @@ impl PoolingCoordinator {
                 requested_model,
                 context,
             ))
-            .at(timing.started);
+            // Eligibility must use the current instant. A request-admission
+            // timestamp can predate a concurrent zero-delay quota recovery.
+            .at(Instant::now());
         if let Some(codec) = required_codec_for_selection(route, requested_model, context) {
             request = request
                 .with_codec(codec)
@@ -2715,6 +2720,39 @@ routes:
         assert_eq!(
             final_selection.credential().map(CredentialId::as_str),
             Some("third")
+        );
+    }
+
+    #[test]
+    fn selection_uses_current_time_for_concurrent_quota_recovery() {
+        let config = pooled_config(false);
+        let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
+        coordinator
+            .set_account_enabled("second", false)
+            .expect("disable fallback");
+        let registry = coordinator
+            .registries
+            .get(&route_registry_key("pooled"))
+            .expect("route registry");
+        let credential = CredentialId::new("first").expect("credential");
+        let reset_at = Instant::now();
+        registry
+            .set_quota(&credential, Some(0), Some(reset_at))
+            .expect("set elapsed quota");
+
+        let selection = coordinator
+            .select_with_context(
+                &config,
+                &config.routes()[0],
+                None,
+                &HeaderMap::new(),
+                &SelectionContext::default(),
+                SelectionTiming::new(0, reset_at - Duration::from_secs(1)),
+            )
+            .expect("elapsed quota must recover despite stale request start");
+        assert_eq!(
+            selection.credential().map(CredentialId::as_str),
+            Some("first")
         );
     }
 

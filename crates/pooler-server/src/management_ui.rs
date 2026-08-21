@@ -37,6 +37,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
       <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Optional for local auth">
       <button id="refresh" type="button">Refresh</button>
       <button id="reload" type="button">Reload config</button>
+      <button id="export" type="button">Download export</button>
     </div>
   </header>
 
@@ -63,45 +64,45 @@ const INDEX_HTML: &str = r##"<!doctype html>
 
     <div class="columns">
       <section class="panel" aria-labelledby="listeners-heading">
-        <div class="section-heading compact"><h2 id="listeners-heading">Listeners</h2><a href="/management/listeners">JSON</a></div>
+        <div class="section-heading compact"><h2 id="listeners-heading">Listeners</h2></div>
         <div id="listeners" class="table-wrap"><p class="muted">Loading…</p></div>
       </section>
       <section class="panel" aria-labelledby="providers-heading">
-        <div class="section-heading compact"><h2 id="providers-heading">Providers</h2><a href="/management/health/providers">JSON</a></div>
+        <div class="section-heading compact"><h2 id="providers-heading">Providers</h2></div>
         <div id="providers" class="table-wrap"><p class="muted">Loading…</p></div>
       </section>
     </div>
 
     <div class="columns">
       <section class="panel" aria-labelledby="routes-heading">
-        <div class="section-heading compact"><h2 id="routes-heading">Routes</h2><a href="/management/routes">JSON</a></div>
+        <div class="section-heading compact"><h2 id="routes-heading">Routes</h2></div>
         <div id="routes" class="table-wrap"><p class="muted">Loading…</p></div>
       </section>
       <section class="panel" aria-labelledby="models-heading">
-        <div class="section-heading compact"><h2 id="models-heading">Models</h2><span><a href="/management/models">JSON</a> · <button id="reload-models" type="button">Reload</button></span></div>
+        <div class="section-heading compact"><h2 id="models-heading">Models</h2><button id="reload-models" type="button">Reload</button></div>
         <div id="models" class="table-wrap"><p class="muted">Loading…</p></div>
       </section>
     </div>
 
     <div class="columns">
       <section class="panel" aria-labelledby="accounts-heading">
-        <div class="section-heading compact"><h2 id="accounts-heading">Accounts</h2><a href="/management/accounts">JSON</a></div>
+        <div class="section-heading compact"><h2 id="accounts-heading">Accounts</h2></div>
         <div id="accounts" class="table-wrap"><p class="muted">Loading…</p></div>
       </section>
       <section class="panel" aria-labelledby="quota-heading">
-        <div class="section-heading compact"><h2 id="quota-heading">Quota &amp; cooldowns</h2><a href="/management/quota">JSON</a></div>
+        <div class="section-heading compact"><h2 id="quota-heading">Quota &amp; cooldowns</h2></div>
         <div id="quota" class="table-wrap"><p class="muted">Loading…</p></div>
       </section>
     </div>
 
     <section class="panel" aria-labelledby="metrics-heading">
-      <div class="section-heading compact"><h2 id="metrics-heading">Metrics</h2><span><a href="/management/metrics">JSON</a> · <a href="/management/export">Export</a></span></div>
+      <div class="section-heading compact"><h2 id="metrics-heading">Metrics</h2></div>
       <div id="metrics" class="metrics-grid"><p class="muted">Loading…</p></div>
     </section>
 
     <div class="columns operational">
-      <section class="panel" aria-labelledby="traces-heading"><div class="section-heading compact"><h2 id="traces-heading">Recent traces</h2><a href="/management/traces">JSON</a></div><div id="traces" class="table-wrap"><p class="muted">Loading…</p></div></section>
-      <section class="panel" aria-labelledby="audit-heading"><div class="section-heading compact"><h2 id="audit-heading">Management audit</h2><a href="/management/audit">JSON</a></div><div id="audit" class="table-wrap"><p class="muted">Loading…</p></div></section>
+      <section class="panel" aria-labelledby="traces-heading"><div class="section-heading compact"><h2 id="traces-heading">Recent traces</h2></div><div id="traces" class="table-wrap"><p class="muted">Loading…</p></div></section>
+      <section class="panel" aria-labelledby="audit-heading"><div class="section-heading compact"><h2 id="audit-heading">Management audit</h2></div><div id="audit" class="table-wrap"><p class="muted">Loading…</p></div></section>
     </div>
   </main>
 
@@ -214,6 +215,20 @@ const APP_JS: &str = r##"(() => {
     await refresh();
   }
 
+  async function downloadExport() {
+    const response = await fetch("/management/export", { headers: requestHeaders(), cache: "no-store" });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "pooler-management-export.json";
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
   function modelPath(id) {
     return String(id).split("/").map(encodeURIComponent).join("/");
   }
@@ -316,6 +331,7 @@ const APP_JS: &str = r##"(() => {
   $("refresh").addEventListener("click", refresh);
   $("reload").addEventListener("click", () => mutate("/management/reload").catch(showError));
   $("reload-models").addEventListener("click", () => mutate("/management/models/reload").catch(showError));
+  $("export").addEventListener("click", () => downloadExport().catch(showError));
   token.addEventListener("change", refresh);
   refresh();
 })();
