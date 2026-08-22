@@ -110,6 +110,8 @@ pub(crate) enum ConfigManagementError {
     Confirmation,
     #[error("configuration persistence failed")]
     Persistence,
+    #[error("configuration persistence restoration failed; operator recovery is required")]
+    RecoveryRequired,
 }
 
 pub(crate) fn serving_source(source: impl AsRef<Path>) -> Result<PathBuf, ConfigManagementError> {
@@ -320,7 +322,7 @@ impl ConfigManagement {
         let persistence = match persist_atomic(&self.managed_path, &encoded) {
             Ok(persistence) => persistence,
             Err(error) => {
-                state.commit_in_progress = true;
+                state.commit_in_progress = matches!(error, ConfigManagementError::RecoveryRequired);
                 return Err(error);
             }
         };
@@ -403,7 +405,7 @@ impl ConfigManagement {
         let persistence = match persist_atomic(&self.managed_path, &prior) {
             Ok(persistence) => persistence,
             Err(error) => {
-                state.commit_in_progress = true;
+                state.commit_in_progress = matches!(error, ConfigManagementError::RecoveryRequired);
                 return Err(error);
             }
         };
@@ -730,8 +732,10 @@ fn persist_atomic(path: &Path, bytes: &[u8]) -> Result<PersistenceState, ConfigM
         write_atomic(&parent, path, bytes)
     })();
     if mutation.is_err() {
-        let _ = restore_persistence(path, &persistence);
-        return Err(ConfigManagementError::Persistence);
+        return match restore_persistence(path, &persistence) {
+            Ok(()) => Err(ConfigManagementError::Persistence),
+            Err(_) => Err(ConfigManagementError::RecoveryRequired),
+        };
     }
     Ok(persistence)
 }
@@ -1048,7 +1052,7 @@ mod tests {
             ),
             Err(ConfigManagementError::Persistence)
         ));
-        assert!(manager.state.lock().expect("state lock").commit_in_progress);
+        assert!(!manager.state.lock().expect("state lock").commit_in_progress);
         assert!(fs::read_to_string(&managed)
             .expect("managed file after injected commit failure")
             .contains("1001"));
@@ -1056,7 +1060,10 @@ mod tests {
             .expect("backup after injected commit failure")
             .contains("1002"));
 
-        manager.state.lock().expect("state lock").commit_in_progress = false;
+        assert!(matches!(
+            manager.commit(injected_id, injected_etag, 6, "wrong-confirmation"),
+            Err(ConfigManagementError::Confirmation)
+        ));
         FAIL_WRITE_AFTER_RENAME.set(true);
         assert!(matches!(
             manager.rollback(7),

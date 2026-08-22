@@ -3048,6 +3048,7 @@ mod tests {
                 output_tokens: Some(5),
                 total_tokens: Some(8),
                 cost_in_usd_ticks: Some(12),
+                ..Usage::default()
             }),
             Some("provider"),
             Some("model"),

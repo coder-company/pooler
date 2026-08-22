@@ -406,10 +406,22 @@ pub enum PoolError {
 #[derive(Clone)]
 pub struct PoolingCoordinator {
     registries: Arc<BTreeMap<String, Arc<CredentialRegistry>>>,
+    interaction_affinity_registries: Arc<BTreeMap<String, BTreeSet<String>>>,
     accounts: Arc<BTreeMap<String, AccountPlan>>,
     store: Arc<dyn Store>,
     catalog: Option<Arc<CatalogService>>,
     disabled_models: Arc<RwLock<BTreeSet<String>>>,
+}
+
+/// Non-secret snapshot of the selected account and compatible registries used
+/// while observing a Gemini create response. It intentionally contains no
+/// interaction identifier.
+pub(crate) struct InteractionAffinityBinding {
+    credential: CredentialId,
+    provider: ProviderId,
+    upstream_model: String,
+    ttl: Duration,
+    registries: Vec<(String, ModelId)>,
 }
 
 impl std::fmt::Debug for PoolingCoordinator {
@@ -468,8 +480,30 @@ impl PoolingCoordinator {
             registries.insert(key, registry);
         }
 
+        let mut interaction_affinity_registries = BTreeMap::<String, BTreeSet<String>>::new();
+        for route in config.routes() {
+            let Some(policy_id) = route.target().policy() else {
+                continue;
+            };
+            let Some(affinity) = config
+                .policies()
+                .get(policy_id)
+                .and_then(|policy| policy.selection().affinity())
+            else {
+                continue;
+            };
+            if affinity.key() == "gemini.interaction_id" && route.target().model_source().is_none()
+            {
+                interaction_affinity_registries
+                    .entry(policy_id.to_owned())
+                    .or_default()
+                    .insert(route_registry_key(route.id()));
+            }
+        }
+
         let coordinator = Self {
             registries: Arc::new(registries),
+            interaction_affinity_registries: Arc::new(interaction_affinity_registries),
             accounts: Arc::new(accounts),
             store,
             catalog: None,
@@ -1308,6 +1342,105 @@ impl PoolingCoordinator {
                 let _ =
                     registry.set_quota_snapshot(registration.credential(), classification.snapshot);
             }
+        }
+    }
+
+    /// Capture the non-secret account and registry metadata needed to bind a
+    /// Gemini Interaction ID observed after response headers are committed.
+    pub(crate) fn interaction_affinity_binding(
+        &self,
+        selection: &PoolSelection,
+    ) -> Option<InteractionAffinityBinding> {
+        let policy = selection.policy()?;
+        let affinity = policy.selection().affinity()?;
+        if affinity.key() != "gemini.interaction_id" {
+            return None;
+        }
+        let credential = selection.credential()?.clone();
+        let provider = selection.provider().clone();
+        let mut registry_keys = self
+            .interaction_affinity_registries
+            .get(policy.id())
+            .cloned()
+            .unwrap_or_default();
+        registry_keys.insert(selection.registry_key.as_deref()?.to_owned());
+        let registries = registry_keys
+            .into_iter()
+            .filter_map(|registry_key| {
+                let registry = self.registries.get(&registry_key)?;
+                let model = registry
+                    .registrations()
+                    .ok()?
+                    .into_iter()
+                    .find(|registration| {
+                        registration.credential() == &credential
+                            && registration.provider() == &provider
+                    })?
+                    .model()
+                    .clone();
+                Some((registry_key, model))
+            })
+            .collect::<Vec<_>>();
+        if registries.is_empty() {
+            return None;
+        }
+        Some(InteractionAffinityBinding {
+            credential,
+            provider,
+            upstream_model: selection
+                .upstream_model()
+                .unwrap_or(selection.model().as_str())
+                .to_owned(),
+            ttl: affinity.ttl(),
+            registries,
+        })
+    }
+
+    /// Bind one hashed provider-returned Gemini Interaction ID to the exact
+    /// account selected for its create request. Only the redacted key is
+    /// installed in memory and persistence.
+    pub(crate) fn bind_interaction_affinity(
+        &self,
+        binding: &InteractionAffinityBinding,
+        key: AffinityKey,
+        now: Timestamp,
+    ) {
+        let Some(expires_at) =
+            now.checked_add(u64::try_from(binding.ttl.as_millis()).unwrap_or(u64::MAX))
+        else {
+            return;
+        };
+        let now_instant = Instant::now();
+        let expires_instant = now_instant.checked_add(binding.ttl).unwrap_or(now_instant);
+        for (registry_key, model) in &binding.registries {
+            let Some(registry) = self.registries.get(registry_key) else {
+                continue;
+            };
+            let evicted = match registry.restore_affinity(
+                key.clone(),
+                binding.credential.clone(),
+                binding.provider.clone(),
+                model.clone(),
+                now_instant,
+                expires_instant,
+            ) {
+                Ok(evicted) => evicted,
+                Err(_) => continue,
+            };
+            if let Some(evicted) = evicted {
+                let _ = self
+                    .store
+                    .remove_session_affinity(&format!("{registry_key}|{}", evicted.as_str()));
+            }
+            let persisted = SessionAffinity::new(
+                format!("{registry_key}|{}", key.as_str()),
+                binding.provider.as_str(),
+                binding.credential.as_str(),
+                &binding.upstream_model,
+                now,
+                expires_at,
+            );
+            let _ = self.store.upsert_session_affinity(persisted);
         }
     }
 
@@ -2514,6 +2647,139 @@ policies:
         assert_eq!(
             affinity_value(policy, &HeaderMap::new(), &context),
             Some("int_123".to_owned())
+        );
+    }
+
+    #[test]
+    fn returned_gemini_interaction_id_binds_exact_account_across_operations() {
+        let config = pooler_config::compile_yaml(
+            "gemini-returned-affinity.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: http://127.0.0.1:1}}
+accounts:
+  first: {provider: local, secret: env:POOLER_FIRST}
+  second: {provider: local, secret: env:POOLER_SECOND}
+models:
+  - id: public-gemini
+    targets:
+      - {provider: local, upstream_model: private-gemini, capabilities: [text]}
+policies:
+  interactions:
+    selection:
+      strategy: round_robin
+      accounts: [first, second]
+      affinity: {key: gemini.interaction_id, ttl: 30m}
+routes:
+  - id: create
+    listen: local
+    match: {method: POST, path: /v1beta/interactions}
+    ingress: {mode: semantic, decoder: decode.gemini.generate_content}
+    target: {provider: local, model_from: request.model, policy: interactions}
+    response: {mode: opaque}
+  - id: resource
+    listen: local
+    match: {methods: [GET, DELETE], path_template: '/v1beta/interactions/{interaction}'}
+    ingress: {mode: semantic, decoder: decode.gemini.generate_content}
+    target: {provider: local, policy: interactions}
+    response: {mode: opaque}
+  - id: cancel
+    listen: local
+    match: {method: POST, path_template: '/v1beta/interactions/{interaction}/cancel'}
+    ingress: {mode: semantic, decoder: decode.gemini.generate_content}
+    target: {provider: local, policy: interactions}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("Gemini interaction affinity config");
+        let store = Arc::new(MemoryStore::new());
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        let resource = config.route("resource").expect("resource route");
+
+        // Advance the resource route's independent round-robin cursor so an
+        // affinity miss would choose the other account.
+        drop(
+            coordinator
+                .select_with_context(
+                    &config,
+                    resource,
+                    None,
+                    &HeaderMap::new(),
+                    &SelectionContext::default(),
+                    SelectionTiming::new(1, Instant::now()),
+                )
+                .expect("unbound resource selection"),
+        );
+
+        let mut create_context = SelectionContext::default();
+        create_context.with_model("public-gemini");
+        create_context.require(Capability::Text);
+        let create = coordinator
+            .select_with_context(
+                &config,
+                config.route("create").expect("create route"),
+                None,
+                &HeaderMap::new(),
+                &create_context,
+                SelectionTiming::new(1, Instant::now()),
+            )
+            .expect("create selection");
+        assert_eq!(create.credential().map(CredentialId::as_str), Some("first"));
+        let binding = coordinator
+            .interaction_affinity_binding(&create)
+            .expect("configured interaction binding");
+        let now = timestamp_now();
+        coordinator.bind_interaction_affinity(
+            &binding,
+            AffinityKey::new("int_returned_123").expect("hashed interaction ID"),
+            now,
+        );
+        drop(create);
+
+        let persisted = store.session_affinities(now).expect("persisted affinities");
+        assert!(persisted.len() >= 3);
+        assert!(persisted
+            .iter()
+            .all(|entry| !entry.key.contains("int_returned_123")));
+        assert!(persisted.iter().all(|entry| {
+            entry.expires_at == now + Duration::from_secs(30 * 60).as_millis() as u64
+        }));
+
+        let mut follow_up = SelectionContext::default();
+        follow_up.with_affinity_value("gemini.interaction_id", "int_returned_123");
+        for route_id in ["resource", "cancel"] {
+            let selected = coordinator
+                .select_with_context(
+                    &config,
+                    config.route(route_id).expect("follow-up route"),
+                    None,
+                    &HeaderMap::new(),
+                    &follow_up,
+                    SelectionTiming::new(2, Instant::now()),
+                )
+                .expect("bound follow-up selection");
+            assert_eq!(
+                selected.credential().map(CredentialId::as_str),
+                Some("first")
+            );
+        }
+
+        let restarted = coordinator.reconfigure(&config).expect("reconfigure");
+        let selected = restarted
+            .select_with_context(
+                &config,
+                resource,
+                None,
+                &HeaderMap::new(),
+                &follow_up,
+                SelectionTiming::new(3, Instant::now()),
+            )
+            .expect("persisted follow-up selection");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("first")
         );
     }
 

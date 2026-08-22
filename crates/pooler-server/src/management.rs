@@ -1688,6 +1688,10 @@ impl ManagementApi {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "configuration persistence failed",
             ),
+            ConfigManagementError::RecoveryRequired => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "configuration persistence requires operator recovery",
+            ),
         };
         ManagementResponse::json(status, json!({"error": message}), false)
     }

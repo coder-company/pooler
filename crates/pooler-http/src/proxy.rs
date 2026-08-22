@@ -45,7 +45,7 @@ use pooler_observe::{
     QuotaRecord, RequestObservation, RetryRecord, TraceRecord, TraceRecorder, TraceStage,
     Usage as ObservedUsage,
 };
-use pooler_policy::{CommitmentState, QuotaObservation, ReplayCheck, SelectionLease};
+use pooler_policy::{AffinityKey, CommitmentState, QuotaObservation, ReplayCheck, SelectionLease};
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
 use pooler_store::{CostProvenance, RequestEvent, RequestEventKind, Store, UsageRecord};
 use ring::rand::SecureRandom;
@@ -76,6 +76,7 @@ use crate::{
     DrainGuard, DrainedBody, FrameLimitedBody, LimitedBody, NativeAuthorization,
     NativeAuthorizationRequest, NativeRuntime, NativeRuntimeError, PoolError, PoolSelection,
     PoolingCoordinator, ResponseCache, RuntimeResources, SelectionContext, SelectionTiming,
+    SseLimits, SseParser,
 };
 
 /// The erased body type used by responses returned from [`HttpProxy`].
@@ -1396,6 +1397,8 @@ where
         let cancellation = guard.cancellation_token();
         let method = request.method().clone();
         let downstream_uri = request.uri().clone();
+        let gemini_interaction_create =
+            is_exact_gemini_interaction_create(&method, downstream_uri.path());
         let version = request.version();
         let limits = route.limits();
         let downstream_headers = request.headers().clone();
@@ -1407,6 +1410,12 @@ where
         strip_hop_by_hop_headers(&mut headers);
         headers.remove(header::HOST);
         headers.remove(header::AUTHORIZATION);
+        if gemini_interaction_create {
+            headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
+        }
         let incoming = request.into_body();
         let idempotency_key_present = headers.contains_key("idempotency-key");
         let method_safe_for_cache = safe_method_for_cache(method.as_str(), idempotency_key_present);
@@ -2155,6 +2164,7 @@ where
                         request_headers: downstream_headers,
                         semantic_response_hint,
                         cache_leader,
+                        gemini_interaction_create,
                         lifecycle: lifecycle.clone(),
                     },
                 )
@@ -2526,6 +2536,7 @@ where
             request_headers,
             semantic_response_hint,
             mut cache_leader,
+            gemini_interaction_create,
             lifecycle,
         } = context;
         let (parts, body) = response.into_parts();
@@ -2535,6 +2546,24 @@ where
             .is_some();
         let mut response_headers = parts.headers;
         strip_hop_by_hop_headers(&mut response_headers);
+        if gemini_interaction_create
+            && parts.status.is_success()
+            && response_headers
+                .get_all(header::CONTENT_ENCODING)
+                .iter()
+                .any(|value| {
+                    value.to_str().map_or(true, |value| {
+                        value
+                            .split(',')
+                            .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
+                    })
+                })
+        {
+            observation.complete(CompletionClass::Unsupported, None);
+            return Err(ProxyError::SemanticResponse(
+                "compressed Gemini Interaction create responses are not supported".to_owned(),
+            ));
+        }
         let upstream = self
             .config
             .upstreams()
@@ -2614,6 +2643,25 @@ where
         }
         self.pooling
             .persist_affinity(&selection, crate::pool::timestamp_now());
+        if gemini_interaction_create && parts.status.is_success() {
+            if let Some(binding) = self.pooling.interaction_affinity_binding(&selection) {
+                let is_sse = response_headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| {
+                        value.split(';').next().is_some_and(|mime| {
+                            mime.trim().eq_ignore_ascii_case("text/event-stream")
+                        })
+                    });
+                body = GeminiInteractionAffinityBody::new(
+                    body,
+                    Arc::clone(&self.pooling),
+                    binding,
+                    is_sse,
+                )
+                .boxed();
+            }
+        }
         let usage_target = UsageTarget {
             provider: selection.provider().as_str().to_owned(),
             model: selection.upstream_model().map(str::to_owned),
@@ -2672,6 +2720,7 @@ struct FinishResponseContext {
     request_headers: HeaderMap,
     semantic_response_hint: SemanticResponseHint,
     cache_leader: Option<CacheLeader>,
+    gemini_interaction_create: bool,
     lifecycle: RequestLifecycle,
 }
 
@@ -2731,6 +2780,176 @@ impl PreparedBody {
             }
         }
     }
+}
+
+const MAX_INTERACTION_AFFINITY_OBSERVATION_BYTES: usize = 256 * 1024;
+
+struct GeminiInteractionAffinityBody {
+    inner: Pin<Box<ProxyBody>>,
+    pooling: Arc<PoolingCoordinator>,
+    binding: crate::pool::InteractionAffinityBinding,
+    observation: InteractionIdObservation,
+}
+
+enum InteractionIdObservation {
+    Json(Vec<u8>),
+    Sse {
+        parser: SseParser,
+        observed_bytes: usize,
+    },
+    Done,
+}
+
+impl GeminiInteractionAffinityBody {
+    fn new(
+        inner: ProxyBody,
+        pooling: Arc<PoolingCoordinator>,
+        binding: crate::pool::InteractionAffinityBinding,
+        sse: bool,
+    ) -> Self {
+        let observation = if sse {
+            InteractionIdObservation::sse()
+        } else {
+            InteractionIdObservation::json()
+        };
+        Self {
+            inner: Box::pin(inner),
+            pooling,
+            binding,
+            observation,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8], end_stream: bool) {
+        if let Some(key) = self.observation.observe(bytes, end_stream) {
+            self.pooling.bind_interaction_affinity(
+                &self.binding,
+                key,
+                crate::pool::timestamp_now(),
+            );
+        }
+    }
+}
+
+impl InteractionIdObservation {
+    fn json() -> Self {
+        Self::Json(Vec::new())
+    }
+
+    fn sse() -> Self {
+        Self::Sse {
+            parser: SseParser::with_limits(SseLimits::new(
+                MAX_INTERACTION_AFFINITY_OBSERVATION_BYTES,
+                MAX_INTERACTION_AFFINITY_OBSERVATION_BYTES,
+            )),
+            observed_bytes: 0,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8], end_stream: bool) -> Option<AffinityKey> {
+        let interaction_id = match self {
+            Self::Json(buffer) => {
+                if buffer.len().saturating_add(bytes.len())
+                    > MAX_INTERACTION_AFFINITY_OBSERVATION_BYTES
+                {
+                    *self = Self::Done;
+                    return None;
+                }
+                buffer.extend_from_slice(bytes);
+                if !end_stream {
+                    return None;
+                }
+                serde_json::from_slice::<serde_json::Value>(buffer)
+                    .ok()
+                    .and_then(|value| {
+                        interaction_id_from_json(&value)
+                            .and_then(|id| AffinityKey::new(id.as_bytes()).ok())
+                    })
+            }
+            Self::Sse {
+                parser,
+                observed_bytes,
+            } => {
+                let remaining =
+                    MAX_INTERACTION_AFFINITY_OBSERVATION_BYTES.saturating_sub(*observed_bytes);
+                let observed = bytes.len().min(remaining);
+                *observed_bytes = observed_bytes.saturating_add(observed);
+                let interaction_id = match parser.feed(&bytes[..observed]) {
+                    Ok(events) => events.into_iter().find_map(|event| {
+                        serde_json::from_str::<serde_json::Value>(&event.data)
+                            .ok()
+                            .and_then(|value| {
+                                interaction_id_from_json(&value)
+                                    .and_then(|id| AffinityKey::new(id.as_bytes()).ok())
+                            })
+                    }),
+                    Err(_) => {
+                        *self = Self::Done;
+                        return None;
+                    }
+                };
+                if interaction_id.is_none()
+                    && (observed < bytes.len()
+                        || *observed_bytes == MAX_INTERACTION_AFFINITY_OBSERVATION_BYTES)
+                {
+                    *self = Self::Done;
+                    return None;
+                }
+                interaction_id
+            }
+            Self::Done => return None,
+        };
+        if interaction_id.is_some() || end_stream {
+            *self = Self::Done;
+        }
+        interaction_id
+    }
+}
+
+impl Body for GeminiInteractionAffinityBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let result = self.inner.as_mut().poll_frame(context);
+        match &result {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    let end_stream = self.inner.is_end_stream();
+                    self.observe(data, end_stream);
+                }
+            }
+            Poll::Ready(None) => self.observe(&[], true),
+            Poll::Ready(Some(Err(_))) | Poll::Pending => {}
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn interaction_id_from_json(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("interaction")
+        .unwrap_or(value)
+        .as_object()?
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
 }
 
 struct SelectionLeaseBody {
@@ -3187,6 +3406,14 @@ fn openai_websocket_error(error: OpenAiResponsesWebSocketError) -> ProxyError {
         || ProxyError::Upstream(Box::new(error)),
         ProxyError::WebSocketHandshakeStatus,
     )
+}
+
+fn is_exact_gemini_interaction_create(method: &http::Method, path: &str) -> bool {
+    method == http::Method::POST
+        && matches!(
+            path,
+            "/v1/interactions" | "/v1beta/interactions" | "/v1beta2/interactions"
+        )
 }
 
 fn downstream_session_identity(headers: &HeaderMap, body: &[u8]) -> Option<Arc<str>> {
@@ -4875,6 +5102,67 @@ routes:
             .match_route_request(&request)
             .expect("template route matches");
         assert_eq!(route.id(), "templated");
+    }
+
+    #[test]
+    fn gemini_create_detection_is_exact() {
+        for path in [
+            "/v1/interactions",
+            "/v1beta/interactions",
+            "/v1beta2/interactions",
+        ] {
+            assert!(is_exact_gemini_interaction_create(
+                &http::Method::POST,
+                path
+            ));
+        }
+        assert!(!is_exact_gemini_interaction_create(
+            &http::Method::GET,
+            "/v1beta/interactions"
+        ));
+        assert!(!is_exact_gemini_interaction_create(
+            &http::Method::POST,
+            "/v1beta/interactions/int_123"
+        ));
+        assert!(!is_exact_gemini_interaction_create(
+            &http::Method::POST,
+            "/prefix/v1beta/interactions"
+        ));
+    }
+
+    #[test]
+    fn gemini_interaction_observation_handles_fragmented_json_and_sse_with_bounds() {
+        let mut json = InteractionIdObservation::json();
+        assert_eq!(json.observe(br#"{"id":"int_"#, false), None);
+        assert_eq!(
+            json.observe(br#"json","status":"completed"}"#, true),
+            Some(AffinityKey::new("int_json").expect("hashed JSON ID"))
+        );
+        assert!(matches!(json, InteractionIdObservation::Done));
+
+        let mut sse = InteractionIdObservation::sse();
+        assert_eq!(
+            sse.observe(
+                b"event: interaction.start\ndata: {\"interaction\":{\"id\":\"int_",
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            sse.observe(b"sse\",\"status\":\"in_progress\"}}\n\n", false),
+            Some(AffinityKey::new("int_sse").expect("hashed SSE ID"))
+        );
+        assert!(matches!(sse, InteractionIdObservation::Done));
+
+        let mut oversized = InteractionIdObservation::json();
+        assert_eq!(
+            oversized.observe(
+                &vec![b'x'; MAX_INTERACTION_AFFINITY_OBSERVATION_BYTES + 1],
+                false
+            ),
+            None
+        );
+        assert!(matches!(oversized, InteractionIdObservation::Done));
     }
 
     #[test]

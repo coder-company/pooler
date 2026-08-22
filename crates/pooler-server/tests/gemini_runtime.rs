@@ -371,6 +371,170 @@ async fn gemini_model_get_alias_rewrites_path_and_preserves_query() {
 }
 
 #[tokio::test]
+async fn gemini_returned_interaction_id_keeps_follow_ups_on_the_creating_account() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("affinity upstream binds");
+    let upstream_address = listener.local_addr().expect("upstream address");
+    let upstream_task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..7 {
+            let (mut stream, _) = listener.accept().await.expect("upstream accepts");
+            let request = read_request(&mut stream).await.expect("upstream request");
+            let body = if index == 2 {
+                br#"{"id":"int_bound","status":"completed"}"#.as_slice()
+            } else {
+                br#"{}"#.as_slice()
+            };
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("response headers");
+            stream.write_all(body).await.expect("response body");
+            requests.push(request);
+        }
+        requests
+    });
+    let secrets = tempfile::tempdir().expect("secret directory");
+    let first_secret = secrets.path().join("first");
+    let second_secret = secrets.path().join("second");
+    std::fs::write(&first_secret, "first-token").expect("first secret");
+    std::fs::write(&second_secret, "second-token").expect("second secret");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o600))
+            .expect("first secret permissions");
+        std::fs::set_permissions(&second_secret, std::fs::Permissions::from_mode(0o600))
+            .expect("second secret permissions");
+    }
+    let config = compile_yaml(
+        "gemini-interaction-affinity-runtime.yaml",
+        &format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: 'file:{}'}}\n  second: {{provider: local, secret: 'file:{}'}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{provider: local, upstream_model: private-gemini, capabilities: [text]}}\npolicies:\n  interactions:\n    selection:\n      strategy: round_robin\n      accounts: [first, second]\n      affinity: {{key: gemini.interaction_id, ttl: 30m}}\nroutes:\n  - id: create\n    listen: local\n    match: {{method: POST, path: /v1beta/interactions, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model, policy: interactions}}\n    response: {{mode: opaque}}\n  - id: resource\n    listen: local\n    match: {{methods: [GET, DELETE], path_template: '/v1beta/interactions/{{interaction}}'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, policy: interactions}}\n    response: {{mode: opaque}}\n  - id: cancel\n    listen: local\n    match: {{method: POST, path_template: '/v1beta/interactions/{{interaction}}/cancel'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, policy: interactions}}\n    response: {{mode: opaque}}\n",
+            first_secret.display(),
+            second_secret.display(),
+        ),
+    )
+    .expect("Gemini interaction affinity config");
+    let running = start_server(config).await;
+
+    // Advance the independent resource and cancel cursors. Without the
+    // returned-ID binding, the later follow-ups would rotate accounts.
+    for (method, path) in [
+        ("GET", "/v1beta/interactions/int_unbound"),
+        ("POST", "/v1beta/interactions/int_unbound/cancel"),
+    ] {
+        let preflight = send_method_request(running.address, method, path, b"").await;
+        assert_eq!(response_status(&preflight), 200);
+    }
+
+    let create = send_request(
+        running.address,
+        "/v1beta/interactions",
+        br#"{"model":"public-gemini","input":"hello"}"#,
+    )
+    .await;
+    assert_eq!(response_status(&create), 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&decoded_response_body(&create)).expect("create response"),
+        json!({"id":"int_bound","status":"completed"})
+    );
+
+    let get = send_method_request(
+        running.address,
+        "GET",
+        "/v1beta/interactions/int_bound",
+        b"",
+    )
+    .await;
+    assert_eq!(response_status(&get), 200);
+    let delete = send_method_request(
+        running.address,
+        "DELETE",
+        "/v1beta/interactions/int_bound",
+        b"",
+    )
+    .await;
+    assert_eq!(response_status(&delete), 200);
+    let cancel = send_method_request(
+        running.address,
+        "POST",
+        "/v1beta/interactions/int_bound/cancel",
+        b"",
+    )
+    .await;
+    assert_eq!(response_status(&cancel), 200);
+    let previous = send_request(
+        running.address,
+        "/v1beta/interactions",
+        br#"{"model":"public-gemini","input":"continue","previous_interaction_id":"int_bound"}"#,
+    )
+    .await;
+    assert_eq!(response_status(&previous), 200);
+
+    let requests = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("upstream timeout")
+        .expect("upstream task");
+    assert_eq!(requests.len(), 7);
+    for request in &requests {
+        assert_eq!(
+            header_value(request, "authorization"),
+            Some("Bearer first-token")
+        );
+        if request.starts_with(b"POST /v1beta/interactions ") {
+            assert_eq!(header_value(request, "accept-encoding"), Some("identity"));
+        }
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn gemini_interaction_create_rejects_compressed_responses_before_commitment() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("compressed upstream binds");
+    let upstream_address = listener.local_addr().expect("upstream address");
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("upstream accepts");
+        let request = read_request(&mut stream).await.expect("upstream request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: identity\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngzip",
+            )
+            .await
+            .expect("compressed response");
+        request
+    });
+    let config = compile_yaml(
+        "gemini-compressed-interaction.yaml",
+        &format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nmodels: [{{id: public-gemini, targets: [{{provider: local, upstream_model: private-gemini, capabilities: [text]}}]}}]\nroutes:\n  - id: create\n    listen: local\n    match: {{method: POST, path: /v1beta/interactions, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model}}\n    response: {{mode: opaque}}\n",
+        ),
+    )
+    .expect("compressed interaction config");
+    let running = start_server(config).await;
+    let response = send_request(
+        running.address,
+        "/v1beta/interactions",
+        br#"{"model":"public-gemini","input":"hello"}"#,
+    )
+    .await;
+    assert_eq!(response_status(&response), 502);
+    let request = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("upstream timeout")
+        .expect("upstream task");
+    assert_eq!(header_value(&request, "accept-encoding"), Some("identity"));
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn gemini_interaction_alias_rewrites_body_and_preserves_query() {
     let upstream_body = br#"{"id":"int_123","status":"completed"}"#.to_vec();
     let (upstream_address, upstream_task) = spawn_upstream("application/json", upstream_body).await;

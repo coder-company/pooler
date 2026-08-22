@@ -26,6 +26,7 @@ use crate::{
 };
 
 const DEFAULT_AFFINITY_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_AFFINITY_BINDINGS: usize = 4_096;
 
 /// A stable, redacted key used for session affinity.
 ///
@@ -1018,12 +1019,14 @@ impl CredentialRegistry {
         model: ModelId,
         last_used_at: Instant,
         expires_at: Instant,
-    ) -> Result<(), SelectionError> {
+    ) -> Result<Option<AffinityKey>, SelectionError> {
         let mut state = self.inner.state.write().map_err(lock_error)?;
         if !state.entries.contains_key(&credential) {
-            return Ok(());
+            return Ok(None);
         }
-        state.affinity.insert(
+        purge_expired_affinity(&mut state, Instant::now());
+        let evicted = insert_bounded_affinity(
+            &mut state,
             key,
             AffinityBinding {
                 credential,
@@ -1033,7 +1036,7 @@ impl CredentialRegistry {
                 expires_at,
             },
         );
-        Ok(())
+        Ok(evicted)
     }
 
     /// Take a cheap clone of one credential's health state.
@@ -1207,7 +1210,8 @@ fn select_from_state(
             .now
             .checked_add(request.affinity_ttl)
             .unwrap_or(request.now);
-        state.affinity.insert(
+        let _ = insert_bounded_affinity(
+            state,
             key,
             AffinityBinding {
                 credential: registration.credential.clone(),
@@ -1475,6 +1479,31 @@ fn resolve_alias(aliases: &BTreeMap<ModelId, ModelId>, model: &ModelId) -> Optio
         };
         current = next.clone();
     }
+}
+
+fn insert_bounded_affinity(
+    state: &mut RegistryState,
+    key: AffinityKey,
+    binding: AffinityBinding,
+) -> Option<AffinityKey> {
+    if !state.affinity.contains_key(&key) && state.affinity.len() >= MAX_AFFINITY_BINDINGS {
+        let oldest = state
+            .affinity
+            .iter()
+            .min_by(|(left_key, left), (right_key, right)| {
+                left.last_used_at
+                    .cmp(&right.last_used_at)
+                    .then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(oldest, _)| oldest.clone());
+        if let Some(oldest) = oldest {
+            state.affinity.remove(&oldest);
+            state.affinity.insert(key, binding);
+            return Some(oldest);
+        }
+    }
+    state.affinity.insert(key, binding);
+    None
 }
 
 fn purge_expired_affinity(state: &mut RegistryState, now: Instant) {
@@ -2155,6 +2184,29 @@ mod tests {
             ),
             Err(SelectionError::ModelAliasCycle)
         );
+    }
+
+    #[test]
+    fn affinity_storage_evicts_oldest_entries_at_the_hard_bound() {
+        let mut state = RegistryState::default();
+        let now = Instant::now();
+        let first = AffinityKey::new("interaction-0").expect("first key");
+        for index in 0..=MAX_AFFINITY_BINDINGS {
+            let key = AffinityKey::new(format!("interaction-{index}")).expect("affinity key");
+            let _ = insert_bounded_affinity(
+                &mut state,
+                key,
+                AffinityBinding {
+                    credential: CredentialId::new("account").expect("credential"),
+                    provider: ProviderId::new("provider").expect("provider"),
+                    model: ModelId::new("model").expect("model"),
+                    last_used_at: now + Duration::from_nanos(index as u64),
+                    expires_at: now + Duration::from_secs(60),
+                },
+            );
+        }
+        assert_eq!(state.affinity.len(), MAX_AFFINITY_BINDINGS);
+        assert!(!state.affinity.contains_key(&first));
     }
 
     #[test]
