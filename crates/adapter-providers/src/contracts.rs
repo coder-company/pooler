@@ -11,6 +11,8 @@ pub const CLI_PROXY_API_REFERENCE_REVISION: &str = "2e6b1d83f6c304a102aa33c1faf0
 pub enum ProviderKind {
     /// Moonshot AI / Kimi.
     Kimi,
+    /// Google AI Studio Gemini API.
+    AiStudio,
     /// Google Cloud Vertex AI.
     Vertex,
     /// Google Antigravity's compatibility-only internal surface.

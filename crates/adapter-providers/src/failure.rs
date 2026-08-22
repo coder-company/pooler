@@ -273,7 +273,9 @@ impl ProviderResponseClassifier {
         let (scope, causation) = quota_scope(self.provider, status, marker).or_else(|| {
             has_zero_rate_header(headers).then_some(match self.provider {
                 ProviderKind::Kimi => (ProviderQuotaScope::Account, CredentialCausation::Unknown),
-                ProviderKind::Vertex => (ProviderQuotaScope::Project, CredentialCausation::Unknown),
+                ProviderKind::AiStudio | ProviderKind::Vertex => {
+                    (ProviderQuotaScope::Project, CredentialCausation::Unknown)
+                }
                 ProviderKind::Antigravity | ProviderKind::OpenAiCompatible => {
                     (ProviderQuotaScope::Provider, CredentialCausation::Unknown)
                 }
@@ -353,6 +355,14 @@ fn quota_scope(
                 || marker.contains("quota_exhausted") =>
         {
             Some((ProviderQuotaScope::Account, CredentialCausation::Proven))
+        }
+        ProviderKind::AiStudio
+            if marker.contains("resource_exhausted")
+                || marker.contains("quota_exceeded")
+                || marker.contains("quota_exhausted")
+                || marker.contains("rate_limit_exceeded") =>
+        {
+            Some((ProviderQuotaScope::Project, CredentialCausation::Unknown))
         }
         ProviderKind::Vertex
             if marker.contains("quota_exceeded") || marker.contains("quota_exhausted") =>

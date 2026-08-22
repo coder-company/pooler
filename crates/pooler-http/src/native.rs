@@ -261,9 +261,28 @@ impl NativeRuntime {
                     Arc::new(CodexNativeProviderBinding::new(provider)),
                 );
             } else if is_configured_native_kind(native.kind()) {
+                let provider = if native.kind().eq_ignore_ascii_case("kimi")
+                    || native.kind().eq_ignore_ascii_case("vertex")
+                {
+                    upstream
+                        .oauth()
+                        .map(|oauth| {
+                            build_configured_oauth_provider(
+                                upstream.id(),
+                                oauth,
+                                Arc::clone(&transport),
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
                 bindings.insert(
                     upstream.id().to_owned(),
-                    Arc::new(ConfiguredNativeProviderBinding::new(native.kind())),
+                    Arc::new(ConfiguredNativeProviderBinding::new(
+                        native.kind(),
+                        provider,
+                    )),
                 );
             }
         }
@@ -763,12 +782,14 @@ impl NativeProviderBinding for CodexNativeProviderBinding {
 /// authorization boundary, and the only retained result is a header delta.
 struct ConfiguredNativeProviderBinding {
     kind: String,
+    provider: Option<Arc<dyn OAuthRefresher>>,
 }
 
 impl ConfiguredNativeProviderBinding {
-    fn new(kind: &str) -> Self {
+    fn new(kind: &str, provider: Option<Arc<dyn OAuthRefresher>>) -> Self {
         Self {
             kind: kind.to_owned(),
+            provider,
         }
     }
 }
@@ -780,11 +801,25 @@ impl NativeProviderBinding for ConfiguredNativeProviderBinding {
 
     fn materialize_oauth_authorization(
         &self,
-        _snapshot: &TokenSnapshot,
+        snapshot: &TokenSnapshot,
         _account_id: Option<&str>,
         _request_headers: &HeaderMap,
     ) -> Result<NativeAuthorization, NativeRuntimeError> {
-        Err(NativeRuntimeError::Unsupported)
+        if self.provider.is_none() {
+            return Err(NativeRuntimeError::Unsupported);
+        }
+        let authorization = AuthPlacement::from_configured_parts("bearer_secret", None, None)
+            .map_err(|_| NativeRuntimeError::Authorization)?
+            .materialize(snapshot.tokens().access_token())
+            .map_err(|_| NativeRuntimeError::Authorization)?;
+        let mut headers = HeaderMap::new();
+        authorization.apply_to(&mut headers);
+        Ok(NativeAuthorization {
+            headers,
+            removals: Vec::new(),
+            generation: snapshot.generation(),
+            refreshable: true,
+        })
     }
 
     fn materialize_configured_authorization(
@@ -813,7 +848,7 @@ impl NativeProviderBinding for ConfiguredNativeProviderBinding {
     }
 
     fn refresh_provider(&self) -> Option<&dyn OAuthRefresher> {
-        None
+        self.provider.as_deref()
     }
 
     fn quota_evidence(
@@ -859,6 +894,30 @@ fn resolve_secret(secret: &SecretRef) -> Result<SecretValue, NativeRuntimeError>
         return Err(NativeRuntimeError::CredentialUnavailable);
     }
     Ok(secret)
+}
+
+fn build_configured_oauth_provider(
+    id: &str,
+    oauth: &OAuthPlan,
+    transport: Arc<HyperOAuthTransport>,
+) -> Result<Arc<dyn OAuthRefresher>, NativeRuntimeError> {
+    let mut config = OAuthClientConfig::new(
+        oauth.client_id().to_owned(),
+        oauth.callback().clone(),
+        oauth.authorization_endpoint().clone(),
+        oauth.token_endpoint().clone(),
+    )
+    .map_err(|_| NativeRuntimeError::Configuration)?
+    .with_scopes(oauth.scopes().iter().map(ToString::to_string));
+    if let Some(endpoint) = oauth.revocation_endpoint() {
+        config = config.with_revocation_endpoint(endpoint.clone());
+    }
+    if let Some(endpoint) = oauth.identity_endpoint() {
+        config = config.with_identity_endpoint(endpoint.clone());
+    }
+    let provider = StandardOAuthProvider::new(id, config, transport)
+        .map_err(|_| NativeRuntimeError::Configuration)?;
+    Ok(Arc::new(provider))
 }
 
 fn build_codex_provider(
@@ -1043,6 +1102,62 @@ mod tests {
             ),
         )
         .expect("configured native config")
+    }
+
+    fn compatible_config(static_path: &Path) -> CompiledConfig {
+        pooler_config::compile_yaml(
+            "native-compatible-test.yaml",
+            &format!(
+                "version: 1\nupstreams:\n  compatible:\n    url: http://127.0.0.1:8336\n    native: {{kind: compatible}}\n    auth:\n      kind: header\n      header: x-provider-token\n      value_prefix: 'Token '\n      secret: 'file:{}'\n",
+                static_path.display()
+            ),
+        )
+        .expect("compatible native config")
+    }
+
+    fn kimi_oauth_config() -> CompiledConfig {
+        pooler_config::compile_yaml(
+            "native-kimi-oauth-test.yaml",
+            r#"
+version: 1
+upstreams:
+  kimi-coding:
+    url: http://127.0.0.1:8334
+    native: {kind: kimi}
+    oauth:
+      authorization_endpoint: https://auth.kimi.com/api/oauth/authorize
+      token_endpoint: https://auth.kimi.com/api/oauth/token
+      client_id: operator-owned-client
+      scopes: [operator-registered-scope]
+accounts:
+  kimi-subscription: {provider: kimi-coding, auth_kind: oauth}
+"#,
+        )
+        .expect("Kimi OAuth config")
+    }
+
+    fn vertex_oauth_config() -> CompiledConfig {
+        pooler_config::compile_yaml(
+            "native-vertex-oauth-test.yaml",
+            r#"
+version: 1
+upstreams:
+  vertex:
+    url: http://127.0.0.1:8335
+    native:
+      kind: vertex
+      project: test-project
+      location: us-central1
+    oauth:
+      authorization_endpoint: https://accounts.google.com/o/oauth2/v2/auth
+      token_endpoint: https://oauth2.googleapis.com/token
+      client_id: operator-owned-client
+      scopes: [https://www.googleapis.com/auth/cloud-platform]
+accounts:
+  vertex-user: {provider: vertex, auth_kind: oauth}
+"#,
+        )
+        .expect("Vertex OAuth config")
     }
 
     fn configured_without_auth_config() -> CompiledConfig {
@@ -1334,6 +1449,130 @@ accounts:
     }
 
     #[tokio::test]
+    async fn configured_kimi_oauth_materializes_refreshable_bearer_token() {
+        let credential = CredentialId::new("kimi-subscription").expect("credential");
+        let store = Arc::new(MemoryOAuthTokenStore::new());
+        store.insert(
+            credential.clone(),
+            OAuthTokens::bearer(
+                "kimi-oauth-access",
+                Some("kimi-oauth-refresh"),
+                Some(SystemTime::now() + Duration::from_secs(3600)),
+            ),
+        );
+        let config = kimi_oauth_config();
+        let runtime = NativeRuntime::new(&config, store).expect("Kimi native runtime");
+        let upstream = &config.upstreams()["kimi-coding"];
+
+        let authorization = runtime
+            .authorize(
+                upstream,
+                &credential,
+                &HeaderMap::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("Kimi OAuth authorization");
+        let mut headers = HeaderMap::new();
+        authorization
+            .apply_to(&mut headers)
+            .expect("authorization headers");
+
+        assert!(authorization.is_refreshable());
+        assert_header_value(&headers, "authorization", b"Bearer kimi-oauth-access");
+    }
+
+    #[tokio::test]
+    async fn kimi_api_key_and_subscription_oauth_identities_remain_distinct() {
+        let api_secret = secret_file("kimi-open-platform-key");
+        let api_reference =
+            SecretRef::parse(&format!("file:{}", api_secret.path().display())).expect("API ref");
+        let api_credential = CredentialId::new("kimi-open-platform").expect("credential");
+        let oauth_credential = CredentialId::new("kimi-subscription").expect("credential");
+        let store = Arc::new(MemoryOAuthTokenStore::new());
+        store.insert(
+            oauth_credential.clone(),
+            OAuthTokens::bearer(
+                "kimi-subscription-access",
+                Some("kimi-subscription-refresh"),
+                Some(SystemTime::now() + Duration::from_secs(3600)),
+            ),
+        );
+        let config = kimi_oauth_config();
+        let runtime = NativeRuntime::new(&config, store).expect("Kimi native runtime");
+        let upstream = &config.upstreams()["kimi-coding"];
+
+        assert!(matches!(
+            runtime
+                .authorize_attempt(NativeAuthorizationRequest {
+                    upstream,
+                    account_auth_kind: Some(AccountAuthKind::ApiKey),
+                    credential: Some(&api_credential),
+                    account_secret: Some(&api_reference),
+                    static_auth: upstream.auth(),
+                    request_headers: &HeaderMap::new(),
+                    cancellation: CancellationToken::new(),
+                })
+                .await,
+            Err(NativeRuntimeError::Authorization)
+        ));
+
+        let oauth_authorization = runtime
+            .authorize(
+                upstream,
+                &oauth_credential,
+                &HeaderMap::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("Kimi subscription authorization");
+        let mut oauth_headers = HeaderMap::new();
+        oauth_authorization
+            .apply_to(&mut oauth_headers)
+            .expect("OAuth headers");
+        assert!(oauth_authorization.is_refreshable());
+        assert_header_value(
+            &oauth_headers,
+            "authorization",
+            b"Bearer kimi-subscription-access",
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_vertex_oauth_materializes_refreshable_access_token() {
+        let credential = CredentialId::new("vertex-user").expect("credential");
+        let store = Arc::new(MemoryOAuthTokenStore::new());
+        store.insert(
+            credential.clone(),
+            OAuthTokens::bearer(
+                "vertex-oauth-access",
+                Some("vertex-oauth-refresh"),
+                Some(SystemTime::now() + Duration::from_secs(3600)),
+            ),
+        );
+        let config = vertex_oauth_config();
+        let runtime = NativeRuntime::new(&config, store).expect("Vertex native runtime");
+        let upstream = &config.upstreams()["vertex"];
+
+        let authorization = runtime
+            .authorize(
+                upstream,
+                &credential,
+                &HeaderMap::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("Vertex OAuth authorization");
+        let mut headers = HeaderMap::new();
+        authorization
+            .apply_to(&mut headers)
+            .expect("authorization headers");
+
+        assert!(authorization.is_refreshable());
+        assert_header_value(&headers, "authorization", b"Bearer vertex-oauth-access");
+    }
+
+    #[tokio::test]
     async fn configured_oauth_account_fails_closed_without_fallback() {
         let static_secret = secret_file("static-secret");
         let config = configured_config(static_secret.path());
@@ -1349,6 +1588,59 @@ accounts:
                     account_auth_kind: Some(AccountAuthKind::OAuth),
                     credential: Some(&credential),
                     account_secret: Some(&account_secret),
+                    static_auth: upstream.auth(),
+                    request_headers: &HeaderMap::new(),
+                    cancellation: CancellationToken::new(),
+                })
+                .await,
+            Err(NativeRuntimeError::Authorization)
+        ));
+    }
+
+    #[tokio::test]
+    async fn compatible_api_key_and_oauth_identities_do_not_substitute() {
+        let static_secret = secret_file("static-fallback");
+        let account_secret = secret_file("compatible-account-key");
+        let account_reference =
+            SecretRef::parse(&format!("file:{}", account_secret.path().display()))
+                .expect("account secret reference");
+        let config = compatible_config(static_secret.path());
+        let upstream = &config.upstreams()["compatible"];
+        let runtime =
+            NativeRuntime::new(&config, Arc::new(PanicOAuthStore)).expect("native runtime");
+        let api_credential = CredentialId::new("compatible-api").expect("credential");
+
+        let authorization = runtime
+            .authorize_attempt(NativeAuthorizationRequest {
+                upstream,
+                account_auth_kind: Some(AccountAuthKind::ApiKey),
+                credential: Some(&api_credential),
+                account_secret: Some(&account_reference),
+                static_auth: upstream.auth(),
+                request_headers: &HeaderMap::new(),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("compatible API-key authorization");
+        let mut headers = HeaderMap::new();
+        authorization
+            .apply_once(&mut headers)
+            .expect("API-key header");
+        assert_header_value(
+            &headers,
+            "x-provider-token",
+            b"Token compatible-account-key",
+        );
+        assert_eq!(headers.get("authorization"), None);
+
+        let oauth_credential = CredentialId::new("compatible-oauth").expect("credential");
+        assert!(matches!(
+            runtime
+                .authorize_attempt(NativeAuthorizationRequest {
+                    upstream,
+                    account_auth_kind: Some(AccountAuthKind::OAuth),
+                    credential: Some(&oauth_credential),
+                    account_secret: None,
                     static_auth: upstream.auth(),
                     request_headers: &HeaderMap::new(),
                     cancellation: CancellationToken::new(),

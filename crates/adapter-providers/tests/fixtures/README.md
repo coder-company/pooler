@@ -11,6 +11,9 @@ conformance:
   <https://cloud.google.com/vertex-ai/generative-ai/docs/start/quickstart>,
   <https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/api-errors>, and
   <https://cloud.google.com/vertex-ai/generative-ai/docs/resources/throughput-quota>
+- Google AI Studio Gemini API keys and project-level rate limits:
+  <https://ai.google.dev/gemini-api/docs/api-key> and
+  <https://ai.google.dev/gemini-api/docs/rate-limits>
 - OpenAI authentication and model-list baseline:
   <https://developers.openai.com/api/reference/overview> and
   <https://developers.openai.com/api/reference/resources/models>

@@ -1,0 +1,35 @@
+{
+  "source": {
+    "provider": "operator-configured OpenAI-compatible fixture vendor",
+    "contract": "explicit operation allow-list, endpoint paths, and authentication placement"
+  },
+  "mapping": {
+    "public_model": "public-model",
+    "upstream_model": "vendor-model",
+    "downstream_models_path": "/v1/models",
+    "upstream_models_path": "/vendor/v2/models",
+    "downstream_chat_path": "/v1/chat/completions",
+    "upstream_chat_path": "/vendor/v2/generate"
+  },
+  "request": {
+    "model": "public-model",
+    "messages": [
+      {
+        "role": "user",
+        "content": "sanitized"
+      }
+    ],
+    "stream": false,
+    "vendor_extension": {
+      "preserved": true
+    }
+  },
+  "authentication": {
+    "placement": "x-provider-token: Token <operator credential>",
+    "caller_credential_headers": "stripped or overwritten by selected upstream authorization"
+  },
+  "redactions": [
+    "The provider name, host, model, prompt, and credential are synthetic.",
+    "This proves explicit nonstandard configuration against a strict loopback contract, not compatibility with an unnamed live vendor."
+  ]
+}

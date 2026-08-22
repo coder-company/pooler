@@ -15,7 +15,10 @@ use std::{
     time::{Duration, Instant as StdInstant},
 };
 
-use adapter_providers::{AuthPlacement, ProviderKind, ProviderResponseClassifier};
+use adapter_providers::{
+    AuthPlacement, ProviderAdapter, ProviderKind, ProviderOperation, ProviderResponseClassifier,
+    VertexAdapter,
+};
 use base64::Engine;
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
@@ -1832,6 +1835,8 @@ where
             .semantic
             .rewrite_upstream_uri(route, downstream_uri, selection.upstream_model(), uri)
             .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
+        let uri =
+            rewrite_native_upstream_uri(upstream, downstream_uri, selection.upstream_model(), uri)?;
         let header_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
         route
             .limits()
@@ -2904,6 +2909,7 @@ fn provider_quota_observations(
 ) -> Vec<QuotaObservation> {
     let provider = match upstream.native().map(|native| native.kind()) {
         Some(kind) if kind.eq_ignore_ascii_case("kimi") => ProviderKind::Kimi,
+        Some(kind) if kind.eq_ignore_ascii_case("gemini") => ProviderKind::AiStudio,
         Some(kind) if kind.eq_ignore_ascii_case("vertex") => ProviderKind::Vertex,
         Some(kind) if kind.eq_ignore_ascii_case("antigravity") => ProviderKind::Antigravity,
         _ => ProviderKind::OpenAiCompatible,
@@ -2911,6 +2917,58 @@ fn provider_quota_observations(
     ProviderResponseClassifier::new(provider)
         .parse_policy_observations(status, headers, body)
         .unwrap_or_default()
+}
+
+fn rewrite_native_upstream_uri(
+    upstream: &UpstreamPlan,
+    downstream: &Uri,
+    upstream_model: Option<&str>,
+    upstream_uri: Uri,
+) -> Result<Uri, ProxyError> {
+    let Some(native) = upstream.native() else {
+        return Ok(upstream_uri);
+    };
+    if !native.kind().eq_ignore_ascii_case("vertex") {
+        return Ok(upstream_uri);
+    }
+    let Some(project) = native.project() else {
+        return Ok(upstream_uri);
+    };
+    let Some(location) = native.location() else {
+        return Ok(upstream_uri);
+    };
+    let operation = match downstream.path().rsplit_once(':').map(|(_, action)| action) {
+        Some("generateContent") => ProviderOperation::GenerateContent,
+        Some("streamGenerateContent") => ProviderOperation::StreamGenerateContent,
+        Some("countTokens") => ProviderOperation::CountTokens,
+        Some("predict") => ProviderOperation::Predict,
+        _ => return Ok(upstream_uri),
+    };
+    let model = upstream_model.ok_or_else(|| {
+        ProxyError::SemanticRequest("Vertex model action requires a selected model".to_owned())
+    })?;
+    let mut adapter = VertexAdapter::project(project, location)
+        .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
+    if let Some(publisher) = native.publisher() {
+        adapter = adapter
+            .with_publisher(publisher)
+            .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
+    }
+    let endpoint = adapter
+        .endpoint_candidates(operation, Some(model))
+        .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ProxyError::InvalidUri)?;
+    let mut target =
+        url::Url::parse(&upstream_uri.to_string()).map_err(|_| ProxyError::InvalidUri)?;
+    target.set_path(endpoint.path());
+    if let Some(query) = upstream_uri.query() {
+        target.set_query(Some(query));
+    } else {
+        target.set_query(endpoint.query());
+    }
+    target.as_str().parse().map_err(|_| ProxyError::InvalidUri)
 }
 
 fn upstream_uri(

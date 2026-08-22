@@ -719,6 +719,9 @@ fn native_schema() -> Value {
         properties([
             ("kind", optional_string()),
             ("quota_endpoint", optional_string()),
+            ("project", optional_string()),
+            ("location", optional_string()),
+            ("publisher", optional_string()),
         ]),
         &[],
         false,

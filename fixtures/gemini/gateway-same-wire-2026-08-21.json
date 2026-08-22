@@ -1,6 +1,12 @@
 {
   "fixture_version": "2026-08-21",
   "provenance": "Sanitized request shapes from the Google Gemini Models and Interactions REST references, replayed against Pooler's strict loopback Google contract; no live credential or provider response is included.",
+  "documentation": {
+    "models": "https://ai.google.dev/api/models",
+    "api_key": "https://ai.google.dev/gemini-api/docs/api-key",
+    "rate_limits": "https://ai.google.dev/gemini-api/docs/rate-limits"
+  },
+  "account_identity": "AI Studio project API key; never a Vertex OAuth or service-account identity",
   "requests": [
     {
       "method": "GET",

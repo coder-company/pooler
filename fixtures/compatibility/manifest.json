@@ -430,26 +430,148 @@
       ]
     },
     {
+      "adapter": "kimi",
+      "protocol": "openai-compatible-chat",
+      "version": "open-platform-2026-08-22",
+      "fixture": "../kimi/gateway-native-2026-08-22.json",
+      "equivalence": "json_structural",
+      "status": "sanitized_local_reference",
+      "source": "Kimi Open Platform public API paths replayed through Pooler's mounted strict local Kimi contract",
+      "supported_capabilities": [
+        "chat_completions",
+        "model_discovery",
+        "bearer_authentication",
+        "credential_sanitization",
+        "same_wire_json"
+      ],
+      "unsupported_capabilities": [
+        "live_provider",
+        "subscription_oauth_conformance"
+      ],
+      "notes": [
+        "The Kimi Open Platform API-key identity remains separate from Kimi Coding subscription profiles.",
+        "This fixture proves mounted routing and authentication against a strict loopback contract; it does not claim live Kimi conformance.",
+        "Replay: cargo test -p pooler-server --test gateway_provider_auth kimi_open_platform_is_mounted_with_its_native_contract --locked."
+      ]
+    },
+    {
+      "adapter": "vertex",
+      "protocol": "publisher-model-actions",
+      "version": "v1-2026-08-22",
+      "fixture": "../vertex/gateway-native-2026-08-22.json",
+      "equivalence": "http_same_wire",
+      "status": "sanitized_local_reference",
+      "source": "Documented Vertex publisher-model action paths replayed through Pooler's mounted strict local Vertex contract",
+      "supported_capabilities": [
+        "project_location_endpoint_construction",
+        "generate_content",
+        "stream_generate_content",
+        "count_tokens",
+        "oauth_bearer_authentication",
+        "credential_sanitization",
+        "vertex_catalog_parsing",
+        "google_rpc_quota_causation"
+      ],
+      "unsupported_capabilities": [
+        "live_provider",
+        "service_account_jwt_minting",
+        "api_key_identity_substitution"
+      ],
+      "notes": [
+        "The mounted test proves project/location/publisher path construction, semantic Gemini request handling, stream query canonicalization, and bearer sanitization.",
+        "Existing provider-contract fixtures separately execute Vertex catalog parsing and Google RPC quota/error/retry causation.",
+        "This fixture proves mounted routing against a strict loopback contract; it does not claim live Vertex conformance.",
+        "Replay: cargo test -p pooler-server --test gateway_provider_auth vertex_model_actions_use_project_paths_and_google_access_tokens --locked."
+      ]
+    },
+    {
+      "adapter": "compatible",
+      "protocol": "explicit-openai-compatible",
+      "version": "config-v1-2026-08-22",
+      "fixture": "../compatible/nonstandard-openai-2026-08-22.json",
+      "equivalence": "json_structural",
+      "status": "sanitized_local_reference",
+      "source": "Synthetic nonstandard OpenAI-compatible paths and authentication replayed through Pooler's explicitly configured strict loopback contract",
+      "supported_capabilities": [
+        "model_discovery",
+        "chat_completions",
+        "nonstandard_endpoint_paths",
+        "custom_header_authentication",
+        "credential_sanitization",
+        "public_to_upstream_model_mapping",
+        "vendor_extension_preservation",
+        "bounded_quota_and_error_mapping"
+      ],
+      "unsupported_capabilities": [
+        "live_provider",
+        "undeclared_operations",
+        "inferred_vendor_contract",
+        "undocumented_oauth_or_subscription"
+      ],
+      "notes": [
+        "No real vendor is named or claimed; every nonstandard behavior is operator-declared.",
+        "OAuth and subscription accounts fail closed instead of borrowing an API-key identity.",
+        "Existing provider-contract fixtures separately exercise explicit operation allow-lists and generic quota/error causation.",
+        "Replay: cargo test -p pooler-server --test gateway_provider_auth explicit_compatible_provider_honors_nonstandard_paths_auth_and_models --locked."
+      ]
+    },
+    {
+      "adapter": "antigravity",
+      "protocol": "pinned-internal",
+      "version": "2e6b1d83-2026-08-22",
+      "fixture": "../antigravity/gateway-native-2026-08-22.json",
+      "equivalence": "http_same_wire",
+      "status": "sanitized_local_reference",
+      "source": "Pinned CLIProxyAPI Antigravity request and model-hint shapes replayed through Pooler's explicitly mounted strict loopback contract",
+      "supported_capabilities": [
+        "generate_content",
+        "stream_generate_content",
+        "count_tokens",
+        "model_hint_discovery",
+        "bearer_authentication",
+        "credential_sanitization",
+        "same_wire_internal_envelope",
+        "credit_and_quota_causation"
+      ],
+      "unsupported_capabilities": [
+        "public_api_conformance",
+        "live_provider",
+        "embedded_oauth_registration",
+        "automatic_control_plane_onboarding"
+      ],
+      "notes": [
+        "The compatibility surface is disabled unless native.kind antigravity and explicit internal routes are configured.",
+        "Pooler preserves owner-supplied internal envelopes and does not invent proprietary OAuth clients or profile metadata.",
+        "Existing provider-contract fixtures separately execute bounded model-hint, credit, quota, error, and cooldown parsing.",
+        "Replay: cargo test -p pooler-server --test gateway_provider_auth antigravity_internal_surface_is_explicitly_mounted_same_wire --locked."
+      ]
+    },
+    {
       "adapter": "gemini",
       "protocol": "models-actions-interactions",
       "version": "2026-08-21",
       "fixture": "../gemini/gateway-same-wire-2026-08-21.json",
       "equivalence": "http_same_wire",
       "status": "sanitized_local_reference",
-      "source": "Sanitized Google Models and Interactions REST request shapes replayed through the gateway against Pooler's strict loopback Google contract",
+      "source": "Sanitized Google AI Studio Models and Interactions REST shapes replayed through Pooler's mounted strict loopback Google contract",
       "supported_capabilities": [
         "model_discovery",
         "model_get",
         "generate_content",
         "stream_generate_content",
         "count_tokens",
-        "interactions_create_get_delete_cancel"
+        "interactions_create_get_delete_cancel",
+        "api_key_authentication",
+        "credential_sanitization",
+        "project_quota_causation"
       ],
       "unsupported_capabilities": [
         "live_provider",
         "cross_protocol_translation"
       ],
       "notes": [
+        "AI Studio API-key identity remains distinct from Vertex OAuth and service-account identities.",
+        "Google RPC quota fixtures prove project-scoped retry causation without credential blame.",
         "This is executable same-wire routing evidence, not a live Google provider conformance claim.",
         "Replay: cargo test -p pooler-server --test gateway_provider_auth gemini_routes_satisfy_a_strict_gemini_endpoint --locked."
       ]

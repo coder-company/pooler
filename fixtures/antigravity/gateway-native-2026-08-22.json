@@ -1,0 +1,63 @@
+{
+  "source": {
+    "contract": "CLIProxyAPI pinned compatibility reference",
+    "revision": "2e6b1d83f6c304a102aa33c1faf0a4f94d0d331e",
+    "request_reference": "internal/runtime/executor/antigravity_executor_request.go",
+    "model_reference": "sdk/cliproxy/antigravity_models.go"
+  },
+  "requests": [
+    {
+      "name": "generate-content",
+      "method": "POST",
+      "path": "/v1internal:generateContent",
+      "query": null,
+      "body": {
+        "model": "gemini-fixture",
+        "project": "fixture-project",
+        "requestType": "agent",
+        "requestId": "agent-sanitized",
+        "request": {
+          "contents": [
+            {
+              "role": "user",
+              "parts": [
+                {
+                  "text": "sanitized"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "stream-generate-content",
+      "method": "POST",
+      "path": "/v1internal:streamGenerateContent",
+      "query": "alt=sse"
+    },
+    {
+      "name": "count-tokens",
+      "method": "POST",
+      "path": "/v1internal:countTokens",
+      "query": null
+    },
+    {
+      "name": "fetch-model-hints",
+      "method": "POST",
+      "path": "/v1internal:fetchAvailableModels",
+      "query": null,
+      "body": {}
+    }
+  ],
+  "authentication": {
+    "placement": "Authorization: Bearer <owner-private imported access token>",
+    "user_agent": "synthetic compatibility marker",
+    "caller_credential_headers": "stripped"
+  },
+  "redactions": [
+    "No OAuth client credential, provider access token, user profile, prompt, response, or authorization header is retained.",
+    "Project, request, model, and session identifiers are synthetic.",
+    "This is opt-in pinned strict-loopback compatibility evidence, not a public API or live-provider conformance claim."
+  ]
+}

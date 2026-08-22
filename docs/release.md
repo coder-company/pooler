@@ -59,9 +59,11 @@ it before publication:
 ```
 
 Every workflow job uses a pinned Blacksmith ephemeral runner class. Linux x86_64
-jobs use `blacksmith-4vcpu-ubuntu-2404`; the Linux ARM64 release row uses the
-matching `blacksmith-4vcpu-ubuntu-2404-arm` image. macOS quality and both Apple
-release targets use the ARM64 M4-backed `blacksmith-6vcpu-macos-15` image. Rust
+jobs use the lower-cost `blacksmith-2vcpu-ubuntu-2404`; the Linux ARM64 release
+row uses the matching `blacksmith-2vcpu-ubuntu-2404-arm` image. macOS quality and
+both Apple release targets retain the ARM64 M4-backed
+`blacksmith-6vcpu-macos-15` image because Blacksmith's smallest available macOS
+class is 6 vCPU. Rust
 builds both `x86_64-apple-darwin` and `aarch64-apple-darwin` on that native macOS
 host, so neither platform row is a Linux proxy.
 

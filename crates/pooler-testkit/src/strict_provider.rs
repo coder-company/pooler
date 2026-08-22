@@ -53,6 +53,12 @@ pub struct ProviderContract {
 const FOREIGN_CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "x-api-key", "x-goog-api-key"];
 
 const OPENAI_MODELS: &str = r#"{"data":[{"id":"gpt-4o"}]}"#;
+const KIMI_MODELS: &str = r#"{"data":[{"id":"kimi-k2.5","object":"model"}]}"#;
+const VERTEX_MODELS: &str = r#"{"publisherModels":[{"name":"publishers/google/models/gemini-2.5-pro","supportedActions":["generateContent","streamGenerateContent","countTokens"]}]}"#;
+const VERTEX_GENERATE_RESPONSE: &str = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"sanitized"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2},"modelVersion":"gemini-2.5-pro"}"#;
+const VERTEX_STREAM_RESPONSE: &str = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"sanitized\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2},\"modelVersion\":\"gemini-2.5-pro\"}\n\n";
+const ANTIGRAVITY_MODELS: &str = r#"{"webSearchModelIds":["GEMINI-FIXTURE","claude-fixture"]}"#;
+const COMPATIBLE_MODELS: &str = r#"{"object":"list","data":[{"id":"vendor-model","object":"model","owned_by":"fixture-vendor"}]}"#;
 const XAI_MODELS: &str = r#"{"data":[{"id":"grok-4.1-fast"}]}"#;
 const ANTHROPIC_MODELS: &str = r#"{"data":[{"id":"claude-sonnet-4"}]}"#;
 const GEMINI_MODELS: &str = r#"{"models":[{"name":"models/gemini-2.5-pro","supportedGenerationMethods":["generateContent","streamGenerateContent","countTokens"]}]}"#;
@@ -225,6 +231,142 @@ impl ProviderContract {
                     content_type: None,
                     required_body_fields: &[],
                     response: "",
+                },
+            ],
+        }
+    }
+
+    /// Kimi Open Platform: bearer credential and OpenAI-compatible model/chat paths.
+    #[must_use]
+    pub const fn kimi() -> Self {
+        Self {
+            name: "kimi",
+            credential_header: "authorization",
+            credential_prefix: "Bearer ",
+            required_headers: &[],
+            routes: &[
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1/models",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: KIMI_MODELS,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["model", "messages"],
+                    response: ACCEPTED,
+                },
+            ],
+        }
+    }
+
+    /// Vertex AI: Google access token and project/location publisher-model paths.
+    #[must_use]
+    pub const fn vertex() -> Self {
+        Self {
+            name: "vertex",
+            credential_header: "authorization",
+            credential_prefix: "Bearer ",
+            required_headers: &[],
+            routes: &[
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1/projects/test-project/locations/us-central1/publishers/google/models",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: VERTEX_MODELS,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-pro:generateContent",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["contents"],
+                    response: VERTEX_GENERATE_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-pro:streamGenerateContent",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["contents"],
+                    response: VERTEX_STREAM_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-pro:countTokens",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["contents"],
+                    response: ACCEPTED,
+                },
+            ],
+        }
+    }
+
+    /// Antigravity pinned compatibility surface: bearer credential and internal paths.
+    #[must_use]
+    pub const fn antigravity() -> Self {
+        Self {
+            name: "antigravity",
+            credential_header: "authorization",
+            credential_prefix: "Bearer ",
+            required_headers: &[("user-agent", "antigravity/hub/sanitized darwin/arm64")],
+            routes: &[
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1internal:generateContent",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["model", "request"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1internal:streamGenerateContent",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["model", "request"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1internal:countTokens",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["model", "request"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1internal:fetchAvailableModels",
+                    content_type: Some("application/json"),
+                    required_body_fields: &[],
+                    response: ANTIGRAVITY_MODELS,
+                },
+            ],
+        }
+    }
+
+    /// Explicit OpenAI-compatible vendor with nonstandard paths and auth header.
+    #[must_use]
+    pub const fn compatible() -> Self {
+        Self {
+            name: "compatible",
+            credential_header: "x-provider-token",
+            credential_prefix: "Token ",
+            required_headers: &[],
+            routes: &[
+                ProviderRoute {
+                    method: "GET",
+                    path: "/vendor/v2/models",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: COMPATIBLE_MODELS,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/vendor/v2/generate",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["model", "messages"],
+                    response: ACCEPTED,
                 },
             ],
         }

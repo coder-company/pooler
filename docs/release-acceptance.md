@@ -5,9 +5,9 @@ reproducible result. A green unit-test run alone is not release acceptance.
 The current repository status is intentionally pending for external client,
 provider, platform, performance, stress, and artifact evidence. Every workflow
 job targets an explicit Blacksmith runner class: Linux x86_64 uses
-`blacksmith-4vcpu-ubuntu-2404`, Linux ARM64 release builds use
-`blacksmith-4vcpu-ubuntu-2404-arm`, and macOS quality and release builds use
-`blacksmith-6vcpu-macos-15`. A queued or failed macOS lane is not a passing
+`blacksmith-2vcpu-ubuntu-2404`, Linux ARM64 release builds use
+`blacksmith-2vcpu-ubuntu-2404-arm`, and macOS quality and release builds retain
+`blacksmith-6vcpu-macos-15`, Blacksmith's smallest available macOS class. A queued or failed macOS lane is not a passing
 result. CI, Hardening, and Secret Scan run automatically for each pushed commit
 and do not expose manual dispatch. Push CI always includes macOS; reusable
 callers default `include-macos` to false, while release CI explicitly sets it to

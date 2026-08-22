@@ -28,7 +28,7 @@ env:
 jobs:
   quality:
     name: Quality (Linux)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       # Action references are immutable commit pins. Dependabot updates them
       # weekly after checking the corresponding release tag.
@@ -97,7 +97,7 @@ jobs:
 
   fixtures-and-properties:
     name: Fixtures and property harnesses
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -121,7 +121,7 @@ jobs:
 
   supply-chain:
     name: Dependency and license policy
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

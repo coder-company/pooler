@@ -826,6 +826,12 @@ pub struct NativeProviderConfig {
     pub kind: Option<String>,
     /// Optional provider quota endpoint.
     pub quota_endpoint: Option<String>,
+    /// Provider project identifier used by resource-addressed native APIs.
+    pub project: Option<String>,
+    /// Provider region/location used by resource-addressed native APIs.
+    pub location: Option<String>,
+    /// Provider publisher/namespace; Vertex defaults to `google`.
+    pub publisher: Option<String>,
 }
 
 /// Downstream authentication declaration.
@@ -1361,6 +1367,9 @@ impl OAuthPlan {
 pub struct NativeProviderPlan {
     kind: Arc<str>,
     quota_endpoint: Option<Url>,
+    project: Option<Arc<str>>,
+    location: Option<Arc<str>>,
+    publisher: Option<Arc<str>>,
 }
 
 impl NativeProviderPlan {
@@ -1374,6 +1383,24 @@ impl NativeProviderPlan {
     #[must_use]
     pub fn quota_endpoint(&self) -> Option<&Url> {
         self.quota_endpoint.as_ref()
+    }
+
+    /// Optional provider project identifier.
+    #[must_use]
+    pub fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+
+    /// Optional provider location.
+    #[must_use]
+    pub fn location(&self) -> Option<&str> {
+        self.location.as_deref()
+    }
+
+    /// Optional provider publisher/namespace.
+    #[must_use]
+    pub fn publisher(&self) -> Option<&str> {
+        self.publisher.as_deref()
     }
 }
 
@@ -3922,9 +3949,31 @@ fn compile_provider_auth(
             .as_deref()
             .map(|value| compile_secure_endpoint(value, label, "native.quota_endpoint"))
             .transpose()?;
+        let compile_identifier = |value: Option<&str>, field: &str| {
+            value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    validate_component_id(value, label, field)?;
+                    Ok(Arc::<str>::from(value))
+                })
+                .transpose()
+        };
+        let project = compile_identifier(native.project.as_deref(), "native.project")?;
+        let location = compile_identifier(native.location.as_deref(), "native.location")?;
+        let publisher = compile_identifier(native.publisher.as_deref(), "native.publisher")?;
+        if kind.eq_ignore_ascii_case("vertex") && project.is_some() != location.is_some() {
+            return Err(invalid(
+                label,
+                "Vertex native.project and native.location must be configured together",
+            ));
+        }
         Some(NativeProviderPlan {
             kind: Arc::from(kind),
             quota_endpoint,
+            project,
+            location,
+            publisher,
         })
     } else if declaration.oauth.is_none() {
         known
@@ -3935,6 +3984,9 @@ fn compile_provider_auth(
                 Ok(NativeProviderPlan {
                     kind: Arc::from(kind),
                     quota_endpoint: None,
+                    project: None,
+                    location: None,
+                    publisher: None,
                 })
             })
             .transpose()?
@@ -7107,6 +7159,38 @@ upstreams:
         let native = config.upstreams()["codex"].native().expect("native plan");
         assert_eq!(native.kind(), "codex");
         assert_eq!(native.quota_endpoint().expect("quota").path(), "/quota");
+    }
+
+    #[test]
+    fn compiles_vertex_resource_addressing_and_rejects_partial_location() {
+        let text = r#"
+version: 1
+upstreams:
+  vertex:
+    url: https://us-central1-aiplatform.googleapis.com
+    native:
+      kind: vertex
+      project: production-project
+      location: us-central1
+      publisher: google
+"#;
+        let config = compile_yaml("vertex-native.yaml", text).expect("Vertex native config");
+        let native = config.upstreams()["vertex"].native().expect("native plan");
+        assert_eq!(native.kind(), "vertex");
+        assert_eq!(native.project(), Some("production-project"));
+        assert_eq!(native.location(), Some("us-central1"));
+        assert_eq!(native.publisher(), Some("google"));
+
+        for partial in [
+            text.replace("      location: us-central1\n", ""),
+            text.replace("      project: production-project\n", ""),
+        ] {
+            let error = compile_yaml("vertex-native-partial.yaml", &partial)
+                .expect_err("partial Vertex resource addressing must fail");
+            assert!(error
+                .to_string()
+                .contains("native.project and native.location must be configured together"));
+        }
     }
 
     #[test]

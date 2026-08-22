@@ -231,6 +231,29 @@ fn antigravity_is_disabled_until_explicitly_enabled_and_is_overrideable() {
         Err(AdapterError::CompatibilityNotEnabled)
     );
 
+    let pinned = AntigravityAdapter::new(disabled.clone().enable()).expect("explicit opt-in");
+    assert_eq!(
+        pinned
+            .endpoint_candidates(ProviderOperation::GenerateContent, None)
+            .expect("pinned generate endpoints")[0]
+            .as_str(),
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent"
+    );
+    assert_eq!(
+        pinned
+            .endpoint_candidates(ProviderOperation::StreamGenerateContent, None)
+            .expect("pinned stream endpoints")[0]
+            .as_str(),
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+    );
+    assert_eq!(
+        pinned
+            .endpoint_candidates(ProviderOperation::FetchAvailableModels, None)
+            .expect("pinned model-hint endpoints")[0]
+            .as_str(),
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+    );
+
     let mut untrusted = disabled.clone().enable();
     untrusted.inference_base_urls =
         vec![Url::parse("https://compat-one.example.com/root").expect("unrelated base")];

@@ -1,0 +1,41 @@
+{
+  "source": {
+    "provider": "Kimi Open Platform",
+    "documentation": "https://platform.kimi.ai/docs/api/overview",
+    "models": "GET /v1/models",
+    "chat": "POST /v1/chat/completions"
+  },
+  "requests": [
+    {
+      "name": "chat-completion",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "content_type": "application/json",
+      "body": {
+        "model": "kimi-k2.5",
+        "messages": [
+          {
+            "role": "user",
+            "content": "sanitized"
+          }
+        ],
+        "stream": false
+      }
+    },
+    {
+      "name": "model-discovery",
+      "method": "GET",
+      "path": "/v1/models",
+      "body": null
+    }
+  ],
+  "authentication": {
+    "placement": "Authorization: Bearer <operator credential>",
+    "caller_credential_headers": "stripped"
+  },
+  "redactions": [
+    "The operator credential is not stored.",
+    "The prompt is a synthetic marker.",
+    "This is strict-loopback evidence, not live Kimi conformance."
+  ]
+}

@@ -108,6 +108,31 @@
       "has_cooldown": false
     },
     {
+      "provider": "ai_studio",
+      "status": 429,
+      "headers": {},
+      "body": {
+        "error": {
+          "status": "RESOURCE_EXHAUSTED",
+          "details": [
+            {
+              "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+              "reason": "QUOTA_EXCEEDED"
+            },
+            {
+              "@type": "type.googleapis.com/google.rpc.RetryInfo",
+              "retryDelay": "3s"
+            }
+          ]
+        }
+      },
+      "scope": "project",
+      "class": "credential_quota_exhausted",
+      "retry_ms": 3000,
+      "credential_proven": false,
+      "has_cooldown": false
+    },
+    {
       "provider": "antigravity",
       "status": 429,
       "headers": {},

@@ -1118,6 +1118,15 @@
         "kind": {
           "type": "string"
         },
+        "location": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "publisher": {
+          "type": "string"
+        },
         "quota_endpoint": {
           "type": "string"
         }

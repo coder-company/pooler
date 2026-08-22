@@ -87,6 +87,14 @@ async fn exchange(
     let upstream = StrictProvider::start(contract, SECRET).await;
     let directory = TempDir::new().expect("config directory");
     let config = gateway_config(&directory, provider, upstream.address());
+    exchange_configured(upstream, config, calls).await
+}
+
+async fn exchange_configured(
+    upstream: StrictProvider,
+    config: pooler_config::CompiledConfig,
+    calls: &[Call<'_>],
+) -> (ProviderLog, Vec<String>) {
     let server = bind_gateway(config).await;
     let proxy = server.listener_addresses()[0].address().to_owned();
     let runner = {
@@ -129,6 +137,196 @@ async fn exchange(
     server.begin_drain();
     runner.await.expect("server task").expect("server shutdown");
     (upstream.finish().await, responses)
+}
+
+fn vertex_config(directory: &TempDir, upstream: SocketAddr) -> pooler_config::CompiledConfig {
+    let mut secret_file = tempfile::NamedTempFile::new_in(directory.path()).expect("secret file");
+    secret_file
+        .write_all(SECRET.as_bytes())
+        .expect("secret contents");
+    let (_, secret) = secret_file.keep().expect("secret persists");
+    pooler_config::compile_yaml(
+        "vertex-mounted-test.yaml",
+        &format!(
+            r#"
+version: 1
+listeners:
+  vertex: {{bind: 127.0.0.1:0}}
+upstreams:
+  vertex:
+    url: http://{upstream}
+    native:
+      kind: vertex
+      project: test-project
+      location: us-central1
+      publisher: google
+    auth:
+      secret: 'file:{}'
+models:
+  - id: gemini-2.5-pro
+    targets:
+      - provider: vertex
+        upstream_model: gemini-2.5-pro
+        capabilities: [text, streaming, tools]
+        codecs: [decode.gemini.generate_content]
+routes:
+  - id: vertex-model-actions
+    listen: vertex
+    match:
+      methods: [POST]
+      path_template: '/v1beta/models/{{model_action}}'
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_frame_bytes: 1048576
+      max_event_bytes: 1048576
+    ingress:
+      mode: semantic
+      decoder: decode.gemini.generate_content
+    target:
+      endpoint_family: generate_content
+      provider: vertex
+    response:
+      mode: opaque
+"#,
+            secret.display()
+        ),
+    )
+    .expect("Vertex config compiles")
+}
+
+fn antigravity_config(directory: &TempDir, upstream: SocketAddr) -> pooler_config::CompiledConfig {
+    let mut secret_file = tempfile::NamedTempFile::new_in(directory.path()).expect("secret file");
+    secret_file
+        .write_all(SECRET.as_bytes())
+        .expect("secret contents");
+    let (_, secret) = secret_file.keep().expect("secret persists");
+    let route = |id: &str, path: &str, endpoint_family: &str| {
+        format!(
+            r#"
+  - id: {id}
+    listen: antigravity
+    match:
+      methods: [POST]
+      path: {path}
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_frame_bytes: 1048576
+    ingress: {{mode: opaque}}
+    target:
+      endpoint_family: {endpoint_family}
+      provider: antigravity
+    response: {{mode: opaque}}
+"#,
+        )
+    };
+    pooler_config::compile_yaml(
+        "antigravity-mounted-test.yaml",
+        &format!(
+            r#"
+version: 1
+listeners:
+  antigravity: {{bind: 127.0.0.1:0}}
+upstreams:
+  antigravity:
+    url: http://{upstream}
+    native: {{kind: antigravity}}
+    auth:
+      secret: 'file:{}'
+routes:
+{}{}{}{}
+"#,
+            secret.display(),
+            route(
+                "antigravity-generate",
+                "/v1internal:generateContent",
+                "generate_content"
+            ),
+            route(
+                "antigravity-stream",
+                "/v1internal:streamGenerateContent",
+                "generate_content"
+            ),
+            route(
+                "antigravity-count",
+                "/v1internal:countTokens",
+                "count_tokens"
+            ),
+            route(
+                "antigravity-models",
+                "/v1internal:fetchAvailableModels",
+                "models"
+            )
+        ),
+    )
+    .expect("Antigravity config compiles")
+}
+
+fn compatible_provider_config(
+    directory: &TempDir,
+    upstream: SocketAddr,
+) -> pooler_config::CompiledConfig {
+    let mut secret_file = tempfile::NamedTempFile::new_in(directory.path()).expect("secret file");
+    secret_file
+        .write_all(SECRET.as_bytes())
+        .expect("secret contents");
+    let (_, secret) = secret_file.keep().expect("secret persists");
+    pooler_config::compile_yaml(
+        "compatible-mounted-test.yaml",
+        &format!(
+            r#"
+version: 1
+listeners:
+  compatible: {{bind: 127.0.0.1:0}}
+upstreams:
+  compatible:
+    url: http://{upstream}
+    native: {{kind: compatible}}
+    auth:
+      kind: header
+      header: x-provider-token
+      value_prefix: 'Token '
+      secret: 'file:{}'
+models:
+  - id: public-model
+    targets:
+      - provider: compatible
+        upstream_model: vendor-model
+        capabilities: [text]
+routes:
+  - id: compatible-models
+    listen: compatible
+    match: {{method: GET, path: /v1/models}}
+    ingress: {{mode: opaque}}
+    target:
+      endpoint_family: models
+      provider: compatible
+      path: /vendor/v2/models
+    response: {{mode: opaque}}
+  - id: compatible-chat
+    listen: compatible
+    match:
+      method: POST
+      path: /v1/chat/completions
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_frame_bytes: 1048576
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      endpoint_family: chat_completions
+      provider: compatible
+      path: /vendor/v2/generate
+      model_from: request.model
+    response: {{mode: opaque}}
+"#,
+            secret.display()
+        ),
+    )
+    .expect("compatible provider config compiles")
 }
 
 fn get(path: &str) -> Call<'_> {
@@ -206,7 +404,7 @@ fn assert_all_accepted(log: &ProviderLog, responses: &[String]) {
     for response in responses {
         assert!(
             response.starts_with("HTTP/1.1 200"),
-            "the gateway must return the provider's success: {response}"
+            "the gateway must return the provider's success: {response}; provider log: {log:?}"
         );
     }
 }
@@ -494,6 +692,244 @@ async fn openai_realtime_control_routes_match_the_sdk_wire_contract() {
 }
 
 #[tokio::test]
+async fn kimi_open_platform_is_mounted_with_its_native_contract() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/kimi/gateway-native-2026-08-22.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(MANIFEST_FIXTURE).expect("Kimi compatibility fixture");
+    assert_eq!(fixture["requests"][0]["path"], "/v1/chat/completions");
+    assert_eq!(fixture["requests"][1]["path"], "/v1/models");
+    let body = br#"{"model":"kimi-k2.5","messages":[{"role":"user","content":"sanitized"}],"stream":false}"#;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(body).expect("request JSON"),
+        fixture["requests"][0]["body"]
+    );
+    let sentinels = "authorization: Bearer downstream-sentinel\r\nx-api-key: downstream-sentinel\r\nx-goog-api-key: downstream-sentinel\r\n";
+    let calls = [
+        Call {
+            method: "POST",
+            path: "/v1/chat/completions",
+            content_type: Some("application/json"),
+            body,
+            extra_headers: sentinels,
+        },
+        Call {
+            method: "GET",
+            path: "/v1/models",
+            content_type: None,
+            body: b"",
+            extra_headers: sentinels,
+        },
+    ];
+    let (log, responses) = exchange(ProviderContract::kimi(), "moonshotai", &calls).await;
+
+    assert_all_accepted(&log, &responses);
+    assert!(log.accepted_for("/v1/models").is_some());
+    let request = log
+        .accepted_for("/v1/chat/completions")
+        .expect("Kimi chat reached the upstream");
+    assert_eq!(
+        request.header("authorization"),
+        Some(format!("Bearer {SECRET}").as_str())
+    );
+    assert_eq!(request.header("x-api-key"), None);
+    assert_eq!(request.header("x-goog-api-key"), None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&request.body).expect("upstream JSON"),
+        serde_json::from_slice::<serde_json::Value>(body).expect("fixture JSON")
+    );
+}
+
+#[tokio::test]
+async fn vertex_model_actions_use_project_paths_and_google_access_tokens() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/vertex/gateway-native-2026-08-22.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(MANIFEST_FIXTURE).expect("Vertex compatibility fixture");
+    assert_eq!(fixture["resource"]["project"], "test-project");
+    assert_eq!(fixture["resource"]["location"], "us-central1");
+    assert_eq!(
+        fixture["requests"][0]["upstream_path"],
+        "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-pro:generateContent"
+    );
+
+    let upstream = StrictProvider::start(ProviderContract::vertex(), SECRET).await;
+    let directory = TempDir::new().expect("config directory");
+    let config = vertex_config(&directory, upstream.address());
+    let body = br#"{"contents":[{"role":"user","parts":[{"text":"sanitized"}]}]}"#;
+    let calls = [
+        Call {
+            method: "POST",
+            path: "/v1beta/models/gemini-2.5-pro:generateContent",
+            content_type: Some("application/json"),
+            body,
+            extra_headers: "authorization: Bearer downstream-sentinel\r\nx-goog-api-key: downstream-sentinel\r\n",
+        },
+        Call {
+            method: "POST",
+            path: "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=json",
+            content_type: Some("application/json"),
+            body,
+            extra_headers: "",
+        },
+        Call {
+            method: "POST",
+            path: "/v1beta/models/gemini-2.5-pro:countTokens",
+            content_type: Some("application/json"),
+            body,
+            extra_headers: "",
+        },
+    ];
+    let (log, responses) = exchange_configured(upstream, config, &calls).await;
+
+    assert_all_accepted(&log, &responses);
+    assert_eq!(log.accepted.len(), 3);
+    for request in &log.accepted {
+        assert_eq!(
+            request.header("authorization"),
+            Some(format!("Bearer {SECRET}").as_str())
+        );
+        assert_eq!(request.header("x-goog-api-key"), None);
+        assert!(request.path.starts_with(
+            "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-pro:"
+        ));
+    }
+    let stream = log
+        .accepted
+        .iter()
+        .find(|request| request.path.ends_with(":streamGenerateContent"))
+        .expect("stream request reached Vertex");
+    assert_eq!(stream.query.as_deref(), Some("alt=sse"));
+}
+
+#[tokio::test]
+async fn antigravity_internal_surface_is_explicitly_mounted_same_wire() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/antigravity/gateway-native-2026-08-22.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(MANIFEST_FIXTURE).expect("Antigravity compatibility fixture");
+    let envelope =
+        serde_json::to_vec(&fixture["requests"][0]["body"]).expect("Antigravity request envelope");
+    let empty = b"{}";
+    let headers = "user-agent: antigravity/hub/sanitized darwin/arm64\r\nauthorization: Bearer downstream-sentinel\r\nx-api-key: downstream-sentinel\r\nx-goog-api-key: downstream-sentinel\r\n";
+    let calls = [
+        Call {
+            method: "POST",
+            path: "/v1internal:generateContent",
+            content_type: Some("application/json"),
+            body: &envelope,
+            extra_headers: headers,
+        },
+        Call {
+            method: "POST",
+            path: "/v1internal:streamGenerateContent?alt=sse",
+            content_type: Some("application/json"),
+            body: &envelope,
+            extra_headers: headers,
+        },
+        Call {
+            method: "POST",
+            path: "/v1internal:countTokens",
+            content_type: Some("application/json"),
+            body: &envelope,
+            extra_headers: headers,
+        },
+        Call {
+            method: "POST",
+            path: "/v1internal:fetchAvailableModels",
+            content_type: Some("application/json"),
+            body: empty,
+            extra_headers: headers,
+        },
+    ];
+    let upstream = StrictProvider::start(ProviderContract::antigravity(), SECRET).await;
+    let directory = TempDir::new().expect("config directory");
+    let config = antigravity_config(&directory, upstream.address());
+    let (log, responses) = exchange_configured(upstream, config, &calls).await;
+
+    assert_all_accepted(&log, &responses);
+    assert_eq!(log.accepted.len(), 4);
+    for request in &log.accepted {
+        assert_eq!(
+            request.header("authorization"),
+            Some(format!("Bearer {SECRET}").as_str())
+        );
+        assert_eq!(request.header("x-api-key"), None);
+        assert_eq!(request.header("x-goog-api-key"), None);
+        assert_eq!(
+            request.header("user-agent"),
+            Some("antigravity/hub/sanitized darwin/arm64")
+        );
+    }
+    let generate = log
+        .accepted_for("/v1internal:generateContent")
+        .expect("Antigravity generate request");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&generate.body).expect("upstream JSON"),
+        fixture["requests"][0]["body"]
+    );
+    let stream = log
+        .accepted
+        .iter()
+        .find(|request| request.path == "/v1internal:streamGenerateContent")
+        .expect("Antigravity stream request");
+    assert_eq!(stream.query.as_deref(), Some("alt=sse"));
+}
+
+#[tokio::test]
+async fn explicit_compatible_provider_honors_nonstandard_paths_auth_and_models() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/compatible/nonstandard-openai-2026-08-22.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(MANIFEST_FIXTURE).expect("compatible provider fixture");
+    let body = serde_json::to_vec(&fixture["request"]).expect("fixture request");
+    let sentinels = "authorization: Bearer downstream-sentinel\r\nx-api-key: downstream-sentinel\r\nx-goog-api-key: downstream-sentinel\r\nx-provider-token: downstream-sentinel\r\n";
+    let calls = [
+        Call {
+            method: "GET",
+            path: "/v1/models",
+            content_type: None,
+            body: b"",
+            extra_headers: sentinels,
+        },
+        Call {
+            method: "POST",
+            path: "/v1/chat/completions",
+            content_type: Some("application/json"),
+            body: &body,
+            extra_headers: sentinels,
+        },
+    ];
+    let upstream = StrictProvider::start(ProviderContract::compatible(), SECRET).await;
+    let directory = TempDir::new().expect("config directory");
+    let config = compatible_provider_config(&directory, upstream.address());
+    let (log, responses) = exchange_configured(upstream, config, &calls).await;
+
+    assert_all_accepted(&log, &responses);
+    assert_eq!(log.accepted.len(), 2);
+    for request in &log.accepted {
+        assert_eq!(
+            request.header("x-provider-token"),
+            Some(format!("Token {SECRET}").as_str())
+        );
+        assert_eq!(request.header("authorization"), None);
+        assert_eq!(request.header("x-api-key"), None);
+        assert_eq!(request.header("x-goog-api-key"), None);
+    }
+    assert!(log.accepted_for("/vendor/v2/models").is_some());
+    let chat = log
+        .accepted_for("/vendor/v2/generate")
+        .expect("compatible chat reached custom path");
+    let upstream_body: serde_json::Value =
+        serde_json::from_str(&chat.body).expect("upstream request JSON");
+    assert_eq!(upstream_body["model"], "vendor-model");
+    assert_eq!(
+        upstream_body["vendor_extension"],
+        fixture["request"]["vendor_extension"]
+    );
+}
+
+#[tokio::test]
 async fn xai_responses_compact_satisfies_the_strict_xai_endpoint() {
     let (log, responses) = exchange(
         ProviderContract::xai(),
@@ -565,7 +1001,7 @@ async fn gemini_routes_satisfy_a_strict_gemini_endpoint() {
             path: request["path"].as_str().expect("fixture path"),
             content_type: body.as_ref().map(|_| "application/json"),
             body: body.as_deref().unwrap_or_default(),
-            extra_headers: "",
+            extra_headers: "authorization: Bearer downstream-sentinel\r\nx-api-key: downstream-sentinel\r\nx-goog-api-key: downstream-sentinel\r\n",
         })
         .collect::<Vec<_>>();
     let (log, responses) = exchange(ProviderContract::gemini(), "google", &calls).await;
@@ -581,6 +1017,8 @@ async fn gemini_routes_satisfy_a_strict_gemini_endpoint() {
         .accepted_for("/v1beta/models/gemini-2.5-pro:generateContent")
         .expect("generateContent reached the upstream");
     assert_eq!(generate.header("x-goog-api-key"), Some(SECRET));
+    assert_eq!(generate.header("authorization"), None);
+    assert_eq!(generate.header("x-api-key"), None);
 }
 
 #[tokio::test]

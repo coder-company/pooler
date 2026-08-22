@@ -1,0 +1,59 @@
+{
+  "source": {
+    "provider": "Google Cloud Vertex AI",
+    "documentation": "https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference",
+    "authentication": "https://cloud.google.com/docs/authentication/rest",
+    "quota": "https://cloud.google.com/vertex-ai/generative-ai/docs/resources/throughput-quota"
+  },
+  "resource": {
+    "project": "test-project",
+    "location": "us-central1",
+    "publisher": "google",
+    "model": "gemini-2.5-pro"
+  },
+  "requests": [
+    {
+      "name": "generate-content",
+      "method": "POST",
+      "downstream_path": "/v1beta/models/gemini-2.5-pro:generateContent",
+      "upstream_path": "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-pro:generateContent",
+      "content_type": "application/json",
+      "body": {
+        "contents": [
+          {
+            "role": "user",
+            "parts": [
+              {
+                "text": "sanitized"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "stream-generate-content",
+      "method": "POST",
+      "downstream_path": "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=json",
+      "upstream_path": "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+      "content_type": "application/json"
+    },
+    {
+      "name": "count-tokens",
+      "method": "POST",
+      "downstream_path": "/v1beta/models/gemini-2.5-pro:countTokens",
+      "upstream_path": "/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-pro:countTokens",
+      "content_type": "application/json"
+    }
+  ],
+  "authentication": {
+    "placement": "Authorization: Bearer <short-lived Google access token>",
+    "caller_credential_headers": "stripped",
+    "account_identity": "configured Vertex OAuth or externally minted service-account access token"
+  },
+  "redactions": [
+    "No Google access token, refresh token, service-account key, project credential, or caller prompt is stored.",
+    "Project and model names are synthetic test identifiers.",
+    "This is strict-loopback evidence, not live Vertex conformance."
+  ]
+}

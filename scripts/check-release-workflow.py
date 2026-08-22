@@ -25,8 +25,8 @@ except ImportError as error:  # pragma: no cover - depends on the runner image
 CHECKOUT_REF = "${{ inputs.checkout-ref || github.sha }}"
 RELEASE_SHA = "${{ needs.resolve.outputs.sha }}"
 RELEASE_TAG_REF = "${{ inputs.tag || github.ref }}"
-BLACKSMITH_LINUX_X64_RUNNER = "blacksmith-4vcpu-ubuntu-2404"
-BLACKSMITH_LINUX_ARM64_RUNNER = "blacksmith-4vcpu-ubuntu-2404-arm"
+BLACKSMITH_LINUX_X64_RUNNER = "blacksmith-2vcpu-ubuntu-2404"
+BLACKSMITH_LINUX_ARM64_RUNNER = "blacksmith-2vcpu-ubuntu-2404-arm"
 BLACKSMITH_MACOS_RUNNER = "blacksmith-6vcpu-macos-15"
 REQUIRED_RELEASE_JOBS = {
     "resolve",
