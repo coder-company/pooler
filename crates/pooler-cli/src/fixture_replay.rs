@@ -346,12 +346,16 @@ mod tests {
     #[test]
     fn capture_is_opt_in_and_bounded() {
         let directory = tempfile::tempdir().expect("temporary directory");
+        let capture_directory = directory
+            .path()
+            .canonicalize()
+            .expect("canonical temporary directory");
         #[cfg(unix)]
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        fs::set_permissions(&capture_directory, fs::Permissions::from_mode(0o700))
             .expect("private capture directory");
-        let input = directory.path().join("fixture.json");
-        let output = directory.path().join("capture.json");
-        let explicit_output = directory.path().join("capture-with-bodies.json");
+        let input = capture_directory.join("fixture.json");
+        let output = capture_directory.join("capture.json");
+        let explicit_output = capture_directory.join("capture-with-bodies.json");
         let mut fixture = fixture();
         fixture.downstream_request = Some(
             ScriptedRequest::new("POST", "/v1")
