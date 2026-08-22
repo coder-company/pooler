@@ -83,12 +83,17 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: cargo fmt --all --check
+      - name: Install workflow checker dependencies
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
       - run: bash scripts/check-release-workflow.sh
       - run: ./scripts/check-config-schema.sh
       - run: cargo check --workspace --all-targets --all-features --locked
