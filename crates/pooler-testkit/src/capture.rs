@@ -942,7 +942,11 @@ mod tests {
     #[test]
     fn capture_file_is_owner_private() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("nested").join("capture.json");
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical temporary directory");
+        let path = root.join("nested").join("capture.json");
         let fixture = capture_fixture(
             &Fixture::new("file", Equivalence::ByteLevel),
             &CaptureOptions::default(),
@@ -958,14 +962,13 @@ mod tests {
             0o600
         );
         assert_eq!(
-            fs::metadata(directory.path().join("nested"))
-                .expect("directory metadata")
+            fs::metadata(root.join("nested")).expect("directory metadata")
                 .permissions()
                 .mode()
                 & 0o777,
             0o700
         );
-        assert!(fs::read_dir(directory.path().join("nested"))
+        assert!(fs::read_dir(root.join("nested"))
             .expect("capture directory")
             .all(|entry| !entry
                 .expect("capture entry")
@@ -981,11 +984,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().expect("temporary directory");
-        let parent = directory.path().join("captures");
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical temporary directory");
+        let parent = root.join("captures");
         fs::create_dir(&parent).expect("capture directory");
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
             .expect("private capture directory");
-        let target = directory.path().join("outside.json");
+        let target = root.join("outside.json");
         fs::write(&target, b"do not replace").expect("outside target");
         let destination = parent.join("capture.json");
         symlink(&target, &destination).expect("destination symlink");
@@ -1013,14 +1020,18 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().expect("temporary directory");
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical temporary directory");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
             .expect("non-private directory");
         let fixture = capture_fixture(
             &Fixture::new("permissions", Equivalence::ByteLevel),
             &CaptureOptions::default(),
         );
 
-        let error = write_captured_fixture(directory.path().join("capture.json"), &fixture)
+        let error = write_captured_fixture(root.join("capture.json"), &fixture)
             .expect_err("non-private directory must be rejected");
         assert!(matches!(error, CaptureError::InsecureDirectory { .. }));
     }
