@@ -7,6 +7,7 @@
 //! configuration observed by an in-flight request.
 
 mod catalog_runtime;
+mod config_management;
 mod config_store;
 mod http_runtime;
 mod lifecycle;
@@ -32,6 +33,20 @@ pub use management::{
 pub use model_facts_refresh::{fetch_model_facts, project_model_facts, ModelFactsRefreshError};
 pub use pooler_core::ConfigGeneration;
 pub use server::{ReloadError, ReloadOutcome, Server, ServerError};
+
+/// Select a validated Pooler-managed sidecar when one exists, otherwise the
+/// operator-authored source. Existing sidecars must be owner-private regular
+/// files with Pooler's generated-file marker.
+pub fn managed_configuration_source(
+    source: impl AsRef<std::path::Path>,
+) -> std::io::Result<std::path::PathBuf> {
+    config_management::serving_source(source).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed configuration source is unsafe",
+        )
+    })
+}
 
 // Re-export the source/config crates used by this crate.  Keeping the server
 // generic over its compiled configuration avoids coupling process lifecycle

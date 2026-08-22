@@ -44,8 +44,10 @@ class MockState:
         self.posts: dict[str, int] = {}
         self.post_bodies: dict[str, bytes] = {}
         self.post_transfer_encoding: dict[str, str | None] = {}
+        self.mutation_headers: dict[str, dict[str, str | None]] = {}
         self.get_authorization: dict[str, str | None] = {}
         self.get_targets: list[str] = []
+
 
 STATE = MockState()
 
@@ -55,23 +57,60 @@ def payload(path: str) -> dict:
     responses = {
         "/management/setup/options": {
             **generation,
-            "providers": [{
-                "id": "openai", "name": "OpenAI", "request_dialect": "openai",
-                "native_kind": "openai_compatible", "capabilities": ["text", "streaming"],
-                "endpoint_families": ["chat_completions", "models"],
-                "credential_environment_variables": ["OPENAI_API_KEY"],
-                "authentication": [
-                    {"method": "api_key", "support": "supported", "note": "Use a protected reference."},
-                    {"method": "authorization_code_pkce", "support": "supported", "note": "Use browser OAuth with a bundled public profile."},
-                    {"method": "device_code", "support": "requires_explicit_configuration", "note": "Operator registration is required."},
-                ],
-                "discovery": {"available": True, "parser": "openai", "path": "/v1/models"},
-                "configured_upstreams": ["openai-upstream"],
-                "clients": ["native", "openai", "codex", "cursor", "droid", "factory", "devin"],
-            }],
+            "providers": [
+                {
+                    "id": "openai",
+                    "name": "OpenAI",
+                    "request_dialect": "openai",
+                    "native_kind": "openai_compatible",
+                    "capabilities": ["text", "streaming"],
+                    "endpoint_families": ["chat_completions", "models"],
+                    "credential_environment_variables": ["OPENAI_API_KEY"],
+                    "authentication": [
+                        {
+                            "method": "api_key",
+                            "support": "supported",
+                            "note": "Use a protected reference.",
+                        },
+                        {
+                            "method": "authorization_code_pkce",
+                            "support": "supported",
+                            "note": "Use browser OAuth with a bundled public profile.",
+                        },
+                        {
+                            "method": "device_code",
+                            "support": "requires_explicit_configuration",
+                            "note": "Operator registration is required.",
+                        },
+                    ],
+                    "discovery": {
+                        "available": True,
+                        "parser": "openai",
+                        "path": "/v1/models",
+                    },
+                    "configured_upstreams": ["openai-upstream"],
+                    "clients": [
+                        "native",
+                        "openai",
+                        "codex",
+                        "cursor",
+                        "droid",
+                        "factory",
+                        "devin",
+                    ],
+                }
+            ],
             "clients": [
-                {"id": "native", "name": "Provider-native API", "description": "Native"},
-                {"id": "openai", "name": "OpenAI-compatible client", "description": "OpenAI"},
+                {
+                    "id": "native",
+                    "name": "Provider-native API",
+                    "description": "Native",
+                },
+                {
+                    "id": "openai",
+                    "name": "OpenAI-compatible client",
+                    "description": "OpenAI",
+                },
                 {"id": "codex", "name": "Codex", "description": "Codex"},
                 {"id": "cursor", "name": "Cursor", "description": "Cursor"},
                 {"id": "droid", "name": "Factory Droid", "description": "Droid"},
@@ -89,24 +128,150 @@ def payload(path: str) -> dict:
             "ready": True,
             "connection": "verified",
             "checks": [
-                {"id": "generated_configuration", "status": "passed", "detail": "Generated YAML passed."},
-                {"id": "connectivity", "status": "passed", "detail": "Bounded discovery succeeded."},
+                {
+                    "id": "generated_configuration",
+                    "status": "passed",
+                    "detail": "Generated YAML passed.",
+                },
+                {
+                    "id": "connectivity",
+                    "status": "passed",
+                    "detail": "Bounded discovery succeeded.",
+                },
             ],
         },
-        "/management/health": {**generation, "status": "ok", "management": {"mutations": True}, "credential_health_entries": 1, "cooling_provider_entries": 0},
+        "/management/config": {
+            **generation,
+            "etag": "generation-7",
+            "management": {"mutations": True, "typed_drafts": True},
+        },
+        "/management/health": {
+            **generation,
+            "status": "ok",
+            "management": {"mutations": True},
+            "credential_health_entries": 1,
+            "cooling_provider_entries": 0,
+        },
         "/management/active": {"active": 1, "by_listener": {"main": 1}},
-        "/management/health/providers": {**generation, "providers": [{"id": "openai", "transport": "http", "native": "openai", "auth_configured": True, "status": "not_cooling"}]},
-        "/management/accounts": {**generation, "mutation_capable": True, "accounts": [{"id": "primary", "provider": "openai-upstream", "enabled": True, "selected": False, "auth_kind": "oauth", "available_actions": ["switch", "disable", "refresh", "revoke"], "status": "available", "failure_count": 0, "cooldown_until": None}]},
+        "/management/health/providers": {
+            **generation,
+            "providers": [
+                {
+                    "id": "openai",
+                    "transport": "http",
+                    "native": "openai",
+                    "auth_configured": True,
+                    "status": "not_cooling",
+                }
+            ],
+        },
+        "/management/accounts": {
+            **generation,
+            "mutation_capable": True,
+            "accounts": [
+                {
+                    "id": "primary",
+                    "provider": "openai-upstream",
+                    "enabled": True,
+                    "selected": False,
+                    "auth_kind": "oauth",
+                    "available_actions": ["switch", "disable", "refresh", "revoke"],
+                    "status": "available",
+                    "failure_count": 0,
+                    "cooldown_until": None,
+                }
+            ],
+        },
         "/management/quota": {**generation, "windows": [], "cooldowns": []},
-        "/management/models": {**generation, "mutation_capable": True, "models": [{"id": "gpt-test", "selection_origin": "configured", "enabled": True, "targets": [{"provider": "openai", "upstream_model": "gpt-test", "capabilities": ["text"]}]}], "catalog_sources": [], "model_overrides": {}},
+        "/management/models": {
+            **generation,
+            "mutation_capable": True,
+            "models": [
+                {
+                    "id": "gpt-test",
+                    "selection_origin": "configured",
+                    "enabled": True,
+                    "targets": [
+                        {
+                            "provider": "openai",
+                            "upstream_model": "gpt-test",
+                            "capabilities": ["text"],
+                        }
+                    ],
+                }
+            ],
+            "catalog_sources": [],
+            "model_overrides": {},
+        },
         "/management/catalog": {"catalog_generation": 2, "sources": []},
-        "/management/listeners": {**generation, "listeners": [{"id": "main", "bind": "127.0.0.1:8080", "protocol": "http1", "tls": False, "route_count": 1}]},
-        "/management/routes": {**generation, "routes": [{"id": "route", "listener": "main", "path": "/v1", "target": {"upstream": "openai"}}]},
-        "/management/metrics": {**generation, "metrics": {"usage": [], "attempts": [], "latencies": []}},
-        "/management/decisions": {"decisions": [{"id": "decision-1", "recorded_at": 1, "request_id": "request-123456", "route_id": "route", "model": "gpt-test", "selected_provider": "openai", "selected_credential": "primary", "attempt": 1, "reason": "selected", "candidates": [{"provider_id": "openai", "credential_id": "primary", "score": 10, "eligible": True, "reason": "healthy"}]}]},
+        "/management/listeners": {
+            **generation,
+            "listeners": [
+                {
+                    "id": "main",
+                    "bind": "127.0.0.1:8080",
+                    "protocol": "http1",
+                    "tls": False,
+                    "route_count": 1,
+                }
+            ],
+        },
+        "/management/routes": {
+            **generation,
+            "routes": [
+                {
+                    "id": "route",
+                    "listener": "main",
+                    "path": "/v1",
+                    "target": {"upstream": "openai"},
+                }
+            ],
+        },
+        "/management/metrics": {
+            **generation,
+            "metrics": {"usage": [], "attempts": [], "latencies": []},
+        },
+        "/management/decisions": {
+            "decisions": [
+                {
+                    "id": "decision-1",
+                    "recorded_at": 1,
+                    "request_id": "request-123456",
+                    "route_id": "route",
+                    "model": "gpt-test",
+                    "selected_provider": "openai",
+                    "selected_credential": "primary",
+                    "attempt": 1,
+                    "reason": "selected",
+                    "candidates": [
+                        {
+                            "provider_id": "openai",
+                            "credential_id": "primary",
+                            "score": 10,
+                            "eligible": True,
+                            "reason": "healthy",
+                        }
+                    ],
+                }
+            ]
+        },
         "/management/traces": {"traces": [], "dropped": 0},
         "/management/audit": {"events": []},
-        "/management/reloads": {**generation, "reloads": [{"request_id": STATE.reload_request_id, "kind": "catalog", "status": STATE.reload_status, "requested_at_ms": 1, "completed_at_ms": 2, "accepted_configuration_generation": 7, "configuration_generation": 7, "catalog_generation": 2}]},
+        "/management/reloads": {
+            **generation,
+            "reloads": [
+                {
+                    "request_id": STATE.reload_request_id,
+                    "kind": "catalog",
+                    "status": STATE.reload_status,
+                    "requested_at_ms": 1,
+                    "completed_at_ms": 2,
+                    "accepted_configuration_generation": 7,
+                    "configuration_generation": 7,
+                    "catalog_generation": 2,
+                }
+            ],
+        },
     }
     return responses.get(path, generation)
 
@@ -163,10 +328,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(401, b'{"error":"unauthorized"}', "application/json")
             return
         if STATE.fail_all_reads:
-            self.send_bytes(503, b'{"error":"management state unavailable"}', "application/json")
+            self.send_bytes(
+                503, b'{"error":"management state unavailable"}', "application/json"
+            )
             return
         if route == "/management/health/providers" and STATE.fail_providers:
-            self.send_bytes(503, b'{"error":"provider state unavailable"}', "application/json")
+            self.send_bytes(
+                503, b'{"error":"provider state unavailable"}', "application/json"
+            )
             return
         if STATE.slow_models and route in {"/management/models", "/management/catalog"}:
             STATE.models_started.set()
@@ -175,6 +344,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(200, body, "application/json")
 
     def do_POST(self) -> None:  # noqa: N802
+        self.handle_mutation("POST")
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self.handle_mutation("PATCH")
+
+    def handle_mutation(self, method: str) -> None:
         route = urlsplit(self.path).path
         if STATE.reject_all or self.headers.get("Authorization") != "Bearer good-token":
             self.send_bytes(401, b'{"error":"unauthorized"}', "application/json")
@@ -182,13 +357,51 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         STATE.post_bodies[route] = self.rfile.read(length) if length else b""
         STATE.post_transfer_encoding[route] = self.headers.get("Transfer-Encoding")
+        STATE.mutation_headers[route] = {
+            "authorization": self.headers.get("Authorization"),
+            "if_match": self.headers.get("If-Match"),
+            "content_type": self.headers.get("Content-Type"),
+            "method": method,
+        }
         STATE.posts[route] = STATE.posts.get(route, 0) + 1
-        time.sleep(0.25)
+        time.sleep(0.05 if route.startswith("/management/config/") else 0.25)
         if route in {"/management/reload", "/management/models/reload"}:
             STATE.reload_request_id += 1
             STATE.reload_status = STATE.reload_outcome
-            body = json.dumps({"status": "pending", "request_id": STATE.reload_request_id}).encode()
+            body = json.dumps(
+                {"status": "pending", "request_id": STATE.reload_request_id}
+            ).encode()
             self.send_bytes(202, body, "application/json")
+        elif route == "/management/config/drafts":
+            self.send_bytes(
+                201,
+                b'{"draft_id":11,"base_generation":7,"etag":"draft-a","status":"draft"}',
+                "application/json",
+            )
+        elif route == "/management/config/drafts/11" and method == "PATCH":
+            self.send_bytes(
+                200,
+                b'{"draft_id":11,"base_generation":7,"etag":"draft-b","status":"draft"}',
+                "application/json",
+            )
+        elif route == "/management/config/drafts/11/validate":
+            self.send_bytes(
+                200,
+                b'{"draft_id":11,"etag":"draft-b","valid":true,"semantic_diff":[{"section":"models","id":"browser-model","change":"added"}],"confirmation_token":"confirm-browser"}',
+                "application/json",
+            )
+        elif route == "/management/config/drafts/11/commit":
+            self.send_bytes(
+                202,
+                b'{"status":"pending","request_id":41,"base_generation":7}',
+                "application/json",
+            )
+        elif route == "/management/config/rollback":
+            self.send_bytes(
+                202,
+                b'{"status":"pending","request_id":42,"base_generation":7}',
+                "application/json",
+            )
         else:
             self.send_bytes(200, b'{"status":"accepted"}', "application/json")
 
@@ -204,34 +417,76 @@ def run_browser(playwright) -> None:
     thread.start()
     origin = f"http://127.0.0.1:{server.server_port}"
     browser = playwright.chromium.launch(headless=True)
-    page = browser.new_page(viewport={"width": 1280, "height": 800}, accept_downloads=True)
+    page = browser.new_page(
+        viewport={"width": 1280, "height": 800}, accept_downloads=True
+    )
     errors: list[str] = []
     page.on("pageerror", lambda error: errors.append(str(error)))
     try:
         response = page.goto(f"{origin}/management/ui/", wait_until="networkidle")
-        expect(response is not None and response.headers.get("content-security-policy") == CSP, "strict CSP header missing")
-        expect(page.locator("[style]").count() == 0, "inline style attribute rendered under strict CSP")
-        expect(page.locator('[data-notice="auth"]').count() == 1, "parallel 401 responses were not coalesced")
-        expect(page.locator("#session-dialog").evaluate("el => el.open"), "401 did not expose the session dialog")
+        expect(
+            response is not None
+            and response.headers.get("content-security-policy") == CSP,
+            "strict CSP header missing",
+        )
+        expect(
+            page.locator("[style]").count() == 0,
+            "inline style attribute rendered under strict CSP",
+        )
+        expect(
+            page.locator('[data-notice="auth"]').count() == 1,
+            "parallel 401 responses were not coalesced",
+        )
+        expect(
+            page.locator("#session-dialog").evaluate("el => el.open"),
+            "401 did not expose the session dialog",
+        )
 
         page.locator("#token-input").fill("wrong-token")
         page.locator("#token-apply").click()
         page.locator("#session-button", has_text="Token rejected").wait_for()
-        expect(page.locator("#session-dialog").evaluate("el => el.open"), "invalid token did not return to the session dialog")
-        expect(page.locator("#session-button", has_text="Connected").count() == 0, "unvalidated token was shown as connected")
+        expect(
+            page.locator("#session-dialog").evaluate("el => el.open"),
+            "invalid token did not return to the session dialog",
+        )
+        expect(
+            page.locator("#session-button", has_text="Connected").count() == 0,
+            "unvalidated token was shown as connected",
+        )
         page.locator("#token-input").fill("good-token")
         page.locator("#token-apply").click()
         page.locator("#session-button", has_text="Connected").wait_for()
-        expect(page.evaluate("localStorage.length === 0 && sessionStorage.length === 0 && document.cookie === ''"), "bearer token was persisted in browser storage")
-        expect(page.locator("#view").get_attribute("class") == "view view-overview", "overview view class missing")
-        expect(page.locator('.nav-link[aria-current="page"]').get_attribute("data-route") == "overview", "current navigation state missing")
-        expect(page.locator("table caption").count() > 0, "tables have no accessible captions")
-        expect(page.locator("th:not([scope=col])").count() == 0, "column headers are missing scope")
+        expect(
+            page.evaluate(
+                "localStorage.length === 0 && sessionStorage.length === 0 && document.cookie === ''"
+            ),
+            "bearer token was persisted in browser storage",
+        )
+        expect(
+            page.locator("#view").get_attribute("class") == "view view-overview",
+            "overview view class missing",
+        )
+        expect(
+            page.locator('.nav-link[aria-current="page"]').get_attribute("data-route")
+            == "overview",
+            "current navigation state missing",
+        )
+        expect(
+            page.locator("table caption").count() > 0,
+            "tables have no accessible captions",
+        )
+        expect(
+            page.locator("th:not([scope=col])").count() == 0,
+            "column headers are missing scope",
+        )
 
         STATE.reject_all = True
         page.locator("#refresh-now").click()
         page.wait_for_selector("text=Authorization required")
-        expect(page.locator("#view", has_text="openai").count() == 0, "stale management data remained rendered after a 401")
+        expect(
+            page.locator("#view", has_text="openai").count() == 0,
+            "stale management data remained rendered after a 401",
+        )
         STATE.reject_all = False
         page.locator("#token-input").fill("good-token")
         page.locator("#token-apply").click()
@@ -241,51 +496,138 @@ def run_browser(playwright) -> None:
         page.locator(".skip-link").focus()
         page.locator(".skip-link").press("Enter")
         page.wait_for_timeout(50)
-        expect(page.evaluate("document.activeElement === document.querySelector('#main')"), "skip link did not move focus to main content")
-        expect(page.locator("#theme-toggle").get_attribute("aria-label") in {"Switch to dark theme", "Switch to light theme"}, "theme control label is ambiguous")
-        expect(page.locator("#session-dialog").get_attribute("aria-labelledby") == "session-title", "session dialog is unlabelled")
+        expect(
+            page.evaluate("document.activeElement === document.querySelector('#main')"),
+            "skip link did not move focus to main content",
+        )
+        expect(
+            page.locator("#theme-toggle").get_attribute("aria-label")
+            in {"Switch to dark theme", "Switch to light theme"},
+            "theme control label is ambiguous",
+        )
+        expect(
+            page.locator("#session-dialog").get_attribute("aria-labelledby")
+            == "session-title",
+            "session dialog is unlabelled",
+        )
 
         page.locator('[data-route="setup"]').click()
         page.wait_for_selector(".view-setup .setup-progress")
-        expect(not page.locator('.view-setup input[type="password"]').count(), "setup wizard accepts a credential value")
-        expect(page.locator("[style]").count() == 0, "setup wizard rendered an inline style")
+        expect(
+            not page.locator('.view-setup input[type="password"]').count(),
+            "setup wizard accepts a credential value",
+        )
+        expect(
+            page.locator("[style]").count() == 0,
+            "setup wizard rendered an inline style",
+        )
         page.locator('[data-setup-action="next"]').click()
-        expect(not page.locator('#setup-auth option[value="device_code"]').count(), "explicit-registration flow was offered as runnable")
-        expect("Operator registration is required" in page.locator(".view-setup").inner_text(), "unavailable authentication method lacks an accessible explanation")
-        expect("pooler.setup.yaml" not in page.locator(".view-setup").inner_text(), "account step references a sidecar before it can be generated")
+        expect(
+            not page.locator('#setup-auth option[value="device_code"]').count(),
+            "explicit-registration flow was offered as runnable",
+        )
+        expect(
+            page.locator(".view-setup")
+            .inner_text()
+            .find("Operator registration is required")
+            >= 0,
+            "unavailable authentication method lacks an accessible explanation",
+        )
+        expect(
+            "pooler.setup.yaml" not in page.locator(".view-setup").inner_text(),
+            "account step references a sidecar before it can be generated",
+        )
         page.locator("#setup-account").fill("primary")
         page.locator('[data-setup-action="next"]').click()
-        expect(page.locator("#setup-model").input_value() == "gpt-test", "setup did not reuse active model facts")
+        expect(
+            page.locator("#setup-model").input_value() == "gpt-test",
+            "setup did not reuse active model facts",
+        )
         page.locator('[data-setup-action="next"]').click()
         page.locator("#setup-client").select_option("openai")
         page.locator('[data-setup-action="next"]').click()
         page.wait_for_selector(".setup-config")
         setup_yaml = page.locator(".setup-config").inner_text()
-        expect("env:OPENAI_API_KEY" in setup_yaml, "generated setup omitted protected secret reference")
-        expect("sk-" not in setup_yaml and "Bearer " not in setup_yaml, "generated setup exposed a credential value")
-        expect(STATE.get_authorization.get("/management/setup/config") == "Bearer good-token", "setup configuration did not use authenticated fetch")
-        expect(page.get_by_role("link", name="Finish setup").count() == 0, "setup could finish before connection evidence")
+        expect(
+            "env:OPENAI_API_KEY" in setup_yaml,
+            "generated setup omitted protected secret reference",
+        )
+        expect(
+            "sk-" not in setup_yaml and "Bearer " not in setup_yaml,
+            "generated setup exposed a credential value",
+        )
+        expect(
+            STATE.get_authorization.get("/management/setup/config")
+            == "Bearer good-token",
+            "setup configuration did not use authenticated fetch",
+        )
+        expect(
+            page.get_by_role("link", name="Finish setup").count() == 0,
+            "setup could finish before connection evidence",
+        )
         activation_text = page.locator(".view-setup").inner_text()
-        expect("pooler --config pooler.setup.yaml --credential-key-ref env:POOLER_STORE_KEY serve" in activation_text, "serve instructions omit the OAuth credential-store key")
-        expect("Reopen or reconnect this dashboard" in activation_text, "setup does not explain that verification targets the newly running instance")
+        expect(
+            "pooler --config pooler.setup.yaml --credential-key-ref env:POOLER_STORE_KEY serve"
+            in activation_text,
+            "serve instructions omit the OAuth credential-store key",
+        )
+        expect(
+            "Reopen or reconnect this dashboard" in activation_text,
+            "setup does not explain that verification targets the newly running instance",
+        )
         STATE.reload_outcome = "failed"
         page.locator('[data-setup-action="test"]').click()
         page.wait_for_selector("text=Setup is not verified yet")
-        expect(not any(target.startswith("/management/setup/test?") for target in STATE.get_targets), "failed catalog reload still called setup verification")
-        expect(page.get_by_role("link", name="Finish setup").count() == 0, "failed catalog reload allowed setup completion")
+        expect(
+            not any(
+                target.startswith("/management/setup/test?")
+                for target in STATE.get_targets
+            ),
+            "failed catalog reload still called setup verification",
+        )
+        expect(
+            page.get_by_role("link", name="Finish setup").count() == 0,
+            "failed catalog reload allowed setup completion",
+        )
         STATE.reload_outcome = "succeeded"
         page.locator('[data-setup-action="test"]').click()
         page.wait_for_selector("text=Connection evidence verified")
-        expect(page.get_by_role("link", name="Finish setup").count() == 1, "verified setup has no finish action")
-        expect(STATE.posts.get("/management/models/reload") == 2, "setup verification did not isolate failed and successful catalog reloads")
-        expect(STATE.post_bodies.get("/management/models/reload") == b"", "setup connection test mutation sent a body")
-        expect(STATE.get_authorization.get("/management/setup/test") == "Bearer good-token", "setup connection test did not use authenticated fetch")
-        expect(any("reload_request_id=3" in target for target in STATE.get_targets if target.startswith("/management/setup/test?")), "setup verification was not correlated to its successful catalog reload")
-        expect(page.evaluate("localStorage.length === 0 && sessionStorage.length === 0"), "setup state was persisted in browser storage")
+        expect(
+            page.get_by_role("link", name="Finish setup").count() == 1,
+            "verified setup has no finish action",
+        )
+        expect(
+            STATE.posts.get("/management/models/reload") == 2,
+            "setup verification did not isolate failed and successful catalog reloads",
+        )
+        expect(
+            STATE.post_bodies.get("/management/models/reload") == b"",
+            "setup connection test mutation sent a body",
+        )
+        expect(
+            STATE.get_authorization.get("/management/setup/test")
+            == "Bearer good-token",
+            "setup connection test did not use authenticated fetch",
+        )
+        expect(
+            any(
+                "reload_request_id=3" in target
+                for target in STATE.get_targets
+                if target.startswith("/management/setup/test?")
+            ),
+            "setup verification was not correlated to its successful catalog reload",
+        )
+        expect(
+            page.evaluate("localStorage.length === 0 && sessionStorage.length === 0"),
+            "setup state was persisted in browser storage",
+        )
         STATE.reject_all = True
         page.locator("#refresh-now").click()
         page.wait_for_selector("text=Authorization required")
-        expect(page.locator(".setup-config").count() == 0, "generated setup remained visible after authentication rejection")
+        expect(
+            page.locator(".setup-config").count() == 0,
+            "generated setup remained visible after authentication rejection",
+        )
         STATE.reject_all = False
         page.locator("#token-input").fill("good-token")
         page.locator("#token-apply").click()
@@ -293,18 +635,138 @@ def run_browser(playwright) -> None:
         page.locator('[data-setup-action="generate"]').click()
         page.wait_for_selector(".setup-config")
 
-        for route in ("setup", "overview", "models", "accounts", "usage", "operations", "diagnostics"):
+        page.locator('[data-route="configuration"]').click()
+        page.wait_for_selector('.view-configuration [data-config-action="create"]')
+        expect(
+            not page.locator('.view-configuration input[type="password"]').count(),
+            "configuration editor accepts credential values",
+        )
+        page.locator('[data-config-action="create"]').click()
+        page.wait_for_selector("text=Draft 11")
+        page.locator('[data-config-field="id"]').fill("browser-model")
+        page.locator('[data-config-field="value"]').fill(
+            json.dumps(
+                {
+                    "id": "browser-model",
+                    "targets": [
+                        {"provider": "openai-upstream", "upstream_model": "gpt-browser"}
+                    ],
+                }
+            )
+        )
+        page.locator('[data-config-action="patch"]').click()
+        page.wait_for_selector("text=Typed patch applied")
+        page.locator('[data-config-action="validate"]').click()
+        page.wait_for_selector("text=Draft compiled")
+        expect(
+            "models/browser-model" in page.locator(".view-configuration").inner_text(),
+            "semantic diff is not accessible",
+        )
+        page.locator('[data-config-action="commit"]').click()
+        page.wait_for_selector("text=Configuration reload request 41 accepted")
+        patch_route = "/management/config/drafts/11"
+        patch = json.loads(STATE.post_bodies[patch_route])
+        expect(
+            patch
+            == {
+                "op": "upsert",
+                "section": "models",
+                "id": "browser-model",
+                "value": {
+                    "id": "browser-model",
+                    "targets": [
+                        {"provider": "openai-upstream", "upstream_model": "gpt-browser"}
+                    ],
+                },
+            },
+            f"browser emitted an unrestricted or malformed patch: {patch!r}",
+        )
+        expect(
+            STATE.mutation_headers[patch_route]["method"] == "PATCH",
+            "typed patch did not use PATCH",
+        )
+        expect(
+            STATE.mutation_headers[patch_route]["if_match"] == "draft-a",
+            "typed patch omitted its ETag",
+        )
+        expect(
+            STATE.mutation_headers["/management/config/drafts/11/validate"]["if_match"]
+            == "draft-b",
+            "validation omitted its ETag",
+        )
+        expect(
+            STATE.mutation_headers["/management/config/drafts/11/commit"]["if_match"]
+            == "draft-b",
+            "commit omitted its ETag",
+        )
+        expect(
+            b"confirm-browser"
+            in STATE.post_bodies["/management/config/drafts/11/commit"],
+            "commit omitted explicit confirmation",
+        )
+        rollback_route = "/management/config/rollback"
+        page.locator('[data-config-action="rollback"]').click()
+        page.wait_for_selector("text=Rollback managed configuration?")
+        expect(
+            page.locator("#confirm-dialog").get_attribute("aria-describedby")
+            == "confirm-copy",
+            "rollback confirmation dialog is unlabelled",
+        )
+        page.locator("#confirm-cancel").click()
+        expect(
+            STATE.posts.get(rollback_route, 0) == 0,
+            "cancelled rollback reached the mutation endpoint",
+        )
+        page.locator('[data-config-action="rollback"]').click()
+        page.locator("#confirm-accept").click()
+        page.wait_for_selector("text=Rollback reload request 42 accepted")
+        expect(
+            json.loads(STATE.post_bodies[rollback_route]) == {"confirm": "rollback"},
+            "rollback omitted explicit confirmation",
+        )
+        expect(
+            STATE.mutation_headers[rollback_route]["if_match"] == "generation-7",
+            "rollback omitted its generation ETag",
+        )
+
+        expect(
+            page.evaluate("localStorage.length === 0 && sessionStorage.length === 0"),
+            "configuration draft was persisted in browser storage",
+        )
+
+        for route in (
+            "setup",
+            "configuration",
+            "overview",
+            "models",
+            "accounts",
+            "usage",
+            "operations",
+            "diagnostics",
+        ):
             page.locator(f'[data-route="{route}"]').click()
             page.wait_for_selector(f".view-{route}")
-            expect(page.locator('.nav-link[aria-current="page"]').get_attribute("data-route") == route, f"{route} navigation state missing")
-            expect(page.locator("[style]").count() == 0, f"{route} rendered an inline style under strict CSP")
+            expect(
+                page.locator('.nav-link[aria-current="page"]').get_attribute(
+                    "data-route"
+                )
+                == route,
+                f"{route} navigation state missing",
+            )
+            expect(
+                page.locator("[style]").count() == 0,
+                f"{route} rendered an inline style under strict CSP",
+            )
 
         page.locator('[data-route="usage"]').click()
         page.wait_for_selector(".view-usage")
         STATE.fail_all_reads = True
         page.locator("#refresh-now").click()
         page.wait_for_selector(".endpoint-state")
-        expect(page.locator(".endpoint-state").inner_text().startswith("Refresh failed."), "all-endpoint failure was labelled as partial")
+        expect(
+            page.locator(".endpoint-state").inner_text().startswith("Refresh failed."),
+            "all-endpoint failure was labelled as partial",
+        )
         page.locator("#session-button", has_text="Not verified").wait_for()
         STATE.fail_all_reads = False
         page.locator("#refresh-now").click()
@@ -315,11 +777,16 @@ def run_browser(playwright) -> None:
         page.locator(".skip-link").focus()
         page.locator(".skip-link").press("Enter")
         page.wait_for_timeout(50)
-        expect(page.locator("#view").get_attribute("class") == "view view-diagnostics", "skip link changed the active route")
+        expect(
+            page.locator("#view").get_attribute("class") == "view view-diagnostics",
+            "skip link changed the active route",
+        )
 
         page.locator('[data-route="models"]').click()
         page.wait_for_selector(".view-models .grid-stats-4")
-        expect(page.locator("[style]").count() == 0, "model view introduced inline styles")
+        expect(
+            page.locator("[style]").count() == 0, "model view introduced inline styles"
+        )
         page.locator('[data-route="accounts"]').click()
         page.wait_for_selector(".view-accounts")
         STATE.models_started.clear()
@@ -329,65 +796,144 @@ def run_browser(playwright) -> None:
         page.locator('[data-route="accounts"]').click()
         page.wait_for_selector(".view-accounts")
         page.wait_for_timeout(550)
-        expect(page.locator("#view").get_attribute("class") == "view view-accounts", "stale model request overwrote account view")
+        expect(
+            page.locator("#view").get_attribute("class") == "view view-accounts",
+            "stale model request overwrote account view",
+        )
         STATE.slow_models = False
 
         page.locator('[data-account-connect="primary"]').click()
         page.wait_for_selector(".connection-panel")
         connection_text = page.locator(".connection-panel").inner_text()
-        expect("auth login openai-upstream --profile openai --account primary --method oauth" in connection_text, "account connection guide did not separate the configured upstream from the account ID")
-        expect(not page.locator('.connection-panel input[type="password"]').count(), "account connection flow accepts credentials in the browser")
-        expect("refresh token" in connection_text and "never receives" in connection_text, "account connection guide omits credential-boundary disclosure")
-        expect("device code" in connection_text and "Operator registration is required" in connection_text, "unavailable account login method is not explained")
+        expect(
+            "auth login openai-upstream --profile openai --account primary --method oauth"
+            in connection_text,
+            "account connection guide did not separate the configured upstream from the account ID",
+        )
+        expect(
+            not page.locator('.connection-panel input[type="password"]').count(),
+            "account connection flow accepts credentials in the browser",
+        )
+        expect(
+            "refresh token" in connection_text and "never receives" in connection_text,
+            "account connection guide omits credential-boundary disclosure",
+        )
+        expect(
+            connection_text.find("device code") >= 0
+            and connection_text.find("Operator registration is required") >= 0,
+            "unavailable account login method is not explained",
+        )
         posts_before_status_check = dict(STATE.posts)
         page.locator("[data-account-connect-check]").click()
         page.wait_for_timeout(100)
-        expect(STATE.posts == posts_before_status_check, "account status check sent a mutation")
-        expect(STATE.get_authorization.get("/management/accounts") == "Bearer good-token", "account status check did not use authenticated fetch")
+        expect(
+            STATE.posts == posts_before_status_check,
+            "account status check sent a mutation",
+        )
+        expect(
+            STATE.get_authorization.get("/management/accounts") == "Bearer good-token",
+            "account status check did not use authenticated fetch",
+        )
         page.locator("[data-account-connect-close]").click()
-        expect(not page.locator(".connection-panel").count(), "account connection guide did not close")
+        expect(
+            not page.locator(".connection-panel").count(),
+            "account connection guide did not close",
+        )
 
         switch = page.locator('[data-account-action="switch"]')
         switch.click()
-        expect("primary" in page.locator("#confirm-title").inner_text(), "switch confirmation does not name the selected account")
-        expect(page.locator("#confirm-dialog").get_attribute("aria-describedby") == "confirm-copy", "confirmation dialog is unlabelled")
+        expect(
+            "primary" in page.locator("#confirm-title").inner_text(),
+            "switch confirmation does not name the selected account",
+        )
+        expect(
+            page.locator("#confirm-dialog").get_attribute("aria-describedby")
+            == "confirm-copy",
+            "confirmation dialog is unlabelled",
+        )
         page.locator("#confirm-cancel").focus()
         page.wait_for_timeout(10_300)
-        expect(page.locator("#confirm-dialog").evaluate("el => el.open"), "polling closed the active confirmation dialog")
-        expect(page.evaluate("document.activeElement === document.querySelector('#confirm-cancel')"), "polling displaced confirmation-dialog focus")
+        expect(
+            page.locator("#confirm-dialog").evaluate("el => el.open"),
+            "polling closed the active confirmation dialog",
+        )
+        expect(
+            page.evaluate(
+                "document.activeElement === document.querySelector('#confirm-cancel')"
+            ),
+            "polling displaced confirmation-dialog focus",
+        )
         page.locator("#confirm-cancel").click()
 
         disable = page.locator('[data-account-action="disable"]')
         disable.evaluate("el => { el.click(); el.click(); }")
         page.locator('[data-account-action="disable"]:not([aria-busy])').wait_for()
-        expect(STATE.posts.get("/management/accounts/primary/disable") == 1, "double-submit reached the mutation endpoint")
+        expect(
+            STATE.posts.get("/management/accounts/primary/disable") == 1,
+            "double-submit reached the mutation endpoint",
+        )
 
         page.locator('[data-route="operations"]').click()
         page.wait_for_selector('[data-expand="decision-1"]')
         disclosure = page.locator('[data-expand="decision-1"]')
-        expect(disclosure.get_attribute("aria-expanded") == "false", "disclosure initial state is wrong")
+        expect(
+            disclosure.get_attribute("aria-expanded") == "false",
+            "disclosure initial state is wrong",
+        )
         disclosure.click()
-        expect(page.locator('[data-expand="decision-1"]').get_attribute("aria-expanded") == "true", "disclosure state did not update")
+        expect(
+            page.locator('[data-expand="decision-1"]').get_attribute("aria-expanded")
+            == "true",
+            "disclosure state did not update",
+        )
         page.locator('[data-action="reload-config"]').click()
         page.locator("#confirm-accept").click()
         page.wait_for_selector(".banner-info")
-        expect("Reload request 4 accepted" in page.locator(".banner-info").last.inner_text(), "accepted reload was not correlated in the UI")
-        expect(STATE.posts.get("/management/reload") == 1, "configuration reload mutation was not sent exactly once")
-        expect(STATE.post_bodies.get("/management/reload") == b"", "management mutation unexpectedly sent a body")
-        expect(STATE.post_transfer_encoding.get("/management/reload") is None, "management mutation unexpectedly used Transfer-Encoding")
-        page.wait_for_function("""() => [...document.querySelectorAll('.section')].some((section) => section.textContent.includes('Reload history') && section.textContent.includes('4') && section.textContent.includes('succeeded'))""")
-        reload_history = page.locator(".section").filter(has_text="Reload history").first
+        expect(
+            "Reload request 4 accepted"
+            in page.locator(".banner-info").last.inner_text(),
+            "accepted reload was not correlated in the UI",
+        )
+        expect(
+            STATE.posts.get("/management/reload") == 1,
+            "configuration reload mutation was not sent exactly once",
+        )
+        expect(
+            STATE.post_bodies.get("/management/reload") == b"",
+            "management mutation unexpectedly sent a body",
+        )
+        expect(
+            STATE.post_transfer_encoding.get("/management/reload") is None,
+            "management mutation unexpectedly used Transfer-Encoding",
+        )
+        page.wait_for_function(
+            """() => [...document.querySelectorAll('.section')].some((section) => section.textContent.includes('Reload history') && section.textContent.includes('4') && section.textContent.includes('succeeded'))"""
+        )
+        reload_history = (
+            page.locator(".section").filter(has_text="Reload history").first
+        )
         reload_history_text = reload_history.inner_text()
-        expect("4" in reload_history_text and "succeeded" in reload_history_text, f"reload final outcome was not correlated to request 4: {reload_history_text!r}")
+        expect(
+            "4" in reload_history_text and "succeeded" in reload_history_text,
+            f"reload final outcome was not correlated to request 4: {reload_history_text!r}",
+        )
 
         page.locator('[data-route="overview"]').click()
         page.wait_for_selector("text=openai")
         STATE.fail_providers = True
         page.locator("#refresh-now").click()
         page.wait_for_selector(".endpoint-state")
-        expect(page.locator(".endpoint-state").inner_text().startswith("Partial refresh."), "partial endpoint state is not disclosed")
-        expect(page.locator("text=openai").count() > 0, "stale provider data was discarded")
-        expect("Partial" in page.locator("#footer-updated").inner_text(), "footer claims a complete refresh")
+        expect(
+            page.locator(".endpoint-state").inner_text().startswith("Partial refresh."),
+            "partial endpoint state is not disclosed",
+        )
+        expect(
+            page.locator("text=openai").count() > 0, "stale provider data was discarded"
+        )
+        expect(
+            "Partial" in page.locator("#footer-updated").inner_text(),
+            "footer claims a complete refresh",
+        )
         STATE.fail_providers = False
 
         page.locator('[data-route="diagnostics"]').click()
@@ -395,27 +941,51 @@ def run_browser(playwright) -> None:
         with page.expect_download() as download_info:
             page.locator('[data-action="export"]').click()
         download_info.value.delete()
-        expect(STATE.get_authorization.get("/management/export") == "Bearer good-token", "protected export did not use authenticated fetch")
+        expect(
+            STATE.get_authorization.get("/management/export") == "Bearer good-token",
+            "protected export did not use authenticated fetch",
+        )
 
         page.locator('[data-route="models"]').click()
         filter_input = page.locator("#model-filter")
         filter_input.fill("gpt")
-        filter_input.evaluate("el => { el.dataset.qaIdentity = 'focused'; el.focus(); }")
+        filter_input.evaluate(
+            "el => { el.dataset.qaIdentity = 'focused'; el.focus(); }"
+        )
         page.wait_for_timeout(10_300)
-        expect(filter_input.evaluate("el => el.isConnected && el.dataset.qaIdentity === 'focused' && document.activeElement === el"), "polling replaced focused interactive DOM")
+        expect(
+            filter_input.evaluate(
+                "el => el.isConnected && el.dataset.qaIdentity === 'focused' && document.activeElement === el"
+            ),
+            "polling replaced focused interactive DOM",
+        )
 
         page.set_viewport_size({"width": 390, "height": 780})
         page.locator('[data-route="accounts"]').click()
         page.wait_for_selector(".view-accounts")
-        expect(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "mobile layout overflows the viewport")
-        expect(page.locator("#generation-badge").evaluate("el => getComputedStyle(el).display === 'none'"), "narrow header was not compacted")
+        expect(
+            page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"),
+            "mobile layout overflows the viewport",
+        )
+        expect(
+            page.locator("#generation-badge").evaluate(
+                "el => getComputedStyle(el).display === 'none'"
+            ),
+            "narrow header was not compacted",
+        )
         page.set_viewport_size({"width": 320, "height": 700})
         page.locator('[data-route="operations"]').click()
         page.wait_for_selector(".view-operations")
-        expect(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "320px operations layout overflows the viewport")
+        expect(
+            page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"),
+            "320px operations layout overflows the viewport",
+        )
         page.locator('[data-route="setup"]').click()
         page.wait_for_selector(".view-setup .setup-config")
-        expect(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "320px setup layout overflows the viewport")
+        expect(
+            page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"),
+            "320px setup layout overflows the viewport",
+        )
         expect(not errors, f"browser page errors: {errors}")
         print("PASS: management dashboard browser QA")
     finally:
@@ -436,19 +1006,29 @@ def parse_args() -> argparse.Namespace:
             "Use --require-playwright in CI so an unavailable browser fails instead of skipping."
         ),
     )
-    parser.add_argument("--require-playwright", action="store_true", help="fail when Python Playwright or Chromium is unavailable")
+    parser.add_argument(
+        "--require-playwright",
+        action="store_true",
+        help="fail when Python Playwright or Chromium is unavailable",
+    )
     return parser.parse_args()
 
 
 def missing_playwright_browser(message: str) -> bool:
-    return any(marker in message for marker in ("Executable doesn't exist", "playwright install"))
+    return any(
+        marker in message
+        for marker in ("Executable doesn't exist", "playwright install")
+    )
+
 
 def main() -> int:
     args = parse_args()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as error:
-        print(f"SKIP: Python Playwright is unavailable ({error}). See --help for installation.")
+        print(
+            f"SKIP: Python Playwright is unavailable ({error}). See --help for installation."
+        )
         return 1 if args.require_playwright else 0
     try:
         with sync_playwright() as playwright:
@@ -456,7 +1036,9 @@ def main() -> int:
     except Exception as error:
         message = str(error)
         if missing_playwright_browser(message):
-            print(f"SKIP: Playwright Chromium is unavailable ({error}). See --help for installation.")
+            print(
+                f"SKIP: Playwright Chromium is unavailable ({error}). See --help for installation."
+            )
             return 1 if args.require_playwright else 0
         raise
     return 0

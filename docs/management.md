@@ -6,7 +6,7 @@ Pooler's management listener exposes bounded, redacted runtime state separately 
 
 - Keep the listener on loopback or an owner-private Unix socket. Remote management remains unsupported until management TLS is available.
 - Read endpoints may use the existing loopback policy. Every mutation requires a configured bearer secret, even on loopback.
-- Mutation requests accept no body, reject a mismatched `Origin`, and never put the bearer token in a URL.
+- Operational control mutations accept no body. Typed configuration mutations accept only a bounded JSON body with an ETag precondition. Both reject a mismatched `Origin` and never put the bearer token in a URL.
 - Responses use `Cache-Control: no-store`, a restrictive CSP, frame denial, MIME sniffing protection, and no-referrer policy.
 - Accounts, traces, audit events, and exports contain metadata only. Credential payloads, secret references, request bodies, and authorization headers are never exported.
 
@@ -26,6 +26,7 @@ Send the token as `Authorization: Bearer ...`.
 | Endpoint | Purpose |
 | --- | --- |
 | `/health` | Process, configuration, store, and active-request status |
+| `/config`, `/config/drafts/{id}`, `/config/drafts/{id}/diff` | Active generation and value-free typed-draft metadata or semantic diff |
 | `/setup/options`, `/setup/config`, `/setup/test` | Catalog-derived first-run choices, compiler-validated sidecar generation, and truthful active-runtime checks |
 | `/listeners`, `/routes`, `/models` | Active compiled plan and published model view |
 | `/health/providers`, `/accounts` | Provider and redacted account health |
@@ -64,7 +65,7 @@ Connection remains terminal-only. API keys stay in environment variables or anot
 
 ## Mutations
 
-All mutations use `POST`, require configured bearer authentication, and accept an empty body.
+The operational controls below use body-free `POST` requests and require configured bearer authentication. Typed durable configuration additionally uses bounded JSON `PATCH` and `POST` operations with `If-Match`; see [typed durable configuration](configuration-management.md).
 
 ```text
 POST /accounts/{id}/enable
@@ -83,6 +84,10 @@ Account enable, disable, and switch operations update the live selection registr
 Model enablement is a runtime operator control. It is shared across configuration reload generations in the running process, but is not a replacement for a durable catalog override. For durable model policy, declare `catalog.overrides` in configuration and request a reload.
 
 `POST /reload` asks the serving CLI to reread and compile the configured source before publication; invalid candidates leave the active generation unchanged. `POST /models/reload` refreshes only the configured remote model-catalog sources and does not reread configuration or advance the configuration generation. Both return a correlated request ID, and `/reloads` reports bounded `pending`, `succeeded`, `unchanged`, or `failed` outcomes. Requests are bound to the configuration generation that accepted them, so queued work cannot apply to a newer generation. Listener and management binding changes continue to require a process-level restart.
+
+## Typed durable configuration
+
+The dashboard's **Configuration** view creates an expiring server-side draft, applies section-scoped operations, compiles the whole candidate, shows a value-free semantic diff, and requires explicit confirmation before persistence. Pooler writes an owner-private generated sidecar rather than modifying hand-authored YAML. Atomic persistence, backup, reload correlation, failure restoration, and explicit rollback are documented in [typed durable configuration](configuration-management.md).
 
 ## Cost records
 

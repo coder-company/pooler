@@ -287,7 +287,10 @@ fn serve(
     credential_key_ref: Option<&str>,
     watch: bool,
 ) -> Result<()> {
-    let watcher = ConfigWatcher::new(path)?;
+    let operator_config_source = path.to_path_buf();
+    let config_source = pooler_server::managed_configuration_source(&operator_config_source)
+        .context("failed to read configuration or select a safe managed source")?;
+    let watcher = ConfigWatcher::new(&config_source)?;
     let config = watcher.active().compile()?;
     let resources = runtime_resources(&config, explicit_store_path, credential_key_ref)?;
     pooler_observe::init_tracing().context("failed to initialize structured logging")?;
@@ -302,6 +305,11 @@ fn serve(
             resources.pooling,
         )
         .await?;
+        if server.management_api().is_some() {
+            server
+                .enable_config_management(&operator_config_source)
+                .context("failed to enable typed configuration management")?;
+        }
         for listener in server.listener_addresses() {
             tracing::info!(
                 listener = listener.id(),
@@ -373,6 +381,7 @@ async fn reload_loop(
                 request_id: request.0,
                 catalog_only: request.1,
                 generation: request.2,
+                source: request.3,
             },
         };
         #[cfg(not(unix))]
@@ -383,14 +392,27 @@ async fn reload_loop(
                 request_id: request.0,
                 catalog_only: request.1,
                 generation: request.2,
+                source: request.3,
             },
         };
 
-        let management_request = match event {
+        let _unmanaged_reload_lease =
+            if matches!(event, ReloadTrigger::Watch | ReloadTrigger::Manual) {
+                if !server.try_begin_unmanaged_configuration_reload() {
+                    tracing::info!("unmanaged reload deferred while a managed commit is pending");
+                    continue;
+                }
+                Some(UnmanagedReloadLease(server.clone()))
+            } else {
+                None
+            };
+
+        let management_request = match event.clone() {
             ReloadTrigger::Management {
                 request_id,
                 catalog_only: true,
                 generation,
+                ..
             } => {
                 match server.refresh_catalog(generation).await {
                     Ok(changed) => {
@@ -408,15 +430,24 @@ async fn reload_loop(
                 request_id,
                 catalog_only: false,
                 generation,
-            } => Some((request_id, generation)),
+                source,
+            } => Some((request_id, generation, source.clone())),
             ReloadTrigger::Watch | ReloadTrigger::Manual => None,
         };
         let candidate = {
             let watcher = Arc::clone(&watcher);
+            let candidate_event = event.clone();
             let polled = tokio::task::spawn_blocking(move || {
                 let mut watcher = watcher.lock().expect("configuration watcher lock poisoned");
-                match event {
+                match candidate_event {
                     ReloadTrigger::Watch => watcher.poll().map_err(anyhow::Error::from),
+                    ReloadTrigger::Management {
+                        source: Some(source),
+                        ..
+                    } => watcher
+                        .force_candidate_from(source)
+                        .map(Some)
+                        .map_err(anyhow::Error::from),
                     ReloadTrigger::Manual | ReloadTrigger::Management { .. } => watcher
                         .force_candidate()
                         .map(Some)
@@ -428,8 +459,8 @@ async fn reload_loop(
             match polled {
                 Ok(candidate) => candidate,
                 Err(error) => {
-                    if let Some((request_id, _)) = management_request {
-                        server.complete_management_reload(request_id, None);
+                    if let Some((request_id, _, _)) = &management_request {
+                        server.complete_management_reload(*request_id, None);
                     }
                     tracing::warn!(error = %error, "configuration reload source rejected");
                     continue;
@@ -443,7 +474,15 @@ async fn reload_loop(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+struct UnmanagedReloadLease(pooler_server::HttpProxyServer);
+
+impl Drop for UnmanagedReloadLease {
+    fn drop(&mut self) {
+        self.0.finish_unmanaged_configuration_reload();
+    }
+}
+
+#[derive(Clone, Debug)]
 enum ReloadTrigger {
     Watch,
     Manual,
@@ -451,6 +490,7 @@ enum ReloadTrigger {
         request_id: u64,
         catalog_only: bool,
         generation: u64,
+        source: Option<PathBuf>,
     },
 }
 
@@ -458,7 +498,7 @@ async fn apply_reload_candidate(
     server: &pooler_server::HttpProxyServer,
     watcher: &Arc<Mutex<ConfigWatcher>>,
     candidate: ConfigCandidate,
-    management_request: Option<(u64, u64)>,
+    management_request: Option<(u64, u64, Option<PathBuf>)>,
 ) -> Result<()> {
     let for_compile = candidate.clone();
     let compiled = tokio::task::spawn_blocking(move || for_compile.compile_with_generation(1))
@@ -467,21 +507,21 @@ async fn apply_reload_candidate(
     let compiled = match compiled {
         Ok(config) => config,
         Err(error) => {
-            if let Some((request_id, _)) = management_request {
-                server.complete_management_reload(request_id, None);
+            if let Some((request_id, _, _)) = &management_request {
+                server.complete_management_reload(*request_id, None);
             }
             tracing::warn!(error = %error, "configuration reload rejected");
             return Ok(());
         }
     };
-    let reload = match management_request {
-        Some((_, generation)) => server.reload_for_generation(compiled, generation).await,
+    let reload = match &management_request {
+        Some((_, generation, _)) => server.reload_for_generation(compiled, *generation).await,
         None => server.reload(compiled).await,
     };
     match reload {
         Ok(outcome) => {
-            if let Some((request_id, _)) = management_request {
-                server.complete_management_reload(request_id, Some(outcome.changed()));
+            if let Some((request_id, _, _)) = &management_request {
+                server.complete_management_reload(*request_id, Some(outcome.changed()));
             }
             tracing::info!(
                 generation = outcome.generation(),
@@ -494,8 +534,8 @@ async fn apply_reload_candidate(
                 .accept(candidate);
         }
         Err(error) => {
-            if let Some((request_id, _)) = management_request {
-                server.complete_management_reload(request_id, None);
+            if let Some((request_id, _, _)) = &management_request {
+                server.complete_management_reload(*request_id, None);
             }
             tracing::warn!(error = %error, "configuration reload rejected");
         }
@@ -906,7 +946,9 @@ routes:
         );
         let accepted = api.handle(&http::Method::POST, "/reload", &headers);
         assert_eq!(accepted.status, http::StatusCode::ACCEPTED);
-        let (request_id, catalog_only, generation) = server.next_management_reload_request().await;
+        let (request_id, catalog_only, generation, managed_source) =
+            server.next_management_reload_request().await;
+        assert!(managed_source.is_none());
         assert!(!catalog_only);
         assert_eq!(generation, 1);
 
@@ -920,9 +962,14 @@ routes:
             .expect("config watcher lock")
             .force_candidate()
             .expect("candidate loads");
-        apply_reload_candidate(&server, &watcher, candidate, Some((request_id, generation)))
-            .await
-            .expect("management reload applies");
+        apply_reload_candidate(
+            &server,
+            &watcher,
+            candidate,
+            Some((request_id, generation, None)),
+        )
+        .await
+        .expect("management reload applies");
         assert_eq!(server.config_generation(), 2);
 
         let reloads = api.handle(&http::Method::GET, "/reloads", &headers);

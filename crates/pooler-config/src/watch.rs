@@ -179,6 +179,16 @@ impl ConfigWatcher {
         Ok(ConfigCandidate { loaded })
     }
 
+    /// Load a candidate from an explicitly managed source. The active root is
+    /// switched only after the caller publishes it and calls [`Self::accept`].
+    pub fn force_candidate_from(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<ConfigCandidate, ConfigError> {
+        let loaded = self.loader.load_tracked(path)?;
+        Ok(ConfigCandidate { loaded })
+    }
+
     /// Mark a candidate as successfully applied and switch the dependency set.
     pub fn accept(&mut self, candidate: ConfigCandidate) {
         self.active = candidate.loaded;

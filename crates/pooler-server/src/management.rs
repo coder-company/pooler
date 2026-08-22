@@ -2,7 +2,8 @@
 //!
 //! The management surface is intentionally separate from inference routes.
 //! It exposes immutable plans and redacted mutable state, accepts only bounded
-//! body-free control operations, and never serializes credential references.
+//! typed configuration operations and body-free controls, and never serializes
+//! credential references.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -24,7 +25,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::{header, HeaderMap, Method, Response, StatusCode, Uri};
 use http_body::Body as _;
-use http_body_util::Full;
+use http_body_util::{BodyExt as _, Full, Limited};
 use hyper::{body::Incoming, service::service_fn, Request};
 use hyper_util::rt::TokioIo;
 use pooler_auth::{
@@ -44,6 +45,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::config_management::{
+    ConfigManagement, ConfigManagementError, PreparedCommit, TypedConfigPatch,
+};
 use crate::http_runtime::RuntimeGeneration;
 use crate::management_ui;
 use crate::{merged_model_catalog_value, CatalogRuntime, ConfigSnapshot, ConfigStore};
@@ -54,8 +58,10 @@ const MAX_MANAGEMENT_AUDIT_EVENTS: usize = 256;
 const MAX_MANAGEMENT_RELOADS: usize = 256;
 const MAX_PENDING_MANAGEMENT_RELOADS: usize = 16;
 const MAX_MANAGEMENT_HEADER_BYTES: usize = 64 * 1024;
+const MAX_CONFIG_MUTATION_BODY_BYTES: usize = 256 * 1024;
 const MANAGEMENT_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const MANAGEMENT_BODY_GUARD_TIMEOUT: Duration = Duration::from_millis(50);
+const MANAGEMENT_CONFIG_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOPBACK_HOST_ERROR: &str =
     "management Host header must name localhost or a loopback address";
 
@@ -542,12 +548,31 @@ fn management_model_action(path: &str) -> Option<(String, &str)> {
     None
 }
 
+fn is_config_request(path: &str) -> bool {
+    path == "/config/drafts" || path == "/config/rollback" || path.starts_with("/config/drafts/")
+}
+
+fn is_config_mutation(method: &Method, path: &str) -> bool {
+    is_config_request(path) && (*method == Method::POST || *method == Method::PATCH)
+}
+
+fn config_draft_action(path: &str) -> Option<(u64, Option<&str>)> {
+    let suffix = path.strip_prefix("/config/drafts/")?;
+    let (id, action) = suffix
+        .split_once('/')
+        .map_or((suffix, None), |(id, action)| (id, Some(action)));
+    let id = id.parse::<u64>().ok()?;
+    (id > 0 && action.is_none_or(|action| matches!(action, "validate" | "diff" | "commit")))
+        .then_some((id, action))
+}
+
 fn is_management_mutation(method: &Method, path: &str) -> bool {
-    *method == Method::POST
-        && (path == "/reload"
-            || path == "/models/reload"
-            || management_account_action(path).is_some()
-            || management_model_action(path).is_some())
+    is_config_mutation(method, path)
+        || (*method == Method::POST
+            && (path == "/reload"
+                || path == "/models/reload"
+                || management_account_action(path).is_some()
+                || management_model_action(path).is_some()))
 }
 
 fn mutation_body_rejection(headers: &HeaderMap) -> Option<(StatusCode, &'static str)> {
@@ -683,11 +708,12 @@ impl ManagementReloadKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManagementReloadRequest {
     pub(crate) id: u64,
     pub(crate) kind: ManagementReloadKind,
     pub(crate) generation: u64,
+    pub(crate) source: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -721,6 +747,8 @@ pub struct ManagementApi {
     audit: Arc<Mutex<VecDeque<Value>>>,
     reload: Arc<ReloadControl>,
     native_commands: Option<mpsc::Sender<NativeAccountCommand>>,
+    config_management: Arc<Mutex<Option<Arc<ConfigManagement>>>>,
+    configuration_reload_serial: Arc<Mutex<()>>,
     active: ActiveCounts,
 }
 
@@ -779,6 +807,8 @@ impl ManagementApi {
             audit: Arc::new(Mutex::new(VecDeque::new())),
             reload: Arc::new(ReloadControl::default()),
             native_commands: None,
+            config_management: Arc::new(Mutex::new(None)),
+            configuration_reload_serial: Arc::new(Mutex::new(())),
             active,
         }
     }
@@ -820,8 +850,65 @@ impl ManagementApi {
             audit: Arc::new(Mutex::new(VecDeque::new())),
             reload: Arc::new(ReloadControl::default()),
             native_commands: Some(services.native_commands),
+            config_management: Arc::new(Mutex::new(None)),
+            configuration_reload_serial: Arc::new(Mutex::new(())),
             active,
         }
+    }
+
+    /// Enable bounded typed configuration drafts for this process source.
+    pub fn enable_config_management(&self, source: impl AsRef<Path>) -> io::Result<()> {
+        let manager = ConfigManagement::new(source).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "managed configuration source was rejected",
+            )
+        })?;
+        *self
+            .config_management
+            .lock()
+            .expect("configuration management lock poisoned") = Some(Arc::new(manager));
+        Ok(())
+    }
+
+    pub(crate) fn try_begin_unmanaged_configuration_reload(&self) -> bool {
+        self.config_management
+            .lock()
+            .expect("configuration management lock poisoned")
+            .as_ref()
+            .is_none_or(|manager| manager.try_begin_unmanaged_reload())
+    }
+
+    pub(crate) fn finish_unmanaged_configuration_reload(&self) {
+        if let Some(manager) = self
+            .config_management
+            .lock()
+            .expect("configuration management lock poisoned")
+            .as_ref()
+        {
+            manager.finish_unmanaged_reload();
+        }
+    }
+
+    fn managed_configuration_reload_pending(&self) -> bool {
+        if !self.try_begin_unmanaged_configuration_reload() {
+            return true;
+        }
+        self.finish_unmanaged_configuration_reload();
+        false
+    }
+
+    fn has_pending_configuration_reload(&self) -> bool {
+        self.reload
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records
+            .iter()
+            .any(|record| {
+                record["kind"] == ManagementReloadKind::Configuration.as_str()
+                    && record["status"] == "pending"
+            })
     }
 
     pub(crate) fn record_native_result(
@@ -883,6 +970,21 @@ impl ManagementApi {
         configuration_generation: u64,
         catalog_generation: Option<u64>,
     ) {
+        let restoration_failed = self
+            .config_management
+            .lock()
+            .expect("configuration management lock poisoned")
+            .as_ref()
+            .is_some_and(|manager| {
+                manager
+                    .complete_commit(request_id, matches!(outcome, "succeeded" | "unchanged"))
+                    .is_err()
+            });
+        let outcome = if restoration_failed {
+            "restoration_failed"
+        } else {
+            outcome
+        };
         let kind = {
             let mut state = self
                 .reload
@@ -919,12 +1021,13 @@ impl ManagementApi {
         );
     }
 
-    fn enqueue_reload(
+    fn new_reload_request(
         &self,
         kind: ManagementReloadKind,
         configuration_generation: u64,
-    ) -> Option<ManagementReloadRequest> {
-        let request = ManagementReloadRequest {
+        source: Option<PathBuf>,
+    ) -> ManagementReloadRequest {
+        ManagementReloadRequest {
             id: self
                 .reload
                 .next_id
@@ -932,7 +1035,13 @@ impl ManagementApi {
                 .saturating_add(1),
             kind,
             generation: configuration_generation,
-        };
+            source,
+        }
+    }
+
+    fn enqueue_reload_request(&self, request: ManagementReloadRequest) -> bool {
+        let kind = request.kind;
+        let configuration_generation = request.generation;
         {
             let mut state = self
                 .reload
@@ -940,9 +1049,9 @@ impl ManagementApi {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.pending.len() >= MAX_PENDING_MANAGEMENT_RELOADS {
-                return None;
+                return false;
             }
-            state.pending.push_back(request);
+            state.pending.push_back(request.clone());
             state.records.push_back(json!({
                 "request_id": request.id,
                 "kind": kind.as_str(),
@@ -966,7 +1075,18 @@ impl ManagementApi {
             ],
         );
         self.reload.notify.notify_one();
-        Some(request)
+        true
+    }
+
+    fn enqueue_reload(
+        &self,
+        kind: ManagementReloadKind,
+        configuration_generation: u64,
+        source: Option<PathBuf>,
+    ) -> Option<ManagementReloadRequest> {
+        let request = self.new_reload_request(kind, configuration_generation, source);
+        self.enqueue_reload_request(request.clone())
+            .then_some(request)
     }
 
     fn reloads(&self, generation: u64) -> ManagementResponse {
@@ -1245,17 +1365,263 @@ impl ManagementApi {
         self.plan.bind()
     }
 
-    /// Handle one body-free request.
-    ///
-    /// `path_and_query` may be a complete URI or just a path. A request body
-    /// is deliberately not accepted by this API; callers should route only
-    /// the method, URI, and headers here.
+    fn config_manager(&self) -> Option<Arc<ConfigManagement>> {
+        self.config_management
+            .lock()
+            .expect("configuration management lock poisoned")
+            .clone()
+    }
+
+    fn config_error(error: ConfigManagementError) -> ManagementResponse {
+        let (status, message) = match error {
+            ConfigManagementError::NotFound => {
+                (StatusCode::NOT_FOUND, "configuration draft was not found")
+            }
+            ConfigManagementError::Expired => (StatusCode::GONE, "configuration draft has expired"),
+            ConfigManagementError::Precondition => (
+                StatusCode::PRECONDITION_FAILED,
+                "configuration precondition failed",
+            ),
+            ConfigManagementError::UnsupportedPatch => (
+                StatusCode::BAD_REQUEST,
+                "configuration patch is not supported",
+            ),
+            ConfigManagementError::PatchLimit => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "configuration patch limit reached",
+            ),
+            ConfigManagementError::TooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "configuration document is too large",
+            ),
+            ConfigManagementError::Invalid(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "configuration candidate is invalid",
+            ),
+            ConfigManagementError::Confirmation => (
+                StatusCode::CONFLICT,
+                "configuration confirmation is invalid",
+            ),
+            ConfigManagementError::Persistence => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "configuration persistence failed",
+            ),
+        };
+        ManagementResponse::json(status, json!({"error": message}), false)
+    }
+
+    fn queue_config_commit(
+        &self,
+        manager: &Arc<ConfigManagement>,
+        commit: PreparedCommit,
+        action: &str,
+    ) -> ManagementResponse {
+        let generation = commit.base_generation;
+        let source = commit.managed_path.clone();
+        let request = self.new_reload_request(
+            ManagementReloadKind::Configuration,
+            generation,
+            Some(source),
+        );
+        manager.register_commit(request.id, commit);
+        if !self.enqueue_reload_request(request.clone()) {
+            let outcome = if manager.complete_commit(request.id, false).is_ok() {
+                "queue_unavailable"
+            } else {
+                "restoration_failed"
+            };
+            self.record_audit(action, None, outcome);
+            return state_unavailable();
+        }
+        self.record_audit_with_fields(
+            action,
+            None,
+            "accepted",
+            &[
+                ("request_id", json!(request.id)),
+                ("base_generation", json!(generation)),
+            ],
+        );
+        ManagementResponse::json(
+            StatusCode::ACCEPTED,
+            json!({
+                "request_id": request.id,
+                "base_generation": generation,
+                "status": "pending"
+            }),
+            false,
+        )
+    }
+
+    fn handle_config_request(
+        &self,
+        method: &Method,
+        path: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+        active_generation: u64,
+    ) -> ManagementResponse {
+        let Some(manager) = self.config_manager() else {
+            return ManagementResponse::json(
+                StatusCode::CONFLICT,
+                json!({"error": "managed configuration is not enabled"}),
+                false,
+            );
+        };
+        let if_match = || {
+            headers
+                .get(header::IF_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    ManagementResponse::json(
+                        StatusCode::PRECONDITION_REQUIRED,
+                        json!({"error": "If-Match is required"}),
+                        false,
+                    )
+                })
+        };
+        let result = match (method, path, config_draft_action(path)) {
+            (&Method::POST, "/config/drafts", _) if body.is_empty() => {
+                manager.create(active_generation)
+            }
+            (&Method::GET, _, Some((id, None))) if body.is_empty() => manager.view(id),
+            (&Method::GET, _, Some((id, Some("diff")))) if body.is_empty() => manager.diff(id),
+            (&Method::PATCH, _, Some((id, None))) => {
+                let etag = match if_match() {
+                    Ok(etag) => etag,
+                    Err(response) => return response,
+                };
+                let patch = match serde_json::from_slice::<TypedConfigPatch>(body) {
+                    Ok(patch) => patch,
+                    Err(_) => {
+                        return ManagementResponse::json(
+                            StatusCode::BAD_REQUEST,
+                            json!({"error": "typed configuration patch is invalid"}),
+                            false,
+                        );
+                    }
+                };
+                manager.apply(id, etag, patch)
+            }
+            (&Method::POST, _, Some((id, Some("validate")))) if body.is_empty() => {
+                let etag = match if_match() {
+                    Ok(etag) => etag,
+                    Err(response) => return response,
+                };
+                manager.validate(id, etag)
+            }
+            (&Method::POST, _, Some((id, Some("commit")))) => {
+                let etag = match if_match() {
+                    Ok(etag) => etag,
+                    Err(response) => return response,
+                };
+                let token = serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("confirmation_token")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                let Some(token) = token else {
+                    return ManagementResponse::json(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "confirmation_token is required"}),
+                        false,
+                    );
+                };
+                let _serial = self
+                    .configuration_reload_serial
+                    .lock()
+                    .expect("configuration reload serialization lock poisoned");
+                if self.has_pending_configuration_reload() {
+                    return Self::config_error(ConfigManagementError::Precondition);
+                }
+                return match manager.commit(id, etag, active_generation, &token) {
+                    Ok(commit) => self.queue_config_commit(&manager, commit, "config_commit"),
+                    Err(error) => Self::config_error(error),
+                };
+            }
+            (&Method::POST, "/config/rollback", _) => {
+                let expected = format!("generation-{active_generation}");
+                let matched = if_match().is_ok_and(|value| value.trim_matches('"') == expected);
+                let confirmed = serde_json::from_slice::<Value>(body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("confirm")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .is_some_and(|value| value == "rollback");
+                if !matched || !confirmed {
+                    return ManagementResponse::json(
+                        StatusCode::PRECONDITION_FAILED,
+                        json!({"error": "rollback generation and confirmation are required"}),
+                        false,
+                    );
+                }
+                let _serial = self
+                    .configuration_reload_serial
+                    .lock()
+                    .expect("configuration reload serialization lock poisoned");
+                if self.has_pending_configuration_reload() {
+                    return Self::config_error(ConfigManagementError::Precondition);
+                }
+                return match manager.rollback(active_generation) {
+                    Ok(commit) => self.queue_config_commit(&manager, commit, "config_rollback"),
+                    Err(error) => Self::config_error(error),
+                };
+            }
+            _ => {
+                return ManagementResponse::json(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    json!({"error": "configuration operation is not supported"}),
+                    false,
+                );
+            }
+        };
+        match result {
+            Ok(value) => {
+                let status = if *method == Method::POST && path == "/config/drafts" {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                };
+                self.record_audit(path, None, "succeeded");
+                let etag = value.get("etag").and_then(Value::as_str).map(str::to_owned);
+                let mut response = ManagementResponse::json(status, value, false);
+                if let Some(etag) =
+                    etag.and_then(|etag| header::HeaderValue::from_str(&format!("\"{etag}\"")).ok())
+                {
+                    response.headers.insert(header::ETAG, etag);
+                }
+                response
+            }
+            Err(error) => {
+                self.record_audit(path, None, "failed");
+                Self::config_error(error)
+            }
+        }
+    }
+
+    /// Handle one body-free management request.
     #[must_use]
     pub fn handle(
         &self,
         method: &Method,
         path_and_query: &str,
         headers: &HeaderMap,
+    ) -> ManagementResponse {
+        self.handle_with_body(method, path_and_query, headers, &[])
+    }
+
+    fn handle_with_body(
+        &self,
+        method: &Method,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        body: &[u8],
     ) -> ManagementResponse {
         let uri = path_and_query.parse::<Uri>().ok();
         let request_path = uri.as_ref().map_or(path_and_query, Uri::path);
@@ -1279,7 +1645,7 @@ impl ManagementApi {
             );
             response.headers.insert(
                 header::ALLOW,
-                header::HeaderValue::from_static("GET, HEAD, POST"),
+                header::HeaderValue::from_static("GET, HEAD, POST, PATCH"),
             );
             return response;
         }
@@ -1291,7 +1657,7 @@ impl ManagementApi {
             );
         }
         let local_ui_shell = ui_asset && management_bind_is_loopback(self.bind());
-        if mutation {
+        if mutation && !is_config_mutation(method, path) {
             if let Some((status, message)) = mutation_body_rejection(headers) {
                 self.record_audit(path, None, "rejected_body");
                 return ManagementResponse::json(status, json!({"error": message}), false);
@@ -1360,6 +1726,13 @@ impl ManagementApi {
         }
         let response = match path {
             "/health" | "/healthz" | "/" => self.health(snapshot, pooling),
+            path if is_config_request(path) => self.handle_config_request(
+                method,
+                path,
+                headers,
+                body,
+                snapshot.generation().value(),
+            ),
             "/config" | "/config/generation" => self.config_generation(snapshot),
             "/setup/options" => self.setup_options(snapshot),
             "/setup/config" => self.setup_config(uri.as_ref().and_then(Uri::query)),
@@ -1399,7 +1772,23 @@ impl ManagementApi {
                 } else {
                     ManagementReloadKind::Configuration
                 };
-                match self.enqueue_reload(kind, snapshot.generation().value()) {
+                let request = if kind == ManagementReloadKind::Configuration {
+                    let _serial = self
+                        .configuration_reload_serial
+                        .lock()
+                        .expect("configuration reload serialization lock poisoned");
+                    if self.managed_configuration_reload_pending() {
+                        return ManagementResponse::json(
+                            StatusCode::CONFLICT,
+                            json!({"error": "a managed configuration reload is pending"}),
+                            false,
+                        );
+                    }
+                    self.enqueue_reload(kind, snapshot.generation().value(), None)
+                } else {
+                    self.enqueue_reload(kind, snapshot.generation().value(), None)
+                };
+                match request {
                     Some(request) => ManagementResponse::json(
                         StatusCode::ACCEPTED,
                         json!({
@@ -1436,6 +1825,43 @@ impl ManagementApi {
         } else {
             response
         }
+    }
+
+    fn config_mutation_authorization_rejection(
+        &self,
+        path: &str,
+        headers: &HeaderMap,
+    ) -> Option<ManagementResponse> {
+        if !management_origin_allowed(headers) {
+            self.record_audit(path, None, "rejected_origin");
+            return Some(ManagementResponse::json(
+                StatusCode::FORBIDDEN,
+                json!({"error": "management mutation Origin does not match Host"}),
+                false,
+            ));
+        }
+        if self.plan.auth().is_none() {
+            self.record_audit(path, None, "authentication_not_configured");
+            return Some(ManagementResponse::json(
+                StatusCode::FORBIDDEN,
+                json!({"error": "management mutations require configured bearer authentication"}),
+                false,
+            ));
+        }
+        if !self.authorized(headers) {
+            self.record_audit(path, None, "unauthorized");
+            let mut response = ManagementResponse::json(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "management authentication required"}),
+                false,
+            );
+            response.headers.insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Bearer"),
+            );
+            return Some(response);
+        }
+        None
     }
 
     fn authorized(&self, headers: &HeaderMap) -> bool {
@@ -1489,14 +1915,29 @@ impl ManagementApi {
     }
 
     fn config_generation(&self, snapshot: &ConfigSnapshot<CompiledConfig>) -> ManagementResponse {
-        ManagementResponse::json(
+        let generation = snapshot.generation().value();
+        let etag = format!("generation-{generation}");
+        let mut response = ManagementResponse::json(
             StatusCode::OK,
             json!({
-                "configuration_generation": snapshot.generation().value(),
-                "management": {"mutations": self.plan.auth().is_some()},
+                "configuration_generation": generation,
+                "etag": etag,
+                "management": {
+                    "mutations": self.plan.auth().is_some(),
+                    "typed_drafts": self.config_management
+                        .lock()
+                        .expect("configuration management lock poisoned")
+                        .is_some(),
+                },
             }),
             false,
-        )
+        );
+        response.headers.insert(
+            header::ETAG,
+            header::HeaderValue::from_str(&format!("\"generation-{generation}\""))
+                .expect("generation ETag is a valid header"),
+        );
+        response
     }
 
     fn setup_options(&self, snapshot: &ConfigSnapshot<CompiledConfig>) -> ManagementResponse {
@@ -2503,7 +2944,36 @@ fn raw_management_path(request_target: &str) -> Option<String> {
     Some(management_path.to_owned())
 }
 
-fn raw_is_management_mutation(prefix: &[u8]) -> bool {
+fn raw_config_mutation_headers(prefix: &[u8]) -> Result<Option<(String, HeaderMap)>, ()> {
+    let header_end = prefix
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or(())?;
+    let headers = std::str::from_utf8(&prefix[..header_end]).map_err(|_| ())?;
+    let mut lines = headers.split("\r\n");
+    let mut request = lines.next().ok_or(())?.split_whitespace();
+    let method = match request.next().ok_or(())? {
+        "POST" => Method::POST,
+        "PATCH" => Method::PATCH,
+        _ => return Ok(None),
+    };
+    let request_target = request.next().ok_or(())?;
+    let management_path = raw_management_path(request_target).ok_or(())?;
+    if !is_config_mutation(&method, &management_path) {
+        return Ok(None);
+    }
+
+    let mut parsed = HeaderMap::new();
+    for line in lines {
+        let (name, value) = line.split_once(':').ok_or(())?;
+        let name = header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| ())?;
+        let value = header::HeaderValue::from_str(value.trim()).map_err(|_| ())?;
+        parsed.append(name, value);
+    }
+    Ok(Some((management_path, parsed)))
+}
+
+fn raw_is_body_free_management_mutation(prefix: &[u8]) -> bool {
     let Some(header_end) = prefix.windows(4).position(|window| window == b"\r\n\r\n") else {
         return false;
     };
@@ -2514,16 +2984,19 @@ fn raw_is_management_mutation(prefix: &[u8]) -> bool {
         return false;
     };
     let mut request = request_line.split_whitespace();
-    if request.next() != Some("POST") {
-        return false;
-    }
+    let method = match request.next() {
+        Some("POST") => Method::POST,
+        Some("PATCH") => Method::PATCH,
+        _ => return false,
+    };
     let Some(request_target) = request.next() else {
         return false;
     };
     let Some(management_path) = raw_management_path(request_target) else {
         return false;
     };
-    is_management_mutation(&Method::POST, &management_path)
+    is_management_mutation(&method, &management_path)
+        && !is_config_mutation(&method, &management_path)
 }
 
 fn raw_mutation_body_rejection(prefix: &[u8]) -> Option<(StatusCode, &'static str)> {
@@ -2531,12 +3004,16 @@ fn raw_mutation_body_rejection(prefix: &[u8]) -> Option<(StatusCode, &'static st
     let headers = std::str::from_utf8(&prefix[..header_end]).ok()?;
     let mut lines = headers.split("\r\n");
     let mut request = lines.next()?.split_whitespace();
-    if request.next()? != "POST" {
-        return None;
-    }
+    let method = match request.next()? {
+        "POST" => Method::POST,
+        "PATCH" => Method::PATCH,
+        _ => return None,
+    };
     let request_target = request.next()?;
     let management_path = raw_management_path(request_target)?;
-    if !is_management_mutation(&Method::POST, &management_path) {
+    if !is_management_mutation(&method, &management_path)
+        || is_config_mutation(&method, &management_path)
+    {
         return None;
     }
 
@@ -2595,28 +3072,64 @@ async fn serve_management_connection<I>(
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return,
         },
     };
-    if raw_mutation_body_rejection(&prefix).is_none() && raw_is_management_mutation(&prefix) {
-        let mut probe = [0_u8; 1024];
-        let probe_result = tokio::select! {
-            _ = cancellation.cancelled() => return,
-            result = tokio::time::timeout(
-                MANAGEMENT_BODY_GUARD_TIMEOUT,
-                io.read(&mut probe),
-            ) => result,
-        };
-        match probe_result {
-            Ok(Ok(0)) | Err(_) => {}
-            Ok(Ok(read)) => prefix.extend_from_slice(&probe[..read]),
-            Ok(Err(_)) => return,
+    let header_end = prefix
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("header reader returned a complete prefix")
+        + 4;
+    let overflow = prefix.split_off(header_end);
+    let mut boundary_response = match raw_config_mutation_headers(&prefix) {
+        Ok(Some((path, headers))) => {
+            if !management_request_host_allowed(&api, false, &headers) {
+                api.record_audit(&path, None, "rejected_host");
+                Some(ManagementResponse::json(
+                    StatusCode::FORBIDDEN,
+                    json!({"error": LOOPBACK_HOST_ERROR}),
+                    false,
+                ))
+            } else {
+                api.config_mutation_authorization_rejection(&path, &headers)
+            }
+        }
+        Ok(None) => None,
+        Err(()) => Some(ManagementResponse::json(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "management request headers are invalid"}),
+            false,
+        )),
+    };
+
+    if boundary_response.is_none() {
+        prefix.extend_from_slice(&overflow);
+        if raw_mutation_body_rejection(&prefix).is_none()
+            && raw_is_body_free_management_mutation(&prefix)
+        {
+            let mut probe = [0_u8; 1024];
+            let probe_result = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                result = tokio::time::timeout(
+                    MANAGEMENT_BODY_GUARD_TIMEOUT,
+                    io.read(&mut probe),
+                ) => result,
+            };
+            match probe_result {
+                Ok(Ok(0)) | Err(_) => {}
+                Ok(Ok(read)) => prefix.extend_from_slice(&probe[..read]),
+                Ok(Err(_)) => return,
+            }
+        }
+        if let Some((status, message)) = raw_mutation_body_rejection(&prefix) {
+            api.record_audit("http_boundary", None, "rejected_body");
+            boundary_response = Some(ManagementResponse::json(
+                status,
+                json!({"error": message}),
+                false,
+            ));
         }
     }
-    if let Some((status, message)) = raw_mutation_body_rejection(&prefix) {
-        api.record_audit("http_boundary", None, "rejected_body");
-        let response = management_http_response(ManagementResponse::json(
-            status,
-            json!({"error": message}),
-            false,
-        ));
+
+    if let Some(response) = boundary_response {
+        let response = management_http_response(response);
         let service = service_fn(move |_request: Request<Incoming>| {
             let response = response.clone();
             async move { Ok::<_, std::convert::Infallible>(response) }
@@ -2651,6 +3164,58 @@ async fn serve_management_connection<I>(
                     json!({"error": LOOPBACK_HOST_ERROR}),
                     false,
                 )
+            } else if is_config_mutation(request.method(), management_path) {
+                if let Some(response) =
+                    api.config_mutation_authorization_rejection(management_path, request.headers())
+                {
+                    response
+                } else if request.headers().contains_key(header::TRANSFER_ENCODING) {
+                    ManagementResponse::json(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "typed configuration mutations require Content-Length"}),
+                        false,
+                    )
+                } else if request
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .is_some_and(|length| length > MAX_CONFIG_MUTATION_BODY_BYTES)
+                {
+                    ManagementResponse::json(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        json!({"error": "typed configuration mutation is too large"}),
+                        false,
+                    )
+                } else {
+                    let (parts, incoming) = request.into_parts();
+                    match tokio::time::timeout(
+                        MANAGEMENT_CONFIG_BODY_TIMEOUT,
+                        Limited::new(incoming, MAX_CONFIG_MUTATION_BODY_BYTES).collect(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(collected)) => api.handle_with_body(
+                            &parts.method,
+                            parts.uri.to_string().as_str(),
+                            &parts.headers,
+                            &collected.to_bytes(),
+                        ),
+                        Ok(Err(_)) => ManagementResponse::json(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            json!({"error": "typed configuration mutation is too large"}),
+                            false,
+                        ),
+                        Err(_) => {
+                            api.record_audit(parts.uri.path(), None, "body_timeout");
+                            ManagementResponse::json(
+                                StatusCode::REQUEST_TIMEOUT,
+                                json!({"error": "typed configuration mutation body timed out"}),
+                                false,
+                            )
+                        }
+                    }
+                }
             } else if is_management_mutation(request.method(), management_path) {
                 if let Some((status, message)) = mutation_body_rejection(request.headers()) {
                     api.record_audit(management_path, None, "rejected_body");
@@ -3114,6 +3679,7 @@ routes:
         assert!(html_body.contains("/management/ui/icons.js"));
         assert!(html_body.contains("/management/ui/providers.js"));
         assert!(html_body.contains("/management/ui/assets/mark-charcoal-64.png"));
+        assert!(html_body.contains("data-route=\"configuration\""));
         assert!(!html_body.contains("type=\"submit\""));
         for endpoint in [
             "listeners",
@@ -3181,6 +3747,10 @@ routes:
         assert!(js_body.contains("\"/metrics\""));
         assert!(js_body.contains("cache: \"no-store\""));
         assert!(js_body.contains("method: \"POST\""));
+        assert!(js_body.contains("\"PATCH\""));
+        assert!(js_body.contains("If-Match"));
+        assert!(js_body.contains("/config/drafts"));
+        assert!(js_body.contains("confirmation_token"));
         assert!(js_body.contains("Authorization"));
         assert!(js_body.contains("downloadExport"));
         assert!(js_body.contains("`${BASE}/export`"));
@@ -3939,7 +4509,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         let api = api();
         let generation = api.state.load().config.generation().value();
         let first = api
-            .enqueue_reload(ManagementReloadKind::Catalog, generation)
+            .enqueue_reload(ManagementReloadKind::Catalog, generation, None)
             .expect("first catalog reload queued");
         api.complete_reload(first.id, "succeeded", generation, Some(0));
         let path = format!(
@@ -3956,7 +4526,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         );
 
         let second = api
-            .enqueue_reload(ManagementReloadKind::Catalog, generation)
+            .enqueue_reload(ManagementReloadKind::Catalog, generation, None)
             .expect("second catalog reload queued");
         api.complete_reload(second.id, "failed", generation, Some(0));
         let stale = api.handle(&Method::GET, &path, &loopback_headers());
@@ -3965,6 +4535,262 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             stale["checks"][4]["status"], "failed",
             "an older successful reload must not bypass a newer failed reload"
         );
+    }
+
+    #[tokio::test]
+    async fn typed_configuration_api_requires_etags_and_activates_only_after_reload() {
+        const SECRET_ENV: &str = "POOLER_MANAGEMENT_CONFIG_TEST_KEY";
+        std::env::set_var(SECRET_ENV, "managed-config-secret");
+        let directory = tempfile::tempdir().expect("temporary configuration directory");
+        let source = directory.path().join("gateway.yaml");
+        std::fs::write(
+            &source,
+            format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{SECRET_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\nmodels: [{{id: public-model, targets: [{{provider: provider-a, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+            ),
+        )
+        .expect("source configuration written");
+        let api = authenticated_api(SECRET_ENV);
+        api.enable_config_management(&source)
+            .expect("typed management enabled");
+        let mut headers = loopback_headers();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer managed-config-secret"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://localhost"),
+        );
+
+        let created = api.handle_with_body(&Method::POST, "/config/drafts", &headers, &[]);
+        assert_eq!(created.status, StatusCode::CREATED);
+        let created = response_value(created);
+        let draft = created["draft_id"].as_u64().expect("draft id");
+        let etag = created["etag"].as_str().expect("draft etag");
+        let patch_path = format!("/config/drafts/{draft}");
+        let missing_etag = api.handle_with_body(
+            &Method::PATCH,
+            &patch_path,
+            &headers,
+            br#"{"op":"remove","section":"models","id":"public-model"}"#,
+        );
+        assert_eq!(missing_etag.status, StatusCode::PRECONDITION_REQUIRED);
+
+        headers.insert(
+            header::IF_MATCH,
+            header::HeaderValue::from_str(etag).expect("ETag header"),
+        );
+        let patch = json!({
+            "op": "upsert",
+            "section": "models",
+            "id": "public-model",
+            "value": {
+                "id": "public-model",
+                "targets": [{
+                    "provider": "provider-a",
+                    "upstream_model": "provider-model-2"
+                }]
+            }
+        });
+        let patched = api.handle_with_body(
+            &Method::PATCH,
+            &patch_path,
+            &headers,
+            &serde_json::to_vec(&patch).expect("patch JSON"),
+        );
+        assert_eq!(patched.status, StatusCode::OK);
+        let patched = response_value(patched);
+        let etag = patched["etag"].as_str().expect("patched etag");
+        headers.insert(
+            header::IF_MATCH,
+            header::HeaderValue::from_str(etag).expect("updated ETag header"),
+        );
+        let validated = api.handle_with_body(
+            &Method::POST,
+            &format!("{patch_path}/validate"),
+            &headers,
+            &[],
+        );
+        assert_eq!(validated.status, StatusCode::OK);
+        let validated = response_value(validated);
+        assert_eq!(validated["valid"], true);
+        assert_eq!(validated["semantic_diff"][0]["section"], "models");
+        assert!(validated["semantic_diff"][0].get("value").is_none());
+        let confirmation = validated["confirmation_token"]
+            .as_str()
+            .expect("confirmation token");
+        let committed = api.handle_with_body(
+            &Method::POST,
+            &format!("{patch_path}/commit"),
+            &headers,
+            &serde_json::to_vec(&json!({"confirmation_token": confirmation})).expect("commit JSON"),
+        );
+        assert_eq!(committed.status, StatusCode::ACCEPTED);
+        let committed_body = String::from_utf8(committed.body).expect("commit response text");
+        assert!(!committed_body.contains(SECRET_ENV));
+        assert!(!committed_body.contains("managed-config-secret"));
+        assert!(!committed_body.contains("provider-model-2"));
+
+        assert!(api.managed_configuration_reload_pending());
+        let overlapping = api.handle(&Method::POST, "/reload", &headers);
+        assert_eq!(overlapping.status, StatusCode::CONFLICT);
+
+        let request = api.next_reload_request().await;
+        let managed = directory.path().join("gateway.managed.yaml");
+        assert_eq!(request.source.as_deref(), Some(managed.as_path()));
+        assert!(managed.is_file());
+        let generated = std::fs::read_to_string(&managed).expect("managed sidecar readable");
+        assert!(generated.starts_with("# Generated and exclusively managed by Pooler."));
+        assert!(generated.contains("provider-model-2"));
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("operator source readable"),
+            format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{SECRET_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\nmodels: [{{id: public-model, targets: [{{provider: provider-a, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+            )
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&managed)
+                .expect("managed metadata")
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+
+        api.complete_reload(request.id, "failed", request.generation, None);
+        assert!(
+            !managed.exists(),
+            "a failed publication restores the pre-commit filesystem state"
+        );
+        std::env::remove_var(SECRET_ENV);
+    }
+
+    #[tokio::test]
+    async fn management_listener_collects_only_bounded_typed_configuration_json() {
+        const SECRET_ENV: &str = "POOLER_MANAGEMENT_TYPED_BODY_TEST_KEY";
+        assert!(!raw_is_body_free_management_mutation(
+            b"PATCH /management/config/drafts/1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ));
+        assert!(raw_is_body_free_management_mutation(
+            b"POST /management/reload HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ));
+
+        std::env::set_var(SECRET_ENV, "typed-body-secret");
+        let directory = tempfile::tempdir().expect("temporary configuration directory");
+        let source = directory.path().join("gateway.yaml");
+        std::fs::write(
+            &source,
+            format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{SECRET_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\nmodels: [{{id: public-model, targets: [{{provider: provider-a, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+            ),
+        )
+        .expect("source configuration written");
+        let api = Arc::new(authenticated_api(SECRET_ENV));
+        api.enable_config_management(&source)
+            .expect("typed management enabled");
+        let server = ManagementHttpServer::bind(Arc::clone(&api))
+            .await
+            .expect("management listener binds");
+        let address: SocketAddr = server
+            .address()
+            .parse()
+            .expect("ephemeral management address");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let send = |request: Vec<u8>| async move {
+            let mut stream = TcpStream::connect(address)
+                .await
+                .expect("management connects");
+            stream
+                .write_all(&request)
+                .await
+                .expect("management request writes");
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut response),
+            )
+            .await
+            .expect("management response arrives")
+            .expect("management response reads");
+            response
+        };
+        let created = send(
+            b"POST /management/config/drafts HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nAuthorization: Bearer typed-body-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&created).contains("201 Created"));
+        let created_body = created
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| &created[position + 4..])
+            .expect("HTTP response body");
+        let created: Value = serde_json::from_slice(created_body).expect("created draft JSON");
+        let draft = created["draft_id"].as_u64().expect("draft id");
+        let etag = created["etag"].as_str().expect("draft ETag");
+        let patch = serde_json::to_vec(&json!({
+            "op": "remove",
+            "section": "models",
+            "id": "public-model"
+        }))
+        .expect("patch JSON");
+        let request = format!(
+            "PATCH /management/config/drafts/{draft} HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nAuthorization: Bearer typed-body-secret\r\nIf-Match: {etag}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            patch.len()
+        );
+        let mut request = request.into_bytes();
+        request.extend_from_slice(&patch);
+        let patched = send(request).await;
+        assert!(
+            String::from_utf8_lossy(&patched).contains("200 OK"),
+            "typed mutation response was {}",
+            String::from_utf8_lossy(&patched)
+        );
+
+        let oversized = send(
+            b"PATCH /management/config/drafts/1 HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nAuthorization: Bearer typed-body-secret\r\nIf-Match: ignored\r\nContent-Type: application/json\r\nContent-Length: 300000\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&oversized).contains("413 Payload Too Large"));
+
+        let unauthenticated = send(
+            b"PATCH /management/config/drafts/1 HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789"
+                .to_vec(),
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&unauthenticated).contains("401 Unauthorized"));
+
+        let mut slow = TcpStream::connect(address)
+            .await
+            .expect("slow management client connects");
+        slow.write_all(
+            b"PATCH /management/config/drafts/1 HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nAuthorization: Bearer typed-body-secret\r\nIf-Match: ignored\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .expect("slow management headers write");
+        let mut timed_out = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            slow.read_to_end(&mut timed_out),
+        )
+        .await
+        .expect("bounded body deadline elapses")
+        .expect("body timeout response reads");
+        assert!(String::from_utf8_lossy(&timed_out).contains("408 Request Timeout"));
+
+        server.begin_shutdown();
+        runner
+            .await
+            .expect("management task does not panic")
+            .expect("management task shuts down");
+        std::env::remove_var(SECRET_ENV);
     }
 
     #[tokio::test]

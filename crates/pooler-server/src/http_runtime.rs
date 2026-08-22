@@ -779,6 +779,31 @@ impl HttpProxyServer {
         self.state.management_api.clone()
     }
 
+    /// Enable bounded typed configuration management for the serving source.
+    pub fn enable_config_management(&self, source: impl AsRef<std::path::Path>) -> io::Result<()> {
+        let api = self.state.management_api.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "management API is not enabled")
+        })?;
+        api.enable_config_management(source)
+    }
+
+    /// Acquire the process-local lease that prevents a managed commit from
+    /// changing the watched file during an ordinary watch or signal reload.
+    #[must_use]
+    pub fn try_begin_unmanaged_configuration_reload(&self) -> bool {
+        self.state
+            .management_api
+            .as_ref()
+            .is_none_or(|api| api.try_begin_unmanaged_configuration_reload())
+    }
+
+    /// Release an ordinary configuration reload lease.
+    pub fn finish_unmanaged_configuration_reload(&self) {
+        if let Some(api) = self.state.management_api.as_ref() {
+            api.finish_unmanaged_configuration_reload();
+        }
+    }
+
     /// Notification used by compatibility callers observing management reload requests.
     #[must_use]
     pub fn management_reload_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {
@@ -790,10 +815,10 @@ impl HttpProxyServer {
 
     /// Wait for the next bounded management reload request.
     ///
-    /// The boolean is true only for a catalog-only refresh; the final value is
-    /// the accepting configuration generation. A server without management
-    /// enabled waits forever rather than causing caller spin.
-    pub async fn next_management_reload_request(&self) -> (u64, bool, u64) {
+    /// The boolean is true only for a catalog-only refresh. The final values are
+    /// the accepting generation and an optional server-chosen managed source.
+    /// A server without management enabled waits forever rather than spinning.
+    pub async fn next_management_reload_request(&self) -> (u64, bool, u64, Option<PathBuf>) {
         let Some(api) = self.state.management_api.as_ref() else {
             return std::future::pending().await;
         };
@@ -805,6 +830,7 @@ impl HttpProxyServer {
                     request.id,
                     request.kind == ManagementReloadKind::Catalog,
                     request.generation,
+                    request.source,
                 );
             }
             let catalog_generation = generation
@@ -4779,8 +4805,9 @@ mod tests {
 
         let accepted = api.handle(&http::Method::POST, "/reload", &headers);
         assert_eq!(accepted.status, http::StatusCode::ACCEPTED);
-        let (second_request_id, catalog_only, accepted_generation) =
+        let (second_request_id, catalog_only, accepted_generation, managed_source) =
             server.next_management_reload_request().await;
+        assert!(managed_source.is_none());
         assert!(!catalog_only);
         assert_eq!(accepted_generation, 2);
         let third = pooler_config::compile_yaml(

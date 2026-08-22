@@ -34,7 +34,9 @@ pooler-observe = { path = "../pooler-observe" }
 pooler-store = { path = "../pooler-store" }
 ring.workspace = true
 rustls.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+serde_yml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
