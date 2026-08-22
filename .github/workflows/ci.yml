@@ -55,6 +55,8 @@ jobs:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: cargo fmt --all --check
+      - name: Install workflow checker dependencies
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
       - run: bash scripts/check-release-workflow.sh
       - run: ./scripts/check-config-schema.sh
       - name: Verify dashboard asset provenance

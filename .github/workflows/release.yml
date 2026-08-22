@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing semantic-version tag to publish; it must already exist
+        description: Existing semantic-version tag to publish
         required: true
         type: string
 
@@ -63,7 +63,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload exact release source evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: release-source
           path: ${{ runner.temp }}/release-source.txt
@@ -91,7 +91,8 @@ jobs:
     uses: ./.github/workflows/secret-scan.yml
     permissions:
       contents: read
-      pull-requests: read # Gitleaks reads pull-request metadata when scanning PRs.
+      # Gitleaks reads pull-request metadata when scanning pull requests.
+      pull-requests: read
     with:
       checkout-ref: ${{ needs.resolve.outputs.sha }}
 
@@ -125,10 +126,18 @@ jobs:
           toolchain: 1.88.0
           components: clippy,rustfmt
 
+      - name: Install Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
+
       - name: Install dependency policy tools
-        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20
         with:
           tool: cargo-audit,cargo-deny
+
+      - name: Install workflow checker dependencies
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -137,7 +146,9 @@ jobs:
         run: bash scripts/check-release-workflow.sh
 
       - name: Check Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: >-
+          cargo clippy --workspace --all-targets --all-features --locked --
+          -D warnings
 
       - name: Run the complete test suite
         run: cargo test --workspace --all-features --locked
@@ -165,7 +176,7 @@ jobs:
         run: scripts/benchmark-release.sh
 
       - name: Upload benchmark and stress evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-benchmark
           path: target/pooler-benchmark-report.json
@@ -224,14 +235,17 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes gcc-aarch64-linux-gnu
+          sudo apt-get install --no-install-recommends --yes \
+            gcc-aarch64-linux-gnu
 
       - name: Read the package version
         id: package
         shell: bash
         run: |
           set -Eeuo pipefail
-          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          version="$(
+          cargo metadata --locked --no-deps --format-version 1 |
+            python3 -c '
           import json
           import sys
           versions = {
@@ -256,9 +270,11 @@ jobs:
           source_date_epoch="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH="$source_date_epoch"
           export CARGO_INCREMENTAL=0
-          export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=/usr/src/pooler"
+          source="${GITHUB_WORKSPACE}"
+          export RUSTFLAGS="--remap-path-prefix=${source}=/usr/src/pooler"
           if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            linker="aarch64-linux-gnu-gcc"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$linker"
           fi
 
           build_root="${RUNNER_TEMP}/pooler-build"
@@ -267,9 +283,11 @@ jobs:
           first_binary="${first_target_dir}/${TARGET}/release/pooler"
           second_binary="${second_target_dir}/${TARGET}/release/pooler"
           CARGO_TARGET_DIR="$first_target_dir" cargo build \
-            --locked --release --package pooler-cli --bin pooler --target "$TARGET"
+            --locked --release --package pooler-cli --bin pooler \
+            --target "$TARGET"
           CARGO_TARGET_DIR="$second_target_dir" cargo build \
-            --locked --release --package pooler-cli --bin pooler --target "$TARGET"
+            --locked --release --package pooler-cli --bin pooler \
+            --target "$TARGET"
           test -x "$first_binary"
           test -x "$second_binary"
           cmp -- "$first_binary" "$second_binary"
@@ -281,7 +299,8 @@ jobs:
           fi
 
           metadata="${RUNNER_TEMP}/metadata-${TARGET}.json"
-          cargo metadata --locked --format-version 1 --filter-platform "$TARGET" > "$metadata"
+          cargo metadata --locked --format-version 1 \
+            --filter-platform "$TARGET" > "$metadata"
           sbom_root="${RUNNER_TEMP}/sbom/${TARGET}"
           mkdir -p "$sbom_root"
           python3 scripts/sbom.py \
@@ -300,7 +319,8 @@ jobs:
           install -m 0755 "$first_binary" "$stage/bin/pooler"
           install -m 0644 README.md LICENSE NOTICE "$stage/"
           cp -R third-party/dashboard-assets "$stage/third-party/"
-          install -m 0644 config/pooler.example.yaml config/cursor.example.yaml \
+          install -m 0644 config/pooler.example.yaml \
+            config/cursor.example.yaml \
             config/media.example.yaml "$stage/config/"
           install -m 0644 schema/pooler.schema.json "$stage/schema/"
           install -m 0644 fixtures/compatibility/manifest.json \
@@ -314,7 +334,8 @@ jobs:
           duplicate_archive="${RUNNER_TEMP}/${package_name}.duplicate.tar.gz"
           python3 scripts/archive.py --root "$stage" --archive "$archive" \
             --epoch "$SOURCE_DATE_EPOCH"
-          python3 scripts/archive.py --root "$stage" --archive "$duplicate_archive" \
+          python3 scripts/archive.py --root "$stage" \
+            --archive "$duplicate_archive" \
             --epoch "$SOURCE_DATE_EPOCH"
           cmp -- "$archive" "$duplicate_archive"
           test -s "$archive"
@@ -327,14 +348,15 @@ jobs:
           packaged_binary="${packaged_root}/bin/pooler"
           test -x "$packaged_binary"
           test -s "${packaged_root}/third-party/dashboard-assets/manifest.json"
-          test -s "${packaged_root}/third-party/dashboard-assets/licenses/Iconoir-MIT.txt"
-          test -s "${packaged_root}/third-party/dashboard-assets/licenses/LobeHub-Icons-MIT.txt"
-          test -s "${packaged_root}/third-party/dashboard-assets/licenses/Simple-Icons-CC0-1.0.md"
-          test -s "${packaged_root}/third-party/dashboard-assets/licenses/Geist-OFL-1.1.txt"
+          license_root="${packaged_root}/third-party/dashboard-assets/licenses"
+          test -s "${license_root}/Iconoir-MIT.txt"
+          test -s "${license_root}/LobeHub-Icons-MIT.txt"
+          test -s "${license_root}/Simple-Icons-CC0-1.0.md"
+          test -s "${license_root}/Geist-OFL-1.1.txt"
           if [[ "$RUN_SMOKE" == "true" ]]; then
+            smoke_config="${packaged_root}/config/pooler.example.yaml"
             "$packaged_binary" --version
-            "$packaged_binary" \
-              --config "${smoke_root}/${package_name}/config/pooler.example.yaml" check
+            "$packaged_binary" --config "$smoke_config" check
           fi
 
           cat > "${artifact_dir}/build-info-${TARGET}.txt" <<EOF
@@ -348,7 +370,7 @@ jobs:
           EOF
 
       - name: Upload the platform artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-${{ matrix.target }}
           path: ${{ runner.temp }}/release/${{ matrix.target }}
@@ -388,7 +410,9 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          version="$(
+          cargo metadata --locked --no-deps --format-version 1 |
+            python3 -c '
           import json
           import sys
           versions = {
@@ -404,7 +428,7 @@ jobs:
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Download platform artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: release-*
           path: release
@@ -435,7 +459,10 @@ jobs:
             file "${RUNNER_TEMP}/pooler-${target}"
           done
 
-          (cd release && sha256sum pooler-*.tar.gz | LC_ALL=C sort -k2 > SHA256SUMS)
+          (
+            cd release
+            sha256sum pooler-*.tar.gz | LC_ALL=C sort -k2 > SHA256SUMS
+          )
           (cd release && sha256sum -c SHA256SUMS)
 
           metadata="${RUNNER_TEMP}/metadata.json"
@@ -459,7 +486,7 @@ jobs:
           EOF
 
       - name: Upload the assembled release
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-bundle
           path: release
@@ -480,13 +507,13 @@ jobs:
 
     steps:
       - name: Download the assembled release
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: release-bundle
           path: release
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a
 
       - name: Sign the checksum manifest
         shell: bash
@@ -499,7 +526,8 @@ jobs:
           test -s "release/${RELEASE_TAG}.sigstore.json"
 
       - name: Attest release provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: >-
+          actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: release/*.tar.gz
 
