@@ -284,10 +284,16 @@ async fn send_json_request(proxy: &str, path: &str, headers: &str, body: &[u8]) 
         );
     }
     let mut response = Vec::new();
-    downstream
-        .read_to_end(&mut response)
-        .await
-        .expect("JSON response");
+    if let Err(error) = downstream.read_to_end(&mut response).await {
+        assert!(
+            !response.is_empty()
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ),
+            "JSON response: {error}"
+        );
+    }
     String::from_utf8(response).expect("JSON response UTF-8")
 }
 
