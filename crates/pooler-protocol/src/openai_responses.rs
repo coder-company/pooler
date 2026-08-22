@@ -1321,6 +1321,18 @@ fn required_string<'a>(
         .ok_or_else(|| invalid_shape(field, "a string"))
 }
 
+fn required_u64(
+    object: &Map<String, Value>,
+    key: &str,
+    field: &str,
+) -> Result<u64, OpenAiResponsesError> {
+    object
+        .get(key)
+        .ok_or_else(|| missing(field))?
+        .as_u64()
+        .ok_or_else(|| invalid_shape(field, "an unsigned integer"))
+}
+
 fn optional_string(
     object: &Map<String, Value>,
     key: &str,
@@ -1516,6 +1528,7 @@ impl OpenAiResponsesEventDecoder {
             "error" => self.decode_error(object),
             "response.queued" => Ok(Vec::new()),
             other if is_builtin_lifecycle_event(other) => {
+                validate_builtin_lifecycle_event(other, object)?;
                 Ok(self.decode_builtin_lifecycle_event(object, input))
             }
             other => Err(OpenAiResponsesError::InvalidStream {
@@ -2190,18 +2203,59 @@ fn reject_nonempty_message_annotations(
     Ok(())
 }
 
+const OPENAI_RESPONSES_MEDIA_EVENTS: &[&str] = &[
+    "response.audio.delta",
+    "response.audio.done",
+    "response.audio.transcript.delta",
+    "response.audio.transcript.done",
+    "response.image_generation_call.completed",
+    "response.image_generation_call.generating",
+    "response.image_generation_call.in_progress",
+    "response.image_generation_call.partial_image",
+];
+
 fn is_builtin_lifecycle_event(kind: &str) -> bool {
-    [
-        "response.web_search_call.",
-        "response.file_search_call.",
-        "response.code_interpreter_call.",
-        "response.image_generation_call.",
-        "response.mcp_call.",
-        "response.mcp_call_arguments.",
-        "response.custom_tool_call_input.",
-    ]
-    .into_iter()
-    .any(|prefix| kind.starts_with(prefix))
+    OPENAI_RESPONSES_MEDIA_EVENTS.contains(&kind)
+        || [
+            "response.web_search_call.",
+            "response.file_search_call.",
+            "response.code_interpreter_call.",
+            "response.mcp_call.",
+            "response.mcp_call_arguments.",
+            "response.custom_tool_call_input.",
+        ]
+        .into_iter()
+        .any(|prefix| kind.starts_with(prefix))
+}
+
+fn validate_builtin_lifecycle_event(
+    kind: &str,
+    object: &Map<String, Value>,
+) -> Result<(), OpenAiResponsesError> {
+    if !OPENAI_RESPONSES_MEDIA_EVENTS.contains(&kind) {
+        return Ok(());
+    }
+    required_u64(object, "sequence_number", "event.sequence_number")?;
+    match kind {
+        "response.audio.delta" | "response.audio.transcript.delta" => {
+            required_string(object, "delta", "event.delta")?;
+        }
+        "response.image_generation_call.completed"
+        | "response.image_generation_call.generating"
+        | "response.image_generation_call.in_progress" => {
+            required_string(object, "item_id", "event.item_id")?;
+            required_u64(object, "output_index", "event.output_index")?;
+        }
+        "response.image_generation_call.partial_image" => {
+            required_string(object, "item_id", "event.item_id")?;
+            required_u64(object, "output_index", "event.output_index")?;
+            required_string(object, "partial_image_b64", "event.partial_image_b64")?;
+            required_u64(object, "partial_image_index", "event.partial_image_index")?;
+        }
+        "response.audio.done" | "response.audio.transcript.done" => {}
+        _ => unreachable!("media event list and validator must stay in sync"),
+    }
+    Ok(())
 }
 
 fn response_object(
@@ -2559,6 +2613,9 @@ impl OpenAiResponsesEventEncoder {
             return Err(OpenAiResponsesError::UnsupportedEvent {
                 message: "preserved built-in event has an unknown event type".to_owned(),
             });
+        }
+        if !output_item_event {
+            validate_builtin_lifecycle_event(event, object)?;
         }
 
         let mut report = ConversionReport::default();
@@ -3485,6 +3542,82 @@ mod tests {
                 value["response"]["incomplete_details"]["reason"],
                 wire_reason
             );
+        }
+    }
+
+    #[test]
+    fn media_lifecycle_events_round_trip_with_sdk_6_40_shapes() {
+        let events = [
+            json!({
+                "type":"response.image_generation_call.in_progress",
+                "item_id":"image_1",
+                "output_index":0,
+                "sequence_number":1
+            }),
+            json!({
+                "type":"response.image_generation_call.generating",
+                "item_id":"image_1",
+                "output_index":0,
+                "sequence_number":2
+            }),
+            json!({
+                "type":"response.image_generation_call.partial_image",
+                "item_id":"image_1",
+                "output_index":0,
+                "partial_image_b64":"AQI=",
+                "partial_image_index":0,
+                "sequence_number":3
+            }),
+            json!({
+                "type":"response.image_generation_call.completed",
+                "item_id":"image_1",
+                "output_index":0,
+                "sequence_number":4
+            }),
+            json!({"type":"response.audio.delta","delta":"AQI=","sequence_number":5}),
+            json!({"type":"response.audio.done","sequence_number":6}),
+            json!({"type":"response.audio.transcript.delta","delta":"spoken","sequence_number":7}),
+            json!({"type":"response.audio.transcript.done","sequence_number":8}),
+        ];
+        let mut decoder = OpenAiResponsesEventDecoder::new();
+        for source in events {
+            let body = serde_json::to_vec(&source).expect("event JSON");
+            let decoded = decoder.decode_data(&body).expect("SDK media event decodes");
+            let opaque = decoded
+                .iter()
+                .find(|event| matches!(event.kind, StreamEventKind::Opaque { .. }))
+                .expect("media event remains opaque");
+            let mut encoder = OpenAiResponsesEventEncoder::new();
+            let encoded = encoder
+                .encode_event(opaque, LossPolicy::Reject)
+                .expect("SDK media event re-encodes");
+            assert_eq!(encoded.len(), 1);
+            assert_eq!(encoded[0].event, source["type"]);
+            assert_eq!(encoded[0].body, body);
+            assert!(encoded[0].report.is_lossless());
+        }
+
+        decoder
+            .decode_data(
+                br#"{"type":"response.completed","response":{"id":"resp_media","status":"completed"}}"#,
+            )
+            .expect("media stream completes");
+        decoder.finish().expect("terminal media stream finishes");
+
+        for invalid in [
+            json!({"type":"response.audio.unknown","sequence_number":9}),
+            json!({
+                "type":"response.image_generation_call.partial_image",
+                "item_id":"image_1",
+                "output_index":0,
+                "partial_image_index":1,
+                "sequence_number":10
+            }),
+        ] {
+            let body = serde_json::to_vec(&invalid).expect("invalid event JSON");
+            assert!(OpenAiResponsesEventDecoder::new()
+                .decode_data(&body)
+                .is_err());
         }
     }
 

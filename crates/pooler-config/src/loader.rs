@@ -737,7 +737,7 @@ enum GatewaySurface {
 /// A route is mounted only when the selected provider documents that family
 /// and satisfies the surface, so a Gemini path is never mounted against an
 /// Anthropic upstream merely because both document `models`.
-const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 27] = [
+const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 37] = [
     ("models", GatewaySurface::Discovery("/v1/models"), "models"),
     (
         "chat-completions",
@@ -749,6 +749,56 @@ const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 27] = [
         "responses-compact",
         GatewaySurface::Dialect("openai"),
         "responses_compact",
+    ),
+    (
+        "image-generations",
+        GatewaySurface::Dialect("openai"),
+        "image_generations",
+    ),
+    (
+        "image-edits",
+        GatewaySurface::Dialect("openai"),
+        "image_edits",
+    ),
+    (
+        "audio-transcriptions",
+        GatewaySurface::Dialect("openai"),
+        "audio_transcriptions",
+    ),
+    (
+        "video-creations",
+        GatewaySurface::Dialect("openai"),
+        "video_creations",
+    ),
+    (
+        "video-edits",
+        GatewaySurface::Dialect("openai"),
+        "video_edits",
+    ),
+    (
+        "video-extensions",
+        GatewaySurface::Dialect("openai"),
+        "video_extensions",
+    ),
+    (
+        "video-remixes",
+        GatewaySurface::Dialect("openai"),
+        "video_remixes",
+    ),
+    (
+        "video-retrieval",
+        GatewaySurface::Dialect("openai"),
+        "video_retrieval",
+    ),
+    (
+        "video-content",
+        GatewaySurface::Dialect("openai"),
+        "video_content",
+    ),
+    (
+        "video-deletions",
+        GatewaySurface::Dialect("openai"),
+        "video_deletions",
     ),
     (
         "responses-websocket",

@@ -22,6 +22,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const SECRET: &str = "operator-chosen-key";
+const VIDEO_CREATE_BODY: &[u8] = b"--pooler-video-create\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nA city in the clouds\r\n--pooler-video-create\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nsora-2\r\n--pooler-video-create\r\nContent-Disposition: form-data; name=\"seconds\"\r\n\r\n4\r\n--pooler-video-create\r\nContent-Disposition: form-data; name=\"size\"\r\n\r\n1280x720\r\n--pooler-video-create\r\nContent-Disposition: form-data; name=\"input_reference\"; filename=\"frame.png\"\r\nContent-Type: image/png\r\n\r\nPNG\r\n--pooler-video-create--\r\n";
+const VIDEO_EDIT_BODY: &[u8] = b"--pooler-video-edit\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nTurn the lights blue\r\n--pooler-video-edit\r\nContent-Disposition: form-data; name=\"video\"; filename=\"source.mp4\"\r\nContent-Type: video/mp4\r\n\r\nMP4\r\n--pooler-video-edit--\r\n";
+const VIDEO_EXTEND_BODY: &[u8] = b"--pooler-video-extend\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nContinue toward the sunrise\r\n--pooler-video-extend\r\nContent-Disposition: form-data; name=\"seconds\"\r\n\r\n8\r\n--pooler-video-extend\r\nContent-Disposition: form-data; name=\"video[id]\"\r\n\r\nvideo_sanitized\r\n--pooler-video-extend--\r\n";
+const IMAGE_EDIT_BODY: &[u8] = b"--pooler-image\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit the cat\r\n--pooler-image\r\nContent-Disposition: form-data; name=\"image\"; filename=\"cat.png\"\r\nContent-Type: image/png\r\n\r\nPNG\r\n--pooler-image--\r\n";
+const AUDIO_TRANSCRIPTION_BODY: &[u8] = b"--pooler-audio\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF\r\n--pooler-audio\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o-transcribe\r\n--pooler-audio\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\nen\r\n--pooler-audio\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nkeep this field\r\n--pooler-audio\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\nverbose_json\r\n--pooler-audio--\r\n";
 
 fn gateway_config(
     directory: &TempDir,
@@ -146,6 +151,46 @@ fn post<'a>(path: &'a str, body: &'a [u8]) -> Call<'a> {
     }
 }
 
+fn multipart_post<'a>(path: &'a str, body: &'a [u8]) -> Call<'a> {
+    Call {
+        method: "POST",
+        path,
+        content_type: Some("multipart/form-data; boundary=pooler-image"),
+        body,
+        extra_headers: "",
+    }
+}
+
+fn audio_multipart_post<'a>(path: &'a str, body: &'a [u8]) -> Call<'a> {
+    Call {
+        method: "POST",
+        path,
+        content_type: Some("multipart/form-data; boundary=pooler-audio"),
+        body,
+        extra_headers: "",
+    }
+}
+
+fn video_multipart_post<'a>(path: &'a str, content_type: &'a str, body: &'a [u8]) -> Call<'a> {
+    Call {
+        method: "POST",
+        path,
+        content_type: Some(content_type),
+        body,
+        extra_headers: "",
+    }
+}
+
+fn video_content_get<'a>(path: &'a str) -> Call<'a> {
+    Call {
+        method: "GET",
+        path,
+        content_type: None,
+        body: b"",
+        extra_headers: "accept: application/binary\r\n",
+    }
+}
+
 fn call_without_body<'a>(method: &'a str, path: &'a str) -> Call<'a> {
     Call {
         method,
@@ -168,6 +213,15 @@ fn assert_all_accepted(log: &ProviderLog, responses: &[String]) {
 
 #[tokio::test]
 async fn openai_routes_satisfy_a_strict_openai_endpoint() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/openai/native-image-audio-2026-08-22.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(MANIFEST_FIXTURE).expect("native image/audio fixture");
+    let media_requests = fixture["requests"].as_array().expect("media requests");
+    assert_eq!(media_requests[0]["path"], "/v1/images/generations");
+    assert_eq!(media_requests[1]["path"], "/v1/images/edits");
+    assert_eq!(media_requests[2]["path"], "/v1/audio/transcriptions");
+
     let (log, responses) = exchange(
         ProviderContract::openai(),
         "openai",
@@ -181,11 +235,55 @@ async fn openai_routes_satisfy_a_strict_openai_endpoint() {
                 "/v1/responses/compact",
                 br#"{"model":"gpt-4o","input":"sanitized"}"#,
             ),
+            post("/v1/images/generations", br#"{"prompt":"a cat"}"#),
+            multipart_post("/v1/images/edits", IMAGE_EDIT_BODY),
+            audio_multipart_post("/v1/audio/transcriptions", AUDIO_TRANSCRIPTION_BODY),
         ],
     )
     .await;
 
     assert_all_accepted(&log, &responses);
+    assert_eq!(
+        responses[3]
+            .split_once("\r\n\r\n")
+            .expect("generation response")
+            .1,
+        r#"{"ok":true}"#
+    );
+    assert_eq!(
+        responses[4]
+            .split_once("\r\n\r\n")
+            .expect("edit response")
+            .1,
+        r#"{"ok":true}"#
+    );
+    assert_eq!(
+        log.accepted_for("/v1/images/generations")
+            .expect("generation reached the upstream")
+            .body,
+        r#"{"prompt":"a cat"}"#
+    );
+    assert_eq!(
+        log.accepted_for("/v1/images/edits")
+            .expect("edit reached the upstream")
+            .body
+            .as_bytes(),
+        IMAGE_EDIT_BODY
+    );
+    assert_eq!(
+        responses[5]
+            .split_once("\r\n\r\n")
+            .expect("transcription response")
+            .1,
+        r#"{"text":"transcribed","segments":[],"provider_extension":{"opaque":true}}"#
+    );
+    assert_eq!(
+        log.accepted_for("/v1/audio/transcriptions")
+            .expect("transcription reached the upstream")
+            .body
+            .as_bytes(),
+        AUDIO_TRANSCRIPTION_BODY
+    );
     let chat = log
         .accepted_for("/v1/chat/completions")
         .expect("chat reached the upstream");
@@ -193,6 +291,113 @@ async fn openai_routes_satisfy_a_strict_openai_endpoint() {
         chat.header("authorization"),
         Some(format!("Bearer {SECRET}").as_str())
     );
+}
+
+#[tokio::test]
+async fn openai_video_routes_match_sdk_6_40_wire_contract_without_server_poll_state() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/openai/native-video-2026-08-22.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(MANIFEST_FIXTURE).expect("native video fixture");
+    let fixture_requests = fixture["requests"].as_array().expect("video requests");
+
+    let (log, responses) = exchange(
+        ProviderContract::openai(),
+        "openai",
+        &[
+            video_multipart_post(
+                "/v1/videos",
+                "multipart/form-data; boundary=pooler-video-create",
+                VIDEO_CREATE_BODY,
+            ),
+            video_multipart_post(
+                "/v1/videos/edits",
+                "multipart/form-data; boundary=pooler-video-edit",
+                VIDEO_EDIT_BODY,
+            ),
+            video_multipart_post(
+                "/v1/videos/extensions",
+                "multipart/form-data; boundary=pooler-video-extend",
+                VIDEO_EXTEND_BODY,
+            ),
+            post(
+                "/v1/videos/video_sanitized/remix",
+                br#"{"prompt":"make it dawn"}"#,
+            ),
+            get("/v1/videos/video_sanitized"),
+            get("/v1/videos/video_sanitized"),
+            video_content_get("/v1/videos/video_sanitized/content?variant=thumbnail"),
+            call_without_body("DELETE", "/v1/videos/video_sanitized"),
+        ],
+    )
+    .await;
+
+    assert_all_accepted(&log, &responses);
+    assert_eq!(
+        log.accepted_for("/v1/videos")
+            .expect("video creation reached the upstream")
+            .body
+            .as_bytes(),
+        VIDEO_CREATE_BODY
+    );
+    assert_eq!(
+        log.accepted_for("/v1/videos/edits")
+            .expect("video edit reached the upstream")
+            .body
+            .as_bytes(),
+        VIDEO_EDIT_BODY
+    );
+    assert_eq!(
+        log.accepted_for("/v1/videos/extensions")
+            .expect("video extension reached the upstream")
+            .body
+            .as_bytes(),
+        VIDEO_EXTEND_BODY
+    );
+    let remix = log
+        .accepted_for("/v1/videos/video_sanitized/remix")
+        .expect("video remix reached the upstream");
+    assert_eq!(remix.body, r#"{"prompt":"make it dawn"}"#);
+    assert_eq!(
+        log.accepted
+            .iter()
+            .filter(|request| {
+                request.method == "GET" && request.path == "/v1/videos/video_sanitized"
+            })
+            .count(),
+        2,
+        "each caller-driven status retrieval must reach the provider"
+    );
+    let content = log
+        .accepted_for("/v1/videos/video_sanitized/content")
+        .expect("video content reached the upstream");
+    assert_eq!(content.query.as_deref(), Some("variant=thumbnail"));
+    assert_eq!(content.header("accept"), Some("application/binary"));
+    assert_eq!(
+        responses[6]
+            .split_once("\r\n\r\n")
+            .expect("video content response")
+            .1,
+        "VIDEO_BYTES"
+    );
+    assert_eq!(
+        responses[7]
+            .split_once("\r\n\r\n")
+            .expect("video deletion response")
+            .1,
+        r#"{"id":"video_sanitized","object":"video.deleted","deleted":true}"#
+    );
+    for request in fixture_requests {
+        let fixture_path = request["path"].as_str().expect("fixture request path");
+        let (path, query) = fixture_path
+            .split_once('?')
+            .map_or((fixture_path, None), |(path, query)| (path, Some(query)));
+        assert!(log.accepted.iter().any(|observed| {
+            observed.method == request["method"].as_str().expect("fixture method")
+                && observed.path == path
+                && observed.query.as_deref() == query
+        }));
+    }
 }
 
 #[tokio::test]

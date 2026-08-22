@@ -570,6 +570,26 @@ async fn the_gateway_preset_uses_semantic_responses_websocket_with_continuation(
         first_response.contains("\"total_tokens\":13"),
         "terminal usage must survive semantic transport: {first_response}"
     );
+    for event_type in [
+        "response.image_generation_call.in_progress",
+        "response.image_generation_call.generating",
+        "response.image_generation_call.partial_image",
+        "response.image_generation_call.completed",
+        "response.audio.delta",
+        "response.audio.done",
+        "response.audio.transcript.delta",
+        "response.audio.transcript.done",
+    ] {
+        assert!(
+            first_response.contains(event_type),
+            "validated media event must survive semantic transport: {event_type}"
+        );
+    }
+    assert!(
+        first_response.contains("\"partial_image_b64\":\"AQI=\"")
+            && first_response.contains("\"delta\":\"spoken\""),
+        "media deltas must retain their same-wire fields: {first_response}"
+    );
 
     let second_body = serde_json::to_vec(&downstream_turns[1]).expect("second request JSON");
     let second_response = send_responses_request(&proxy, &second_body).await;

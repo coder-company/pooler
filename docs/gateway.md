@@ -43,7 +43,7 @@ absent rather than present and broken.
 
 | Provider | Routes mounted |
 | --- | --- |
-| `openai` | `models`, `chat-completions`, `responses`, `responses-compact`, `responses-websocket`, `realtime-websocket`, `realtime-client-secrets`, legacy `realtime-sessions` / `realtime-transcription-sessions`, and four explicit `realtime-calls-*` actions |
+| `openai` | `models`, `chat-completions`, `responses`, `responses-compact`, `image-generations`, `image-edits`, `audio-transcriptions`, `video-creations`, `video-edits`, `video-extensions`, `video-remixes`, `video-retrieval`, `video-content`, `video-deletions`, `responses-websocket`, `realtime-websocket`, `realtime-client-secrets`, legacy `realtime-sessions` / `realtime-transcription-sessions`, and four explicit `realtime-calls-*` actions |
 | `xai` | `models`, `chat-completions`, `responses`, `responses-compact`, `responses-websocket` |
 | `anthropic` | `models`, `messages`, `messages-count-tokens` |
 | `google` | `gemini-models`, `gemini-model-get`, `gemini-model-actions`, and create/resource/cancel routes for `v1`, `v1beta`, and `v1beta2` Interactions |
@@ -54,6 +54,16 @@ absent rather than present and broken.
 | `chat-completions` | `POST /v1/chat/completions` | `chat_completions` | patch |
 | `responses` | `POST /v1/responses` | `responses` | semantic Responses-over-WebSocket transport |
 | `responses-compact` | `POST /v1/responses/compact` | `responses_compact` | bounded same-wire patch |
+| `image-generations` | `POST /v1/images/generations` | `image_generations` | bounded same-wire opaque JSON |
+| `image-edits` | `POST /v1/images/edits` | `image_edits` | bounded lossless multipart request, opaque response |
+| `audio-transcriptions` | `POST /v1/audio/transcriptions` | `audio_transcriptions` | bounded lossless multipart request, opaque response |
+| `video-creations` | `POST /v1/videos` | `video_creations` | bounded lossless multipart request, opaque JSON response |
+| `video-edits` | `POST /v1/videos/edits` | `video_edits` | bounded lossless multipart request, opaque JSON response |
+| `video-extensions` | `POST /v1/videos/extensions` | `video_extensions` | bounded lossless multipart request, opaque JSON response |
+| `video-remixes` | `POST /v1/videos/{video_id}/remix` | `video_remixes` | bounded JSON request, opaque response |
+| `video-retrieval` | `GET /v1/videos/{video_id}` | `video_retrieval` | caller-driven bounded opaque status response |
+| `video-content` | `GET /v1/videos/{video_id}/content?variant=...` | `video_content` | streamed bounded opaque binary response |
+| `video-deletions` | `DELETE /v1/videos/{video_id}` | `video_deletions` | bounded opaque JSON response |
 | `responses-websocket` | `GET /v1/responses` (upgrade) | `responses` | opaque tunnel |
 | `realtime-websocket` | `GET /v1/realtime?model=...` or `?call_id=...` (upgrade) | `realtime` | bounded semantic same-wire validation; sideband reuses this route |
 | `realtime-client-secrets` | `POST /v1/realtime/client_secrets` | `realtime_client_secrets` | bounded opaque same-wire |
@@ -74,10 +84,11 @@ rather than by dialect, so Anthropic keeps its OpenAI-shaped `/v1/models` list
 while Gemini gets `/v1beta/models`. The Interactions versions follow Google's
 current stable/beta reference plus the documented `v1beta2` migration surface.
 
-Embeddings, images, audio, files, batches, and legacy completions are **not**
-mounted when the selected provider does not document those families. They remain
-available to hand-authored routes, where the operator asserts the endpoint
-exists.
+Embeddings, files, batches, and legacy completions are **not** mounted when the
+selected provider does not document those families. The image and audio
+transcription routes above are likewise absent for providers without their
+dedicated endpoint families. These surfaces remain available to hand-authored
+routes, where the operator asserts the endpoint exists.
 
 ### Rejecting an unsupported combination
 
@@ -177,13 +188,47 @@ OpenAI-compatible, xAI, Anthropic, or Google provider removes them at compile
 time. The SDK declares translation-session data types but exports no creation
 method or HTTP path, so no translation-session endpoint is mounted.
 
+OpenAI image generation and editing return their result in the same bounded
+HTTP response to `POST /images/generations` or `POST /images/edits`. The
+installed SDK 6.40.0 `Images` resource exports no separate result-retrieval
+method or path, so Pooler preserves that direct response—including URL or
+base64 result fields—rather than inventing an asynchronous image job endpoint.
+
+### OpenAI video jobs
+
+The installed OpenAI SDK 6.40.0 executable `resources/videos.js` defines the
+video routes mounted above: `create` uses `POST /videos`, `edit` uses
+`POST /videos/edits`, `extend` uses `POST /videos/extensions`, `remix` uses
+`POST /videos/{videoID}/remix`, `retrieve` uses `GET /videos/{videoID}`,
+`downloadContent` uses `GET /videos/{videoID}/content`, and `delete` uses
+`DELETE /videos/{videoID}`. With the OpenAI base URL these become the `/v1`
+paths in the table. Pooler preserves the multipart fields and bytes for the
+three upload methods, accepts only bounded JSON for remix, preserves resource
+IDs and query text, and forwards the SDK's `Accept: application/binary` on
+content downloads. Video content is streamed through an opaque response body
+with a 256 MiB route ceiling rather than retained in memory.
+
+Status polling is caller-driven: each `GET /v1/videos/{video_id}` is an
+independent upstream request. Pooler does not start a poller, retain job state,
+or cache video metadata. This bounded unit deliberately does not mount the SDK's
+video list or character helper methods, and it does not infer cancel, webhook,
+or alternate video paths.
+
 The `responses` route is semantic. It decodes the OpenAI-compatible request,
 performs normal model/account/capability selection, sends a bounded
 `response.create` message to the provider WebSocket, validates every provider
 event, and emits Responses SSE to the REST caller. OpenAI and xAI select their
 respective request/event codecs. Tools, reasoning, usage, failures, incomplete
 terminals, and completed terminals pass through the semantic lifecycle rather
-than an unchecked frame tunnel.
+than an unchecked frame tunnel. Against the installed OpenAI SDK 6.40.0 types,
+its narrow Responses event codec also validates and preserves the exact media
+lifecycle names `response.image_generation_call.{in_progress,generating,
+partial_image,completed}`, `response.audio.{delta,done}`, and
+`response.audio.transcript.{delta,done}`. Their JSON event data, including
+image and audio deltas, remains unchanged in the emitted SSE; the existing
+frame, event, bootstrap, queue, retained-state, terminal, and error bounds
+still apply. These Responses events do not change the separate image, audio,
+or video HTTP route behavior.
 
 A reusable provider connection requires an explicit downstream session identity
 (`session-id`, `session_id`, `x-session-id`, `x-thread-id`, `x-conversation-id`,
@@ -273,8 +318,10 @@ Each claim above is backed by an executable test.
 | `/v1/models` serves the active view and hides routing | `crates/pooler-server/tests/gateway_models.rs` |
 | A disabled or capability-mismatched model is not advertised | `gateway_models.rs::an_operator_disabled_model_leaves_the_published_view`, `::a_model_lacking_a_required_capability_is_not_published` |
 | Caller body preservation and the bounded raw WebSocket tunnel | `crates/pooler-server/tests/gateway_preset.rs` |
-| Mounted semantic Responses WebSocket authentication, tools, reasoning, usage, terminal state, session reuse, and continuation | `gateway_preset.rs::the_gateway_preset_uses_semantic_responses_websocket_with_continuation` |
+| Mounted semantic Responses WebSocket authentication, tools, reasoning, usage, media lifecycle payloads, terminal state, session reuse, and continuation | `gateway_preset.rs::the_gateway_preset_uses_semantic_responses_websocket_with_continuation` |
 | Responses Compact capability isolation, request preservation, credentials, response shape, and local malformed/model/size rejection | `gateway_preset.rs::responses_compact_replays_the_documented_same_wire_shape` |
+| OpenAI image and audio request fields are preserved byte-for-byte, with opaque responses and bounded requests | `gateway_provider_auth.rs::openai_routes_satisfy_a_strict_openai_endpoint` |
+| OpenAI video create/edit/extend/remix, two caller-driven retrievals, content query/header preservation, streamed bytes, and deletion follow SDK 6.40.0 paths | `gateway_provider_auth.rs::openai_video_routes_match_sdk_6_40_wire_contract_without_server_poll_state` |
 | OpenAI Realtime authentication, secret-subprotocol stripping, query preservation, audio, tools, interruption, terminal state, and same-wire lifecycle | `gateway_preset.rs::the_gateway_preset_validates_openai_realtime_lifecycle` |
 | Invalid Realtime client events stop before provider delivery | `gateway_preset.rs::openai_realtime_rejects_invalid_client_events_before_upstream_delivery` |
 | Realtime client-secret, legacy session/transcription-session, and exact SIP control paths, headers, bodies, and credentials | `gateway_provider_auth.rs::openai_realtime_control_routes_match_the_sdk_wire_contract` |

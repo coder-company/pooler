@@ -193,6 +193,32 @@ VERIFIERS: dict[EntryKey, Verifier] = {
         test_name="openai_realtime_control_routes_match_the_sdk_wire_contract",
     ),
     (
+        "openai",
+        "native-image-audio",
+        "SDK-6.40.0",
+        "../openai/native-image-audio-2026-08-22.json",
+        "http_same_wire",
+        "sanitized_local_reference",
+    ): CargoTest(
+        package="pooler-server",
+        target="gateway_provider_auth",
+        source="crates/pooler-server/tests/gateway_provider_auth.rs",
+        test_name="openai_routes_satisfy_a_strict_openai_endpoint",
+    ),
+    (
+        "openai",
+        "native-video",
+        "SDK-6.40.0",
+        "../openai/native-video-2026-08-22.json",
+        "http_same_wire",
+        "sanitized_local_reference",
+    ): CargoTest(
+        package="pooler-server",
+        target="gateway_provider_auth",
+        source="crates/pooler-server/tests/gateway_provider_auth.rs",
+        test_name="openai_video_routes_match_sdk_6_40_wire_contract_without_server_poll_state",
+    ),
+    (
         "gemini",
         "models-actions-interactions",
         "2026-08-21",

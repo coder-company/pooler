@@ -1,0 +1,41 @@
+{
+  "source": {
+    "sdk": "openai-node 6.40.0",
+    "images": "resources/images.js#create -> POST /images/generations; edit -> POST /images/edits",
+    "audio": "resources/audio/transcriptions.js#create -> POST /audio/transcriptions",
+    "image_retrieval": "The SDK exports no separate image-result retrieval method; generation and edit results are returned by the creation response."
+  },
+  "requests": [
+    {
+      "name": "image-generation",
+      "method": "POST",
+      "path": "/v1/images/generations",
+      "content_type": "application/json",
+      "body": {"prompt": "a cat"}
+    },
+    {
+      "name": "image-edit",
+      "method": "POST",
+      "path": "/v1/images/edits",
+      "content_type": "multipart/form-data",
+      "body_contract": ["prompt", "image:image/png"]
+    },
+    {
+      "name": "audio-transcription",
+      "method": "POST",
+      "path": "/v1/audio/transcriptions",
+      "content_type": "multipart/form-data",
+      "body_contract": ["file:audio/wav", "model", "language", "prompt", "response_format"]
+    }
+  ],
+  "provider_responses": {
+    "image-generation": {"ok": true},
+    "image-edit": {"ok": true},
+    "audio-transcription": {"text": "transcribed", "segments": [], "provider_extension": {"opaque": true}}
+  },
+  "redactions": [
+    "Operator bearer credentials are not stored.",
+    "Media payloads are tiny synthetic markers rather than user media.",
+    "This is strict-loopback evidence, not live OpenAI conformance."
+  ]
+}

@@ -18,13 +18,23 @@ fn example_path() -> PathBuf {
 }
 
 /// The routes the shipped example mounts. The example selects OpenAI, whose
-/// integration documents `chat_completions`, `responses`, and `models`, so the
-/// Anthropic and Gemini surfaces are deliberately absent.
+/// integration documents the OpenAI text, image, audio, video, Responses,
+/// Realtime, and models families, so the Anthropic and Gemini surfaces are deliberately absent.
 const MOUNTED_ROUTES: &[&str] = &[
     "gateway-models",
     "gateway-chat-completions",
     "gateway-responses",
     "gateway-responses-compact",
+    "gateway-image-generations",
+    "gateway-image-edits",
+    "gateway-audio-transcriptions",
+    "gateway-video-creations",
+    "gateway-video-edits",
+    "gateway-video-extensions",
+    "gateway-video-remixes",
+    "gateway-video-retrieval",
+    "gateway-video-content",
+    "gateway-video-deletions",
     "gateway-responses-websocket",
     "gateway-realtime-client-secrets",
     "gateway-realtime-sessions",
@@ -100,6 +110,145 @@ fn the_gateway_preset_selects_models_and_mounts_semantic_responses_transport() {
     assert_eq!(compact.target().model_source(), Some(ModelSource::Request));
     assert!(compact.response().mode().preserves_original());
     assert_eq!(compact.limits().max_request_body_bytes, 8 * 1024 * 1024);
+
+    let image_generations = config
+        .route("gateway-image-generations")
+        .expect("image generations route");
+    assert!(image_generations.ingress().mode().preserves_original());
+    assert!(image_generations
+        .target()
+        .capabilities()
+        .contains(Capability::Images));
+    assert_eq!(
+        image_generations.limits().max_request_body_bytes,
+        32 * 1024 * 1024
+    );
+
+    let image_edits = config
+        .route("gateway-image-edits")
+        .expect("image edits route");
+    assert!(image_edits.ingress().mode().is_semantic());
+    assert_eq!(
+        image_edits.ingress().decoder(),
+        Some("decode.media.multipart")
+    );
+    assert!(image_edits.response().mode().preserves_original());
+    assert!(image_edits
+        .target()
+        .capabilities()
+        .contains(Capability::Files));
+    assert_eq!(
+        image_edits
+            .target()
+            .codecs()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>(),
+        ["decode.media.multipart"]
+    );
+
+    let audio_transcriptions = config
+        .route("gateway-audio-transcriptions")
+        .expect("audio transcriptions route");
+    assert!(audio_transcriptions.ingress().mode().is_semantic());
+    assert_eq!(
+        audio_transcriptions.ingress().decoder(),
+        Some("decode.media.multipart")
+    );
+    assert!(audio_transcriptions.response().mode().preserves_original());
+    for capability in [
+        Capability::Text,
+        Capability::Audio,
+        Capability::InputAudio,
+        Capability::Files,
+    ] {
+        assert!(audio_transcriptions
+            .target()
+            .capabilities()
+            .contains(capability));
+    }
+    assert_eq!(
+        audio_transcriptions
+            .target()
+            .codecs()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>(),
+        ["decode.media.multipart"]
+    );
+    assert_eq!(
+        audio_transcriptions.limits().max_request_body_bytes,
+        32 * 1024 * 1024
+    );
+    assert_eq!(
+        audio_transcriptions.limits().max_frame_bytes,
+        32 * 1024 * 1024
+    );
+
+    for id in [
+        "gateway-video-creations",
+        "gateway-video-edits",
+        "gateway-video-extensions",
+    ] {
+        let route = config.route(id).expect("video multipart route");
+        assert_eq!(route.ingress().mode(), BodyMode::Semantic);
+        assert_eq!(route.ingress().decoder(), Some("decode.media.multipart"));
+        assert!(route.response().mode().preserves_original());
+        assert_eq!(
+            route
+                .target()
+                .codecs()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            ["decode.media.multipart"]
+        );
+        assert_eq!(route.limits().max_request_body_bytes, 32 * 1024 * 1024);
+        assert_eq!(route.limits().max_response_body_bytes, 1024 * 1024);
+    }
+    let video_creations = config
+        .route("gateway-video-creations")
+        .expect("video creation route");
+    for capability in [Capability::Text, Capability::Images, Capability::Files] {
+        assert!(video_creations.target().capabilities().contains(capability));
+    }
+
+    let video_remixes = config
+        .route("gateway-video-remixes")
+        .expect("video remix route");
+    assert_eq!(video_remixes.ingress().mode(), BodyMode::Opaque);
+    assert_eq!(video_remixes.matcher().methods().len(), 1);
+    assert_eq!(video_remixes.matcher().methods()[0].as_ref(), "POST");
+    assert_eq!(video_remixes.limits().max_request_body_bytes, 1024 * 1024);
+
+    let video_retrieval = config
+        .route("gateway-video-retrieval")
+        .expect("video retrieval route");
+    assert_eq!(video_retrieval.matcher().methods()[0].as_ref(), "GET");
+    assert!(video_retrieval.response().mode().preserves_original());
+
+    let video_content = config
+        .route("gateway-video-content")
+        .expect("video content route");
+    assert_eq!(video_content.matcher().methods()[0].as_ref(), "GET");
+    assert_eq!(
+        video_content
+            .matcher()
+            .headers()
+            .get("accept")
+            .map(AsRef::as_ref),
+        Some("application/binary")
+    );
+    assert_eq!(
+        video_content.limits().max_response_body_bytes,
+        256 * 1024 * 1024
+    );
+
+    let video_deletions = config
+        .route("gateway-video-deletions")
+        .expect("video deletion route");
+    assert_eq!(video_deletions.matcher().methods()[0].as_ref(), "DELETE");
+    assert!(video_deletions.response().mode().preserves_original());
 
     // Discovery stays opaque and selects no model.
     let models = config.route("gateway-models").expect("models route");
@@ -233,6 +382,16 @@ fn each_provider_mounts_only_its_documented_endpoint_families() {
                 "gw-chat-completions",
                 "gw-responses",
                 "gw-responses-compact",
+                "gw-image-generations",
+                "gw-image-edits",
+                "gw-audio-transcriptions",
+                "gw-video-creations",
+                "gw-video-edits",
+                "gw-video-extensions",
+                "gw-video-remixes",
+                "gw-video-retrieval",
+                "gw-video-content",
+                "gw-video-deletions",
                 "gw-responses-websocket",
                 "gw-realtime-client-secrets",
                 "gw-realtime-sessions",

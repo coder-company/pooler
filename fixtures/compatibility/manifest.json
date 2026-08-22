@@ -247,7 +247,7 @@
       "fixture": "../openai/responses-websocket-semantic-2026-08-21.json",
       "equivalence": "event_semantic",
       "status": "sanitized_local_reference",
-      "source": "Sanitized OpenAI Responses WebSocket turns replayed through the mounted gateway against a strict local WebSocket provider",
+      "source": "Sanitized OpenAI SDK 6.40.0 Responses WebSocket event shapes replayed through the mounted gateway against a strict local WebSocket provider",
       "supported_capabilities": [
         "provider_authentication",
         "tools",
@@ -255,13 +255,18 @@
         "usage",
         "terminal_state",
         "session_scoped_reuse",
-        "continuation_delta"
+        "continuation_delta",
+        "image_generation_lifecycle",
+        "responses_audio_lifecycle",
+        "same_wire_media_event_payloads",
+        "terminal_after_media_events"
       ],
       "unsupported_capabilities": [
         "live_provider"
       ],
       "notes": [
         "This fixture proves the mounted REST-to-WebSocket semantic transport against a strict loopback provider, not live OpenAI authorization or conformance.",
+        "The media event names and required fields are taken from the installed OpenAI SDK 6.40.0 ResponsesServerEvent types; the fixture does not claim live media-provider behavior.",
         "Cancellation, retry commitment, credential isolation, and age/queue bounds are covered by pooler-http unit tests rather than claimed by this fixture row.",
         "Replay: cargo test -p pooler-server --test gateway_preset the_gateway_preset_uses_semantic_responses_websocket_with_continuation --locked."
       ]
@@ -367,6 +372,61 @@
         "Returned ephemeral secrets and identifiers in the fixture are synthetic; this is strict-loopback evidence, not live OpenAI conformance.",
         "Replay: cargo test -p pooler-server --test gateway_provider_auth openai_realtime_control_routes_match_the_sdk_wire_contract --locked.",
         "Replay: cargo test -p pooler-server --test gateway_preset openai_realtime_sideband_reuses_the_call_id_websocket_route --locked."
+      ]
+    },
+    {
+      "adapter": "openai",
+      "protocol": "native-image-audio",
+      "version": "SDK-6.40.0",
+      "fixture": "../openai/native-image-audio-2026-08-22.json",
+      "equivalence": "http_same_wire",
+      "status": "sanitized_local_reference",
+      "source": "Installed OpenAI SDK 6.40.0 image and transcription resource methods replayed through Pooler's strict local OpenAI contract",
+      "supported_capabilities": [
+        "image_generation",
+        "image_editing",
+        "image_result_response",
+        "audio_transcription",
+        "bounded_multipart",
+        "provider_authentication"
+      ],
+      "unsupported_capabilities": [
+        "separate_image_result_retrieval",
+        "live_provider"
+      ],
+      "notes": [
+        "Generation results remain in the provider response because SDK 6.40.0 exports no separate image-result retrieval method.",
+        "Multipart bytes and opaque provider response fields are preserved by strict mounted tests.",
+        "Replay: cargo test -p pooler-server --test gateway_provider_auth openai_routes_satisfy_a_strict_openai_endpoint --locked."
+      ]
+    },
+    {
+      "adapter": "openai",
+      "protocol": "native-video",
+      "version": "SDK-6.40.0",
+      "fixture": "../openai/native-video-2026-08-22.json",
+      "equivalence": "http_same_wire",
+      "status": "sanitized_local_reference",
+      "source": "Installed OpenAI SDK 6.40.0 video resource methods replayed through Pooler's strict local OpenAI contract",
+      "supported_capabilities": [
+        "video_creation",
+        "video_editing",
+        "video_extension",
+        "video_remix",
+        "caller_driven_status_retrieval",
+        "content_download",
+        "video_deletion",
+        "bounded_multipart",
+        "provider_authentication"
+      ],
+      "unsupported_capabilities": [
+        "server_managed_polling",
+        "live_provider"
+      ],
+      "notes": [
+        "Pooler retains no video job or polling state; every retrieval reaches the provider.",
+        "Content query/header preservation and response bytes are asserted by the mounted test.",
+        "Replay: cargo test -p pooler-server --test gateway_provider_auth openai_video_routes_match_sdk_6_40_wire_contract_without_server_poll_state --locked."
       ]
     },
     {

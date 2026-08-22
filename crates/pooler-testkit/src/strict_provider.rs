@@ -57,6 +57,13 @@ const XAI_MODELS: &str = r#"{"data":[{"id":"grok-4.1-fast"}]}"#;
 const ANTHROPIC_MODELS: &str = r#"{"data":[{"id":"claude-sonnet-4"}]}"#;
 const GEMINI_MODELS: &str = r#"{"models":[{"name":"models/gemini-2.5-pro","supportedGenerationMethods":["generateContent","streamGenerateContent","countTokens"]}]}"#;
 const ACCEPTED: &str = r#"{"ok":true}"#;
+const OPENAI_TRANSCRIPTION_RESPONSE: &str =
+    r#"{"text":"transcribed","segments":[],"provider_extension":{"opaque":true}}"#;
+const OPENAI_VIDEO_RESPONSE: &str =
+    r#"{"id":"video_sanitized","object":"video","status":"in_progress","progress":42}"#;
+const OPENAI_VIDEO_DELETE_RESPONSE: &str =
+    r#"{"id":"video_sanitized","object":"video.deleted","deleted":true}"#;
+const OPENAI_VIDEO_CONTENT: &str = "VIDEO_BYTES";
 const OPENAI_COMPACTED_RESPONSE: &str = r#"{"id":"resp_compact_sanitized","created_at":1787270400,"object":"response.compaction","output":[{"id":"msg_sanitized","type":"message","status":"completed","role":"user","content":[{"type":"input_text","text":"sanitized"}]},{"id":"cmp_sanitized","type":"compaction","encrypted_content":"sanitized-encrypted-content"}],"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":0},"output_tokens":4,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":16}}"#;
 const OPENAI_CLIENT_SECRET_RESPONSE: &str = r#"{"value":"ek_sanitized","expires_at":1787271000,"session":{"id":"sess_sanitized","object":"realtime.session","type":"realtime"}}"#;
 const OPENAI_LEGACY_SESSION_RESPONSE: &str = r#"{"client_secret":{"value":"ek_sanitized","expires_at":1787270460},"model":"gpt-4o-realtime-preview"}"#;
@@ -99,6 +106,76 @@ impl ProviderContract {
                     content_type: Some("application/json"),
                     required_body_fields: &["model"],
                     response: OPENAI_COMPACTED_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/images/generations",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["prompt"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/images/edits",
+                    content_type: Some("multipart/form-data"),
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/audio/transcriptions",
+                    content_type: Some("multipart/form-data"),
+                    required_body_fields: &[],
+                    response: OPENAI_TRANSCRIPTION_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/videos",
+                    content_type: Some("multipart/form-data"),
+                    required_body_fields: &[],
+                    response: OPENAI_VIDEO_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/videos/edits",
+                    content_type: Some("multipart/form-data"),
+                    required_body_fields: &[],
+                    response: OPENAI_VIDEO_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/videos/extensions",
+                    content_type: Some("multipart/form-data"),
+                    required_body_fields: &[],
+                    response: OPENAI_VIDEO_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/videos/*/remix",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["prompt"],
+                    response: OPENAI_VIDEO_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1/videos/*",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: OPENAI_VIDEO_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1/videos/*/content",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: OPENAI_VIDEO_CONTENT,
+                },
+                ProviderRoute {
+                    method: "DELETE",
+                    path: "/v1/videos/*",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: OPENAI_VIDEO_DELETE_RESPONSE,
                 },
                 ProviderRoute {
                     method: "POST",
@@ -425,11 +502,23 @@ async fn serve(
         };
         match check(&contract, &credential, &request) {
             Ok(body) => {
-                respond(&mut stream, 200, "OK", body).await;
+                let content_type = if request.path.ends_with("/content") {
+                    "video/mp4"
+                } else {
+                    "application/json"
+                };
+                respond(&mut stream, 200, "OK", body, content_type).await;
                 log.accepted.push(request);
             }
             Err(rejection) => {
-                respond(&mut stream, rejection.status, rejection.reason_phrase, "{}").await;
+                respond(
+                    &mut stream,
+                    rejection.status,
+                    rejection.reason_phrase,
+                    "{}",
+                    "application/json",
+                )
+                .await;
                 log.rejected.push(format!(
                     "{} {} {} -> {} {}",
                     contract.name, request.method, request.path, rejection.status, rejection.detail
@@ -544,7 +633,12 @@ fn check(
     if let Some(query) = &request.query {
         let documented_stream_query =
             route.path.ends_with(":streamGenerateContent") && query == "alt=sse";
-        if !documented_stream_query {
+        let documented_video_query = route.path == "/v1/videos/*/content"
+            && matches!(
+                query.as_str(),
+                "variant=video" | "variant=thumbnail" | "variant=spritesheet"
+            );
+        if !documented_stream_query && !documented_video_query {
             return Err(Rejection::new(
                 400,
                 "Bad Request",
@@ -591,13 +685,20 @@ fn openai_route_headers(path: &str) -> &'static [(&'static str, &'static str)] {
         | "/v1/realtime/calls/*/reject"
         | "/v1/realtime/calls/*/refer"
         | "/v1/realtime/calls/*/hangup" => &[("accept", "*/*")],
+        "/v1/videos/*/content" => &[("accept", "application/binary")],
         _ => &[],
     }
 }
 
-async fn respond(stream: &mut TcpStream, status: u16, reason: &str, body: &str) {
+async fn respond(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+    content_type: &str,
+) {
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes()).await;

@@ -146,6 +146,209 @@ routes:
     response:
       mode: opaque
 
+  # Provider-native image endpoints keep bounded media requests and the
+  # provider's response wire unchanged. Edits are validated losslessly as
+  # multipart; generations remain opaque JSON because their fields are
+  # provider-specific.
+  - id: image-generations
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/images/generations
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: image_generations
+      provider: gateway
+      capabilities: [images]
+    response:
+      mode: opaque
+
+  - id: image-edits
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/images/edits
+      content_types: [multipart/form-data]
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.media.multipart
+    target:
+      endpoint_family: image_edits
+      provider: gateway
+      capabilities: [text, images, files]
+      codecs: [decode.media.multipart]
+    response:
+      mode: opaque
+
+  # Provider-native audio transcription keeps multipart fields and the
+  # provider response wire unchanged while applying bounded media validation.
+  - id: audio-transcriptions
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/audio/transcriptions
+      content_types: [multipart/form-data]
+    limits:
+      max_request_body_bytes: 33554432
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.media.multipart
+    target:
+      endpoint_family: audio_transcriptions
+      provider: gateway
+      capabilities: [text, audio, input_audio, files]
+      codecs: [decode.media.multipart]
+    response:
+      mode: opaque
+
+  # ------------------------------------------------------- OpenAI video family
+  # The installed OpenAI SDK 6.40.0 uses multipart for create/edit/extend,
+  # JSON for remix, and caller-driven GET/DELETE resource operations. These
+  # routes preserve provider-specific fields and keep all bodies bounded.
+  - id: video-creations
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/videos
+      content_types: [multipart/form-data]
+    limits:
+      max_request_body_bytes: 33554432
+      max_response_body_bytes: 1048576
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.media.multipart
+    target:
+      endpoint_family: video_creations
+      provider: gateway
+      capabilities: [text, images, files]
+      codecs: [decode.media.multipart]
+    response:
+      mode: opaque
+
+  - id: video-edits
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/videos/edits
+      content_types: [multipart/form-data]
+    limits:
+      max_request_body_bytes: 33554432
+      max_response_body_bytes: 1048576
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.media.multipart
+    target:
+      endpoint_family: video_edits
+      provider: gateway
+      capabilities: [text, files]
+      codecs: [decode.media.multipart]
+    response:
+      mode: opaque
+
+  - id: video-extensions
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/videos/extensions
+      content_types: [multipart/form-data]
+    limits:
+      max_request_body_bytes: 33554432
+      max_response_body_bytes: 1048576
+      max_frame_bytes: 33554432
+    ingress:
+      mode: semantic
+      decoder: decode.media.multipart
+    target:
+      endpoint_family: video_extensions
+      provider: gateway
+      capabilities: [text, files]
+      codecs: [decode.media.multipart]
+    response:
+      mode: opaque
+
+  - id: video-remixes
+    listen: gateway
+    match:
+      methods: [POST]
+      path_template: "/v1/videos/{video_id}/remix"
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_response_body_bytes: 1048576
+      max_frame_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: video_remixes
+      provider: gateway
+      capabilities: [text]
+    response:
+      mode: opaque
+
+  - id: video-retrieval
+    listen: gateway
+    match:
+      methods: [GET]
+      path_template: "/v1/videos/{video_id}"
+    limits:
+      max_request_body_bytes: 65536
+      max_response_body_bytes: 1048576
+      max_frame_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: video_retrieval
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: video-content
+    listen: gateway
+    match:
+      methods: [GET]
+      path_template: "/v1/videos/{video_id}/content"
+      headers:
+        accept: application/binary
+    limits:
+      max_request_body_bytes: 65536
+      max_response_body_bytes: 268435456
+      max_frame_bytes: 33554432
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: video_content
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: video-deletions
+    listen: gateway
+    match:
+      methods: [DELETE]
+      path_template: "/v1/videos/{video_id}"
+    limits:
+      max_request_body_bytes: 65536
+      max_response_body_bytes: 1048576
+      max_frame_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: video_deletions
+      provider: gateway
+    response:
+      mode: opaque
+
   # GA client secrets and the deprecated session creation endpoints are kept
   # as distinct same-wire families. The latter two require the SDK's beta
   # header from the caller; Pooler does not synthesize undocumented variants.

@@ -1,6 +1,6 @@
 {
   "fixture_version": "2026-08-21",
-  "provenance": "Sanitized OpenAI Responses WebSocket request and event shapes replayed through Pooler's mounted gateway against a strict local WebSocket; no live credential or provider response is included.",
+  "provenance": "Sanitized OpenAI SDK 6.40.0 Responses WebSocket request and event shapes replayed through Pooler's mounted gateway against a strict local WebSocket; no live credential or provider response is included.",
   "session_id": "mounted-session",
   "downstream_turns": [
     {
@@ -66,6 +66,14 @@
   "provider_turns": [
     [
       {"type": "response.created", "response": {"id": "resp_1", "model": "gpt-4o", "status": "in_progress", "output": []}},
+      {"type": "response.image_generation_call.in_progress", "item_id": "image_1", "output_index": 0, "sequence_number": 1},
+      {"type": "response.image_generation_call.generating", "item_id": "image_1", "output_index": 0, "sequence_number": 2},
+      {"type": "response.image_generation_call.partial_image", "item_id": "image_1", "output_index": 0, "partial_image_b64": "AQI=", "partial_image_index": 0, "sequence_number": 3},
+      {"type": "response.image_generation_call.completed", "item_id": "image_1", "output_index": 0, "sequence_number": 4},
+      {"type": "response.audio.delta", "delta": "AQI=", "sequence_number": 5},
+      {"type": "response.audio.done", "sequence_number": 6},
+      {"type": "response.audio.transcript.delta", "delta": "spoken", "sequence_number": 7},
+      {"type": "response.audio.transcript.done", "sequence_number": 8},
       {"type": "response.output_item.added", "output_index": 0, "item": {"id": "fc_weather", "type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "", "status": "in_progress"}},
       {"type": "response.function_call_arguments.delta", "item_id": "fc_weather", "output_index": 0, "delta": "{\"city\":\"Paris\"}"},
       {"type": "response.function_call_arguments.done", "item_id": "fc_weather", "output_index": 0, "name": "weather", "arguments": "{\"city\":\"Paris\"}"},
@@ -94,6 +102,10 @@
     "usage",
     "terminal_state",
     "session_scoped_reuse",
-    "continuation_delta"
+    "continuation_delta",
+    "image_generation_lifecycle",
+    "responses_audio_lifecycle",
+    "same_wire_media_event_payloads",
+    "terminal_after_media_events"
   ]
 }

@@ -1,0 +1,26 @@
+{
+  "source": {
+    "sdk": "openai-node 6.40.0",
+    "resource": "resources/videos.js",
+    "polling": "Caller-driven GET retrieval; Pooler retains no video job or polling state."
+  },
+  "requests": [
+    {"name": "create", "method": "POST", "path": "/v1/videos", "content_type": "multipart/form-data", "body_contract": ["prompt", "model", "seconds", "size", "input_reference:image/png"]},
+    {"name": "edit", "method": "POST", "path": "/v1/videos/edits", "content_type": "multipart/form-data", "body_contract": ["prompt", "video:video/mp4"]},
+    {"name": "extend", "method": "POST", "path": "/v1/videos/extensions", "content_type": "multipart/form-data", "body_contract": ["prompt", "seconds", "video[id]"]},
+    {"name": "remix", "method": "POST", "path": "/v1/videos/video_sanitized/remix", "content_type": "application/json", "body": {"prompt": "make it dawn"}},
+    {"name": "retrieve", "method": "GET", "path": "/v1/videos/video_sanitized"},
+    {"name": "download", "method": "GET", "path": "/v1/videos/video_sanitized/content?variant=thumbnail", "accept": "application/binary"},
+    {"name": "delete", "method": "DELETE", "path": "/v1/videos/video_sanitized"}
+  ],
+  "provider_responses": {
+    "retrieve": {"id": "video_sanitized", "status": "completed"},
+    "download_wire": "VIDEO_BYTES",
+    "delete": {"id": "video_sanitized", "object": "video.deleted", "deleted": true}
+  },
+  "redactions": [
+    "Operator bearer credentials are not stored.",
+    "Video identifiers and media bytes are synthetic.",
+    "This is strict-loopback evidence, not live OpenAI conformance."
+  ]
+}
