@@ -17,6 +17,7 @@ mod management_ui;
 mod model_facts_refresh;
 mod server;
 mod tls;
+mod usage_management;
 
 pub use catalog_runtime::{
     merged_model_catalog_value, merged_model_ids, CatalogFetchFuture, CatalogFetcherRegistration,

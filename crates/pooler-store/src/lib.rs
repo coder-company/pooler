@@ -14,10 +14,11 @@ use thiserror::Error;
 mod encrypted;
 mod oauth;
 mod sqlite;
-
+mod usage;
 pub use encrypted::{CredentialPayload, MasterKey, SecretPayload};
 pub use oauth::{CredentialProfileMetadata, SqliteOAuthTokenStore};
 pub use sqlite::SqliteStore;
+pub use usage::{CostProvenance, UsageRecord};
 
 /// Milliseconds since the Unix epoch, supplied by the caller.
 pub type Timestamp = u64;
@@ -33,6 +34,8 @@ pub struct RetentionPolicy {
     pub max_decisions: usize,
     pub max_request_events: usize,
     pub request_history_ttl_ms: u64,
+    pub max_usage_records: usize,
+    pub usage_history_ttl_ms: u64,
 }
 
 impl RetentionPolicy {
@@ -52,6 +55,8 @@ impl RetentionPolicy {
             max_decisions,
             max_request_events: 4_096,
             request_history_ttl_ms: 7 * 24 * 60 * 60 * 1_000,
+            max_usage_records: 16_384,
+            usage_history_ttl_ms: 90 * 24 * 60 * 60 * 1_000,
         })
     }
 
@@ -68,6 +73,20 @@ impl RetentionPolicy {
         self.request_history_ttl_ms = request_history_ttl_ms;
         Ok(self)
     }
+
+    /// Override bounded historical-usage retention.
+    pub const fn with_usage_history(
+        mut self,
+        max_usage_records: usize,
+        usage_history_ttl_ms: u64,
+    ) -> Result<Self, StoreError> {
+        if max_usage_records == 0 || usage_history_ttl_ms == 0 {
+            return Err(StoreError::InvalidRetention);
+        }
+        self.max_usage_records = max_usage_records;
+        self.usage_history_ttl_ms = usage_history_ttl_ms;
+        Ok(self)
+    }
 }
 
 impl Default for RetentionPolicy {
@@ -78,6 +97,8 @@ impl Default for RetentionPolicy {
             max_decisions: 4_096,
             max_request_events: 4_096,
             request_history_ttl_ms: 7 * 24 * 60 * 60 * 1_000,
+            max_usage_records: 16_384,
+            usage_history_ttl_ms: 90 * 24 * 60 * 60 * 1_000,
         }
     }
 }
@@ -468,6 +489,7 @@ pub struct StoreLengths {
     pub affinities: usize,
     pub decisions: usize,
     pub request_events: usize,
+    pub usage_records: usize,
 }
 
 impl StoreLengths {
@@ -477,6 +499,7 @@ impl StoreLengths {
             && self.affinities == 0
             && self.decisions == 0
             && self.request_events == 0
+            && self.usage_records == 0
     }
 }
 
@@ -488,6 +511,7 @@ pub struct PruneReport {
     pub evicted_affinities: usize,
     pub evicted_decisions: usize,
     pub evicted_request_events: usize,
+    pub evicted_usage_records: usize,
 }
 
 impl PruneReport {
@@ -498,6 +522,7 @@ impl PruneReport {
             + self.evicted_affinities
             + self.evicted_decisions
             + self.evicted_request_events
+            + self.evicted_usage_records
     }
 }
 
@@ -514,6 +539,8 @@ pub enum StoreError {
     DecisionIdExhausted,
     #[error("request event identifier exhausted")]
     RequestEventIdExhausted,
+    #[error("usage record identifier exhausted")]
+    UsageRecordIdExhausted,
     #[error("database path is invalid: {0}")]
     InvalidPath(String),
     #[error("database path is not private: {0}")]
@@ -609,6 +636,8 @@ pub trait Store: Send + Sync {
     fn request_events(&self) -> StoreResult<Vec<RequestEvent>>;
     fn request_events_for(&self, request_id: &str) -> StoreResult<Vec<RequestEvent>>;
 
+    fn append_usage_record(&self, record: UsageRecord) -> StoreResult<UsageRecord>;
+    fn usage_records(&self) -> StoreResult<Vec<UsageRecord>>;
     fn prune(&self, now: Timestamp) -> StoreResult<PruneReport>;
 }
 
@@ -620,8 +649,10 @@ struct Inner {
     affinities: BTreeMap<String, SessionAffinity>,
     decisions: VecDeque<DecisionRecord>,
     request_events: VecDeque<RequestEvent>,
+    usage_records: VecDeque<UsageRecord>,
     next_decision_id: u64,
     next_request_event_id: u64,
+    next_usage_record_id: u64,
 }
 
 /// A deterministic, concurrency-safe in-memory [`Store`].
@@ -651,6 +682,7 @@ impl MemoryStore {
             affinities: inner.affinities.len(),
             decisions: inner.decisions.len(),
             request_events: inner.request_events.len(),
+            usage_records: inner.usage_records.len(),
         })
     }
 
@@ -1169,6 +1201,41 @@ impl Store for MemoryStore {
         Ok(events)
     }
 
+    fn append_usage_record(&self, mut record: UsageRecord) -> StoreResult<UsageRecord> {
+        record.validate()?;
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        let id = if inner.next_usage_record_id == 0 {
+            1
+        } else {
+            inner
+                .next_usage_record_id
+                .checked_add(1)
+                .ok_or(StoreError::UsageRecordIdExhausted)?
+        };
+        inner.next_usage_record_id = id;
+        record.id = id;
+        inner.usage_records.push_back(record.clone());
+        let newest_recorded_at = inner
+            .usage_records
+            .iter()
+            .map(|candidate| candidate.recorded_at)
+            .max()
+            .unwrap_or(record.recorded_at);
+        let cutoff = newest_recorded_at.saturating_sub(self.retention.usage_history_ttl_ms);
+        inner
+            .usage_records
+            .retain(|candidate| candidate.recorded_at >= cutoff);
+        while inner.usage_records.len() > self.retention.max_usage_records {
+            inner.usage_records.pop_front();
+        }
+        Ok(record)
+    }
+
+    fn usage_records(&self) -> StoreResult<Vec<UsageRecord>> {
+        let inner = self.inner.read().map_err(lock_error)?;
+        Ok(inner.usage_records.iter().cloned().collect())
+    }
+
     fn prune(&self, now: Timestamp) -> StoreResult<PruneReport> {
         let mut inner = self.inner.write().map_err(lock_error)?;
         Self::purge_expired_cooldowns(&mut inner, now);
@@ -1185,6 +1252,17 @@ impl Store for MemoryStore {
                 self.retention.max_request_events,
                 now.saturating_sub(self.retention.request_history_ttl_ms),
             ),
+            evicted_usage_records: {
+                let before = inner.usage_records.len();
+                let cutoff = now.saturating_sub(self.retention.usage_history_ttl_ms);
+                inner
+                    .usage_records
+                    .retain(|record| record.recorded_at >= cutoff);
+                while inner.usage_records.len() > self.retention.max_usage_records {
+                    inner.usage_records.pop_front();
+                }
+                before.saturating_sub(inner.usage_records.len())
+            },
         })
     }
 }
@@ -1400,6 +1478,7 @@ mod tests {
                 affinities: 8,
                 decisions: 8,
                 request_events: 0,
+                usage_records: 0,
             }
         );
     }
@@ -1479,6 +1558,30 @@ mod tests {
             Err(StoreError::Serialization(message))
                 if message == "request body hash must be a SHA-256 hex digest"
         ));
+    }
+
+    #[test]
+    fn usage_history_is_bounded_by_age_and_count() {
+        let retention = policy(2, 2, 2)
+            .with_usage_history(2, 100)
+            .expect("usage retention");
+        let store = MemoryStore::with_retention(retention);
+        for (request_id, recorded_at) in [("one", 100), ("two", 101), ("old", 0)] {
+            store
+                .append_usage_record(UsageRecord::new(
+                    recorded_at,
+                    request_id,
+                    "route",
+                    "success",
+                ))
+                .expect("usage record");
+        }
+        let records = store.usage_records().expect("usage records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].request_id, "one");
+        let report = store.prune(250).expect("prune usage");
+        assert_eq!(report.evicted_usage_records, 2);
+        assert!(store.usage_records().expect("pruned usage").is_empty());
     }
 
     #[test]

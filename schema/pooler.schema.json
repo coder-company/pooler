@@ -1675,6 +1675,74 @@
         }
       },
       "type": "object"
+    },
+    "usage_price_book": {
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/usage_price_entry"
+          },
+          "maxItems": 4096,
+          "minItems": 1,
+          "type": "array"
+        },
+        "version": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "entries"
+      ],
+      "type": "object"
+    },
+    "usage_price_entry": {
+      "additionalProperties": false,
+      "properties": {
+        "audio_per_unit_usd_ticks": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_per_million_usd_ticks": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "image_per_unit_usd_ticks": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "input_per_million_usd_ticks": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "model": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "output_per_million_usd_ticks": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reasoning_per_million_usd_ticks": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "video_per_unit_usd_ticks": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "provider",
+        "model"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://coder-company.github.io/pooler/schemas/config-v1.json",
@@ -1797,6 +1865,9 @@
         "type": "string"
       },
       "type": "object"
+    },
+    "usage_price_book": {
+      "$ref": "#/$defs/usage_price_book"
     },
     "version": {
       "maximum": 1,

@@ -506,7 +506,10 @@ fn apply_patch(document: &mut Value, patch: TypedConfigPatch) -> Result<(), Conf
             }
         }
         TypedConfigPatch::Replace { section, value } => {
-            if !matches!(section.as_str(), "catalog" | "management") {
+            if !matches!(
+                section.as_str(),
+                "catalog" | "management" | "usage_price_book"
+            ) {
                 return Err(ConfigManagementError::UnsupportedPatch);
             }
             document
@@ -676,7 +679,7 @@ fn semantic_diff(base: &Value, candidate: &Value) -> Value {
             }
         }
     }
-    for section in ["catalog", "management"] {
+    for section in ["catalog", "management", "usage_price_book"] {
         if base.get(section) != candidate.get(section) {
             changes.push(json!({"section": section, "change": "changed"}));
         }
@@ -1141,6 +1144,54 @@ mod tests {
             serving_source(&path),
             Err(ConfigManagementError::Persistence)
         ));
+    }
+
+    #[test]
+    fn versioned_usage_price_book_is_a_compiler_validated_typed_section() {
+        let (_directory, path) = source();
+        let manager = ConfigManagement::new(&path).expect("manager");
+        let created = manager.create(1).expect("draft");
+        let id = created["draft_id"].as_u64().expect("id");
+        let patched = manager
+            .apply(
+                id,
+                created["etag"].as_str().expect("etag"),
+                TypedConfigPatch::Upsert {
+                    section: "upstreams".into(),
+                    id: "provider".into(),
+                    value: json!({"url": "http://127.0.0.1:1"}),
+                },
+            )
+            .expect("provider patch");
+        let patched = manager
+            .apply(
+                id,
+                patched["etag"].as_str().expect("etag"),
+                TypedConfigPatch::Replace {
+                    section: "usage_price_book".into(),
+                    value: json!({
+                        "version": "operator-v1",
+                        "entries": [{
+                            "provider": "provider",
+                            "model": "model",
+                            "input_per_million_usd_ticks": 1
+                        }]
+                    }),
+                },
+            )
+            .expect("price book patch");
+        let validated = manager
+            .validate(id, patched["etag"].as_str().expect("etag"))
+            .expect("compiled price book draft");
+        assert!(
+            validated["semantic_diff"]
+                .as_array()
+                .expect("diff")
+                .iter()
+                .any(|change| change["section"] == "usage_price_book"
+                    && change["change"] == "changed")
+        );
+        assert!(!validated.to_string().contains("operator-v1"));
     }
 
     #[test]

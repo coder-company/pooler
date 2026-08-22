@@ -231,6 +231,45 @@ def payload(path: str) -> dict:
             **generation,
             "metrics": {"usage": [], "attempts": [], "latencies": []},
         },
+        "/management/usage/aggregate": {
+            "schema_version": 1,
+            "group_by": [
+                "route",
+                "provider",
+                "upstream_model",
+                "result_class",
+                "cost_provenance",
+                "price_book_version",
+            ],
+            "series": [
+                {
+                    "dimensions": {
+                        "route": "route",
+                        "provider": "openai",
+                        "upstream_model": "gpt-test-2026",
+                        "result_class": "success",
+                        "cost_provenance": "provider_reported",
+                        "price_book_version": "",
+                    },
+                    "totals": {
+                        "records": 2,
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "reasoning_tokens": 3,
+                        "cache_tokens": 2,
+                        "image_units": 1,
+                        "audio_units": 0,
+                        "video_units": 0,
+                        "latency_ms": 60,
+                        "ttft_ms": 24,
+                        "ttft_records": 2,
+                        "cost_in_usd_ticks": 42,
+                    },
+                }
+            ],
+            "max_series": 256,
+            "dropped_series_records": 3,
+        },
         "/management/decisions": {
             "decisions": [
                 {
@@ -844,6 +883,30 @@ def run_browser(playwright) -> None:
                 page.locator("[style]").count() == 0,
                 f"{route} rendered an inline style under strict CSP",
             )
+
+
+        page.locator('[data-route="usage"]').click()
+        page.wait_for_selector("text=Historical usage ledger")
+        usage_text = page.locator(".view-usage").inner_text()
+        expect(
+            "provider_reported" in usage_text
+            and "gpt-test-2026" in usage_text
+            and "11 / 7" in usage_text
+            and "Partial totals" in usage_text,
+            "usage ledger omitted retained dimensions or token totals",
+        )
+        page.locator("#usage-range").select_option("7d")
+        page.wait_for_timeout(100)
+        expect(
+            any(
+                target.startswith("/management/usage/aggregate?")
+                and "since=" in target
+                and "until=" in target
+                and "result_class" in target
+                for target in STATE.get_targets
+            ),
+            "usage time-range selection did not issue a bounded query",
+        )
 
         page.locator('[data-route="requests"]').click()
         page.wait_for_selector('[data-request-id="pool-request-browser-1"]')

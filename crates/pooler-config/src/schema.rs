@@ -29,6 +29,8 @@ pub fn config_schema() -> Value {
     definitions.insert("body".to_owned(), body_schema());
     definitions.insert("cache".to_owned(), cache_schema());
     definitions.insert("catalog".to_owned(), catalog_schema());
+    definitions.insert("usage_price_book".to_owned(), usage_price_book_schema());
+    definitions.insert("usage_price_entry".to_owned(), usage_price_entry_schema());
     definitions.insert("catalog_alias".to_owned(), catalog_alias_schema());
     definitions.insert("catalog_refresh".to_owned(), catalog_refresh_schema());
     definitions.insert("catalog_source".to_owned(), catalog_source_schema());
@@ -79,6 +81,7 @@ pub fn config_schema() -> Value {
     properties.insert("providers", named_map_schema(reference("upstream")));
     properties.insert("models", array_schema(reference("model"), Some(0), None));
     properties.insert("catalog", optional(reference("catalog")));
+    properties.insert("usage_price_book", optional(reference("usage_price_book")));
     properties.insert("accounts", named_map_schema(reference("account")));
     properties.insert("credentials", named_map_schema(reference("account")));
     properties.insert("account_pools", named_map_schema(reference("account_pool")));
@@ -166,6 +169,38 @@ fn catalog_schema() -> Value {
             ),
         ]),
         &["sources"],
+        false,
+    )
+}
+
+fn usage_price_book_schema() -> Value {
+    object_schema(
+        properties([
+            ("version", nonempty_string()),
+            (
+                "entries",
+                array_schema(reference("usage_price_entry"), Some(1), Some(4_096)),
+            ),
+        ]),
+        &["version", "entries"],
+        false,
+    )
+}
+
+fn usage_price_entry_schema() -> Value {
+    object_schema(
+        properties([
+            ("provider", nonempty_string()),
+            ("model", nonempty_string()),
+            ("input_per_million_usd_ticks", optional(u64_schema())),
+            ("output_per_million_usd_ticks", optional(u64_schema())),
+            ("reasoning_per_million_usd_ticks", optional(u64_schema())),
+            ("cache_per_million_usd_ticks", optional(u64_schema())),
+            ("image_per_unit_usd_ticks", optional(u64_schema())),
+            ("audio_per_unit_usd_ticks", optional(u64_schema())),
+            ("video_per_unit_usd_ticks", optional(u64_schema())),
+        ]),
+        &["provider", "model"],
         false,
     )
 }

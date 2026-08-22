@@ -8,7 +8,7 @@ Pooler's management listener exposes bounded, redacted runtime state separately 
 - Read endpoints may use the existing loopback policy. Every mutation requires a configured bearer secret, even on loopback.
 - Operational control mutations accept no body. Typed configuration mutations accept only a bounded JSON body with an ETag precondition. Both reject a mismatched `Origin` and never put the bearer token in a URL.
 - Responses use `Cache-Control: no-store`, a restrictive CSP, frame denial, MIME sniffing protection, and no-referrer policy.
-- Accounts, request history, traces, audit events, and exports contain metadata only. Credential payloads, secret references, raw prompts or responses, request bodies, and authorization headers are never exported.
+- Accounts, request history, historical usage, traces, audit events, and exports contain metadata only. Credential payloads, secret references, raw prompts or responses, request bodies, and authorization headers are never exported.
 
 Example:
 
@@ -31,7 +31,9 @@ Send the token as `Authorization: Bearer ...`.
 | `/listeners`, `/routes`, `/models` | Active compiled plan and published model view |
 | `/health/providers`, `/accounts` | Provider and redacted account health |
 | `/quota` | Typed quota windows plus active cooldowns |
-| `/metrics`, `/metrics/prometheus` | Bounded route/provider/model token usage and provider-reported cost ticks |
+| `/metrics`, `/metrics/prometheus` | Bounded process-local compatibility counters |
+| `/usage`, `/usage/aggregate` | Paginated retained usage records and bounded multidimensional time-range aggregates |
+| `/usage/export`, `/usage/prometheus`, `/usage/otlp` | Bounded redacted JSON, Prometheus text, and OTLP/JSON usage exports |
 | `/decisions` | Recent redacted routing decisions |
 | `/requests`, `/requests/{id}`, `/requests/{id}/timeline` | Paginated, filterable request summaries and one-ID admission-to-completion timelines |
 | `/requests/export` | Bounded versioned export of filtered redacted request history |
@@ -99,6 +101,26 @@ Model enablement is a runtime operator control. It is shared across configuratio
 
 The dashboard's **Configuration** view creates an expiring server-side draft, applies section-scoped operations, compiles the whole candidate, shows a value-free semantic diff, and requires explicit confirmation before persistence. Pooler writes an owner-private generated sidecar rather than modifying hand-authored YAML. Atomic persistence, backup, reload correlation, failure restoration, and explicit rollback are documented in [typed durable configuration](configuration-management.md).
 
-## Cost records
+## Historical usage ledger
 
-Pooler does not invent pricing. `cost_in_usd_ticks` is recorded only when a provider response explicitly supplies that integer field. Token usage is normalized from supported JSON and SSE response shapes and attributed to route, provider, and selected model. Observation is bounded and does not retain response content.
+Each completed request appends one bounded metadata-only usage record. The record contains explicitly reported input, output, reasoning, and cache tokens; explicitly reported image, audio, and video units; route, provider, public and upstream model, and non-secret account pseudonym; latency and TTFT; result class and service tier; configuration and catalog generation; and cost provenance. JSON, SSE, and unfragmented upstream WebSocket JSON events use the same bounded usage normalizer. Pooler does not retain response or frame content after extracting these fields.
+
+Memory and SQLite stores apply an independent usage-record count and TTL policy; request-history retention does not control usage retention. Persistent usage is accepted only by encrypted SQLite. Every record is an authenticated encrypted envelope bound to its row identity, survives restart, and fails closed if modified. Unencrypted SQLite rejects usage persistence. The list/export paths cap records, aggregation caps both grouping dimensions and output series, and all management responses pass through strict redaction.
+
+`/usage` accepts descending `cursor` pagination plus `since`, `until`, `route`, `provider`, `model`, `account`, `result_class`, and `service_tier` filters. `/usage/aggregate`, `/usage/prometheus`, and `/usage/otlp` accept the same filters and up to six comma-separated `group_by` dimensions from `route`, `provider`, `public_model`, `upstream_model`, `account`, `result_class`, `service_tier`, `cost_provenance`, `price_book_version`, `configuration_generation`, and `catalog_generation`. Aggregation returns at most 256 series and reports the number of records dropped by that cardinality bound. The dashboard **Usage** view offers one-hour, 24-hour, seven-day, 30-day, and all-retained ranges and a bounded JSON export.
+
+### Cost provenance and operator price books
+
+Pooler never invents prices. A provider-supplied `cost_in_usd_ticks` is stored as `provider_reported` and always takes precedence. Without a provider cost, provenance remains `unknown` unless the active configuration has an exact provider/upstream-model match in an explicit versioned `usage_price_book`. Such a match stores `operator_estimated`, its price-book version, and the deterministic estimate. Token rates are integer USD ticks per million reported tokens and round down after each term; media rates are integer USD ticks per explicitly reported unit. Omitted rates do not contribute. Operators must use one deployment-wide fixed-decimal tick scale for provider and price-book values.
+
+```yaml
+usage_price_book:
+  version: operator-2026-08-22
+  entries:
+    - provider: openai
+      model: gpt-example-2026
+      input_per_million_usd_ticks: 0 # replace with an operator-sourced rate
+      output_per_million_usd_ticks: 0 # replace with an operator-sourced rate
+```
+
+The example deliberately contains no real price. The compiler rejects an empty version, duplicate provider/model entries, unknown upstream IDs, entries with no rates, and unknown fields. A typed configuration draft may replace the complete `usage_price_book` section; semantic diffs reveal only that the section changed, never its values.

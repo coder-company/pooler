@@ -36,7 +36,7 @@ use hyper_util::{
 use pooler_auth::{constant_time_eq, SecretRef as AuthSecretRef, SecretValue};
 use pooler_config::{
     CompiledConfig, ModelSource, RequestTransform, RouteMatchError, RoutePlan, RouteRequest,
-    SecretRef, ServedResource, UpstreamPlan,
+    SecretRef, ServedResource, UpstreamPlan, UsageAmounts, UsagePriceBookPlan,
 };
 use pooler_core::{BodyMode, ErrorClass, RouteLimits};
 use pooler_extension::{ExtensionInput, ExtensionRegistry};
@@ -47,7 +47,7 @@ use pooler_observe::{
 };
 use pooler_policy::{CommitmentState, QuotaObservation, ReplayCheck, SelectionLease};
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
-use pooler_store::{RequestEvent, RequestEventKind, Store};
+use pooler_store::{CostProvenance, RequestEvent, RequestEventKind, Store, UsageRecord};
 use ring::rand::SecureRandom;
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use thiserror::Error;
@@ -466,6 +466,7 @@ struct RequestLifecycle {
     route: Arc<str>,
     configuration_generation: u64,
     catalog_generation: Option<u64>,
+    price_book: Option<Arc<UsagePriceBookPlan>>,
     started: StdInstant,
     next_event: Arc<AtomicU32>,
     completed: Arc<AtomicBool>,
@@ -480,6 +481,7 @@ impl RequestLifecycle {
         route: impl Into<Arc<str>>,
         configuration_generation: u64,
         catalog_generation: Option<u64>,
+        price_book: Option<Arc<UsagePriceBookPlan>>,
     ) -> Self {
         let lifecycle = Self {
             store,
@@ -488,6 +490,7 @@ impl RequestLifecycle {
             route: route.into(),
             configuration_generation,
             catalog_generation,
+            price_book,
             started: StdInstant::now(),
             next_event: Arc::new(AtomicU32::new(0)),
             completed: Arc::new(AtomicBool::new(false)),
@@ -609,14 +612,90 @@ impl RequestLifecycle {
     }
 
     fn complete(&self, class: CompletionClass, status: Option<u16>) {
+        self.complete_with_usage(class, status, None);
+    }
+
+    fn complete_with_usage(
+        &self,
+        class: CompletionClass,
+        status: Option<u16>,
+        usage: Option<&ObservedUsage>,
+    ) {
         if self.completed.swap(true, Ordering::AcqRel) {
             return;
         }
+        let recorded_at = request_timestamp_now();
+        let latency_ms = duration_to_history_millis(self.started.elapsed());
         self.record(RequestEventKind::Completion, |event| {
             event.status = status;
             event.error_class = Some(class.to_string());
-            event.latency_ms = Some(duration_to_history_millis(self.started.elapsed()));
+            event.latency_ms = Some(latency_ms);
         });
+
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut record = UsageRecord::new(
+            recorded_at,
+            self.request_id.as_ref(),
+            self.route.as_ref(),
+            class.to_string(),
+        );
+        record.provider.clone_from(&state.provider);
+        record.public_model.clone_from(&state.public_model);
+        record.upstream_model.clone_from(&state.upstream_model);
+        record
+            .account_pseudonym
+            .clone_from(&state.account_pseudonym);
+        record.latency_ms = latency_ms;
+        record.ttft_ms = state.ttft_ms;
+        record.configuration_generation = self.configuration_generation;
+        record.catalog_generation = self.catalog_generation;
+        drop(state);
+        if let Some(usage) = usage {
+            record.input_tokens = usage.input_tokens;
+            record.output_tokens = usage.output_tokens;
+            record.reasoning_tokens = usage.reasoning_tokens;
+            record.cache_tokens = usage.cache_tokens;
+            record.image_units = usage.image_units;
+            record.audio_units = usage.audio_units;
+            record.video_units = usage.video_units;
+            record.service_tier.clone_from(&usage.service_tier);
+            if let Some(cost) = usage.cost_in_usd_ticks {
+                record.cost_in_usd_ticks = Some(cost);
+                record.cost_provenance = CostProvenance::ProviderReported;
+            } else if let (Some(price_book), Some(provider), Some(model)) = (
+                self.price_book.as_ref(),
+                record.provider.as_deref(),
+                record.upstream_model.as_deref(),
+            ) {
+                if let Some(cost) = price_book.estimate(
+                    provider,
+                    model,
+                    UsageAmounts {
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        reasoning_tokens: usage.reasoning_tokens,
+                        cache_tokens: usage.cache_tokens,
+                        image_units: usage.image_units,
+                        audio_units: usage.audio_units,
+                        video_units: usage.video_units,
+                    },
+                ) {
+                    record.cost_in_usd_ticks = Some(cost);
+                    record.cost_provenance = CostProvenance::OperatorEstimated;
+                    record.price_book_version = Some(price_book.version().to_owned());
+                }
+            }
+        }
+        if let Err(error) = self.store.append_usage_record(record) {
+            tracing::warn!(
+                request_id = %self.request_id,
+                error = %error,
+                "usage record was not persisted"
+            );
+        }
     }
 }
 
@@ -646,6 +725,7 @@ pub struct HttpProxy<A = NoSemanticAdapter> {
     native: Arc<NativeRuntime>,
     extensions: Arc<ExtensionRegistry>,
     caches: BTreeMap<Arc<str>, Arc<ResponseCache>>,
+    price_book: Option<Arc<UsagePriceBookPlan>>,
     observability: MetricsRegistry,
     traces: TraceRecorder,
     resources: RuntimeResources,
@@ -753,6 +833,7 @@ where
         h2c_builder.http2_only(true).http2_adaptive_window(true);
         let h2c_client = h2c_builder.build(h2c_connector);
         let caches = build_route_caches(&config)?;
+        let price_book = config.usage_price_book().cloned().map(Arc::new);
         let resources = RuntimeResources::new();
         Ok(Self {
             config,
@@ -765,6 +846,7 @@ where
             native,
             extensions: Arc::new(ExtensionRegistry::default()),
             caches,
+            price_book,
             observability: MetricsRegistry::default(),
             traces: TraceRecorder::default(),
             resources,
@@ -916,6 +998,7 @@ where
             route.id(),
             self.config.generation(),
             self.pooling.catalog_generation(),
+            self.price_book.clone(),
         );
         let mut observation = Some(self.observability.begin_request(route.id()));
         let request_span = self.traces.span(TraceStage::Request, Some(route.id()));
@@ -1252,13 +1335,10 @@ where
                     deadline,
                     lease,
                     observation,
+                    lifecycle,
                 },
             )
             .await;
-            lifecycle.complete(
-                CompletionClass::Success,
-                Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
-            );
         });
         Ok(response)
     }
@@ -2769,12 +2849,12 @@ impl ObservedBody {
         let Some(mut observation) = self.observation.take() else {
             return;
         };
-        if let Some(lifecycle) = self.lifecycle.as_ref() {
-            lifecycle.complete(completion.clone(), self.status);
-        }
         let usage = (!self.usage_overflowed)
             .then(|| extract_observed_usage(&self.usage_bytes))
             .flatten();
+        if let Some(lifecycle) = self.lifecycle.as_ref() {
+            lifecycle.complete_with_usage(completion.clone(), self.status, usage.as_ref());
+        }
         if let Some(target) = self.usage_target.as_ref() {
             observation.complete_for_target(
                 completion,
@@ -2893,24 +2973,73 @@ fn extract_observed_usage(bytes: &[u8]) -> Option<ObservedUsage> {
     }
 }
 
+fn merge_observed_usage(target: &mut Option<ObservedUsage>, update: ObservedUsage) {
+    let current = target.get_or_insert_with(ObservedUsage::default);
+    if update.input_tokens.is_some() {
+        current.input_tokens = update.input_tokens;
+    }
+    if update.output_tokens.is_some() {
+        current.output_tokens = update.output_tokens;
+    }
+    if update.reasoning_tokens.is_some() {
+        current.reasoning_tokens = update.reasoning_tokens;
+    }
+    if update.cache_tokens.is_some() {
+        current.cache_tokens = update.cache_tokens;
+    }
+    if update.image_units.is_some() {
+        current.image_units = update.image_units;
+    }
+    if update.audio_units.is_some() {
+        current.audio_units = update.audio_units;
+    }
+    if update.video_units.is_some() {
+        current.video_units = update.video_units;
+    }
+    if update.service_tier.is_some() {
+        current.service_tier = update.service_tier;
+    }
+    if update.total_tokens.is_some() {
+        current.total_tokens = update.total_tokens;
+    }
+    if update.cost_in_usd_ticks.is_some() {
+        current.cost_in_usd_ticks = update.cost_in_usd_ticks;
+    }
+}
+
 fn visit_usage_values(value: &serde_json::Value, usage: &mut ObservedUsage, found: &mut bool) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, value) in object {
-                if matches!(key.as_str(), "usage" | "usageMetadata" | "usage_metadata") {
-                    if let Some(usage_object) = value.as_object() {
-                        merge_usage_value(usage_object, usage, found);
-                    }
-                }
-                visit_usage_values(value, usage, found);
-            }
+    let Some(root) = value.as_object() else {
+        return;
+    };
+    merge_usage_envelope(root, usage, found);
+    // Provider streaming events place accounting directly under one response
+    // or message envelope. Do not recurse through repeated envelope names or
+    // generated output/content trees looking for usage-shaped user data.
+    for key in ["response", "message"] {
+        if let Some(envelope) = root.get(key).and_then(serde_json::Value::as_object) {
+            merge_usage_envelope(envelope, usage, found);
         }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                visit_usage_values(value, usage, found);
-            }
+    }
+}
+
+fn merge_usage_envelope(
+    object: &serde_json::Map<String, serde_json::Value>,
+    usage: &mut ObservedUsage,
+    found: &mut bool,
+) {
+    for key in ["usage", "usageMetadata", "usage_metadata"] {
+        if let Some(usage_object) = object.get(key).and_then(serde_json::Value::as_object) {
+            merge_usage_value(usage_object, usage, found);
         }
-        _ => {}
+    }
+    if usage.service_tier.is_none() {
+        if let Some(tier) = object
+            .get("service_tier")
+            .and_then(serde_json::Value::as_str)
+        {
+            usage.service_tier = Some(tier.chars().take(64).collect());
+            *found = true;
+        }
     }
 }
 
@@ -2936,14 +3065,43 @@ fn merge_usage_value(
         found,
     );
     merge_usage_field(
+        &mut usage.reasoning_tokens,
+        numeric_alias(object, &["reasoning_tokens", "thoughtsTokenCount"]).or_else(|| {
+            nested_numeric_alias(object, "output_tokens_details", &["reasoning_tokens"])
+        }),
+        found,
+    );
+    merge_usage_field(
+        &mut usage.cache_tokens,
+        numeric_alias(
+            object,
+            &["cached_tokens", "cache_tokens", "cachedContentTokenCount"],
+        )
+        .or_else(|| nested_numeric_alias(object, "input_tokens_details", &["cached_tokens"])),
+        found,
+    );
+    merge_usage_field(
+        &mut usage.image_units,
+        numeric_alias(object, &["image_units"]),
+        found,
+    );
+    merge_usage_field(
+        &mut usage.audio_units,
+        numeric_alias(object, &["audio_units"]),
+        found,
+    );
+    merge_usage_field(
+        &mut usage.video_units,
+        numeric_alias(object, &["video_units"]),
+        found,
+    );
+    merge_usage_field(
         &mut usage.total_tokens,
         numeric_alias(object, &["total_tokens", "totalTokenCount"]),
         found,
     );
-    let cost = find_numeric_key(
-        &serde_json::Value::Object(object.clone()),
-        "cost_in_usd_ticks",
-    );
+    let cost = numeric_alias(object, &["cost_in_usd_ticks"])
+        .or_else(|| nested_numeric_alias(object, "details", &["cost_in_usd_ticks"]));
     merge_usage_field(&mut usage.cost_in_usd_ticks, cost, found);
 }
 
@@ -2956,21 +3114,15 @@ fn numeric_alias(
         .find_map(|name| object.get(*name).and_then(serde_json::Value::as_u64))
 }
 
-fn find_numeric_key(value: &serde_json::Value, wanted: &str) -> Option<u64> {
-    match value {
-        serde_json::Value::Object(object) => object
-            .get(wanted)
-            .and_then(serde_json::Value::as_u64)
-            .or_else(|| {
-                object
-                    .values()
-                    .find_map(|value| find_numeric_key(value, wanted))
-            }),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .find_map(|value| find_numeric_key(value, wanted)),
-        _ => None,
-    }
+fn nested_numeric_alias(
+    object: &serde_json::Map<String, serde_json::Value>,
+    container: &str,
+    names: &[&str],
+) -> Option<u64> {
+    object
+        .get(container)
+        .and_then(serde_json::Value::as_object)
+        .and_then(|nested| numeric_alias(nested, names))
 }
 
 fn merge_usage_field(target: &mut Option<u64>, value: Option<u64>, found: &mut bool) {
@@ -3928,7 +4080,8 @@ fn validate_websocket_message(
     frame: &RawWebSocketFrame,
     state: &mut WebSocketMessageState,
     max_message_bytes: u64,
-) -> Result<(), WebSocketFrameError> {
+) -> Result<Option<Vec<u8>>, WebSocketFrameError> {
+    let mut complete_text = None;
     match frame.opcode {
         1 | 2 => {
             if state.fragmented {
@@ -3938,8 +4091,11 @@ fn validate_websocket_message(
                 if frame.payload_len > max_message_bytes {
                     return Err(WebSocketFrameError::TooLarge);
                 }
-                if frame.opcode == 1 && std::str::from_utf8(&frame.payload).is_err() {
-                    return Err(WebSocketFrameError::InvalidText);
+                if frame.opcode == 1 {
+                    if std::str::from_utf8(&frame.payload).is_err() {
+                        return Err(WebSocketFrameError::InvalidText);
+                    }
+                    complete_text = Some(frame.payload.clone());
                 }
             } else {
                 state.fragmented = true;
@@ -3964,8 +4120,11 @@ fn validate_websocket_message(
                 state.text_bytes.extend_from_slice(&frame.payload);
             }
             if frame.fin {
-                if state.text && std::str::from_utf8(&state.text_bytes).is_err() {
-                    return Err(WebSocketFrameError::InvalidText);
+                if state.text {
+                    if std::str::from_utf8(&state.text_bytes).is_err() {
+                        return Err(WebSocketFrameError::InvalidText);
+                    }
+                    complete_text = Some(state.text_bytes.clone());
                 }
                 state.fragmented = false;
                 state.bytes = 0;
@@ -3976,7 +4135,7 @@ fn validate_websocket_message(
         8 => validate_close_payload(&frame.payload)?,
         _ => {}
     }
-    Ok(())
+    Ok(complete_text)
 }
 
 fn validate_close_payload(payload: &[u8]) -> Result<(), WebSocketFrameError> {
@@ -4029,21 +4188,22 @@ fn websocket_realtime_validator(
     }
 }
 
-fn validate_realtime_frame(
+fn validate_realtime_message(
     frame: &RawWebSocketFrame,
+    complete_text: Option<&[u8]>,
     validator: &mut OpenAiRealtimeValidator,
     from_client: bool,
 ) -> Result<(), WebSocketFrameError> {
+    if let Some(text) = complete_text {
+        let result = if from_client {
+            validator.validate_client(text)
+        } else {
+            validator.validate_server(text)
+        };
+        return result.map_err(|_| WebSocketFrameError::Semantic);
+    }
     match frame.opcode {
-        1 if frame.fin => {
-            let result = if from_client {
-                validator.validate_client(&frame.payload)
-            } else {
-                validator.validate_server(&frame.payload)
-            };
-            result.map_err(|_| WebSocketFrameError::Semantic)
-        }
-        8..=10 => Ok(()),
+        0 | 1 | 8..=10 => Ok(()),
         _ => Err(WebSocketFrameError::Semantic),
     }
 }
@@ -4063,6 +4223,7 @@ struct WebSocketTunnelContext {
     deadline: StdInstant,
     lease: Option<SelectionLease>,
     observation: RequestObservation,
+    lifecycle: RequestLifecycle,
 }
 
 async fn run_websocket_tunnel(
@@ -4078,17 +4239,26 @@ async fn run_websocket_tunnel(
         deadline,
         lease,
         mut observation,
+        lifecycle,
     } = context;
     let upgraded = tokio::select! {
         result = downstream_upgrade => match result {
             Ok(upgraded) => upgraded,
             Err(_) => {
                 observation.complete(CompletionClass::Cancelled, None);
+                lifecycle.complete(
+                    CompletionClass::Cancelled,
+                    Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+                );
                 return;
             }
         },
         () = cancellation.cancelled() => {
             observation.complete(CompletionClass::Cancelled, None);
+            lifecycle.complete(
+                CompletionClass::Cancelled,
+                Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+            );
             return;
         }
     };
@@ -4099,6 +4269,7 @@ async fn run_websocket_tunnel(
     let mut upstream_state = WebSocketMessageState::default();
     let mut timeout = Box::pin(time::sleep_until(Instant::from_std(deadline)));
     let mut completion = CompletionClass::Success;
+    let mut observed_usage = None;
 
     loop {
         let mut downstream_read =
@@ -4121,20 +4292,32 @@ async fn run_websocket_tunnel(
             }
             WebSocketReadEvent::Down(result) => match result {
                 Ok(frame) => {
-                    if let Err(error) =
-                        validate_websocket_message(&frame, &mut downstream_state, max_message)
-                    {
-                        completion = CompletionClass::IncompleteStream;
-                        send_websocket_closes(
-                            &mut downstream,
-                            &mut upstream,
-                            websocket_error_close_code(&error),
-                        )
-                        .await;
-                        break;
-                    }
+                    let complete_text = match validate_websocket_message(
+                        &frame,
+                        &mut downstream_state,
+                        max_message,
+                    ) {
+                        Ok(complete_text) => complete_text,
+                        Err(error) => {
+                            completion = CompletionClass::IncompleteStream;
+                            send_websocket_closes(
+                                &mut downstream,
+                                &mut upstream,
+                                websocket_error_close_code(&error),
+                            )
+                            .await;
+                            break;
+                        }
+                    };
                     if let Some(validator) = realtime_validator.as_mut() {
-                        if validate_realtime_frame(&frame, validator, true).is_err() {
+                        if validate_realtime_message(
+                            &frame,
+                            complete_text.as_deref(),
+                            validator,
+                            true,
+                        )
+                        .is_err()
+                        {
                             completion = CompletionClass::IncompleteStream;
                             send_websocket_closes(&mut downstream, &mut upstream, 1008).await;
                             break;
@@ -4184,26 +4367,45 @@ async fn run_websocket_tunnel(
             },
             WebSocketReadEvent::Up(result) => match result {
                 Ok(frame) => {
-                    if let Err(error) =
-                        validate_websocket_message(&frame, &mut upstream_state, max_message)
-                    {
-                        completion = CompletionClass::IncompleteStream;
-                        send_websocket_closes(
-                            &mut downstream,
-                            &mut upstream,
-                            websocket_error_close_code(&error),
-                        )
-                        .await;
-                        break;
-                    }
+                    let complete_text = match validate_websocket_message(
+                        &frame,
+                        &mut upstream_state,
+                        max_message,
+                    ) {
+                        Ok(complete_text) => complete_text,
+                        Err(error) => {
+                            completion = CompletionClass::IncompleteStream;
+                            send_websocket_closes(
+                                &mut downstream,
+                                &mut upstream,
+                                websocket_error_close_code(&error),
+                            )
+                            .await;
+                            break;
+                        }
+                    };
                     if let Some(validator) = realtime_validator.as_mut() {
-                        let invalid_event =
-                            validate_realtime_frame(&frame, validator, false).is_err();
+                        let invalid_event = validate_realtime_message(
+                            &frame,
+                            complete_text.as_deref(),
+                            validator,
+                            false,
+                        )
+                        .is_err();
                         let incomplete_close = frame.opcode == 8 && validator.finish().is_err();
                         if invalid_event || incomplete_close {
                             completion = CompletionClass::IncompleteStream;
                             send_websocket_closes(&mut downstream, &mut upstream, 1008).await;
                             break;
+                        }
+                    }
+                    if matches!(frame.opcode, 1 | 2) {
+                        observation.mark_first_event();
+                        lifecycle.mark_first_event();
+                    }
+                    if let Some(text) = complete_text {
+                        if let Some(update) = extract_observed_usage(&text) {
+                            merge_observed_usage(&mut observed_usage, update);
                         }
                     }
                     let close = frame.opcode == 8;
@@ -4252,7 +4454,12 @@ async fn run_websocket_tunnel(
     }
     let _ = downstream.shutdown().await;
     let _ = upstream.shutdown().await;
-    observation.complete(completion, None);
+    observation.complete(completion.clone(), None);
+    lifecycle.complete_with_usage(
+        completion,
+        Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+        observed_usage.as_ref(),
+    );
     drop(lease);
     drop(guard);
 }
@@ -4680,10 +4887,11 @@ routes:
                 output_tokens: Some(7),
                 total_tokens: Some(18),
                 cost_in_usd_ticks: None,
+                ..ObservedUsage::default()
             })
         );
 
-        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":13,\"output_tokens\":1}}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":9,\"details\":{\"cost_in_usd_ticks\":42}}}}\n\n";
+        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":13,\"output_tokens\":1}}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"priority\",\"usage\":{\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens_details\":{\"reasoning_tokens\":4},\"image_units\":2,\"audio_units\":5,\"video_units\":1,\"details\":{\"cost_in_usd_ticks\":42}}}}\n\n";
         assert_eq!(
             extract_observed_usage(sse),
             Some(ObservedUsage {
@@ -4691,7 +4899,151 @@ routes:
                 output_tokens: Some(9),
                 total_tokens: Some(22),
                 cost_in_usd_ticks: Some(42),
+                reasoning_tokens: Some(4),
+                cache_tokens: Some(3),
+                image_units: Some(2),
+                audio_units: Some(5),
+                video_units: Some(1),
+                service_tier: Some("priority".to_owned()),
             })
+        );
+        let generated_usage_shape = br#"{"response":{"output":[{"content":{"usage":{"input_tokens":999,"details":{"cost_in_usd_ticks":999}},"service_tier":"generated-secret"}}]}}"#;
+        assert_eq!(extract_observed_usage(generated_usage_shape), None);
+        let repeated_envelope = br#"{"response":{"response":{"service_tier":"generated","usage":{"input_tokens":999,"details":{"cost_in_usd_ticks":999}}}}}"#;
+        assert_eq!(extract_observed_usage(repeated_envelope), None);
+
+        let mut websocket_usage = None;
+        merge_observed_usage(
+            &mut websocket_usage,
+            ObservedUsage {
+                input_tokens: Some(13),
+                ..ObservedUsage::default()
+            },
+        );
+        merge_observed_usage(
+            &mut websocket_usage,
+            ObservedUsage {
+                output_tokens: Some(9),
+                ..ObservedUsage::default()
+            },
+        );
+        assert_eq!(
+            websocket_usage.as_ref().expect("merged usage").input_tokens,
+            Some(13)
+        );
+        assert_eq!(
+            websocket_usage
+                .as_ref()
+                .expect("merged usage")
+                .output_tokens,
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn request_completion_persists_full_usage_ledger_record() {
+        let store = Arc::new(pooler_store::MemoryStore::new());
+        let lifecycle = RequestLifecycle::new(
+            store.clone(),
+            "request-id",
+            Arc::from("listener"),
+            "route",
+            7,
+            Some(9),
+            None,
+        );
+        {
+            let mut state = lifecycle.state.lock().expect("lifecycle state");
+            state.public_model = Some("public-model".to_owned());
+            state.upstream_model = Some("upstream-model".to_owned());
+            state.provider = Some("provider".to_owned());
+            state.account_pseudonym = Some("account-pseudo".to_owned());
+            state.ttft_ms = Some(12);
+        }
+        lifecycle.complete_with_usage(
+            CompletionClass::Success,
+            Some(200),
+            Some(&ObservedUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+                reasoning_tokens: Some(3),
+                cache_tokens: Some(2),
+                image_units: Some(1),
+                audio_units: Some(4),
+                video_units: Some(1),
+                service_tier: Some("priority".to_owned()),
+                total_tokens: Some(18),
+                cost_in_usd_ticks: Some(42),
+            }),
+        );
+        let records = store.usage_records().expect("usage records");
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.request_id, "request-id");
+        assert_eq!(record.public_model.as_deref(), Some("public-model"));
+        assert_eq!(record.upstream_model.as_deref(), Some("upstream-model"));
+        assert_eq!(record.provider.as_deref(), Some("provider"));
+        assert_eq!(record.account_pseudonym.as_deref(), Some("account-pseudo"));
+        assert_eq!(record.reasoning_tokens, Some(3));
+        assert_eq!(record.cache_tokens, Some(2));
+        assert_eq!(record.ttft_ms, Some(12));
+        assert_eq!(record.cost_in_usd_ticks, Some(42));
+        assert_eq!(record.cost_provenance, CostProvenance::ProviderReported);
+        assert_eq!(record.configuration_generation, 7);
+        assert_eq!(record.catalog_generation, Some(9));
+    }
+
+    #[test]
+    fn request_completion_estimates_cost_only_from_a_versioned_operator_price_book() {
+        let config = compile_yaml(
+            "usage-price-book.yaml",
+            r#"
+version: 1
+upstreams: {provider: {url: http://127.0.0.1:8319}}
+usage_price_book:
+  version: operator-2026-08-22
+  entries:
+    - provider: provider
+      model: upstream-model
+      input_per_million_usd_ticks: 2000000
+      image_per_unit_usd_ticks: 5
+"#,
+        )
+        .expect("compiled price book");
+        let price_book = Arc::new(config.usage_price_book().expect("price book plan").clone());
+        let store = Arc::new(pooler_store::MemoryStore::new());
+        let lifecycle = RequestLifecycle::new(
+            store.clone(),
+            "request-id",
+            Arc::from("listener"),
+            "route",
+            1,
+            None,
+            Some(price_book),
+        );
+        {
+            let mut state = lifecycle.state.lock().expect("lifecycle state");
+            state.provider = Some("provider".to_owned());
+            state.upstream_model = Some("upstream-model".to_owned());
+        }
+        lifecycle.complete_with_usage(
+            CompletionClass::Success,
+            Some(200),
+            Some(&ObservedUsage {
+                input_tokens: Some(3),
+                image_units: Some(2),
+                ..ObservedUsage::default()
+            }),
+        );
+        let records = store.usage_records().expect("usage records");
+        assert_eq!(records[0].cost_in_usd_ticks, Some(16));
+        assert_eq!(
+            records[0].cost_provenance,
+            CostProvenance::OperatorEstimated
+        );
+        assert_eq!(
+            records[0].price_book_version.as_deref(),
+            Some("operator-2026-08-22")
         );
     }
 
@@ -4778,6 +5130,36 @@ routes:
             validate_websocket_message(&continuation, &mut state, 8),
             Err(WebSocketFrameError::InvalidText)
         ));
+
+        let mut usage_state = WebSocketMessageState::default();
+        let usage_start = RawWebSocketFrame {
+            bytes: Vec::new(),
+            payload: br#"{"usage":{"input_tokens":"#.to_vec(),
+            fin: false,
+            opcode: 1,
+            payload_len: 25,
+        };
+        assert_eq!(
+            validate_websocket_message(&usage_start, &mut usage_state, 128)
+                .expect("usage fragment"),
+            None
+        );
+        let usage_end = RawWebSocketFrame {
+            bytes: Vec::new(),
+            payload: b"13}}".to_vec(),
+            fin: true,
+            opcode: 0,
+            payload_len: 4,
+        };
+        let complete = validate_websocket_message(&usage_end, &mut usage_state, 128)
+            .expect("complete usage fragment")
+            .expect("complete text");
+        assert_eq!(
+            extract_observed_usage(&complete)
+                .expect("fragmented usage")
+                .input_tokens,
+            Some(13)
+        );
 
         let close = RawWebSocketFrame {
             bytes: Vec::new(),

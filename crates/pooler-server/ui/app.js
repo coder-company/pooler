@@ -31,6 +31,7 @@
     lastSuccessfulRefresh: null,
     pending: new Set(),
     connectionAccount: "",
+    usageRange: "24h",
     requestExplorer: {
       route: "",
       provider: "",
@@ -590,6 +591,37 @@
 
   /* ---------------- Data loading ---------------- */
 
+  function usageRangeParams() {
+    const duration = {
+      "1h": 60 * 60 * 1000,
+      "24h": 24 * 60 * 60 * 1000,
+      "7d": 7 * 24 * 60 * 60 * 1000,
+      "30d": 30 * 24 * 60 * 60 * 1000,
+    }[state.usageRange];
+    const params = new URLSearchParams();
+    if (duration) {
+      const until = Date.now();
+      params.set("since", String(until - duration));
+      params.set("until", String(until));
+    }
+    return params;
+  }
+
+  function usageAggregatePath() {
+    const params = usageRangeParams();
+    params.set(
+      "group_by",
+      "route,provider,upstream_model,result_class,cost_provenance,price_book_version",
+    );
+    return `/usage/aggregate?${params.toString()}`;
+  }
+
+  function usageExportPath() {
+    const params = usageRangeParams();
+    const query = params.toString();
+    return `/usage/export${query ? `?${query}` : ""}`;
+  }
+
   async function loadEndpoints(keys) {
     const generation = ++state.requestGeneration;
     if (state.readController) state.readController.abort();
@@ -663,6 +695,7 @@
     accounts: { path: "/accounts" },
     quota: { path: "/quota" },
     metrics: { path: "/metrics" },
+    usageAggregate: { path: () => usageAggregatePath() },
     decisions: { path: "/decisions?limit=50" },
     requests: { path: () => requestExplorerPath() },
     traces: { path: "/traces" },
@@ -766,8 +799,8 @@
     usage: {
       title: "Usage",
       subtitle:
-        "Token usage, provider-reported cost, rate-limit windows, and latency.",
-      endpoints: ["metrics", "quota"],
+        "Retained usage, cost provenance, rate-limit windows, and latency by time range.",
+      endpoints: ["usageAggregate", "metrics", "quota"],
       render: renderUsage,
     },
     requests: {
@@ -800,7 +833,7 @@
     const enabled = Boolean(active.management?.typed_drafts);
     const sections =
       editor.operation === "replace"
-        ? ["catalog", "management"]
+        ? ["catalog", "management", "usage_price_book"]
         : [
             "listeners",
             "upstreams",
@@ -1955,53 +1988,130 @@
   function renderUsage(root) {
     const metrics = state.data.metrics?.metrics || {};
     const quota = state.data.quota || {};
+    const ledger = state.data.usageAggregate || {};
+    const retained = ledger.series || [];
     const usage = metrics.usage || [];
-    const attempts = metrics.attempts || [];
     const latencies = metrics.latencies || [];
     const windows = quota.windows || [];
     const cooldowns = quota.cooldowns || [];
 
-    const sum = (rows, field) =>
-      rows.reduce((total, row) => total + (Number(row[field]) || 0), 0);
-    const totalRequests = sum(usage, "requests") || sum(attempts, "count");
-    const inputTokens = sum(usage, "input_tokens");
-    const outputTokens = sum(usage, "output_tokens");
-    const costTicks = sum(usage, "cost_in_usd_ticks");
+    const total = (field) =>
+      retained.reduce(
+        (value, row) => value + (Number(row.totals?.[field]) || 0),
+        0,
+      );
+    const totalRequests = total("records");
+    const inputTokens = total("input_tokens");
+    const outputTokens = total("output_tokens");
+    const reasoningTokens = total("reasoning_tokens");
+    const cacheTokens = total("cache_tokens");
+    const mediaUnits =
+      total("image_units") + total("audio_units") + total("video_units");
+    const costTicks = total("cost_in_usd_ticks");
+    const droppedSeriesRecords = Number(ledger.dropped_series_records) || 0;
 
     const stats = [
       statCard(
         "Requests",
         `<span class="num">${fmtCompact(totalRequests)}</span>`,
-        "Observed attempts",
+        droppedSeriesRecords
+          ? "Partial: returned series only"
+          : `Retained in ${state.usageRange === "all" ? "all history" : state.usageRange}`,
       ),
       statCard(
         "Input tokens",
         `<span class="num" title="${fmtInt(inputTokens)}">${fmtCompact(inputTokens)}</span>`,
-        "Normalized from responses",
+        "Explicitly reported",
       ),
       statCard(
         "Output tokens",
         `<span class="num" title="${fmtInt(outputTokens)}">${fmtCompact(outputTokens)}</span>`,
-        "Normalized from responses",
+        "Explicitly reported",
+      ),
+      statCard(
+        "Reasoning / cache",
+        `<span class="num" title="${fmtInt(reasoningTokens)} reasoning, ${fmtInt(cacheTokens)} cache">${fmtCompact(reasoningTokens)} / ${fmtCompact(cacheTokens)}</span>`,
+        "Explicitly reported",
+      ),
+      statCard(
+        "Media units",
+        `<span class="num" title="${fmtInt(mediaUnits)}">${fmtCompact(mediaUnits)}</span>`,
+        "Image, audio, and video",
       ),
       statCard(
         "Cost ticks",
         `<span class="num" title="${fmtInt(costTicks)}">${fmtCompact(costTicks)}</span>`,
-        "Provider-reported, fixed-decimal",
-      ),
-      statCard(
-        "Quota windows",
-        `<span class="num">${fmtInt(windows.length)}</span>`,
-        "Typed windows observed",
-      ),
-      statCard(
-        "Cooldowns",
-        `<span class="num">${fmtInt(cooldowns.length)}</span>`,
-        cooldowns.length
-          ? "Selection is avoiding entries"
-          : "Nothing cooling down",
+        "Reported or versioned estimate",
       ),
     ].join("");
+
+    const retainedTable = tableWrap(
+      [
+        {
+          label: "Route",
+          mono: true,
+          render: (row) => esc(row.dimensions?.route),
+        },
+        {
+          label: "Provider",
+          mono: true,
+          render: (row) => providerCell(row.dimensions?.provider),
+        },
+        {
+          label: "Model",
+          mono: true,
+          nowrap: false,
+          render: (row) => providerCell(row.dimensions?.upstream_model),
+        },
+        {
+          label: "Result",
+          render: (row) => statusBadge(row.dimensions?.result_class),
+        },
+        {
+          label: "Requests",
+          align: "right",
+          render: (row) => `<span class="num">${fmtInt(row.totals?.records)}</span>`,
+        },
+        {
+          label: "Input / output",
+          align: "right",
+          render: (row) => `<span class="num">${fmtInt(row.totals?.input_tokens)} / ${fmtInt(row.totals?.output_tokens)}</span>`,
+        },
+        {
+          label: "Reasoning / cache",
+          align: "right",
+          render: (row) => `<span class="num">${fmtInt(row.totals?.reasoning_tokens)} / ${fmtInt(row.totals?.cache_tokens)}</span>`,
+        },
+        {
+          label: "Media I/A/V",
+          align: "right",
+          render: (row) => `<span class="num">${fmtInt(row.totals?.image_units)} / ${fmtInt(row.totals?.audio_units)} / ${fmtInt(row.totals?.video_units)}</span>`,
+        },
+        {
+          label: "Latency / TTFT",
+          align: "right",
+          render: (row) => {
+            const count = Number(row.totals?.records) || 0;
+            const ttftCount = Number(row.totals?.ttft_records) || 0;
+            const latency = count ? Math.round(Number(row.totals?.latency_ms || 0) / count) : null;
+            const ttft = ttftCount ? Math.round(Number(row.totals?.ttft_ms || 0) / ttftCount) : null;
+            return `<span class="num">${latency === null ? "—" : `${fmtInt(latency)} ms`} / ${ttft === null ? "—" : `${fmtInt(ttft)} ms`}</span>`;
+          },
+        },
+        {
+          label: "Cost",
+          align: "right",
+          render: (row) => `<span class="num">${fmtInt(row.totals?.cost_in_usd_ticks)}</span><span class="muted"> ${esc(text(row.dimensions?.cost_provenance))}${row.dimensions?.price_book_version ? ` · ${esc(row.dimensions.price_book_version)}` : ""}</span>`,
+        },
+      ],
+      retained,
+      {
+        loading: state.loading && !state.data.usageAggregate,
+        error: endpointError("usageAggregate"),
+        emptyTitle: "No retained usage in this range",
+        emptyDescription: "Completed requests appear here after usage metadata is recorded.",
+      },
+    );
 
     const usageTable = tableWrap(
       [
@@ -2152,13 +2262,41 @@
 
     root.innerHTML = `
       ${viewHeader("Usage", views.usage.subtitle)}
+      <div class="toolbar">
+        <label class="field"><span class="field-label">Time range</span><select id="usage-range">
+          ${[["1h", "Last hour"], ["24h", "Last 24 hours"], ["7d", "Last 7 days"], ["30d", "Last 30 days"], ["all", "All retained"]].map(([value, label]) => `<option value="${value}"${value === state.usageRange ? " selected" : ""}>${label}</option>`).join("")}
+        </select></label>
+        <button class="btn btn-secondary btn-sm" type="button" id="usage-export">${ic("cloud-download", 15)} Export JSON</button>
+      </div>
+      ${droppedSeriesRecords ? `<div class="callout callout-warning" role="status"><strong>Partial totals.</strong> ${fmtInt(droppedSeriesRecords)} retained records were omitted after the ${fmtInt(ledger.max_series || 256)}-series cardinality bound. Select a narrower time range before using these totals.</div>` : ""}
       <section class="grid-stats">${stats}</section>
-      ${section("Token usage", usageTable, "Cost is recorded only when a provider response supplies it.")}
+      ${section("Historical usage ledger", retainedTable, `At most ${fmtInt(ledger.max_series || 256)} bounded series are returned. Cost provenance and price-book versions remain distinct.`)}
+      ${section("Live process counters", usageTable, "Compatibility counters since this process started.")}
       <div class="grid-2">
         ${section("Quota windows", windowTable)}
         ${section("Cooldowns", cooldownTable)}
       </div>
       ${section("Latency", latencyTable)}`;
+
+    $("#usage-range", root)?.addEventListener("change", (event) => {
+      state.usageRange = event.target.value;
+      refreshCurrentView();
+    });
+    $("#usage-export", root)?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await downloadExport(
+          state.sessionGeneration,
+          usageExportPath(),
+          `pooler-usage-${state.usageRange}`,
+        );
+      } catch (error) {
+        showBanner("error", `Usage export failed: ${error.message}`);
+      } finally {
+        button.disabled = false;
+      }
+    });
   }
 
   function quotaSubject(windowRow) {

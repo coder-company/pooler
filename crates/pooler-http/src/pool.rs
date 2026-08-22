@@ -540,6 +540,11 @@ impl PoolingCoordinator {
             .map_err(|_| PoolError::Store)
     }
 
+    /// Return bounded, metadata-only historical usage records.
+    pub fn usage_records(&self) -> Result<Vec<pooler_store::UsageRecord>, PoolError> {
+        self.store.usage_records().map_err(|_| PoolError::Store)
+    }
+
     /// Number of persisted decisions, useful for diagnostics and tests.
     pub fn decision_count(&self) -> Result<usize, PoolError> {
         self.store

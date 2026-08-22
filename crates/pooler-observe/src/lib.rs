@@ -2021,6 +2021,18 @@ pub struct Usage {
     #[serde(default)]
     pub output_tokens: Option<u64>,
     #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_tokens: Option<u64>,
+    #[serde(default)]
+    pub image_units: Option<u64>,
+    #[serde(default)]
+    pub audio_units: Option<u64>,
+    #[serde(default)]
+    pub video_units: Option<u64>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    #[serde(default)]
     pub total_tokens: Option<u64>,
     /// Provider-reported cost represented as fixed decimal ticks.
     #[serde(default)]

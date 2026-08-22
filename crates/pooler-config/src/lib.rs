@@ -28,6 +28,7 @@ use thiserror::Error;
 use url::Url;
 
 mod loader;
+mod pricing;
 mod route_match;
 mod schema;
 mod watch;
@@ -37,6 +38,7 @@ pub use pooler_model_catalog::{
     AliasConfig as CatalogAliasConfig, KnownProvider, ProviderCatalog,
     RefreshConfig as CatalogRefreshConfig,
 };
+pub use pricing::{UsageAmounts, UsagePriceBookConfig, UsagePriceBookPlan, UsagePriceEntryConfig};
 use route_match::{prefix_matches, template_matches};
 pub use route_match::{RouteMatchError, RouteRequest};
 pub use schema::{config_schema, render_config_schema, CONFIG_SCHEMA_VERSION};
@@ -280,6 +282,8 @@ pub struct Config {
     pub models: Vec<ModelConfig>,
     /// Optional remote model discovery and public exposure policy.
     pub catalog: Option<ModelCatalogConfig>,
+    /// Optional explicit, versioned rates for operator cost estimates.
+    pub usage_price_book: Option<UsagePriceBookConfig>,
     /// Credential-bearing account declarations keyed by stable ID.
     pub accounts: BTreeMap<String, AccountConfig>,
     /// Compatibility alias for account declarations.
@@ -2671,6 +2675,7 @@ pub struct CompiledConfig {
     policies: BTreeMap<Arc<str>, PolicyPlan>,
     models: BTreeMap<Arc<str>, ModelPlan>,
     catalog: Option<ModelCatalogPlan>,
+    usage_price_book: Option<UsagePriceBookPlan>,
     extensions: BTreeMap<Arc<str>, ExtensionPlan>,
     routes: Vec<RoutePlan>,
     management: Option<ManagementPlan>,
@@ -2705,6 +2710,7 @@ impl CompiledConfig {
             && self.policies == other.policies
             && self.models == other.models
             && self.catalog == other.catalog
+            && self.usage_price_book == other.usage_price_book
             && self.extensions == other.extensions
             && self.routes == other.routes
             && self.management == other.management
@@ -2756,6 +2762,12 @@ impl CompiledConfig {
     #[must_use]
     pub const fn catalog(&self) -> Option<&ModelCatalogPlan> {
         self.catalog.as_ref()
+    }
+
+    /// Optional explicit operator price book.
+    #[must_use]
+    pub const fn usage_price_book(&self) -> Option<&UsagePriceBookPlan> {
+        self.usage_price_book.as_ref()
     }
 
     /// Supervised external extension plans keyed by ID.
@@ -2943,6 +2955,25 @@ fn compile_config(
     let policies = compile_policies(config, source, &accounts, &account_pools)?;
     let models = compile_models(config, source, &upstreams)?;
     let catalog = compile_catalog(config.catalog.as_ref(), source, &upstreams, &accounts)?;
+    let usage_price_book = match config.usage_price_book.as_ref() {
+        Some(declaration) => {
+            let label = SourceLabel::new(source, None, None, "$.usage_price_book");
+            for entry in &declaration.entries {
+                if !upstreams.contains_key(entry.provider.trim()) {
+                    return Err(ConfigError::MissingReference {
+                        kind: "upstream",
+                        name: entry.provider.clone(),
+                        label,
+                    });
+                }
+            }
+            Some(
+                UsagePriceBookPlan::compile(declaration)
+                    .map_err(|message| invalid(&label, message))?,
+            )
+        }
+        None => None,
+    };
     let extensions = compile_extensions(config, source)?;
     let management = compile_management(&config.management, source)?;
 
@@ -3130,6 +3161,7 @@ fn compile_config(
         policies,
         models,
         catalog,
+        usage_price_book,
         extensions,
         routes,
         management,

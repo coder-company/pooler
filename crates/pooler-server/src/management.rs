@@ -50,6 +50,7 @@ use crate::config_management::{
 };
 use crate::http_runtime::RuntimeGeneration;
 use crate::management_ui;
+use crate::usage_management::{usage_aggregate, usage_list, usage_otlp_json, usage_prometheus};
 use crate::{merged_model_catalog_value, CatalogRuntime, ConfigSnapshot, ConfigStore};
 
 const DEFAULT_DECISION_LIMIT: usize = 20;
@@ -67,6 +68,15 @@ const MANAGEMENT_BODY_GUARD_TIMEOUT: Duration = Duration::from_millis(50);
 const MANAGEMENT_CONFIG_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOPBACK_HOST_ERROR: &str =
     "management Host header must name localhost or a loopback address";
+
+#[derive(Clone, Copy)]
+enum UsageRepresentation {
+    List,
+    Aggregate,
+    Export,
+    Prometheus,
+    OtlpJson,
+}
 
 /// A small active-request counter shared by management and the serving
 /// runtime. Counters are process-local and never persisted.
@@ -1768,6 +1778,31 @@ impl ManagementApi {
             "/requests" => self.requests(uri.as_ref().and_then(Uri::query), pooling, false),
             "/requests/export" => self.requests(uri.as_ref().and_then(Uri::query), pooling, true),
             path if path.starts_with("/requests/") => self.request_detail(path, pooling),
+            "/usage" => self.usage(
+                uri.as_ref().and_then(Uri::query),
+                pooling,
+                UsageRepresentation::List,
+            ),
+            "/usage/aggregate" => self.usage(
+                uri.as_ref().and_then(Uri::query),
+                pooling,
+                UsageRepresentation::Aggregate,
+            ),
+            "/usage/export" => self.usage(
+                uri.as_ref().and_then(Uri::query),
+                pooling,
+                UsageRepresentation::Export,
+            ),
+            "/usage/prometheus" => self.usage(
+                uri.as_ref().and_then(Uri::query),
+                pooling,
+                UsageRepresentation::Prometheus,
+            ),
+            "/usage/otlp" => self.usage(
+                uri.as_ref().and_then(Uri::query),
+                pooling,
+                UsageRepresentation::OtlpJson,
+            ),
             "/traces" => self.traces(snapshot.generation().value()),
             "/audit" => self.audit(snapshot.generation().value()),
             "/reloads" => self.reloads(snapshot.generation().value()),
@@ -2570,6 +2605,59 @@ impl ManagementApi {
             pooler_observe::RedactionPolicy::strict().sanitize_json(&value),
             false,
         )
+    }
+
+    fn usage(
+        &self,
+        query: Option<&str>,
+        pooling: &PoolingCoordinator,
+        representation: UsageRepresentation,
+    ) -> ManagementResponse {
+        let records = match pooling.usage_records() {
+            Ok(records) => records,
+            Err(_) => return state_unavailable(),
+        };
+        let policy = pooler_observe::RedactionPolicy::strict();
+        match representation {
+            UsageRepresentation::List => ManagementResponse::json(
+                StatusCode::OK,
+                policy.sanitize_json(&usage_list(
+                    records,
+                    query,
+                    pooling.store().retention(),
+                    false,
+                )),
+                false,
+            ),
+            UsageRepresentation::Export => ManagementResponse::json(
+                StatusCode::OK,
+                policy.sanitize_json(&usage_list(
+                    records,
+                    query,
+                    pooling.store().retention(),
+                    true,
+                )),
+                false,
+            ),
+            UsageRepresentation::Aggregate => ManagementResponse::json(
+                StatusCode::OK,
+                policy.sanitize_json(&usage_aggregate(records, query)),
+                false,
+            ),
+            UsageRepresentation::Prometheus => ManagementResponse::body(
+                StatusCode::OK,
+                "text/plain; version=0.0.4; charset=utf-8",
+                policy
+                    .sanitize_text(&usage_prometheus(records, query))
+                    .into_bytes(),
+                false,
+            ),
+            UsageRepresentation::OtlpJson => ManagementResponse::json(
+                StatusCode::OK,
+                policy.sanitize_json(&usage_otlp_json(records, query)),
+                false,
+            ),
+        }
     }
 
     fn request_detail(&self, path: &str, pooling: &PoolingCoordinator) -> ManagementResponse {
@@ -3604,7 +3692,7 @@ mod tests {
     use pooler_store::{
         CooldownState, CredentialHealthState, CredentialState, DecisionRecord, MemoryStore,
         PruneReport, RequestEvent, RetentionPolicy, SessionAffinity, Store, StoreError,
-        StoreResult, Timestamp,
+        StoreResult, Timestamp, UsageRecord,
     };
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicBool;
@@ -3792,6 +3880,18 @@ mod tests {
                 self.unavailable()
             } else {
                 self.inner.request_events_for(request_id)
+            }
+        }
+
+        fn append_usage_record(&self, record: UsageRecord) -> StoreResult<UsageRecord> {
+            self.inner.append_usage_record(record)
+        }
+
+        fn usage_records(&self) -> StoreResult<Vec<UsageRecord>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.usage_records()
             }
         }
 
@@ -4895,6 +4995,85 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
                 .status,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn usage_ledger_filters_aggregates_and_exports_redacted_formats() {
+        let api = api();
+        let store = api.state.load_full().pooling.store();
+        let mut first = UsageRecord::new(100, "usage-1", "route-a", "success");
+        first.provider = Some("provider-a".to_owned());
+        first.public_model = Some("public-model".to_owned());
+        first.upstream_model = Some("provider-model".to_owned());
+        first.account_pseudonym = Some("account-pseudo".to_owned());
+        first.input_tokens = Some(11);
+        first.output_tokens = Some(7);
+        first.reasoning_tokens = Some(3);
+        first.cache_tokens = Some(2);
+        first.latency_ms = 30;
+        first.ttft_ms = Some(12);
+        first.service_tier = Some("Authorization: Bearer raw-usage-secret".to_owned());
+        first.cost_in_usd_ticks = Some(42);
+        first.cost_provenance = pooler_store::CostProvenance::ProviderReported;
+        first.configuration_generation = 1;
+        store.append_usage_record(first).expect("first usage");
+        store
+            .append_usage_record(UsageRecord::new(
+                200,
+                "usage-2",
+                "other-route",
+                "upstream_error",
+            ))
+            .expect("second usage");
+
+        let headers = loopback_headers();
+        let listed = api.handle(
+            &Method::GET,
+            "/usage?route=route-a&provider=provider-a&limit=1",
+            &headers,
+        );
+        assert_eq!(listed.status, StatusCode::OK);
+        let listed_text = String::from_utf8(listed.body.clone()).expect("usage list text");
+        assert!(!listed_text.contains("raw-usage-secret"));
+        let listed = response_value(listed);
+        assert_eq!(listed["records"].as_array().expect("records").len(), 1);
+        assert_eq!(listed["records"][0]["input_tokens"], 11);
+
+        let aggregate = response_value(api.handle(
+            &Method::GET,
+            "/usage/aggregate?route=route-a&group_by=route,provider",
+            &headers,
+        ));
+        assert_eq!(aggregate["series"][0]["totals"]["input_tokens"], 11);
+        assert_eq!(
+            aggregate["series"][0]["totals"]["provider_reported_cost_records"],
+            1
+        );
+
+        let prometheus = api.handle(
+            &Method::GET,
+            "/usage/prometheus?route=route-a&group_by=service_tier",
+            &headers,
+        );
+        assert_eq!(prometheus.status, StatusCode::OK);
+        let prometheus = String::from_utf8(prometheus.body).expect("Prometheus text");
+        assert!(prometheus.contains("pooler_usage_input_tokens"));
+        assert!(!prometheus.contains("raw-usage-secret"));
+
+        let otlp = response_value(api.handle(
+            &Method::GET,
+            "/usage/otlp?route=route-a&group_by=service_tier",
+            &headers,
+        ));
+        assert_eq!(
+            otlp["resourceMetrics"][0]["scopeMetrics"][0]["scope"]["name"],
+            "pooler.usage"
+        );
+        assert!(!otlp.to_string().contains("raw-usage-secret"));
+        let export = api.handle(&Method::GET, "/usage/export", &headers);
+        assert!(!String::from_utf8(export.body)
+            .expect("usage export text")
+            .contains("raw-usage-secret"));
     }
 
     #[tokio::test]

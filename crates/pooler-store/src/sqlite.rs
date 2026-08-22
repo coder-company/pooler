@@ -17,16 +17,17 @@ use crate::{
     non_empty, CooldownState, CredentialHealthState, CredentialHealthStatus, CredentialState,
     DecisionRecord, MasterKey, MemoryStore, PruneReport, RequestEvent, RetentionPolicy,
     SecretPayload, SessionAffinity, Store, StoreError, StoreLengths, StoreResult, Timestamp,
-    MAX_REQUEST_EVENTS_PER_REQUEST,
+    UsageRecord, MAX_REQUEST_EVENTS_PER_REQUEST,
 };
 
 const MAX_COOLDOWNS: usize = 4_096;
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const LATEST_SCHEMA_VERSION: i64 = 5;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/001_initial.sql")),
     (2, include_str!("migrations/002_health_and_cooldowns.sql")),
     (3, include_str!("migrations/003_credential_payloads.sql")),
     (4, include_str!("migrations/004_request_events.sql")),
+    (5, include_str!("migrations/005_usage_ledger.sql")),
 ];
 
 /// A transactional, WAL-backed SQLite [`Store`].
@@ -124,11 +125,13 @@ impl SqliteStore {
         let affinities = count_rows(&connection, "affinities")?;
         let decisions = count_rows(&connection, "decisions")?;
         let request_events = count_rows(&connection, "request_events")?;
+        let usage_records = count_rows(&connection, "usage_records")?;
         Ok(StoreLengths {
             credentials,
             affinities,
             decisions,
             request_events,
+            usage_records,
         })
     }
 
@@ -985,6 +988,38 @@ fn decrypt_request_event(
     Ok(event)
 }
 
+fn usage_record_aad(id: u64) -> Vec<u8> {
+    format!("pooler-usage-record:v1:{id}").into_bytes()
+}
+
+fn encrypt_usage_record(cipher: &CredentialCipher, record: &UsageRecord) -> StoreResult<Vec<u8>> {
+    let bytes =
+        serde_json::to_vec(record).map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if bytes.len() > 16 * 1024 {
+        return Err(StoreError::Serialization(
+            "usage record exceeds encrypted record bound".to_owned(),
+        ));
+    }
+    cipher.seal_for(
+        &SecretPayload::from_bytes(bytes)?,
+        &usage_record_aad(record.id),
+    )
+}
+
+fn decrypt_usage_record(
+    cipher: &CredentialCipher,
+    id: u64,
+    envelope: &[u8],
+) -> StoreResult<UsageRecord> {
+    let payload = cipher.open_for(envelope, &usage_record_aad(id))?;
+    let record: UsageRecord = serde_json::from_slice(payload.expose_bytes())
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if record.id != id {
+        return Err(StoreError::CredentialEnvelopeAuthenticationFailed);
+    }
+    Ok(record)
+}
+
 fn evict_cooldowns(transaction: &Transaction<'_>) -> StoreResult<()> {
     transaction
         .execute(
@@ -1542,6 +1577,80 @@ impl Store for SqliteStore {
         Ok(events)
     }
 
+    fn append_usage_record(&self, mut record: UsageRecord) -> StoreResult<UsageRecord> {
+        record.validate()?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        self.with_immediate_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO usage_records (recorded_at, envelope) VALUES (?1, X'00')",
+                    [record.recorded_at],
+                )
+                .map_err(sqlite_error)?;
+            let id = transaction.last_insert_rowid();
+            if id <= 0 {
+                return Err(StoreError::UsageRecordIdExhausted);
+            }
+            record.id = u64::try_from(id).map_err(|_| StoreError::UsageRecordIdExhausted)?;
+            let envelope = encrypt_usage_record(&cipher, &record)?;
+            transaction
+                .execute(
+                    "UPDATE usage_records SET envelope = ?1 WHERE id = ?2",
+                    params![envelope, id],
+                )
+                .map_err(sqlite_error)?;
+            let newest_recorded_at: u64 = transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(recorded_at), 0) FROM usage_records",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM usage_records WHERE recorded_at < ?1",
+                    [newest_recorded_at.saturating_sub(self.retention.usage_history_ttl_ms)],
+                )
+                .map_err(sqlite_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM usage_records WHERE id IN (
+                         SELECT id FROM usage_records ORDER BY id ASC
+                         LIMIT MAX((SELECT COUNT(*) FROM usage_records) - ?1, 0)
+                     )",
+                    [i64::try_from(self.retention.max_usage_records)
+                        .map_err(|_| StoreError::InvalidRetention)?],
+                )
+                .map_err(sqlite_error)?;
+            Ok(record.clone())
+        })
+    }
+
+    fn usage_records(&self) -> StoreResult<Vec<UsageRecord>> {
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT id, envelope FROM usage_records ORDER BY id ASC")
+            .map_err(sqlite_error)?;
+        let encrypted = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?;
+        encrypted
+            .into_iter()
+            .map(|(id, envelope)| decrypt_usage_record(&cipher, id, &envelope))
+            .collect()
+    }
+
     fn prune(&self, now: Timestamp) -> StoreResult<PruneReport> {
         self.with_transaction(|transaction| {
             let expired_affinities = transaction
@@ -1560,12 +1669,31 @@ impl Store for SqliteStore {
                     [now.saturating_sub(self.retention.request_history_ttl_ms)],
                 )
                 .map_err(sqlite_error)?;
+            let mut evicted_usage_records = transaction
+                .execute(
+                    "DELETE FROM usage_records WHERE recorded_at < ?1",
+                    [now.saturating_sub(self.retention.usage_history_ttl_ms)],
+                )
+                .map_err(sqlite_error)?;
+            evicted_usage_records = evicted_usage_records.saturating_add(
+                transaction
+                    .execute(
+                        "DELETE FROM usage_records WHERE id IN (
+                             SELECT id FROM usage_records ORDER BY id ASC
+                             LIMIT MAX((SELECT COUNT(*) FROM usage_records) - ?1, 0)
+                         )",
+                        [i64::try_from(self.retention.max_usage_records)
+                            .map_err(|_| StoreError::InvalidRetention)?],
+                    )
+                    .map_err(sqlite_error)?,
+            );
             Ok(PruneReport {
                 expired_affinities,
                 evicted_credentials,
                 evicted_affinities,
                 evicted_decisions,
                 evicted_request_events,
+                evicted_usage_records,
             })
         })
     }
@@ -2216,6 +2344,112 @@ mod tests {
     }
 
     #[test]
+    fn usage_ledger_is_encrypted_bounded_and_restart_safe() {
+        let directory = private_tempdir();
+        let path = directory.path().join("usage.sqlite");
+        let key_bytes = b"usage-ledger-test-master-key";
+        let retention = policy(4, 4, 4)
+            .with_usage_history(2, 100)
+            .expect("usage retention");
+        let store = SqliteStore::open_encrypted_with_retention(
+            &path,
+            retention,
+            MasterKey::from_bytes(key_bytes).expect("master key"),
+        )
+        .expect("encrypted store");
+        let mut record = UsageRecord::new(
+            100,
+            "usage-request-secret-sentinel",
+            "usage-route-secret-sentinel",
+            "success",
+        );
+        record.provider = Some("usage-provider-secret-sentinel".to_owned());
+        record.input_tokens = Some(7);
+        let persisted = store.append_usage_record(record).expect("encrypted usage");
+        drop(store);
+
+        let mut raw = fs::read(&path).expect("database bytes");
+        let wal = path.with_extension("sqlite-wal");
+        if wal.exists() {
+            raw.extend(fs::read(wal).expect("WAL bytes"));
+        }
+        for sentinel in [
+            b"usage-request-secret-sentinel".as_slice(),
+            b"usage-route-secret-sentinel".as_slice(),
+            b"usage-provider-secret-sentinel".as_slice(),
+        ] {
+            assert!(!raw.windows(sentinel.len()).any(|window| window == sentinel));
+        }
+
+        let reopened = SqliteStore::open_encrypted_with_retention(
+            &path,
+            retention,
+            MasterKey::from_bytes(key_bytes).expect("reopen key"),
+        )
+        .expect("reopen encrypted store");
+        assert_eq!(
+            reopened.usage_records().expect("decrypted usage"),
+            vec![persisted.clone()]
+        );
+        let newer = reopened
+            .append_usage_record(UsageRecord::new(200, "newer-request", "route", "success"))
+            .expect("newer usage");
+        reopened
+            .append_usage_record(UsageRecord::new(
+                0,
+                "out-of-order-stale",
+                "route",
+                "success",
+            ))
+            .expect("stale usage accepted then pruned");
+        assert_eq!(
+            reopened.usage_records().expect("retained usage"),
+            vec![persisted, newer]
+        );
+
+        let unencrypted = SqliteStore::open_in_memory().expect("plain store");
+        assert_eq!(
+            unencrypted.append_usage_record(UsageRecord::new(1, "request", "route", "success",)),
+            Err(StoreError::EncryptionRequired)
+        );
+    }
+
+    #[test]
+    fn usage_ledger_tampering_fails_closed() {
+        let directory = private_tempdir();
+        let store = SqliteStore::open_encrypted(
+            directory.path().join("usage-tamper.sqlite"),
+            MasterKey::from_bytes(b"usage tamper master key").expect("master key"),
+        )
+        .expect("encrypted store");
+        let persisted = store
+            .append_usage_record(UsageRecord::new(100, "request", "route", "success"))
+            .expect("usage record");
+        {
+            let connection = store.connection.lock().expect("connection");
+            let mut payload: Vec<u8> = connection
+                .query_row(
+                    "SELECT envelope FROM usage_records WHERE id = ?1",
+                    [persisted.id],
+                    |row| row.get(0),
+                )
+                .expect("encrypted payload");
+            let last = payload.last_mut().expect("non-empty envelope");
+            *last ^= 1;
+            connection
+                .execute(
+                    "UPDATE usage_records SET envelope = ?1 WHERE id = ?2",
+                    params![payload, persisted.id],
+                )
+                .expect("tampered payload persisted");
+        }
+        assert_eq!(
+            store.usage_records(),
+            Err(StoreError::CredentialEnvelopeAuthenticationFailed)
+        );
+    }
+
+    #[test]
     fn concurrent_sqlite_writes_are_transactional_and_bounded() {
         let directory = private_tempdir();
         let path = directory.path().join("pooler.sqlite");
@@ -2258,6 +2492,7 @@ mod tests {
                 affinities: 8,
                 decisions: 8,
                 request_events: 0,
+                usage_records: 0,
             }
         );
     }
