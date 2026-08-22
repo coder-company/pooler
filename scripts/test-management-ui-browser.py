@@ -876,8 +876,7 @@ def run_browser(playwright) -> None:
         page.locator('[data-request-id="pool-request-browser-1"]').click()
         page.wait_for_selector("text=Timeline pool-request-browser-1")
         expect(
-            "/management/requests/pool-request-browser-1/timeline"
-            in STATE.get_targets,
+            "/management/requests/pool-request-browser-1/timeline" in STATE.get_targets,
             "request timeline was not loaded by logical request ID",
         )
         timeline_text = page.locator(".view-requests").inner_text()
