@@ -1657,7 +1657,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::{Barrier, Notify},
+        sync::{oneshot, Barrier, Notify},
         time::{sleep, Duration},
     };
 
@@ -2887,9 +2887,11 @@ mod tests {
             .await
             .expect("upstream binds");
         let upstream_address = upstream_listener.local_addr().expect("upstream address");
+        let (upstream_ready_tx, upstream_ready_rx) = oneshot::channel();
         let upstream = tokio::spawn(async move {
             let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
             read_headers(&mut stream).await.expect("upstream request");
+            upstream_ready_tx.send(()).expect("downstream is waiting");
             let mut byte = [0_u8; 1];
             tokio::time::timeout(TEST_TIMEOUT, stream.read(&mut byte))
                 .await
@@ -2917,6 +2919,10 @@ mod tests {
             .await
             .expect("request writes");
         wait_for_active(&server, 1).await;
+        tokio::time::timeout(TEST_TIMEOUT, upstream_ready_rx)
+            .await
+            .expect("upstream receives request")
+            .expect("upstream readiness sender remains live");
         drop(downstream);
 
         assert_eq!(upstream.await.expect("upstream task"), 0);
