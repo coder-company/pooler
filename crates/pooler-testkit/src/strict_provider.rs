@@ -53,9 +53,14 @@ pub struct ProviderContract {
 const FOREIGN_CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "x-api-key", "x-goog-api-key"];
 
 const OPENAI_MODELS: &str = r#"{"data":[{"id":"gpt-4o"}]}"#;
+const XAI_MODELS: &str = r#"{"data":[{"id":"grok-4.1-fast"}]}"#;
 const ANTHROPIC_MODELS: &str = r#"{"data":[{"id":"claude-sonnet-4"}]}"#;
 const GEMINI_MODELS: &str = r#"{"models":[{"name":"models/gemini-2.5-pro","supportedGenerationMethods":["generateContent","streamGenerateContent","countTokens"]}]}"#;
 const ACCEPTED: &str = r#"{"ok":true}"#;
+const OPENAI_COMPACTED_RESPONSE: &str = r#"{"id":"resp_compact_sanitized","created_at":1787270400,"object":"response.compaction","output":[{"id":"msg_sanitized","type":"message","status":"completed","role":"user","content":[{"type":"input_text","text":"sanitized"}]},{"id":"cmp_sanitized","type":"compaction","encrypted_content":"sanitized-encrypted-content"}],"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":0},"output_tokens":4,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":16}}"#;
+const OPENAI_CLIENT_SECRET_RESPONSE: &str = r#"{"value":"ek_sanitized","expires_at":1787271000,"session":{"id":"sess_sanitized","object":"realtime.session","type":"realtime"}}"#;
+const OPENAI_LEGACY_SESSION_RESPONSE: &str = r#"{"client_secret":{"value":"ek_sanitized","expires_at":1787270460},"model":"gpt-4o-realtime-preview"}"#;
+const OPENAI_TRANSCRIPTION_SESSION_RESPONSE: &str = r#"{"client_secret":{"value":"ek_sanitized","expires_at":1787271000},"input_audio_format":"pcm16"}"#;
 
 impl ProviderContract {
     /// OpenAI: bearer credential, JSON bodies carrying a model.
@@ -93,7 +98,83 @@ impl ProviderContract {
                     path: "/v1/responses/compact",
                     content_type: Some("application/json"),
                     required_body_fields: &["model"],
-                    response: ACCEPTED,
+                    response: OPENAI_COMPACTED_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/realtime/client_secrets",
+                    content_type: Some("application/json"),
+                    required_body_fields: &[],
+                    response: OPENAI_CLIENT_SECRET_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/realtime/sessions",
+                    content_type: Some("application/json"),
+                    required_body_fields: &[],
+                    response: OPENAI_LEGACY_SESSION_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/realtime/transcription_sessions",
+                    content_type: Some("application/json"),
+                    required_body_fields: &[],
+                    response: OPENAI_TRANSCRIPTION_SESSION_RESPONSE,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/realtime/calls/*/accept",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["type"],
+                    response: "",
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/realtime/calls/*/reject",
+                    content_type: Some("application/json"),
+                    required_body_fields: &[],
+                    response: "",
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/realtime/calls/*/refer",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["target_uri"],
+                    response: "",
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/realtime/calls/*/hangup",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: "",
+                },
+            ],
+        }
+    }
+
+    /// xAI: bearer credential and the explicitly documented Compact endpoint.
+    #[must_use]
+    pub const fn xai() -> Self {
+        Self {
+            name: "xai",
+            credential_header: "authorization",
+            credential_prefix: "Bearer ",
+            required_headers: &[],
+            routes: &[
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1/models",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: XAI_MODELS,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/responses/compact",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["model", "input"],
+                    response: OPENAI_COMPACTED_RESPONSE,
                 },
             ],
         }
@@ -451,6 +532,15 @@ fn check(
             format!("{} is not allowed here", request.method),
         ));
     };
+    for (name, value) in openai_route_headers(route.path) {
+        if request.header(name) != Some(*value) {
+            return Err(Rejection::new(
+                400,
+                "Bad Request",
+                format!("{name} must be {value}"),
+            ));
+        }
+    }
     if let Some(query) = &request.query {
         let documented_stream_query =
             route.path.ends_with(":streamGenerateContent") && query == "alt=sse";
@@ -490,6 +580,19 @@ fn check(
         }
     }
     Ok(route.response)
+}
+
+fn openai_route_headers(path: &str) -> &'static [(&'static str, &'static str)] {
+    match path {
+        "/v1/realtime/sessions" | "/v1/realtime/transcription_sessions" => {
+            &[("openai-beta", "assistants=v2")]
+        }
+        "/v1/realtime/calls/*/accept"
+        | "/v1/realtime/calls/*/reject"
+        | "/v1/realtime/calls/*/refer"
+        | "/v1/realtime/calls/*/hangup" => &[("accept", "*/*")],
+        _ => &[],
+    }
 }
 
 async fn respond(stream: &mut TcpStream, status: u16, reason: &str, body: &str) {

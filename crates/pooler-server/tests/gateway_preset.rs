@@ -24,7 +24,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
     accept_async, accept_hdr_async,
-    tungstenite::{handshake::server::Request, Message},
+    tungstenite::{
+        client::IntoClientRequest,
+        handshake::server::{Request, Response},
+        Message,
+    },
 };
 
 const SECRET: &str = "gateway-test-key";
@@ -121,28 +125,180 @@ async fn spawn_semantic_responses_upstream(
     (address, task)
 }
 
-async fn send_responses_request(proxy: &str, body: &[u8]) -> String {
+async fn spawn_openai_realtime_upstream() -> (
+    SocketAddr,
+    JoinHandle<(String, bool, Vec<String>, Vec<Value>)>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Realtime upstream bind");
+    let address = listener.local_addr().expect("Realtime upstream address");
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("Realtime upstream accepts");
+        let mut path = String::new();
+        let mut authorized = false;
+        let mut protocols = Vec::new();
+        let mut socket = accept_hdr_async(stream, |request: &Request, mut response: Response| {
+            path = request.uri().to_string();
+            authorized = request.headers().get(header::AUTHORIZATION)
+                == Some(&HeaderValue::from_static("Bearer gateway-test-key"));
+            protocols = request
+                .headers()
+                .get_all("sec-websocket-protocol")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .map(str::trim)
+                .map(str::to_owned)
+                .collect();
+            response.headers_mut().insert(
+                "sec-websocket-protocol",
+                HeaderValue::from_static("realtime"),
+            );
+            Ok(response)
+        })
+        .await
+        .expect("Realtime upstream handshake");
+
+        socket
+            .send(Message::Text(
+                r#"{"type":"session.created","event_id":"evt_session","session":{"id":"sess_1","type":"realtime"}}"#
+                    .into(),
+            ))
+            .await
+            .expect("session.created");
+
+        let mut client_events = Vec::new();
+        for _ in 0..4 {
+            let message = socket
+                .next()
+                .await
+                .expect("Realtime client event")
+                .expect("Realtime client message")
+                .into_text()
+                .expect("Realtime client text");
+            client_events.push(serde_json::from_str(&message).expect("Realtime client JSON"));
+        }
+
+        for event in [
+            r#"{"type":"response.created","event_id":"evt_created","response":{"id":"resp_1","status":"in_progress"}}"#,
+            r#"{"type":"response.output_audio.delta","event_id":"evt_audio","response_id":"resp_1","item_id":"item_1","output_index":0,"content_index":0,"delta":"AQI="}"#,
+            r#"{"type":"response.function_call_arguments.delta","event_id":"evt_tool","response_id":"resp_1","item_id":"call_1","output_index":1,"call_id":"call_1","delta":"{\"city\":\"Paris\"}"}"#,
+        ] {
+            socket
+                .send(Message::Text(event.into()))
+                .await
+                .expect("Realtime provider event");
+        }
+
+        for _ in 0..2 {
+            let message = socket
+                .next()
+                .await
+                .expect("Realtime interruption event")
+                .expect("Realtime interruption message")
+                .into_text()
+                .expect("Realtime interruption text");
+            client_events.push(serde_json::from_str(&message).expect("interruption JSON"));
+        }
+        socket
+            .send(Message::Text(
+                r#"{"type":"response.done","event_id":"evt_done","response":{"id":"resp_1","status":"cancelled"}}"#
+                    .into(),
+            ))
+            .await
+            .expect("response.done");
+        let _ = socket.close(None).await;
+        (path, authorized, protocols, client_events)
+    });
+    (address, task)
+}
+
+async fn spawn_openai_sideband_upstream() -> (SocketAddr, JoinHandle<(String, bool, Vec<String>)>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("sideband upstream bind");
+    let address = listener.local_addr().expect("sideband upstream address");
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("sideband upstream accepts");
+        let mut path = String::new();
+        let mut authorized = false;
+        let mut protocols = Vec::new();
+        let mut socket = accept_hdr_async(stream, |request: &Request, mut response: Response| {
+            path = request.uri().to_string();
+            authorized = request.headers().get(header::AUTHORIZATION)
+                == Some(&HeaderValue::from_static("Bearer gateway-test-key"));
+            protocols = request
+                .headers()
+                .get_all("sec-websocket-protocol")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .map(str::trim)
+                .map(str::to_owned)
+                .collect();
+            response.headers_mut().insert(
+                "sec-websocket-protocol",
+                HeaderValue::from_static("realtime"),
+            );
+            Ok(response)
+        })
+        .await
+        .expect("sideband upstream handshake");
+        socket
+            .send(Message::Text(
+                r#"{"type":"session.created","event_id":"evt_sideband","session":{"id":"sess_sideband","type":"realtime"}}"#
+                    .into(),
+            ))
+            .await
+            .expect("sideband session.created");
+        while let Some(message) = socket.next().await {
+            if matches!(message.expect("sideband message"), Message::Close(_)) {
+                break;
+            }
+        }
+        (path, authorized, protocols)
+    });
+    (address, task)
+}
+
+async fn send_json_request(proxy: &str, path: &str, headers: &str, body: &[u8]) -> String {
     let mut downstream = TcpStream::connect(proxy).await.expect("proxy connection");
     downstream
         .write_all(
             format!(
-                "POST /v1/responses HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\nsession-id: mounted-session\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                "POST {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
             )
             .as_bytes(),
         )
         .await
-        .expect("Responses request headers");
-    downstream
-        .write_all(body)
-        .await
-        .expect("Responses request body");
+        .expect("JSON request headers");
+    if let Err(error) = downstream.write_all(body).await {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ),
+            "JSON request body: {error}"
+        );
+    }
     let mut response = Vec::new();
     downstream
         .read_to_end(&mut response)
         .await
-        .expect("Responses response");
-    String::from_utf8(response).expect("Responses response UTF-8")
+        .expect("JSON response");
+    String::from_utf8(response).expect("JSON response UTF-8")
+}
+
+async fn send_responses_request(proxy: &str, body: &[u8]) -> String {
+    send_json_request(
+        proxy,
+        "/v1/responses",
+        "session-id: mounted-session\r\n",
+        body,
+    )
+    .await
 }
 
 /// Compile the shipped preset the way an operator imports it, with the sample
@@ -245,6 +401,127 @@ async fn the_gateway_preset_preserves_the_caller_body_and_rewrites_only_the_mode
 }
 
 #[tokio::test]
+async fn responses_compact_replays_the_documented_same_wire_shape() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/openai/responses-compact-2026-08-21.json");
+    let fixture: Value = serde_json::from_str(MANIFEST_FIXTURE).expect("Responses Compact fixture");
+    let request = &fixture["request"];
+    let body = serde_json::to_vec(&request["body"]).expect("Compact request JSON");
+
+    let upstream = StrictProvider::start(ProviderContract::openai(), SECRET).await;
+    let (websocket_address, websocket_task) = spawn_websocket_upstream().await;
+    let directory = TempDir::new().expect("config directory");
+    let config = gateway_config(&directory, upstream.address(), websocket_address);
+    let server = bind_gateway(config).await;
+    let proxy = server.listener_addresses()[0].address().to_owned();
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+
+    let response = send_json_request(
+        &proxy,
+        request["path"].as_str().expect("Compact path"),
+        "",
+        &body,
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let response_body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("Compact HTTP response body");
+    let expected_response = fixture["provider_response_wire"]
+        .as_str()
+        .expect("Compact response wire fixture");
+    assert_eq!(response_body.as_bytes(), expected_response.as_bytes());
+
+    for (case, invalid_body) in [
+        ("missing model", br#"{"input":"missing model"}"#.as_slice()),
+        (
+            "empty model",
+            br#"{"model":"","input":"invalid"}"#.as_slice(),
+        ),
+        (
+            "non-string model",
+            br#"{"model":7,"input":"invalid"}"#.as_slice(),
+        ),
+        ("malformed JSON", b"{".as_slice()),
+    ] {
+        let rejected = send_json_request(
+            &proxy,
+            request["path"].as_str().expect("Compact path"),
+            "",
+            invalid_body,
+        )
+        .await;
+        assert!(rejected.starts_with("HTTP/1.1 400"), "{case}: {rejected}");
+    }
+
+    const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+    let prefix = b"{\"model\":\"gpt-4o\",\"input\":\"";
+    let suffix = b"\"}";
+    let mut exact_limit = Vec::with_capacity(MAX_BODY_BYTES);
+    exact_limit.extend_from_slice(prefix);
+    exact_limit.resize(MAX_BODY_BYTES - suffix.len(), b'a');
+    exact_limit.extend_from_slice(suffix);
+    assert_eq!(exact_limit.len(), MAX_BODY_BYTES);
+    let exact_limit_response = send_json_request(
+        &proxy,
+        request["path"].as_str().expect("Compact path"),
+        "",
+        &exact_limit,
+    )
+    .await;
+    assert!(
+        exact_limit_response.starts_with("HTTP/1.1 200"),
+        "exact limit: {exact_limit_response}"
+    );
+
+    let over_limit = vec![b'x'; MAX_BODY_BYTES + 1];
+    let over_limit_response = send_json_request(
+        &proxy,
+        request["path"].as_str().expect("Compact path"),
+        "",
+        &over_limit,
+    )
+    .await;
+    assert!(
+        over_limit_response.starts_with("HTTP/1.1 413"),
+        "over limit: {over_limit_response}"
+    );
+
+    server.begin_drain();
+    runner.await.expect("server task").expect("server shutdown");
+    let log = upstream.finish().await;
+    websocket_task.abort();
+
+    log.assert_accepted_everything();
+    let compact_requests: Vec<_> = log
+        .accepted
+        .iter()
+        .filter(|request| request.path == "/v1/responses/compact")
+        .collect();
+    assert_eq!(
+        compact_requests.len(),
+        2,
+        "invalid and over-limit Compact input stayed local"
+    );
+    let observed = compact_requests[0];
+    assert_eq!(observed.method, request["method"].as_str().unwrap());
+    assert_eq!(observed.query, None);
+    assert_eq!(
+        observed.header("authorization"),
+        Some("Bearer gateway-test-key")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&observed.body).expect("upstream Compact JSON"),
+        request["body"]
+    );
+    assert_eq!(compact_requests[1].body.len(), MAX_BODY_BYTES);
+}
+
+#[tokio::test]
 async fn the_gateway_preset_uses_semantic_responses_websocket_with_continuation() {
     const MANIFEST_FIXTURE: &str =
         include_str!("../../../fixtures/openai/responses-websocket-semantic-2026-08-21.json");
@@ -325,6 +602,276 @@ async fn the_gateway_preset_uses_semantic_responses_websocket_with_continuation(
         .map(|item| &item["type"])
         .collect();
     assert_eq!(actual_types, expected_types.iter().collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn the_gateway_preset_validates_openai_realtime_lifecycle() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/openai/realtime-websocket-2026-08-22.json");
+    let fixture: Value = serde_json::from_str(MANIFEST_FIXTURE).expect("OpenAI Realtime fixture");
+    let upstream = StrictProvider::start(ProviderContract::openai(), SECRET).await;
+    let (websocket_address, websocket_task) = spawn_openai_realtime_upstream().await;
+    let directory = TempDir::new().expect("config directory");
+    let config = gateway_config(&directory, upstream.address(), websocket_address);
+    let server = bind_gateway(config).await;
+    let proxy = server.listener_addresses()[0].address().to_owned();
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+
+    let mut request = format!(
+        "ws://{proxy}{}",
+        fixture["handshake"]["path"]
+            .as_str()
+            .expect("Realtime path")
+    )
+    .into_client_request()
+    .expect("Realtime client request");
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("realtime, openai-insecure-api-key.downstream-sentinel"),
+    );
+    let (mut client, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("gateway accepts Realtime WebSocket");
+    assert_eq!(
+        response.headers().get("sec-websocket-protocol"),
+        Some(&HeaderValue::from_static("realtime"))
+    );
+    let session_created: Value = serde_json::from_str(
+        &client
+            .next()
+            .await
+            .expect("session.created")
+            .expect("session.created message")
+            .into_text()
+            .expect("session.created text"),
+    )
+    .expect("session.created JSON");
+    assert_eq!(session_created, fixture["server_events"][0]);
+
+    for event in fixture["client_events"]
+        .as_array()
+        .expect("Realtime client events")[..4]
+        .iter()
+    {
+        client
+            .send(Message::Text(event.to_string().into()))
+            .await
+            .expect("Realtime client event");
+    }
+
+    let mut provider_events = Vec::new();
+    for _ in 0..3 {
+        let event: Value = serde_json::from_str(
+            &client
+                .next()
+                .await
+                .expect("Realtime provider event")
+                .expect("Realtime provider message")
+                .into_text()
+                .expect("Realtime provider text"),
+        )
+        .expect("Realtime provider JSON");
+        provider_events.push(event);
+    }
+    assert_eq!(
+        provider_events.as_slice(),
+        &fixture["server_events"]
+            .as_array()
+            .expect("Realtime server events")[1..4]
+    );
+
+    for event in fixture["client_events"]
+        .as_array()
+        .expect("Realtime client events")[4..]
+        .iter()
+    {
+        client
+            .send(Message::Text(event.to_string().into()))
+            .await
+            .expect("Realtime interruption event");
+    }
+    let done: Value = serde_json::from_str(
+        &client
+            .next()
+            .await
+            .expect("response.done")
+            .expect("response.done message")
+            .into_text()
+            .expect("response.done text"),
+    )
+    .expect("response.done JSON");
+    assert_eq!(done, fixture["server_events"][4]);
+    let _ = client.close(None).await;
+
+    let (path, authorized, protocols, client_events) =
+        websocket_task.await.expect("Realtime upstream task");
+    server.begin_drain();
+    runner.await.expect("server task").expect("server shutdown");
+    let log = upstream.finish().await;
+
+    log.assert_accepted_everything();
+    assert_eq!(path, fixture["handshake"]["path"]);
+    assert!(
+        authorized,
+        "Pooler must inject the selected OpenAI credential"
+    );
+    assert_eq!(protocols, ["realtime"]);
+    assert_eq!(
+        client_events.as_slice(),
+        fixture["client_events"]
+            .as_array()
+            .expect("Realtime client events")
+            .as_slice()
+    );
+    assert!(client_events
+        .iter()
+        .any(|event| event["type"] == "input_audio_buffer.append"));
+    assert!(client_events
+        .iter()
+        .any(|event| event["type"] == "response.cancel"));
+    assert!(client_events
+        .iter()
+        .any(|event| event["type"] == "output_audio_buffer.clear"));
+}
+
+#[tokio::test]
+async fn openai_realtime_sideband_reuses_the_call_id_websocket_route() {
+    const FIXTURE: &str = include_str!("../../../fixtures/openai/realtime-control-2026-08-22.json");
+    let fixture: Value = serde_json::from_str(FIXTURE).expect("Realtime control fixture");
+    let expected_path = fixture["sideband_handshake"]["path"]
+        .as_str()
+        .expect("sideband path");
+    let upstream = StrictProvider::start(ProviderContract::openai(), SECRET).await;
+    let (websocket_address, websocket_task) = spawn_openai_sideband_upstream().await;
+    let directory = TempDir::new().expect("config directory");
+    let config = gateway_config(&directory, upstream.address(), websocket_address);
+    let server = bind_gateway(config).await;
+    let proxy = server.listener_addresses()[0].address().to_owned();
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+
+    let mut request = format!("ws://{proxy}{expected_path}")
+        .into_client_request()
+        .expect("sideband request");
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("realtime, openai-insecure-api-key.downstream-sentinel"),
+    );
+    let (mut client, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("gateway accepts sideband connection");
+    assert_eq!(response.status(), 101);
+    assert_eq!(
+        response.headers().get("sec-websocket-protocol"),
+        Some(&HeaderValue::from_static("realtime"))
+    );
+    let created: Value = serde_json::from_str(
+        &client
+            .next()
+            .await
+            .expect("sideband session.created")
+            .expect("sideband session.created message")
+            .into_text()
+            .expect("sideband session.created text"),
+    )
+    .expect("sideband session.created JSON");
+    assert_eq!(created["type"], "session.created");
+    client.close(None).await.expect("close sideband connection");
+
+    let (path, authorized, protocols) = websocket_task.await.expect("sideband upstream task");
+    server.begin_drain();
+    runner.await.expect("server task").expect("server shutdown");
+    upstream.finish().await.assert_accepted_everything();
+
+    assert_eq!(path, expected_path);
+    assert!(
+        authorized,
+        "Pooler must inject the selected OpenAI credential"
+    );
+    assert_eq!(protocols, ["realtime"]);
+}
+
+#[tokio::test]
+async fn openai_realtime_rejects_invalid_client_events_before_upstream_delivery() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Realtime boundary upstream bind");
+    let websocket_address = listener.local_addr().expect("Realtime boundary address");
+    let websocket_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("Realtime boundary accepts");
+        let mut socket = accept_async(stream)
+            .await
+            .expect("Realtime boundary handshake");
+        socket
+            .send(Message::Text(
+                r#"{"type":"session.created","event_id":"evt_session","session":{"id":"sess_1"}}"#
+                    .into(),
+            ))
+            .await
+            .expect("boundary session.created");
+        while let Some(message) = socket.next().await {
+            match message.expect("boundary upstream message") {
+                Message::Text(_) | Message::Binary(_) => return true,
+                Message::Close(_) => return false,
+                Message::Ping(payload) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("boundary pong");
+                }
+                Message::Pong(_) | Message::Frame(_) => {}
+            }
+        }
+        false
+    });
+
+    let upstream = StrictProvider::start(ProviderContract::openai(), SECRET).await;
+    let directory = TempDir::new().expect("config directory");
+    let config = gateway_config(&directory, upstream.address(), websocket_address);
+    let server = bind_gateway(config).await;
+    let proxy = server.listener_addresses()[0].address().to_owned();
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+
+    let (mut client, _) =
+        tokio_tungstenite::connect_async(format!("ws://{proxy}/v1/realtime?model=gpt-realtime"))
+            .await
+            .expect("Realtime boundary WebSocket");
+    let _ = client.next().await.expect("boundary session.created");
+    client
+        .send(Message::Text(
+            r#"{"type":"undocumented.realtime.event"}"#.into(),
+        ))
+        .await
+        .expect("send invalid Realtime event");
+    let close = match client
+        .next()
+        .await
+        .expect("policy close")
+        .expect("policy close message")
+    {
+        Message::Close(Some(close)) => close,
+        other => panic!("expected policy close, got {other:?}"),
+    };
+    assert_eq!(
+        close.code,
+        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+    );
+    assert!(
+        !websocket_task.await.expect("boundary upstream task"),
+        "invalid event must not reach the provider"
+    );
+
+    server.begin_drain();
+    runner.await.expect("server task").expect("server shutdown");
+    upstream.finish().await.assert_accepted_everything();
 }
 
 #[tokio::test]

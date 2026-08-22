@@ -267,6 +267,109 @@
       ]
     },
     {
+      "adapter": "openai",
+      "protocol": "responses-compact",
+      "version": "SDK-6.40.0",
+      "fixture": "../openai/responses-compact-2026-08-21.json",
+      "equivalence": "http_same_wire",
+      "status": "sanitized_local_reference",
+      "source": "Sanitized OpenAI SDK 6.40.0 Responses Compact request and response shapes replayed through the mounted gateway against a strict local OpenAI contract",
+      "supported_capabilities": [
+        "provider_authentication",
+        "dedicated_endpoint_capability",
+        "request_shape_preservation",
+        "model_routing",
+        "compaction_item",
+        "usage",
+        "opaque_same_wire_response",
+        "local_invalid_request_rejection",
+        "exact_request_limit_acceptance",
+        "over_limit_rejection"
+      ],
+      "unsupported_capabilities": [
+        "live_provider",
+        "pi_native_compaction_integration",
+        "alpha_search"
+      ],
+      "notes": [
+        "The installed OpenAI SDK contains executable POST /responses/compact support; the installed Pi transport does not call it and continues to use client-side textual summarization.",
+        "This fixture proves mounted same-wire routing and boundary behavior against strict loopback, not live OpenAI authorization or provider conformance.",
+        "No authoritative Alpha Search contract was found in the installed Pi or OpenAI SDK, so Pooler does not mount one.",
+        "Replay: cargo test -p pooler-server --test gateway_preset responses_compact_replays_the_documented_same_wire_shape --locked."
+      ]
+    },
+    {
+      "adapter": "openai",
+      "protocol": "realtime-websocket",
+      "version": "SDK-6.40.0",
+      "fixture": "../openai/realtime-websocket-2026-08-22.json",
+      "equivalence": "event_same_wire",
+      "status": "sanitized_local_reference",
+      "source": "Sanitized OpenAI SDK 6.40.0 Realtime WebSocket event shapes replayed through the mounted gateway against a strict local WebSocket",
+      "supported_capabilities": [
+        "provider_authentication",
+        "client_credential_subprotocol_stripping",
+        "query_preservation",
+        "bounded_text_frames",
+        "audio_input_and_output",
+        "function_tools",
+        "interruption",
+        "terminal_state",
+        "cancellation",
+        "absolute_connection_age",
+        "invalid_event_rejection_before_provider_delivery",
+        "no_retry_after_websocket_commitment"
+      ],
+      "unsupported_capabilities": [
+        "live_provider",
+        "binary_application_frames",
+        "automatic_reconnection",
+        "dedicated_reasoning_events"
+      ],
+      "notes": [
+        "Pooler validates documented client and server JSON event types and lifecycle while preserving accepted text frames byte-for-byte; it does not translate the Realtime protocol.",
+        "Caller openai-insecure-api-key subprotocols are stripped and never forwarded; the selected upstream credential is injected at the provider boundary.",
+        "Application messages must be complete text frames. Audio is the documented base64 JSON field; binary application frames and fragmented JSON are rejected.",
+        "The one-hour route timeout is an absolute connection-age ceiling. Pooler does not reconnect or replay a committed WebSocket session.",
+        "This is strict-loopback evidence, not live OpenAI provider conformance.",
+        "Replay: cargo test -p pooler-server --test gateway_preset the_gateway_preset_validates_openai_realtime_lifecycle --locked."
+      ]
+    },
+    {
+      "adapter": "openai",
+      "protocol": "realtime-control",
+      "version": "SDK-6.40.0",
+      "fixture": "../openai/realtime-control-2026-08-22.json",
+      "equivalence": "http_same_wire",
+      "status": "sanitized_local_reference",
+      "source": "OpenAI SDK 6.40.0 executable resource methods for GA client secrets, deprecated beta sessions/transcription sessions, and SIP call controls, plus mounted sideband query preservation",
+      "supported_capabilities": [
+        "client_secrets",
+        "legacy_realtime_sessions",
+        "transcription_sessions",
+        "sip_accept",
+        "sip_reject",
+        "sip_refer",
+        "sip_hangup",
+        "sideband_call_id_query",
+        "provider_authentication",
+        "bounded_same_wire_forwarding"
+      ],
+      "unsupported_capabilities": [
+        "translation_session_creation",
+        "live_provider"
+      ],
+      "notes": [
+        "The installed SDK exports POST /realtime/client_secrets and deprecated beta POST /realtime/sessions and /realtime/transcription_sessions methods.",
+        "The installed SDK exports only POST accept, reject, refer, and hangup methods under /realtime/calls/{call_id}; the gateway mounts those four exact action templates only for OpenAI.",
+        "The SDK contains translation session types but no exported resource method or HTTP path for creating one, so Pooler does not invent or mount a translation-session endpoint.",
+        "Sideband uses the existing /v1/realtime WebSocket route and preserves call_id; it is not a separate endpoint family.",
+        "Returned ephemeral secrets and identifiers in the fixture are synthetic; this is strict-loopback evidence, not live OpenAI conformance.",
+        "Replay: cargo test -p pooler-server --test gateway_provider_auth openai_realtime_control_routes_match_the_sdk_wire_contract --locked.",
+        "Replay: cargo test -p pooler-server --test gateway_preset openai_realtime_sideband_reuses_the_call_id_websocket_route --locked."
+      ]
+    },
+    {
       "adapter": "gemini",
       "protocol": "models-actions-interactions",
       "version": "2026-08-21",

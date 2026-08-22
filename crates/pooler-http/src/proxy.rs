@@ -52,6 +52,10 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
+use crate::openai_realtime::{
+    OpenAiRealtimeValidator, CLIENT_DECODER as OPENAI_REALTIME_CLIENT_DECODER,
+    SERVER_DECODER as OPENAI_REALTIME_SERVER_DECODER,
+};
 use crate::openai_websocket::{
     materialized_authorization_generation, materialized_generation, ConnectionIdentity,
     CredentialGeneration, OpenAiResponsesWebSocketAttempt, OpenAiResponsesWebSocketError,
@@ -527,6 +531,7 @@ where
         let listener = listener.into();
         if let Some(route) = config.routes().iter().find(|route| {
             route.listener() == listener.as_ref()
+                && !is_openai_realtime_websocket(route)
                 && ((!matches!(route.ingress().mode(), BodyMode::Opaque | BodyMode::Patch)
                     && !semantic.supports(route))
                     || (route.response().mode() != BodyMode::Opaque && !semantic.supports(route)))
@@ -881,13 +886,11 @@ where
         observation: &mut Option<RequestObservation>,
     ) -> Result<Response<ProxyBody>, ProxyError> {
         let key = validate_websocket_request(&request)?;
-        let offered_protocols = websocket_protocols(request.headers());
-        if route.ingress().mode() != BodyMode::Opaque || route.response().mode() != BodyMode::Opaque
-        {
-            return Err(ProxyError::UnsupportedBodyMode {
-                route: route.id().to_owned(),
-            });
-        }
+        let offered_protocols = websocket_protocols(request.headers())
+            .into_iter()
+            .filter(|protocol| !protocol.starts_with("openai-insecure-api-key."))
+            .collect::<Vec<_>>();
+        let realtime_validator = websocket_realtime_validator(route)?;
 
         let started = StdInstant::now();
         let cancellation = guard.cancellation_token();
@@ -901,6 +904,15 @@ where
         headers.remove("sec-websocket-key");
         headers.remove("sec-websocket-version");
         headers.remove("sec-websocket-extensions");
+        headers.remove("sec-websocket-protocol");
+        if !offered_protocols.is_empty() {
+            let protocols = HeaderValue::from_str(&offered_protocols.join(", ")).map_err(|_| {
+                ProxyError::InvalidWebSocketHandshake(
+                    "invalid Sec-WebSocket-Protocol value".to_owned(),
+                )
+            })?;
+            headers.insert("sec-websocket-protocol", protocols);
+        }
 
         let mut selection = self
             .pooling
@@ -1005,6 +1017,7 @@ where
                 upstream_socket,
                 WebSocketTunnelContext {
                     max_frame_bytes,
+                    realtime_validator,
                     guard,
                     cancellation,
                     deadline,
@@ -3390,6 +3403,7 @@ enum WebSocketFrameError {
     Protocol,
     InvalidClose,
     InvalidText,
+    Semantic,
     Io,
 }
 
@@ -3563,7 +3577,49 @@ fn websocket_error_close_code(error: &WebSocketFrameError) -> u16 {
         WebSocketFrameError::TooLarge => 1009,
         WebSocketFrameError::InvalidText => 1007,
         WebSocketFrameError::Protocol | WebSocketFrameError::InvalidClose => 1002,
+        WebSocketFrameError::Semantic => 1008,
         WebSocketFrameError::Io => 1001,
+    }
+}
+
+fn is_openai_realtime_websocket(route: &RoutePlan) -> bool {
+    route.matcher().websocket() == Some(true)
+        && route.ingress().mode() == BodyMode::Semantic
+        && route.response().mode() == BodyMode::Semantic
+        && route.ingress().decoder() == Some(OPENAI_REALTIME_CLIENT_DECODER)
+        && route.response().decoder() == Some(OPENAI_REALTIME_SERVER_DECODER)
+}
+
+fn websocket_realtime_validator(
+    route: &RoutePlan,
+) -> Result<Option<OpenAiRealtimeValidator>, ProxyError> {
+    if route.ingress().mode() == BodyMode::Opaque && route.response().mode() == BodyMode::Opaque {
+        Ok(None)
+    } else if is_openai_realtime_websocket(route) {
+        Ok(Some(OpenAiRealtimeValidator::default()))
+    } else {
+        Err(ProxyError::UnsupportedBodyMode {
+            route: route.id().to_owned(),
+        })
+    }
+}
+
+fn validate_realtime_frame(
+    frame: &RawWebSocketFrame,
+    validator: &mut OpenAiRealtimeValidator,
+    from_client: bool,
+) -> Result<(), WebSocketFrameError> {
+    match frame.opcode {
+        1 if frame.fin => {
+            let result = if from_client {
+                validator.validate_client(&frame.payload)
+            } else {
+                validator.validate_server(&frame.payload)
+            };
+            result.map_err(|_| WebSocketFrameError::Semantic)
+        }
+        8..=10 => Ok(()),
+        _ => Err(WebSocketFrameError::Semantic),
     }
 }
 
@@ -3576,6 +3632,7 @@ enum WebSocketReadEvent {
 
 struct WebSocketTunnelContext {
     max_frame_bytes: u64,
+    realtime_validator: Option<OpenAiRealtimeValidator>,
     guard: DrainGuard,
     cancellation: CancellationToken,
     deadline: StdInstant,
@@ -3590,6 +3647,7 @@ async fn run_websocket_tunnel(
 ) {
     let WebSocketTunnelContext {
         max_frame_bytes,
+        mut realtime_validator,
         guard,
         cancellation,
         deadline,
@@ -3650,6 +3708,13 @@ async fn run_websocket_tunnel(
                         .await;
                         break;
                     }
+                    if let Some(validator) = realtime_validator.as_mut() {
+                        if validate_realtime_frame(&frame, validator, true).is_err() {
+                            completion = CompletionClass::IncompleteStream;
+                            send_websocket_closes(&mut downstream, &mut upstream, 1008).await;
+                            break;
+                        }
+                    }
                     let close = frame.opcode == 8;
                     if write_websocket_frame(&mut upstream, &frame.bytes, deadline, &cancellation)
                         .await
@@ -3673,7 +3738,9 @@ async fn run_websocket_tunnel(
                     break;
                 }
                 Err(
-                    error @ (WebSocketFrameError::InvalidClose | WebSocketFrameError::InvalidText),
+                    error @ (WebSocketFrameError::InvalidClose
+                    | WebSocketFrameError::InvalidText
+                    | WebSocketFrameError::Semantic),
                 ) => {
                     completion = CompletionClass::IncompleteStream;
                     send_websocket_closes(
@@ -3704,6 +3771,16 @@ async fn run_websocket_tunnel(
                         .await;
                         break;
                     }
+                    if let Some(validator) = realtime_validator.as_mut() {
+                        let invalid_event =
+                            validate_realtime_frame(&frame, validator, false).is_err();
+                        let incomplete_close = frame.opcode == 8 && validator.finish().is_err();
+                        if invalid_event || incomplete_close {
+                            completion = CompletionClass::IncompleteStream;
+                            send_websocket_closes(&mut downstream, &mut upstream, 1008).await;
+                            break;
+                        }
+                    }
                     let close = frame.opcode == 8;
                     if write_websocket_frame(&mut downstream, &frame.bytes, deadline, &cancellation)
                         .await
@@ -3727,7 +3804,9 @@ async fn run_websocket_tunnel(
                     break;
                 }
                 Err(
-                    error @ (WebSocketFrameError::InvalidClose | WebSocketFrameError::InvalidText),
+                    error @ (WebSocketFrameError::InvalidClose
+                    | WebSocketFrameError::InvalidText
+                    | WebSocketFrameError::Semantic),
                 ) => {
                     completion = CompletionClass::IncompleteStream;
                     send_websocket_closes(

@@ -43,7 +43,8 @@ absent rather than present and broken.
 
 | Provider | Routes mounted |
 | --- | --- |
-| `openai`, `xai` | `models`, `chat-completions`, `responses`, `responses-compact`, `responses-websocket` |
+| `openai` | `models`, `chat-completions`, `responses`, `responses-compact`, `responses-websocket`, `realtime-websocket`, `realtime-client-secrets`, legacy `realtime-sessions` / `realtime-transcription-sessions`, and four explicit `realtime-calls-*` actions |
+| `xai` | `models`, `chat-completions`, `responses`, `responses-compact`, `responses-websocket` |
 | `anthropic` | `models`, `messages`, `messages-count-tokens` |
 | `google` | `gemini-models`, `gemini-model-get`, `gemini-model-actions`, and create/resource/cancel routes for `v1`, `v1beta`, and `v1beta2` Interactions |
 
@@ -52,8 +53,13 @@ absent rather than present and broken.
 | `models` | `GET /v1/models` | `models` | served by Pooler |
 | `chat-completions` | `POST /v1/chat/completions` | `chat_completions` | patch |
 | `responses` | `POST /v1/responses` | `responses` | semantic Responses-over-WebSocket transport |
-| `responses-compact` | `POST /v1/responses/compact` | `responses` | patch |
+| `responses-compact` | `POST /v1/responses/compact` | `responses_compact` | bounded same-wire patch |
 | `responses-websocket` | `GET /v1/responses` (upgrade) | `responses` | opaque tunnel |
+| `realtime-websocket` | `GET /v1/realtime?model=...` or `?call_id=...` (upgrade) | `realtime` | bounded semantic same-wire validation; sideband reuses this route |
+| `realtime-client-secrets` | `POST /v1/realtime/client_secrets` | `realtime_client_secrets` | bounded opaque same-wire |
+| `realtime-sessions` | `POST /v1/realtime/sessions` | `realtime_sessions` | bounded opaque deprecated-beta same-wire |
+| `realtime-transcription-sessions` | `POST /v1/realtime/transcription_sessions` | `realtime_transcription_sessions` | bounded opaque deprecated-beta same-wire |
+| `realtime-calls-{accept,reject,refer,hangup}` | `POST /v1/realtime/calls/{call_id}/{action}` | `realtime_calls` | four exact bounded opaque same-wire routes |
 | `messages` | `POST /v1/messages` | `messages` | patch |
 | `messages-count-tokens` | `POST /v1/messages/count_tokens` | `messages` | patch |
 | `gemini-models` | `GET /v1beta/models` | `models` | opaque discovery response |
@@ -125,6 +131,51 @@ selected target's upstream model, and forwards everything else unchanged. This
 is what makes catalog aliases, account pooling, capability filtering, and the
 vendored request-facts dialect apply to a request. A model the catalog does not
 know is rejected before any upstream call.
+
+Responses Compact has its own `responses_compact` endpoint family. Ordinary
+Responses support no longer causes this route to be mounted accidentally. The
+OpenAI and xAI integrations explicitly document the family; other
+OpenAI-compatible providers do not receive the route. Pooler requires bounded
+JSON with a non-empty model, performs normal model/account selection, strips
+caller credentials, injects the selected provider credential, preserves all
+other request fields, and returns the provider's `response.compaction` JSON
+unchanged. The committed replay follows the executable OpenAI SDK 6.40.0
+`POST /responses/compact` request and `CompactedResponse` shapes. It is strict
+loopback evidence, not live-provider conformance, and Pi 0.84.2 does not invoke
+this native endpoint for its `/compact` command.
+
+No Alpha Search route is mounted. Neither the installed Pi 0.84.2 transport nor
+its installed OpenAI SDK 6.40.0 contains an Alpha Search method, path, or wire
+schema. Pooler will not infer that contract from ordinary web-search tools,
+vector-store search, or xAI `search_parameters`.
+
+OpenAI Realtime uses `GET /v1/realtime?model=...` over WebSocket. SIP sideband
+connections reuse that mounted route as `GET /v1/realtime?call_id=...`; there is
+no separate sideband route. Pooler preserves the query, strips caller `openai-insecure-api-key.*` subprotocols, injects
+the selected operator credential, and forwards only the non-secret `realtime`
+subprotocol. Accepted application messages remain byte-for-byte same-wire JSON,
+but both directions are validated against the installed OpenAI SDK 6.40.0 event
+set and lifecycle before forwarding. The validator covers session creation and
+updates, base64 audio append/commit/output, conversation items, function tools,
+response creation, interruption/cancellation, terminal status, errors, rate
+limits, and MCP events. Unknown, malformed, binary, fragmented, out-of-order, or
+over-limit application messages close with an appropriate WebSocket policy or
+size error. A one-hour absolute age bounds each connection; cancellation and
+drain close it. Because the downstream `101` commits the session, Pooler never
+reconnects or replays it. Dedicated reasoning events are not claimed because the
+SDK contract used as evidence defines none.
+
+The REST control surface follows executable OpenAI SDK 6.40.0 methods exactly:
+GA client secrets use `POST /realtime/client_secrets`; the deprecated beta
+session and transcription-session creators use `POST /realtime/sessions` and
+`POST /realtime/transcription_sessions` with `OpenAI-Beta: assistants=v2`; SIP
+uses only `POST /realtime/calls/{call_id}/{accept,reject,refer,hangup}`. Pooler
+mounts these as bounded opaque same-wire routes, preserves request and response
+bodies, strips caller credentials, and injects the selected OpenAI credential.
+Their endpoint families are listed only by the OpenAI provider, so selecting an
+OpenAI-compatible, xAI, Anthropic, or Google provider removes them at compile
+time. The SDK declares translation-session data types but exports no creation
+method or HTTP path, so no translation-session endpoint is mounted.
 
 The `responses` route is semantic. It decodes the OpenAI-compatible request,
 performs normal model/account/capability selection, sends a bounded
@@ -223,6 +274,11 @@ Each claim above is backed by an executable test.
 | A disabled or capability-mismatched model is not advertised | `gateway_models.rs::an_operator_disabled_model_leaves_the_published_view`, `::a_model_lacking_a_required_capability_is_not_published` |
 | Caller body preservation and the bounded raw WebSocket tunnel | `crates/pooler-server/tests/gateway_preset.rs` |
 | Mounted semantic Responses WebSocket authentication, tools, reasoning, usage, terminal state, session reuse, and continuation | `gateway_preset.rs::the_gateway_preset_uses_semantic_responses_websocket_with_continuation` |
+| Responses Compact capability isolation, request preservation, credentials, response shape, and local malformed/model/size rejection | `gateway_preset.rs::responses_compact_replays_the_documented_same_wire_shape` |
+| OpenAI Realtime authentication, secret-subprotocol stripping, query preservation, audio, tools, interruption, terminal state, and same-wire lifecycle | `gateway_preset.rs::the_gateway_preset_validates_openai_realtime_lifecycle` |
+| Invalid Realtime client events stop before provider delivery | `gateway_preset.rs::openai_realtime_rejects_invalid_client_events_before_upstream_delivery` |
+| Realtime client-secret, legacy session/transcription-session, and exact SIP control paths, headers, bodies, and credentials | `gateway_provider_auth.rs::openai_realtime_control_routes_match_the_sdk_wire_contract` |
+| Sideband `call_id` query preservation on the existing Realtime WebSocket route | `gateway_preset.rs::openai_realtime_sideband_reuses_the_call_id_websocket_route` |
 | Credential/session isolation, cancellation commitment, age ceilings, and bootstrap/queue bounds | `crates/pooler-http/src/openai_websocket.rs` unit tests |
 | Strict Gemini model/action/Interactions paths and credentials | `gateway_provider_auth.rs::gemini_routes_satisfy_a_strict_gemini_endpoint` |
 | Invalid Gemini actions and encoded separators never reach the provider | `gateway_provider_auth.rs::gemini_gateway_rejects_unknown_actions_and_encoded_model_separators_locally` |
@@ -241,4 +297,5 @@ The native `GET /v1/responses` upgrade remains a bounded same-wire tunnel; Poole
 does not translate arbitrary downstream WebSocket frames. The committed semantic
 fixture is strict-loopback evidence for the REST-to-WebSocket transport, not
 live OpenAI or xAI provider conformance. Live-provider conformance for the preset
-is a separate gate and has not been run.
+is a separate gate and has not been run. The same limit applies to Responses
+Compact, and no Alpha Search compatibility is claimed.

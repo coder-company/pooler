@@ -179,7 +179,7 @@ async fn openai_routes_satisfy_a_strict_openai_endpoint() {
             ),
             post(
                 "/v1/responses/compact",
-                br#"{"model":"gpt-4o","response_id":"resp_1"}"#,
+                br#"{"model":"gpt-4o","input":"sanitized"}"#,
             ),
         ],
     )
@@ -191,6 +191,121 @@ async fn openai_routes_satisfy_a_strict_openai_endpoint() {
         .expect("chat reached the upstream");
     assert_eq!(
         chat.header("authorization"),
+        Some(format!("Bearer {SECRET}").as_str())
+    );
+}
+
+#[tokio::test]
+async fn openai_realtime_control_routes_match_the_sdk_wire_contract() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/openai/realtime-control-2026-08-22.json");
+    let fixture: serde_json::Value =
+        serde_json::from_str(MANIFEST_FIXTURE).expect("OpenAI Realtime control fixture");
+    let requests = fixture["requests"].as_array().expect("fixture requests");
+    let bodies = requests
+        .iter()
+        .map(|request| {
+            request
+                .get("body")
+                .map(|body| serde_json::to_vec(body).expect("fixture body JSON"))
+        })
+        .collect::<Vec<_>>();
+    let extra_headers = requests
+        .iter()
+        .map(|request| {
+            let mut headers = String::from("authorization: Bearer downstream-sentinel\r\n");
+            for (name, value) in request["headers"].as_object().expect("fixture headers") {
+                headers.push_str(name);
+                headers.push_str(": ");
+                headers.push_str(value.as_str().expect("fixture header value"));
+                headers.push_str("\r\n");
+            }
+            headers
+        })
+        .collect::<Vec<_>>();
+    let calls = requests
+        .iter()
+        .zip(&bodies)
+        .zip(&extra_headers)
+        .map(|((request, body), headers)| Call {
+            method: request["method"].as_str().expect("fixture method"),
+            path: request["path"].as_str().expect("fixture path"),
+            content_type: body.as_ref().map(|_| "application/json"),
+            body: body.as_deref().unwrap_or_default(),
+            extra_headers: headers,
+        })
+        .collect::<Vec<_>>();
+
+    let (log, responses) = exchange(ProviderContract::openai(), "openai", &calls).await;
+
+    assert_all_accepted(&log, &responses);
+    let observed_requests = log
+        .accepted
+        .iter()
+        .filter(|request| request.path.starts_with("/v1/realtime/"))
+        .collect::<Vec<_>>();
+    assert_eq!(observed_requests.len(), requests.len());
+    for ((observed, expected), response) in
+        observed_requests.into_iter().zip(requests).zip(&responses)
+    {
+        assert_eq!(
+            observed.method,
+            expected["method"].as_str().expect("fixture method")
+        );
+        assert_eq!(
+            observed.path,
+            expected["path"].as_str().expect("fixture path")
+        );
+        assert_eq!(observed.query, None);
+        assert_eq!(
+            observed.header("authorization"),
+            Some(format!("Bearer {SECRET}").as_str())
+        );
+        if let Some(body) = expected.get("body") {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&observed.body)
+                    .expect("upstream body JSON"),
+                *body
+            );
+        } else {
+            assert!(observed.body.is_empty());
+        }
+
+        let response_body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("downstream response body");
+        let name = expected["name"].as_str().expect("fixture request name");
+        if let Some(expected_response) = fixture["provider_responses"].get(name) {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(response_body)
+                    .expect("downstream response JSON"),
+                *expected_response
+            );
+        } else {
+            assert!(response_body.is_empty(), "{name}: {response_body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn xai_responses_compact_satisfies_the_strict_xai_endpoint() {
+    let (log, responses) = exchange(
+        ProviderContract::xai(),
+        "xai",
+        &[post(
+            "/v1/responses/compact",
+            br#"{"model":"grok-4.1-fast","input":"sanitized"}"#,
+        )],
+    )
+    .await;
+
+    assert_all_accepted(&log, &responses);
+    let compact = log
+        .accepted_for("/v1/responses/compact")
+        .expect("xAI Compact reached the upstream");
+    assert_eq!(
+        compact.header("authorization"),
         Some(format!("Bearer {SECRET}").as_str())
     );
 }

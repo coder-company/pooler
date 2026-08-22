@@ -737,7 +737,7 @@ enum GatewaySurface {
 /// A route is mounted only when the selected provider documents that family
 /// and satisfies the surface, so a Gemini path is never mounted against an
 /// Anthropic upstream merely because both document `models`.
-const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 19] = [
+const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 27] = [
     ("models", GatewaySurface::Discovery("/v1/models"), "models"),
     (
         "chat-completions",
@@ -748,12 +748,52 @@ const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 19] = [
     (
         "responses-compact",
         GatewaySurface::Dialect("openai"),
-        "responses",
+        "responses_compact",
     ),
     (
         "responses-websocket",
         GatewaySurface::Dialect("openai"),
         "responses",
+    ),
+    (
+        "realtime-client-secrets",
+        GatewaySurface::Dialect("openai"),
+        "realtime_client_secrets",
+    ),
+    (
+        "realtime-sessions",
+        GatewaySurface::Dialect("openai"),
+        "realtime_sessions",
+    ),
+    (
+        "realtime-transcription-sessions",
+        GatewaySurface::Dialect("openai"),
+        "realtime_transcription_sessions",
+    ),
+    (
+        "realtime-calls-accept",
+        GatewaySurface::Dialect("openai"),
+        "realtime_calls",
+    ),
+    (
+        "realtime-calls-reject",
+        GatewaySurface::Dialect("openai"),
+        "realtime_calls",
+    ),
+    (
+        "realtime-calls-refer",
+        GatewaySurface::Dialect("openai"),
+        "realtime_calls",
+    ),
+    (
+        "realtime-calls-hangup",
+        GatewaySurface::Dialect("openai"),
+        "realtime_calls",
+    ),
+    (
+        "realtime-websocket",
+        GatewaySurface::Dialect("openai"),
+        "realtime",
     ),
     ("messages", GatewaySurface::Dialect("anthropic"), "messages"),
     (

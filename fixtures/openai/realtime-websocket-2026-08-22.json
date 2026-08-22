@@ -1,0 +1,91 @@
+{
+  "fixture_version": "2026-08-22",
+  "provenance": "Sanitized OpenAI Realtime WebSocket shapes from the installed OpenAI SDK 6.40.0, replayed through Pooler's mounted gateway against a strict local WebSocket; no live credential, audio, prompt, or provider response is included.",
+  "handshake": {
+    "method": "GET",
+    "path": "/v1/realtime?model=gpt-realtime",
+    "subprotocols_from_client": [
+      "realtime",
+      "openai-insecure-api-key.downstream-sentinel"
+    ],
+    "subprotocols_to_provider": ["realtime"],
+    "provider_authentication": "operator bearer credential"
+  },
+  "client_events": [
+    {
+      "type": "session.update",
+      "session": {
+        "type": "realtime",
+        "audio": {
+          "input": {"format": {"type": "audio/pcm", "rate": 24000}},
+          "output": {"format": {"type": "audio/pcm", "rate": 24000}}
+        },
+        "tools": [
+          {
+            "type": "function",
+            "name": "weather",
+            "description": "lookup",
+            "parameters": {"type": "object"}
+          }
+        ]
+      }
+    },
+    {"type": "input_audio_buffer.append", "audio": "AQI="},
+    {"type": "input_audio_buffer.commit"},
+    {
+      "type": "response.create",
+      "response": {"output_modalities": ["audio"], "tool_choice": "auto"}
+    },
+    {"type": "response.cancel", "response_id": "resp_1"},
+    {"type": "output_audio_buffer.clear"}
+  ],
+  "server_events": [
+    {
+      "type": "session.created",
+      "event_id": "evt_session",
+      "session": {"id": "sess_1", "type": "realtime"}
+    },
+    {
+      "type": "response.created",
+      "event_id": "evt_created",
+      "response": {"id": "resp_1", "status": "in_progress"}
+    },
+    {
+      "type": "response.output_audio.delta",
+      "event_id": "evt_audio",
+      "response_id": "resp_1",
+      "item_id": "item_1",
+      "output_index": 0,
+      "content_index": 0,
+      "delta": "AQI="
+    },
+    {
+      "type": "response.function_call_arguments.delta",
+      "event_id": "evt_tool",
+      "response_id": "resp_1",
+      "item_id": "call_1",
+      "output_index": 1,
+      "call_id": "call_1",
+      "delta": "{\"city\":\"Paris\"}"
+    },
+    {
+      "type": "response.done",
+      "event_id": "evt_done",
+      "response": {"id": "resp_1", "status": "cancelled"}
+    }
+  ],
+  "coverage": [
+    "provider_authentication",
+    "client_credential_subprotocol_stripping",
+    "query_preservation",
+    "bounded_text_frames",
+    "audio_input_and_output",
+    "function_tools",
+    "interruption",
+    "terminal_state",
+    "cancellation",
+    "absolute_connection_age",
+    "invalid_event_rejection_before_provider_delivery",
+    "no_retry_after_websocket_commitment"
+  ]
+}

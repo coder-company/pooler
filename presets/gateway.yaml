@@ -140,11 +140,164 @@ routes:
       mode: patch
       inspectors: [inspect.openai.model]
     target:
-      endpoint_family: responses
+      endpoint_family: responses_compact
       provider: gateway
       model_from: request.model
     response:
       mode: opaque
+
+  # GA client secrets and the deprecated session creation endpoints are kept
+  # as distinct same-wire families. The latter two require the SDK's beta
+  # header from the caller; Pooler does not synthesize undocumented variants.
+  - id: realtime-client-secrets
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/realtime/client_secrets
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_response_body_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: realtime_client_secrets
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: realtime-sessions
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/realtime/sessions
+      headers:
+        openai-beta: assistants=v2
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_response_body_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: realtime_sessions
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: realtime-transcription-sessions
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/realtime/transcription_sessions
+      headers:
+        openai-beta: assistants=v2
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_response_body_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: realtime_transcription_sessions
+      provider: gateway
+    response:
+      mode: opaque
+
+  # SIP call controls intentionally use four exact action templates. A broad
+  # calls prefix would advertise undocumented actions.
+  - id: realtime-calls-accept
+    listen: gateway
+    match:
+      methods: [POST]
+      path_template: "/v1/realtime/calls/{call_id}/accept"
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_response_body_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: realtime_calls
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: realtime-calls-reject
+    listen: gateway
+    match:
+      methods: [POST]
+      path_template: "/v1/realtime/calls/{call_id}/reject"
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_response_body_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: realtime_calls
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: realtime-calls-refer
+    listen: gateway
+    match:
+      methods: [POST]
+      path_template: "/v1/realtime/calls/{call_id}/refer"
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_response_body_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: realtime_calls
+      provider: gateway
+    response:
+      mode: opaque
+
+  - id: realtime-calls-hangup
+    listen: gateway
+    match:
+      methods: [POST]
+      path_template: "/v1/realtime/calls/{call_id}/hangup"
+    limits:
+      max_request_body_bytes: 65536
+      max_response_body_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: realtime_calls
+      provider: gateway
+    response:
+      mode: opaque
+
+  # Both ordinary model sessions and SIP sideband sessions use this endpoint.
+  # The query (`model=...` or `call_id=...`) is preserved by the WebSocket
+  # tunnel rather than split into a second route.
+  - id: realtime-websocket
+    listen: gateway
+    match:
+      methods: [GET]
+      path: /v1/realtime
+      websocket: true
+    limits:
+      max_frame_bytes: 8388608
+      max_queue_bytes: 8388608
+      max_queue_items: 64
+      request_timeout: 1h
+    ingress:
+      mode: semantic
+      decoder: decode.openai.realtime.client
+    target:
+      endpoint_family: realtime
+      provider: gateway-websocket
+      path: /v1/realtime
+    response:
+      mode: semantic
+      decoder: decode.openai.realtime.events
+    loss_policy: reject
 
   # Native WebSocket clients may still use the same-wire upgrade surface. The
   # semantic, pooled transport above is the default for ordinary REST callers;

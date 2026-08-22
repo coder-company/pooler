@@ -1,0 +1,59 @@
+{
+  "fixture_version": "2026-08-21",
+  "provenance": "Sanitized POST /responses/compact request and CompactedResponse shapes from the installed OpenAI SDK 6.40.0, replayed through Pooler's mounted gateway against a strict local OpenAI contract; no live credential or provider response is included.",
+  "request": {
+    "method": "POST",
+    "path": "/v1/responses/compact",
+    "body": {
+      "model": "gpt-4o",
+      "input": [
+        {
+          "role": "user",
+          "content": [{"type": "input_text", "text": "sanitized"}]
+        }
+      ],
+      "instructions": "Preserve the important context.",
+      "prompt_cache_key": "sanitized-session",
+      "service_tier": "auto"
+    }
+  },
+  "provider_response": {
+    "id": "resp_compact_sanitized",
+    "created_at": 1787270400,
+    "object": "response.compaction",
+    "output": [
+      {
+        "id": "msg_sanitized",
+        "type": "message",
+        "status": "completed",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "sanitized"}]
+      },
+      {
+        "id": "cmp_sanitized",
+        "type": "compaction",
+        "encrypted_content": "sanitized-encrypted-content"
+      }
+    ],
+    "usage": {
+      "input_tokens": 12,
+      "input_tokens_details": {"cached_tokens": 0},
+      "output_tokens": 4,
+      "output_tokens_details": {"reasoning_tokens": 0},
+      "total_tokens": 16
+    }
+  },
+  "provider_response_wire": "{\"id\":\"resp_compact_sanitized\",\"created_at\":1787270400,\"object\":\"response.compaction\",\"output\":[{\"id\":\"msg_sanitized\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"sanitized\"}]},{\"id\":\"cmp_sanitized\",\"type\":\"compaction\",\"encrypted_content\":\"sanitized-encrypted-content\"}],\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":4,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":16}}",
+  "coverage": [
+    "provider_authentication",
+    "dedicated_endpoint_capability",
+    "request_shape_preservation",
+    "model_routing",
+    "compaction_item",
+    "usage",
+    "opaque_same_wire_response",
+    "local_invalid_request_rejection",
+    "exact_request_limit_acceptance",
+    "over_limit_rejection"
+  ]
+}

@@ -3164,6 +3164,12 @@
         "endpoint_families": [
           "chat_completions",
           "responses",
+          "responses_compact",
+          "realtime",
+          "realtime_client_secrets",
+          "realtime_sessions",
+          "realtime_transcription_sessions",
+          "realtime_calls",
           "models"
         ],
         "required_headers": {},
@@ -4645,6 +4651,7 @@
         "endpoint_families": [
           "chat_completions",
           "responses",
+          "responses_compact",
           "models"
         ],
         "required_headers": {},

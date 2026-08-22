@@ -882,6 +882,49 @@ mod tests {
     }
 
     #[test]
+    fn responses_compact_requires_input_and_preserves_valid_json() {
+        let body = b"{ \n  \"model\": \"grok\", \"input\": \"sanitized\" \n}";
+        let prepared = XaiRestAdapter::default()
+            .prepare_request(
+                XaiRestEndpoint::ResponsesCompact,
+                XaiRestTransport::Http,
+                body,
+                LossPolicy::Reject,
+            )
+            .expect("valid Responses Compact request");
+        assert_eq!(prepared.body, body);
+
+        let error = XaiRestAdapter::default()
+            .prepare_request(
+                XaiRestEndpoint::ResponsesCompact,
+                XaiRestTransport::Http,
+                br#"{"model":"grok"}"#,
+                LossPolicy::Reject,
+            )
+            .expect_err("xAI Compact input is required");
+        assert!(matches!(
+            error,
+            XaiRestError::MissingField(ref field) if field == "input"
+        ));
+    }
+
+    #[test]
+    fn responses_compact_rejects_websocket_transport() {
+        let error = XaiRestAdapter::default()
+            .prepare_request(
+                XaiRestEndpoint::ResponsesCompact,
+                XaiRestTransport::WebSocket,
+                br#"{"model":"grok","input":"sanitized"}"#,
+                LossPolicy::Reject,
+            )
+            .expect_err("Responses Compact is HTTP-only");
+        assert!(matches!(
+            error,
+            XaiRestError::InvalidField { ref field, .. } if field == "transport"
+        ));
+    }
+
+    #[test]
     fn unchanged_http_request_keeps_exact_json_bytes() {
         let body = b"{ \n  \"model\": \"grok\", \"input\": \"hello\" \n}";
         let prepared = XaiRestAdapter::default()

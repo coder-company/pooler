@@ -3818,7 +3818,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             }));
         let body = String::from_utf8(response.body).expect("UTF-8 setup options");
         assert!(!body.contains("sk-"));
-        assert!(!body.contains("client_secret"));
+        assert!(!body.contains("\"client_secret\":"));
     }
 
     #[test]

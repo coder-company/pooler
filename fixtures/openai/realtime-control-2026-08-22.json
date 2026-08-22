@@ -1,0 +1,135 @@
+{
+  "source": {
+    "sdk": "openai-node 6.40.0",
+    "client_secrets_method": "resources/realtime/client-secrets.js#create -> POST /realtime/client_secrets",
+    "legacy_sessions_method": "resources/beta/realtime/sessions.js#create -> POST /realtime/sessions with OpenAI-Beta: assistants=v2",
+    "transcription_sessions_method": "resources/beta/realtime/transcription-sessions.js#create -> POST /realtime/transcription_sessions with OpenAI-Beta: assistants=v2",
+    "sip_methods": "resources/realtime/calls.js#accept|reject|refer|hangup",
+    "translation_evidence": "SDK 6.40.0 declares translation event and request types, but exports no resource method or HTTP path for creating a translation session",
+    "sideband": "uses the mounted GET /v1/realtime WebSocket endpoint with the caller's call_id query"
+  },
+  "requests": [
+    {
+      "name": "client-secret",
+      "method": "POST",
+      "path": "/v1/realtime/client_secrets",
+      "headers": {},
+      "body": {
+        "expires_after": {
+          "anchor": "created_at",
+          "seconds": 600
+        },
+        "session": {
+          "type": "realtime",
+          "model": "gpt-realtime"
+        }
+      }
+    },
+    {
+      "name": "legacy-session",
+      "method": "POST",
+      "path": "/v1/realtime/sessions",
+      "headers": {
+        "openai-beta": "assistants=v2"
+      },
+      "body": {
+        "model": "gpt-4o-realtime-preview",
+        "modalities": [
+          "audio"
+        ]
+      }
+    },
+    {
+      "name": "transcription-session",
+      "method": "POST",
+      "path": "/v1/realtime/transcription_sessions",
+      "headers": {
+        "openai-beta": "assistants=v2"
+      },
+      "body": {
+        "input_audio_format": "pcm16",
+        "input_audio_transcription": {
+          "model": "gpt-4o-mini-transcribe",
+          "language": "en"
+        }
+      }
+    },
+    {
+      "name": "sip-accept",
+      "method": "POST",
+      "path": "/v1/realtime/calls/call_sanitized/accept",
+      "headers": {
+        "accept": "*/*"
+      },
+      "body": {
+        "type": "realtime",
+        "model": "gpt-realtime"
+      }
+    },
+    {
+      "name": "sip-reject",
+      "method": "POST",
+      "path": "/v1/realtime/calls/call_sanitized/reject",
+      "headers": {
+        "accept": "*/*"
+      },
+      "body": {
+        "status_code": 603
+      }
+    },
+    {
+      "name": "sip-refer",
+      "method": "POST",
+      "path": "/v1/realtime/calls/call_sanitized/refer",
+      "headers": {
+        "accept": "*/*"
+      },
+      "body": {
+        "target_uri": "tel:+14155550123"
+      }
+    },
+    {
+      "name": "sip-hangup",
+      "method": "POST",
+      "path": "/v1/realtime/calls/call_sanitized/hangup",
+      "headers": {
+        "accept": "*/*"
+      }
+    }
+  ],
+  "provider_responses": {
+    "client-secret": {
+      "value": "ek_sanitized",
+      "expires_at": 1787271000,
+      "session": {
+        "id": "sess_sanitized",
+        "object": "realtime.session",
+        "type": "realtime"
+      }
+    },
+    "legacy-session": {
+      "client_secret": {
+        "value": "ek_sanitized",
+        "expires_at": 1787270460
+      },
+      "model": "gpt-4o-realtime-preview"
+    },
+    "transcription-session": {
+      "client_secret": {
+        "value": "ek_sanitized",
+        "expires_at": 1787271000
+      },
+      "input_audio_format": "pcm16"
+    }
+  },
+  "sideband_handshake": {
+    "method": "GET",
+    "path": "/v1/realtime?call_id=call_sanitized",
+    "websocket": true
+  },
+  "redactions": [
+    "Operator bearer credentials are not stored.",
+    "Returned ephemeral client-secret values are replaced with ek_sanitized.",
+    "Call and session identifiers are synthetic."
+  ]
+}

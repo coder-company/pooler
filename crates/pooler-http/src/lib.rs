@@ -14,6 +14,7 @@ mod drain;
 mod headers;
 mod media;
 mod native;
+mod openai_realtime;
 mod openai_websocket;
 mod pool;
 mod proxy;

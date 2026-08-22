@@ -26,6 +26,14 @@ const MOUNTED_ROUTES: &[&str] = &[
     "gateway-responses",
     "gateway-responses-compact",
     "gateway-responses-websocket",
+    "gateway-realtime-client-secrets",
+    "gateway-realtime-sessions",
+    "gateway-realtime-transcription-sessions",
+    "gateway-realtime-calls-accept",
+    "gateway-realtime-calls-reject",
+    "gateway-realtime-calls-refer",
+    "gateway-realtime-calls-hangup",
+    "gateway-realtime-websocket",
 ];
 
 #[test]
@@ -45,6 +53,12 @@ fn the_checked_in_gateway_example_mounts_every_promised_endpoint_family() {
         config.routes().len(),
         MOUNTED_ROUTES.len(),
         "the preset must not mount an undocumented route"
+    );
+    assert!(
+        config
+            .route("gateway-realtime-translation-sessions")
+            .is_none(),
+        "the SDK exposes translation types but no endpoint method/path"
     );
 }
 
@@ -79,6 +93,14 @@ fn the_gateway_preset_selects_models_and_mounts_semantic_responses_transport() {
     assert_eq!(responses.target().path(), Some("/v1/responses"));
     assert_eq!(responses.loss_policy(), LossPolicy::Reject);
 
+    let compact = config
+        .route("gateway-responses-compact")
+        .expect("Responses Compact route");
+    assert_eq!(compact.ingress().mode(), BodyMode::Patch);
+    assert_eq!(compact.target().model_source(), Some(ModelSource::Request));
+    assert!(compact.response().mode().preserves_original());
+    assert_eq!(compact.limits().max_request_body_bytes, 8 * 1024 * 1024);
+
     // Discovery stays opaque and selects no model.
     let models = config.route("gateway-models").expect("models route");
     assert!(models.ingress().mode().preserves_original());
@@ -96,6 +118,25 @@ fn the_gateway_websocket_routes_use_the_websocket_upstream() {
         .route("gateway-responses")
         .expect("semantic Responses route");
     assert_eq!(semantic.target().upstream(), "gateway-websocket");
+
+    let realtime = config
+        .route("gateway-realtime-websocket")
+        .expect("Realtime WebSocket route");
+    assert_eq!(realtime.ingress().mode(), BodyMode::Semantic);
+    assert_eq!(
+        realtime.ingress().decoder(),
+        Some("decode.openai.realtime.client")
+    );
+    assert_eq!(
+        realtime.response().decoder(),
+        Some("decode.openai.realtime.events")
+    );
+    assert_eq!(realtime.target().upstream(), "gateway-websocket");
+    assert_eq!(realtime.target().path(), Some("/v1/realtime"));
+    assert_eq!(
+        realtime.limits().request_timeout,
+        Some(std::time::Duration::from_secs(60 * 60))
+    );
 
     let socket = config
         .route("gateway-responses-websocket")
@@ -184,9 +225,27 @@ fn two_gateway_aliases_stay_isolated() {
 /// A provider is served only the endpoint families it documents.
 #[test]
 fn each_provider_mounts_only_its_documented_endpoint_families() {
-    let expected: [(&str, &[&str]); 3] = [
+    let expected: [(&str, &[&str]); 4] = [
         (
             "openai",
+            &[
+                "gw-models",
+                "gw-chat-completions",
+                "gw-responses",
+                "gw-responses-compact",
+                "gw-responses-websocket",
+                "gw-realtime-client-secrets",
+                "gw-realtime-sessions",
+                "gw-realtime-transcription-sessions",
+                "gw-realtime-calls-accept",
+                "gw-realtime-calls-reject",
+                "gw-realtime-calls-refer",
+                "gw-realtime-calls-hangup",
+                "gw-realtime-websocket",
+            ],
+        ),
+        (
+            "xai",
             &[
                 "gw-models",
                 "gw-chat-completions",

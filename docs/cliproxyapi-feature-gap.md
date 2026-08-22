@@ -23,11 +23,11 @@ CLIProxyAPI currently has the broader integration product.
 | Login experience | Provider-specific Claude, Codex, Kimi, xAI and Antigravity login commands | Safe account lifecycle contracts and documented Codex OAuth; API-key guidance for other providers | Turnkey subscription login only where public provider contracts exist |
 | Model catalog | Large merged catalog with aliases, exclusions, prefixes and virtual mappings | Vendored provider integrations, automatic discovery, model facts, aliases, exclusions and operator overrides | Ongoing evidence refresh and live-provider validation |
 | Account operations | Ready-to-run multi-account rotation, quota switching and provider/project recovery | Ordered fallback, quota scopes, persisted atomic switching, account lifecycle controls and isolated OAuth refresh | Secret-gated real-account acceptance evidence |
-| Protocol surface | Provider-native OpenAI Responses, Claude, Gemini Generate Content/Interactions, xAI WebSocket and media paths | Native Responses, Anthropic, Gemini, xAI realtime, media, files, batches and embeddings semantics | Remaining live-provider conformance evidence |
+| Protocol surface | Provider-native OpenAI Responses/Realtime, Claude, Gemini Generate Content/Interactions, xAI WebSocket and media paths | Native Responses, bounded semantic OpenAI Realtime WebSocket and sideband path, same-wire client-secret/session/transcription-session and explicit SIP controls, Anthropic, Gemini, xAI realtime, media, files, batches and embeddings semantics | Remaining live-provider conformance evidence; no translation-session creation endpoint is claimed because SDK 6.40.0 exports no method/path |
 | Management | Remote management API, browser panel ecosystem, account/config/model controls, quota and usage tooling | Authenticated browser/API account and runtime-model controls, safe reload, quota/usage/cost views, traces, audit and redacted export | Remote TLS and durable browser-managed configuration editing |
 | Extensions | Broad trusted plugin ABI for auth, models, scheduling, execution, translation, interception, CLI and management | Capability-limited external/WASM inspection and transformation | Plugin registry, provider plugin catalog and broader extension hooks |
 | Operator UX | TUI, standalone modes and provider login switches | CLI/server workflow | Interactive operational tooling |
-| Turnkey endpoint surface | One ready-to-use gateway mounts the expected endpoints by default | The [`gateway` preset](gateway.md) mounts nineteen provider-filtered routes across the OpenAI, Anthropic and Gemini surfaces from one import, with catalog-driven model selection and explicit bounds | Closed for mounted reachability; per-endpoint semantic translation remains route-by-route and evidence-gated |
+| Turnkey endpoint surface | One ready-to-use gateway mounts the expected endpoints by default | The [`gateway` preset](gateway.md) mounts twenty-seven provider-filtered routes across the OpenAI, Anthropic and Gemini surfaces from one import, with catalog-driven model selection and explicit bounds; Responses Compact and Realtime control families are explicitly capability-gated | Closed for mounted reachability; Alpha Search and Realtime translation-session creation remain intentionally absent because the installed Pi/OpenAI SDK evidence contains no executable endpoint contract, and per-endpoint semantic translation remains evidence-gated |
 
 Primary CLIProxyAPI evidence:
 
@@ -91,7 +91,7 @@ Build the missing integration layer in this order:
 5. A secure management UI over the existing authenticated management API.
 6. A signed extension registry and provider plugin catalog that retain the
    current process/WASM isolation boundary.
-7. Promote the mounted semantic Responses WebSocket transport from strict-loopback evidence to credential-gated live OpenAI/xAI conformance; keep the native downstream WebSocket upgrade and Gemini Interactions same-wire until evidence supports stronger claims.
+7. Promote the mounted semantic Responses WebSocket transport and same-wire Responses Compact route from strict-loopback evidence to credential-gated live OpenAI/xAI conformance; keep the native downstream WebSocket upgrade and Gemini Interactions same-wire until evidence supports stronger claims. Add Alpha Search only if an authoritative method, path, authentication, and schema become available.
 
 That path closes CLIProxyAPI's usability advantage without sacrificing the
 properties that make Pooler a safer protocol runtime.
