@@ -737,12 +737,42 @@ enum GatewaySurface {
 /// A route is mounted only when the selected provider documents that family
 /// and satisfies the surface, so a Gemini path is never mounted against an
 /// Anthropic upstream merely because both document `models`.
-const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 37] = [
+const GATEWAY_ROUTE_SURFACE: [(&str, GatewaySurface, &str); 47] = [
     ("models", GatewaySurface::Discovery("/v1/models"), "models"),
     (
         "chat-completions",
         GatewaySurface::Dialect("openai"),
         "chat_completions",
+    ),
+    (
+        "completions",
+        GatewaySurface::Dialect("openai"),
+        "completions",
+    ),
+    (
+        "embeddings",
+        GatewaySurface::Dialect("openai"),
+        "embeddings",
+    ),
+    ("files-list", GatewaySurface::Dialect("openai"), "files"),
+    ("files-create", GatewaySurface::Dialect("openai"), "files"),
+    ("files-content", GatewaySurface::Dialect("openai"), "files"),
+    ("files-resource", GatewaySurface::Dialect("openai"), "files"),
+    ("batches-list", GatewaySurface::Dialect("openai"), "batches"),
+    (
+        "batches-create",
+        GatewaySurface::Dialect("openai"),
+        "batches",
+    ),
+    (
+        "batches-cancel",
+        GatewaySurface::Dialect("openai"),
+        "batches",
+    ),
+    (
+        "batches-resource",
+        GatewaySurface::Dialect("openai"),
+        "batches",
     ),
     ("responses", GatewaySurface::Dialect("openai"), "responses"),
     (

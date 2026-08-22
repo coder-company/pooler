@@ -3163,6 +3163,10 @@
         "quota_classifier": "openai",
         "endpoint_families": [
           "chat_completions",
+          "completions",
+          "embeddings",
+          "files",
+          "batches",
           "responses",
           "responses_compact",
           "image_generations",

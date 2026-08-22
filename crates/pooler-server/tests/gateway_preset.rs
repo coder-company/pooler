@@ -262,6 +262,36 @@ async fn spawn_openai_sideband_upstream() -> (SocketAddr, JoinHandle<(String, bo
     (address, task)
 }
 
+async fn send_http_request(
+    proxy: &str,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> String {
+    let mut downstream = TcpStream::connect(proxy).await.expect("proxy connection");
+    let content_type = content_type
+        .map(|value| format!("content-type: {value}\r\n"))
+        .unwrap_or_default();
+    downstream
+        .write_all(
+            format!(
+                "{method} {path} HTTP/1.1\r\nhost: localhost\r\n{content_type}content-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("request headers");
+    downstream.write_all(body).await.expect("request body");
+    let mut response = Vec::new();
+    downstream
+        .read_to_end(&mut response)
+        .await
+        .expect("response body");
+    String::from_utf8(response).expect("response UTF-8")
+}
+
 async fn send_json_request(proxy: &str, path: &str, headers: &str, body: &[u8]) -> String {
     let mut downstream = TcpStream::connect(proxy).await.expect("proxy connection");
     downstream
@@ -403,6 +433,108 @@ async fn the_gateway_preset_preserves_the_caller_body_and_rewrites_only_the_mode
         request.body.contains("\"model\":\"gpt-4o\""),
         "the model must resolve to the requested target: {}",
         request.body
+    );
+}
+
+#[tokio::test]
+async fn the_gateway_preset_mounts_strict_completions_embeddings_files_and_batches() {
+    let upstream = StrictProvider::start(ProviderContract::openai(), SECRET).await;
+    let (websocket_address, websocket_task) = spawn_websocket_upstream().await;
+    let directory = TempDir::new().expect("config directory");
+    let config = gateway_config(&directory, upstream.address(), websocket_address);
+    let server = bind_gateway(config).await;
+    let proxy = server.listener_addresses()[0].address().to_owned();
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+
+    let requests: &[(&str, &str, Option<&str>, &[u8])] = &[
+        (
+            "POST",
+            "/v1/completions",
+            Some("application/json"),
+            br#"{"model":"gpt-4o","prompt":"hello","vendor_extension":true}"#,
+        ),
+        (
+            "POST",
+            "/v1/embeddings",
+            Some("application/json"),
+            br#"{"model":"text-embedding-3-small","input":"hello"}"#,
+        ),
+        ("GET", "/v1/files", None, b""),
+        (
+            "POST",
+            "/v1/files",
+            Some("multipart/form-data; boundary=pooler"),
+            b"--pooler\r\ncontent-disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n--pooler--\r\n",
+        ),
+        ("GET", "/v1/files/file-1", None, b""),
+        ("GET", "/v1/files/file-1/content", None, b""),
+        ("DELETE", "/v1/files/file-1", None, b""),
+        ("GET", "/v1/batches", None, b""),
+        (
+            "POST",
+            "/v1/batches",
+            Some("application/json"),
+            br#"{"input_file_id":"file-1","endpoint":"/v1/responses","completion_window":"24h"}"#,
+        ),
+        ("GET", "/v1/batches/batch-1", None, b""),
+        ("POST", "/v1/batches/batch-1/cancel", None, b""),
+    ];
+    let mut observed = Vec::new();
+    for (method, path, content_type, body) in requests {
+        observed.push((
+            *method,
+            *path,
+            "HTTP/1.1 200",
+            send_http_request(&proxy, method, path, *content_type, body).await,
+        ));
+    }
+
+    for (method, path, expected) in [
+        ("POST", "/v1/files/file-1", "HTTP/1.1 405"),
+        ("DELETE", "/v1/batches/batch-1", "HTTP/1.1 405"),
+        ("POST", "/v1/batches/batch-1/unknown", "HTTP/1.1 404"),
+    ] {
+        observed.push((
+            method,
+            path,
+            expected,
+            send_http_request(&proxy, method, path, None, b"").await,
+        ));
+    }
+
+    server.begin_drain();
+    runner.await.expect("server task").expect("server shutdown");
+    let log = upstream.finish().await;
+    websocket_task.abort();
+
+    log.assert_accepted_everything();
+    for (method, path, expected, response) in observed {
+        assert!(
+            response.starts_with(expected),
+            "{method} {path}: {response}; provider log: {log:?}"
+        );
+    }
+    assert_eq!(
+        log.accepted
+            .iter()
+            .filter(|request| request.path != "/v1/models")
+            .count(),
+        requests.len()
+    );
+    let completion = log
+        .accepted_for("/v1/completions")
+        .expect("legacy completion reached OpenAI");
+    assert!(completion.body.contains("\"vendor_extension\":true"));
+    assert_eq!(
+        log.accepted_for("/v1/embeddings")
+            .expect("embedding reached OpenAI")
+            .body
+            .matches("text-embedding-3-small")
+            .count(),
+        1
     );
 }
 

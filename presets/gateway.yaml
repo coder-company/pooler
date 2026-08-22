@@ -97,6 +97,183 @@ routes:
     response:
       mode: opaque
 
+  # The legacy Completions and Embeddings JSON surfaces remain same-wire. Pooler
+  # rewrites only the selected model while preserving provider-specific fields.
+  - id: completions
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/completions
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      endpoint_family: completions
+      provider: gateway
+      model_from: request.model
+      capabilities: [text]
+    response:
+      mode: opaque
+
+  - id: embeddings
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/embeddings
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 8388608
+      max_frame_bytes: 8388608
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      endpoint_family: embeddings
+      provider: gateway
+      model_from: request.model
+    response:
+      mode: opaque
+
+  # File uploads are streamed once and are never replayed. Collection and
+  # resource routes are separate so unsupported methods fail before upstream.
+  - id: files-list
+    listen: gateway
+    match:
+      methods: [GET]
+      path: /v1/files
+    limits:
+      max_request_body_bytes: 65536
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: files
+      provider: gateway
+      capabilities: [files]
+    response:
+      mode: opaque
+
+  - id: files-create
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/files
+      content_types: [multipart/form-data]
+    limits:
+      max_request_body_bytes: 67108864
+      max_frame_bytes: 67108864
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: files
+      provider: gateway
+      capabilities: [files]
+    response:
+      mode: opaque
+
+  - id: files-content
+    listen: gateway
+    match:
+      methods: [GET]
+      path_template: /v1/files/{file_id}/content
+    limits:
+      max_request_body_bytes: 65536
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: files
+      provider: gateway
+      capabilities: [files]
+    response:
+      mode: opaque
+
+  - id: files-resource
+    listen: gateway
+    match:
+      methods: [GET, DELETE]
+      path_template: /v1/files/{file_id}
+    limits:
+      max_request_body_bytes: 65536
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: files
+      provider: gateway
+      capabilities: [files]
+    response:
+      mode: opaque
+
+  # Batch collection, retrieval, and cancellation are mounted as strict paths;
+  # arbitrary POST requests below `/v1/batches/` are not accepted.
+  - id: batches-list
+    listen: gateway
+    match:
+      methods: [GET]
+      path: /v1/batches
+    limits:
+      max_request_body_bytes: 65536
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: batches
+      provider: gateway
+      capabilities: [batch]
+    response:
+      mode: opaque
+
+  - id: batches-create
+    listen: gateway
+    match:
+      methods: [POST]
+      path: /v1/batches
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 1048576
+      max_frame_bytes: 1048576
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: batches
+      provider: gateway
+      capabilities: [batch]
+    response:
+      mode: opaque
+
+  - id: batches-cancel
+    listen: gateway
+    match:
+      methods: [POST]
+      path_template: /v1/batches/{batch_id}/cancel
+    limits:
+      max_request_body_bytes: 65536
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: batches
+      provider: gateway
+      capabilities: [batch]
+    response:
+      mode: opaque
+
+  - id: batches-resource
+    listen: gateway
+    match:
+      methods: [GET]
+      path_template: /v1/batches/{batch_id}
+    limits:
+      max_request_body_bytes: 65536
+    ingress:
+      mode: opaque
+    target:
+      endpoint_family: batches
+      provider: gateway
+      capabilities: [batch]
+    response:
+      mode: opaque
+
   # REST callers use Pooler's semantic Responses transport. Pooler selects and
   # authenticates an account, sends `response.create` over the provider's
   # bounded WebSocket, and returns a validated Responses SSE stream. Connections

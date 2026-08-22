@@ -52,7 +52,7 @@ pub struct ProviderContract {
 /// from the downstream caller.
 const FOREIGN_CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "x-api-key", "x-goog-api-key"];
 
-const OPENAI_MODELS: &str = r#"{"data":[{"id":"gpt-4o"}]}"#;
+const OPENAI_MODELS: &str = r#"{"data":[{"id":"gpt-4o"},{"id":"text-embedding-3-small"}]}"#;
 const KIMI_MODELS: &str = r#"{"data":[{"id":"kimi-k2.5","object":"model"}]}"#;
 const VERTEX_MODELS: &str = r#"{"publisherModels":[{"name":"publishers/google/models/gemini-2.5-pro","supportedActions":["generateContent","streamGenerateContent","countTokens"]}]}"#;
 const VERTEX_GENERATE_RESPONSE: &str = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"sanitized"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2},"modelVersion":"gemini-2.5-pro"}"#;
@@ -97,6 +97,83 @@ impl ProviderContract {
                     path: "/v1/chat/completions",
                     content_type: Some("application/json"),
                     required_body_fields: &["model", "messages"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/completions",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["model", "prompt"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/embeddings",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["model", "input"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1/files",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/files",
+                    content_type: Some("multipart/form-data"),
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1/files/*/content",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1/files/*",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "DELETE",
+                    path: "/v1/files/*",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1/batches",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/batches",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["input_file_id", "endpoint", "completion_window"],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/v1/batches/*/cancel",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: ACCEPTED,
+                },
+                ProviderRoute {
+                    method: "GET",
+                    path: "/v1/batches/*",
+                    content_type: None,
+                    required_body_fields: &[],
                     response: ACCEPTED,
                 },
                 ProviderRoute {

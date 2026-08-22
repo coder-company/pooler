@@ -43,7 +43,7 @@ absent rather than present and broken.
 
 | Provider | Routes mounted |
 | --- | --- |
-| `openai` | `models`, `chat-completions`, `responses`, `responses-compact`, `image-generations`, `image-edits`, `audio-transcriptions`, `video-creations`, `video-edits`, `video-extensions`, `video-remixes`, `video-retrieval`, `video-content`, `video-deletions`, `responses-websocket`, `realtime-websocket`, `realtime-client-secrets`, legacy `realtime-sessions` / `realtime-transcription-sessions`, and four explicit `realtime-calls-*` actions |
+| `openai` | `models`, `chat-completions`, legacy `completions`, `embeddings`, strict file and batch collection/resource actions, `responses`, `responses-compact`, `image-generations`, `image-edits`, `audio-transcriptions`, `video-creations`, `video-edits`, `video-extensions`, `video-remixes`, `video-retrieval`, `video-content`, `video-deletions`, `responses-websocket`, `realtime-websocket`, `realtime-client-secrets`, legacy `realtime-sessions` / `realtime-transcription-sessions`, and four explicit `realtime-calls-*` actions |
 | `xai` | `models`, `chat-completions`, `responses`, `responses-compact`, `responses-websocket` |
 | `anthropic` | `models`, `messages`, `messages-count-tokens` |
 | `google` | `gemini-models`, `gemini-model-get`, `gemini-model-actions`, and create/resource/cancel routes for `v1`, `v1beta`, and `v1beta2` Interactions |
@@ -52,6 +52,12 @@ absent rather than present and broken.
 | --- | --- | --- | --- |
 | `models` | `GET /v1/models` | `models` | served by Pooler |
 | `chat-completions` | `POST /v1/chat/completions` | `chat_completions` | patch |
+| `completions` | `POST /v1/completions` | `completions` | bounded same-wire model patch |
+| `embeddings` | `POST /v1/embeddings` | `embeddings` | bounded same-wire model patch |
+| `files-list` / `files-create` | `GET` / `POST /v1/files` | `files` | bounded opaque listing or one-shot streamed multipart upload |
+| `files-resource` / `files-content` | `GET` / `DELETE /v1/files/{file_id}` and `GET .../content` | `files` | strict resource templates with opaque responses |
+| `batches-list` / `batches-create` | `GET` / `POST /v1/batches` | `batches` | bounded same-wire collection actions |
+| `batches-resource` / `batches-cancel` | `GET /v1/batches/{batch_id}` and `POST .../cancel` | `batches` | strict same-wire resource templates |
 | `responses` | `POST /v1/responses` | `responses` | semantic Responses-over-WebSocket transport |
 | `responses-compact` | `POST /v1/responses/compact` | `responses_compact` | bounded same-wire patch |
 | `image-generations` | `POST /v1/images/generations` | `image_generations` | bounded same-wire opaque JSON |
@@ -84,11 +90,13 @@ rather than by dialect, so Anthropic keeps its OpenAI-shaped `/v1/models` list
 while Gemini gets `/v1beta/models`. The Interactions versions follow Google's
 current stable/beta reference plus the documented `v1beta2` migration surface.
 
-Embeddings, files, batches, and legacy completions are **not** mounted when the
-selected provider does not document those families. The image and audio
-transcription routes above are likewise absent for providers without their
-dedicated endpoint families. These surfaces remain available to hand-authored
-routes, where the operator asserts the endpoint exists.
+Embeddings, files, batches, and legacy completions are mounted for OpenAI, whose
+shipped integration documents those same-wire families, and are absent when the
+selected provider does not document them. File and batch resource paths use
+strict templates, so unsupported methods and arbitrary subpaths fail before any
+upstream request. The image and audio transcription routes above are likewise
+absent for providers without their dedicated endpoint families. Hand-authored
+routes remain available when an operator explicitly asserts a private endpoint.
 
 ### Rejecting an unsupported combination
 
