@@ -1,4 +1,6 @@
-# Live provider conformance — 2026-08-20
+# Live provider conformance — historical evidence reviewed 2026-08-22
+
+This file records earlier credential-bearing observations through an existing CLIProxyAPI Plus service. It is not direct native-provider conformance, does not cover implementation commit `50f9e66` or a later release candidate, and cannot be promoted to released evidence. Direct live authorization for every advertised native provider remains blocked by unavailable accounts, credentials, entitlements, and terms-bound access in the current environment.
 
 Pooler was run on loopback with the existing CLIProxyAPI Plus service as its
 credential-bearing upstream. Pooler resolved only the CLIProxy client-key
@@ -20,10 +22,12 @@ mock provider. Results:
 | Cancellation | Client cancellation did not terminate or destabilize Pooler |
 | Redaction | Authorization sentinels were absent from responses and sanitized evidence |
 
-This establishes live OpenAI-compatible provider forwarding, streaming,
-reasoning, tools, error propagation, and cancellation through Pooler. It does
-not establish native Anthropic, Gemini, xAI, Kimi, image, audio, or file
-adapters; those remain separate provider-specific compatibility claims.
+This establishes only the exercised brokered OpenAI-compatible forwarding,
+streaming, reasoning, tools, error propagation, and cancellation path. It does
+not establish direct native OpenAI, Anthropic, Gemini, xAI, Kimi, Vertex, AI
+Studio, Antigravity, compatible-provider, image, audio, video, file, batch,
+embedding, Realtime, or Interactions conformance; those remain separate
+provider-specific claims requiring direct credentials and exact-candidate runs.
 
 ## Installed-client results
 

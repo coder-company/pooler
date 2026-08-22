@@ -1,4 +1,6 @@
-# Linux x86_64 release artifact evidence — 2026-08-20
+# Linux x86_64 release artifact evidence — historical evidence reviewed 2026-08-22
+
+This artifact predates the current implementation and is not a released artifact for commit `50f9e66` or any later release candidate. It proves only that the packaging/reproducibility path worked for the named historical commit and target.
 
 Packaging fix commit: `3917eda`. Toolchain: Rust 1.88.0. Target:
 `x86_64-unknown-linux-gnu`.
@@ -27,5 +29,8 @@ Evidence:
 - archive contains the executable, README, LICENSE, NOTICE, examples, schema,
   compatibility manifest/report, and both SBOM formats
 
-This proves the Linux x86_64 artifact locally. Linux ARM64 and both macOS
-artifacts, signatures, and hosted provenance remain separate publication gates.
+This proves the historical Linux x86_64 artifact locally. Current Linux x86_64
+and ARM64 plus macOS x86_64 and ARM64 artifacts, checksums, signatures, SBOMs,
+and hosted provenance remain unfulfilled publication gates. macOS capacity,
+signing credentials, and hosted release publication are external blockers in
+the current environment; historical hashes cannot satisfy them.

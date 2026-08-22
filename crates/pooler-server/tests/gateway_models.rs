@@ -96,7 +96,10 @@ async fn the_models_route_serves_the_active_view_in_the_openai_shape() {
     log.assert_accepted_everything();
 
     assert_eq!(view["object"], "list");
-    assert_eq!(ids(&view), vec!["gpt-4o".to_owned()]);
+    assert_eq!(
+        ids(&view),
+        vec!["gpt-4o".to_owned(), "text-embedding-3-small".to_owned()]
+    );
     assert_eq!(view["data"][0]["object"], "model");
     assert!(view["configuration_generation"].is_u64());
     assert!(view["catalog_generation"].is_u64());
@@ -125,7 +128,8 @@ async fn an_operator_disabled_model_leaves_the_published_view() {
     let config = gateway_config(&directory, upstream.address(), None);
     let pooling = Arc::new(PoolingCoordinator::new(&config).expect("pooling"));
 
-    // The upstream still advertises the model; Pooler must not.
+    // The upstream still advertises both models; Pooler must remove only the
+    // operator-disabled model and keep the independently eligible embedding model.
     pooling
         .set_model_enabled("gpt-4o", false)
         .expect("disable model");
@@ -134,8 +138,9 @@ async fn an_operator_disabled_model_leaves_the_published_view() {
     let log = upstream.finish().await;
     log.assert_accepted_everything();
 
-    assert!(
-        ids(&view).is_empty(),
+    assert_eq!(
+        ids(&view),
+        vec!["text-embedding-3-small".to_owned()],
         "a disabled model must not be advertised: {view}"
     );
 }

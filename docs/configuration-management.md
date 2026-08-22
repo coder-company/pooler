@@ -11,7 +11,7 @@ Pooler's authenticated management listener can edit the serving configuration wi
 7. reload and publish it through the normal generation gate; and
 8. retain a bounded audited outcome and rollback target.
 
-This feature is enabled automatically by `pooler serve --config PATH` when the configuration enables an authenticated management listener. Pooler never rewrites `PATH`. It writes `NAME.managed.yaml` beside the original file with a generated-file banner. On a later start with the same `PATH`, Pooler selects that sidecar only when it is a safe owner-private regular file carrying Pooler's exact generated marker; otherwise startup fails closed or, when no sidecar exists, uses `PATH`. To abandon managed state, stop Pooler and move both the managed sidecar and its sibling `NAME.managed.backup.yaml` aside; the next start uses the operator source.
+This feature is enabled automatically by `pooler serve --config PATH` when the configuration enables an authenticated management listener. Pooler never rewrites `PATH`. It writes `NAME.managed.yaml` beside the original file with a generated-file banner. On a later start with the same `PATH`, Pooler selects that sidecar only when it is a safe owner-private regular file carrying Pooler's exact generated marker; otherwise startup fails closed or, when no sidecar exists, uses `PATH`. A durable `NAME.managed.recovery-required` transaction marker blocks startup and every reload class if a process stops between persistence and publication. Do not remove that marker without verifying the managed and backup files against the interrupted transaction. To abandon known-good managed state, stop Pooler and move the managed sidecar and its sibling `NAME.managed.backup.yaml` aside; the next start uses the operator source only when no recovery marker remains.
 
 ## Safety model
 
@@ -22,10 +22,11 @@ This feature is enabled automatically by `pooler serve --config PATH` when the c
 - Only section operations are accepted. JSON Pointer, arbitrary YAML replacement, and unknown fields are rejected.
 - The ordinary configuration compiler is the final authority. Account, management, TLS, and extension secrets must remain `env:`, `file:`, `command:`, or supported credential-store references; literal secret values fail validation.
 - API views and semantic diffs contain IDs and change kinds, not configuration values, OAuth material, credentials, or secret references.
-- The original configuration, destination, backup, and temporary files are checked for symlinks and unsafe file types. Existing generated files must be regular, singly linked, owned by the serving user, and inaccessible to group/other users.
-- Persistence uses a new owner-only temporary file, file `fsync`, atomic rename, permission enforcement, and directory `fsync`. A pre-existing generated file is backed up with the same rules; failed commits and rollbacks restore both the managed revision and the previous rollback target.
-- The generated sidecar is sent to the normal compile/reload/publication path. A failed publication restores the prior filesystem state; the active runtime generation does not change.
-- Only one managed commit or rollback may be in flight. This avoids reordering backups or generation preconditions.
+- The source, destination, backup, transaction markers, and temporary files are opened with no-follow semantics and validated through the opened descriptor. Sources must be singly linked, owned by the serving user, and not group/other writable; generated files and markers must additionally be inaccessible to group/other users. The source's immediate directory must be owned by the serving user, and its full ancestry must reject untrusted writable directories.
+- Before managed or backup mutation, Pooler creates and synchronizes an owner-private recovery marker with exclusive creation. Persistence then uses a new owner-only temporary file, file `fsync`, atomic rename, permission enforcement, and directory `fsync`.
+- A pre-existing generated file is backed up with the same rules. Failed persistence or publication restores both the managed revision and previous rollback target, rereads both through validated descriptors, and clears recovery state only after exact byte equality is established.
+- Successful publication durably renames the transaction marker to a completed marker before best-effort cleanup. A completed marker is safe to clean at restart; an active or malformed marker returns `RecoveryRequired` and prevents startup, rollback, ordinary reload, and another managed commit.
+- Only one managed commit or rollback may be in flight. The marker remains present through asynchronous reload, preventing reordered backups, crossed generations, and activation of an uncertain sidecar after restart.
 
 ## API
 
