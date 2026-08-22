@@ -1402,19 +1402,23 @@ async fn serve_stress_connection(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(request_id);
     if first_injected_attempt {
+        // Keep the synthetic failure credential-scoped: an unqualified 429 is
+        // provider-scoped quota evidence and can make both benchmark accounts
+        // transiently ineligible under concurrent selection. The zero-delay
+        // authentication marker still exercises bounded credential failover.
         stats
             .failed_authorizations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(request_id, authorization);
         stats.failures.fetch_add(1, Ordering::Relaxed);
-        let body = br#"{"error":"deterministic benchmark failure"}"#;
+        let body = br#"{"error":{"code":"invalid_api_key"}}"#;
         let _ = write_http_response_with_headers(
             &mut stream,
             429,
             "application/json",
             body,
-            &[("X-Error-Code", "insufficient_quota"), ("Retry-After", "0")],
+            &[("X-Error-Code", "invalid_api_key"), ("Retry-After", "0")],
         )
         .await;
         return;
@@ -1579,16 +1583,11 @@ async fn send_http_request(
 
 fn validate_factory_stream(status: u16, body: &[u8]) -> Result<()> {
     if status != 200 {
-        let diagnostic = serde_json::from_slice::<Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .map(|value| value.chars().take(256).collect::<String>())
-            .unwrap_or_else(|| "unclassified bounded response".to_owned());
+        let diagnostic = match body {
+            b"upstream request failed" => "pooler upstream request failure",
+            b"upstream response could not be converted" => "pooler semantic response failure",
+            _ => "unclassified bounded response",
+        };
         bail!("semantic stress request returned HTTP {status}: {diagnostic}")
     }
     let mut parser = SseParser::new();
@@ -1976,7 +1975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_failure_headers_parse_at_the_http_boundary() {
+    async fn injected_auth_failure_headers_parse_at_the_http_boundary() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("header test listener");
@@ -1987,8 +1986,8 @@ mod tests {
                 &mut stream,
                 429,
                 "application/json",
-                br#"{"error":"deterministic benchmark failure"}"#,
-                &[("X-Error-Code", "insufficient_quota"), ("Retry-After", "0")],
+                br#"{"error":{"code":"invalid_api_key"}}"#,
+                &[("X-Error-Code", "invalid_api_key"), ("Retry-After", "0")],
             )
             .await
             .expect("header test response");
@@ -2004,7 +2003,7 @@ mod tests {
 
         assert_eq!(
             request_header(&response, "X-Error-Code"),
-            Some("insufficient_quota".to_owned())
+            Some("invalid_api_key".to_owned())
         );
         assert_eq!(
             request_header(&response, "Retry-After"),

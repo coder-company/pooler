@@ -558,6 +558,21 @@ fn antigravity_override_paths_are_validated_at_adapter_construction() {
 }
 
 #[test]
+fn authentication_marker_on_rate_limit_status_is_not_quota_evidence() {
+    let mut headers = HeaderMap::new();
+    headers.insert("retry-after", HeaderValue::from_static("0"));
+    headers.insert("x-error-code", HeaderValue::from_static("invalid_api_key"));
+    let classifier = ProviderResponseClassifier::new(ProviderKind::OpenAiCompatible);
+
+    assert_eq!(
+        classifier
+            .parse_quota(429, &headers, br#"{"error":{"code":"invalid_api_key"}}"#)
+            .expect("bounded parse"),
+        None
+    );
+}
+
+#[test]
 fn request_and_token_quota_windows_convert_without_collapsing_resets() {
     let mut headers = HeaderMap::new();
     for (name, value) in [
