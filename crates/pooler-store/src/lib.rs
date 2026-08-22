@@ -22,12 +22,17 @@ pub use sqlite::SqliteStore;
 /// Milliseconds since the Unix epoch, supplied by the caller.
 pub type Timestamp = u64;
 
+/// Maximum timeline phases retained for one logical request.
+pub const MAX_REQUEST_EVENTS_PER_REQUEST: usize = 64;
+
 /// Maximum number of retained entries in each in-memory collection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RetentionPolicy {
     pub max_credentials: usize,
     pub max_affinities: usize,
     pub max_decisions: usize,
+    pub max_request_events: usize,
+    pub request_history_ttl_ms: u64,
 }
 
 impl RetentionPolicy {
@@ -45,7 +50,23 @@ impl RetentionPolicy {
             max_credentials,
             max_affinities,
             max_decisions,
+            max_request_events: 4_096,
+            request_history_ttl_ms: 7 * 24 * 60 * 60 * 1_000,
         })
+    }
+
+    /// Override bounded request-history retention.
+    pub const fn with_request_history(
+        mut self,
+        max_request_events: usize,
+        request_history_ttl_ms: u64,
+    ) -> Result<Self, StoreError> {
+        if max_request_events == 0 || request_history_ttl_ms == 0 {
+            return Err(StoreError::InvalidRetention);
+        }
+        self.max_request_events = max_request_events;
+        self.request_history_ttl_ms = request_history_ttl_ms;
+        Ok(self)
     }
 }
 
@@ -55,6 +76,8 @@ impl Default for RetentionPolicy {
             max_credentials: 1_024,
             max_affinities: 4_096,
             max_decisions: 4_096,
+            max_request_events: 4_096,
+            request_history_ttl_ms: 7 * 24 * 60 * 60 * 1_000,
         }
     }
 }
@@ -215,6 +238,91 @@ impl DecisionRecord {
     }
 }
 
+/// One bounded phase in a logical request timeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestEventKind {
+    Admission,
+    Selection,
+    Attempt,
+    Retry,
+    Commitment,
+    Completion,
+}
+
+/// Metadata-only request lifecycle event. Raw bodies, headers, credentials,
+/// secret references, prompts, and responses have no representation here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RequestEvent {
+    /// Store-assigned monotonic id; zero means not yet persisted.
+    pub id: u64,
+    pub request_id: String,
+    pub event_index: u32,
+    pub kind: RequestEventKind,
+    pub recorded_at: Timestamp,
+    pub listener: String,
+    pub route_id: String,
+    pub public_model: Option<String>,
+    pub upstream_model: Option<String>,
+    pub provider: Option<String>,
+    pub account_pseudonym: Option<String>,
+    pub attempt: Option<u32>,
+    pub eligible: Option<bool>,
+    pub retry_reason: Option<String>,
+    pub commitment: Option<String>,
+    pub ttft_ms: Option<u64>,
+    pub latency_ms: Option<u64>,
+    pub status: Option<u16>,
+    pub error_class: Option<String>,
+    pub quota_effect: Option<String>,
+    pub cooldown_effect: Option<String>,
+    pub semantic_losses: Vec<String>,
+    pub configuration_generation: u64,
+    pub catalog_generation: Option<u64>,
+    pub request_body_sha256: Option<String>,
+    pub response_body_sha256: Option<String>,
+}
+
+impl RequestEvent {
+    pub fn new(
+        request_id: impl Into<String>,
+        event_index: u32,
+        kind: RequestEventKind,
+        listener: impl Into<String>,
+        route_id: impl Into<String>,
+        recorded_at: Timestamp,
+    ) -> Self {
+        Self {
+            id: 0,
+            request_id: request_id.into(),
+            event_index,
+            kind,
+            recorded_at,
+            listener: listener.into(),
+            route_id: route_id.into(),
+            public_model: None,
+            upstream_model: None,
+            provider: None,
+            account_pseudonym: None,
+            attempt: None,
+            eligible: None,
+            retry_reason: None,
+            commitment: None,
+            ttft_ms: None,
+            latency_ms: None,
+            status: None,
+            error_class: None,
+            quota_effect: None,
+            cooldown_effect: None,
+            semantic_losses: Vec::new(),
+            configuration_generation: 0,
+            catalog_generation: None,
+            request_body_sha256: None,
+            response_body_sha256: None,
+        }
+    }
+}
+
 fn score_as_integer(score: f64) -> i64 {
     if score.is_finite() {
         score.round() as i64
@@ -359,12 +467,16 @@ pub struct StoreLengths {
     pub credentials: usize,
     pub affinities: usize,
     pub decisions: usize,
+    pub request_events: usize,
 }
 
 impl StoreLengths {
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        self.credentials == 0 && self.affinities == 0 && self.decisions == 0
+        self.credentials == 0
+            && self.affinities == 0
+            && self.decisions == 0
+            && self.request_events == 0
     }
 }
 
@@ -375,6 +487,7 @@ pub struct PruneReport {
     pub evicted_credentials: usize,
     pub evicted_affinities: usize,
     pub evicted_decisions: usize,
+    pub evicted_request_events: usize,
 }
 
 impl PruneReport {
@@ -384,6 +497,7 @@ impl PruneReport {
             + self.evicted_credentials
             + self.evicted_affinities
             + self.evicted_decisions
+            + self.evicted_request_events
     }
 }
 
@@ -398,6 +512,8 @@ pub enum StoreError {
     CredentialNotFound(String),
     #[error("decision identifier exhausted")]
     DecisionIdExhausted,
+    #[error("request event identifier exhausted")]
+    RequestEventIdExhausted,
     #[error("database path is invalid: {0}")]
     InvalidPath(String),
     #[error("database path is not private: {0}")]
@@ -489,6 +605,10 @@ pub trait Store: Send + Sync {
     fn decisions(&self) -> StoreResult<Vec<DecisionRecord>>;
     fn recent_decisions(&self, limit: usize) -> StoreResult<Vec<DecisionRecord>>;
 
+    fn append_request_event(&self, event: RequestEvent) -> StoreResult<RequestEvent>;
+    fn request_events(&self) -> StoreResult<Vec<RequestEvent>>;
+    fn request_events_for(&self, request_id: &str) -> StoreResult<Vec<RequestEvent>>;
+
     fn prune(&self, now: Timestamp) -> StoreResult<PruneReport>;
 }
 
@@ -499,7 +619,9 @@ struct Inner {
     cooldowns: BTreeMap<(String, String), CooldownState>,
     affinities: BTreeMap<String, SessionAffinity>,
     decisions: VecDeque<DecisionRecord>,
+    request_events: VecDeque<RequestEvent>,
     next_decision_id: u64,
+    next_request_event_id: u64,
 }
 
 /// A deterministic, concurrency-safe in-memory [`Store`].
@@ -528,6 +650,7 @@ impl MemoryStore {
             credentials: inner.credentials.len(),
             affinities: inner.affinities.len(),
             decisions: inner.decisions.len(),
+            request_events: inner.request_events.len(),
         })
     }
 
@@ -551,6 +674,58 @@ impl MemoryStore {
         non_empty("request_id", &record.request_id)?;
         non_empty("route_id", &record.route_id)?;
         non_empty("model", &record.model)
+    }
+
+    pub(crate) fn validate_request_event(event: &RequestEvent) -> StoreResult<()> {
+        non_empty("request_id", &event.request_id)?;
+        non_empty("listener", &event.listener)?;
+        non_empty("route_id", &event.route_id)?;
+        if event.request_id.len() > 128
+            || event.listener.len() > 128
+            || event.route_id.len() > 128
+            || event.semantic_losses.len() > 16
+        {
+            return Err(StoreError::Serialization(
+                "request event exceeds metadata bounds".to_owned(),
+            ));
+        }
+        for hash in [
+            event.request_body_sha256.as_deref(),
+            event.response_body_sha256.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if hash.len() != 64 || !hash.bytes().all(|value| value.is_ascii_hexdigit()) {
+                return Err(StoreError::Serialization(
+                    "request body hash must be a SHA-256 hex digest".to_owned(),
+                ));
+            }
+        }
+        for value in [
+            event.public_model.as_deref(),
+            event.upstream_model.as_deref(),
+            event.provider.as_deref(),
+            event.account_pseudonym.as_deref(),
+            event.retry_reason.as_deref(),
+            event.commitment.as_deref(),
+            event.error_class.as_deref(),
+            event.quota_effect.as_deref(),
+            event.cooldown_effect.as_deref(),
+            event.request_body_sha256.as_deref(),
+            event.response_body_sha256.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(event.semantic_losses.iter().map(String::as_str))
+        {
+            if value.len() > 256 {
+                return Err(StoreError::Serialization(
+                    "request event field exceeds metadata bounds".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn evict_credentials(inner: &mut Inner, limit: usize) -> usize {
@@ -617,6 +792,17 @@ impl MemoryStore {
             }
         }
         count
+    }
+
+    fn evict_request_events(inner: &mut Inner, limit: usize, cutoff: Timestamp) -> usize {
+        let before = inner.request_events.len();
+        inner
+            .request_events
+            .retain(|event| event.recorded_at >= cutoff);
+        while inner.request_events.len() > limit {
+            inner.request_events.pop_front();
+        }
+        before.saturating_sub(inner.request_events.len())
     }
 
     fn purge_expired_cooldowns(inner: &mut Inner, now: Timestamp) {
@@ -926,6 +1112,63 @@ impl Store for MemoryStore {
         Ok(inner.decisions.iter().rev().take(limit).cloned().collect())
     }
 
+    fn append_request_event(&self, mut event: RequestEvent) -> StoreResult<RequestEvent> {
+        Self::validate_request_event(&event)?;
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        let id = if inner.next_request_event_id == 0 {
+            1
+        } else {
+            inner
+                .next_request_event_id
+                .checked_add(1)
+                .ok_or(StoreError::RequestEventIdExhausted)?
+        };
+        inner.next_request_event_id = id;
+        event.id = id;
+        inner.request_events.push_back(event.clone());
+
+        let mut matching = inner
+            .request_events
+            .iter()
+            .filter(|candidate| candidate.request_id == event.request_id)
+            .count();
+        while matching > MAX_REQUEST_EVENTS_PER_REQUEST {
+            if let Some(position) = inner
+                .request_events
+                .iter()
+                .position(|candidate| candidate.request_id == event.request_id)
+            {
+                inner.request_events.remove(position);
+                matching -= 1;
+            } else {
+                break;
+            }
+        }
+        let cutoff = event
+            .recorded_at
+            .saturating_sub(self.retention.request_history_ttl_ms);
+        Self::evict_request_events(&mut inner, self.retention.max_request_events, cutoff);
+        Ok(event)
+    }
+
+    fn request_events(&self) -> StoreResult<Vec<RequestEvent>> {
+        let inner = self.inner.read().map_err(lock_error)?;
+        Ok(inner.request_events.iter().cloned().collect())
+    }
+
+    fn request_events_for(&self, request_id: &str) -> StoreResult<Vec<RequestEvent>> {
+        non_empty("request_id", request_id)?;
+        let inner = self.inner.read().map_err(lock_error)?;
+        let mut events = inner
+            .request_events
+            .iter()
+            .filter(|event| event.request_id == request_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| (event.event_index, event.id));
+        Ok(events)
+    }
+
     fn prune(&self, now: Timestamp) -> StoreResult<PruneReport> {
         let mut inner = self.inner.write().map_err(lock_error)?;
         Self::purge_expired_cooldowns(&mut inner, now);
@@ -937,6 +1180,11 @@ impl Store for MemoryStore {
             ),
             evicted_affinities: Self::evict_affinities(&mut inner, self.retention.max_affinities),
             evicted_decisions: Self::evict_decisions(&mut inner, self.retention.max_decisions),
+            evicted_request_events: Self::evict_request_events(
+                &mut inner,
+                self.retention.max_request_events,
+                now.saturating_sub(self.retention.request_history_ttl_ms),
+            ),
         })
     }
 }
@@ -1151,8 +1399,86 @@ mod tests {
                 credentials: 8,
                 affinities: 8,
                 decisions: 8,
+                request_events: 0,
             }
         );
+    }
+
+    #[test]
+    fn request_events_share_one_id_and_are_bounded_by_count_request_and_age() {
+        let retention = policy(2, 2, 2)
+            .with_request_history(3, 100)
+            .expect("request retention");
+        let store = MemoryStore::with_retention(retention);
+        for (request, index, recorded_at) in [
+            ("old", 0, 1),
+            ("one", 0, 100),
+            ("one", 1, 101),
+            ("two", 0, 102),
+        ] {
+            store
+                .append_request_event(RequestEvent::new(
+                    request,
+                    index,
+                    RequestEventKind::Attempt,
+                    "local",
+                    "route",
+                    recorded_at,
+                ))
+                .expect("request event");
+        }
+        let events = store.request_events().expect("events");
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| event.request_id != "old"));
+        assert_eq!(store.request_events_for("one").expect("timeline").len(), 2);
+        let report = store.prune(250).expect("prune request history");
+        assert_eq!(report.evicted_request_events, 3);
+        assert!(store.request_events().expect("pruned events").is_empty());
+    }
+
+    #[test]
+    fn request_timeline_uses_logical_event_order() {
+        let store = MemoryStore::new();
+        for event_index in [2, 0, 1] {
+            store
+                .append_request_event(RequestEvent::new(
+                    "request",
+                    event_index,
+                    RequestEventKind::Attempt,
+                    "local",
+                    "route",
+                    1,
+                ))
+                .expect("request event");
+        }
+        assert_eq!(
+            store
+                .request_events_for("request")
+                .expect("request timeline")
+                .into_iter()
+                .map(|event| event.event_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn request_event_body_hashes_cannot_carry_arbitrary_content() {
+        let store = MemoryStore::new();
+        let mut event = RequestEvent::new(
+            "request",
+            0,
+            RequestEventKind::Admission,
+            "local",
+            "route",
+            1,
+        );
+        event.request_body_sha256 = Some("raw prompt content".to_owned());
+        assert!(matches!(
+            store.append_request_event(event),
+            Err(StoreError::Serialization(message))
+                if message == "request body hash must be a SHA-256 hex digest"
+        ));
     }
 
     #[test]

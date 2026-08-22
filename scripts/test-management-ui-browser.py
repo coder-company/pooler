@@ -255,6 +255,92 @@ def payload(path: str) -> dict:
                 }
             ]
         },
+        "/management/requests": {
+            "schema_version": 1,
+            "requests": [
+                {
+                    "request_id": "pool-request-browser-1",
+                    "started_at": 1,
+                    "updated_at": 30,
+                    "listener": "main",
+                    "route": "route",
+                    "public_model": "gpt-test",
+                    "upstream_model": "gpt-test-2026",
+                    "provider": "openai",
+                    "account_pseudonym": "account-pseudo",
+                    "attempts": 2,
+                    "committed": True,
+                    "ttft_ms": 12,
+                    "latency_ms": 30,
+                    "status": 200,
+                    "error_class": "success",
+                    "quota_effect": "provider_quota",
+                    "cooldown_effect": "credential",
+                    "semantic_losses": ["temperature"],
+                    "configuration_generation": 7,
+                    "catalog_generation": 2,
+                    "last_event_id": 6,
+                }
+            ],
+            "limit": 50,
+            "next_cursor": 5,
+            "retention": {
+                "max_events": 4096,
+                "max_events_per_request": 64,
+                "ttl_ms": 604800000,
+            },
+        },
+        "/management/requests/export": {
+            "schema_version": 1,
+            "requests": [],
+            "limit": 4096,
+            "next_cursor": None,
+            "retention": {
+                "max_events": 4096,
+                "max_events_per_request": 64,
+                "ttl_ms": 604800000,
+            },
+        },
+        "/management/requests/pool-request-browser-1/timeline": {
+            "schema_version": 1,
+            "request_id": "pool-request-browser-1",
+            "timeline": [
+                {
+                    "id": 1,
+                    "request_id": "pool-request-browser-1",
+                    "event_index": 0,
+                    "kind": "admission",
+                    "recorded_at": 1,
+                    "listener": "main",
+                    "route_id": "route",
+                    "provider": None,
+                    "attempt": None,
+                    "status": None,
+                    "error_class": None,
+                    "retry_reason": None,
+                    "quota_effect": None,
+                    "cooldown_effect": None,
+                    "latency_ms": None,
+                },
+                {
+                    "id": 6,
+                    "request_id": "pool-request-browser-1",
+                    "event_index": 5,
+                    "kind": "completion",
+                    "recorded_at": 30,
+                    "listener": "main",
+                    "route_id": "route",
+                    "provider": "openai",
+                    "attempt": 2,
+                    "status": 200,
+                    "error_class": "success",
+                    "retry_reason": None,
+                    "quota_effect": "provider_quota",
+                    "cooldown_effect": "credential",
+                    "latency_ms": 30,
+                },
+            ],
+        },
         "/management/traces": {"traces": [], "dropped": 0},
         "/management/audit": {"events": []},
         "/management/reloads": {
@@ -529,8 +615,8 @@ def run_browser(playwright) -> None:
         expect(
             page.locator(".view-setup")
             .inner_text()
-            .find("Operator registration is required")
-            >= 0,
+            .count("Operator registration is required")
+            > 0,
             "unavailable authentication method lacks an accessible explanation",
         )
         expect(
@@ -741,6 +827,7 @@ def run_browser(playwright) -> None:
             "models",
             "accounts",
             "usage",
+            "requests",
             "operations",
             "diagnostics",
         ):
@@ -757,6 +844,68 @@ def run_browser(playwright) -> None:
                 page.locator("[style]").count() == 0,
                 f"{route} rendered an inline style under strict CSP",
             )
+
+        page.locator('[data-route="requests"]').click()
+        page.wait_for_selector('[data-request-id="pool-request-browser-1"]')
+        request_text = page.locator(".view-requests").inner_text()
+        expect(
+            "pool-request-bro" in request_text and "account-pseudo" in request_text,
+            "request explorer omitted bounded request metadata",
+        )
+        expect(
+            "prompt" not in request_text.lower()
+            and "authorization" not in request_text.lower()
+            and "good-token" not in request_text,
+            "request explorer rendered prohibited content",
+        )
+        page.locator('[data-request-filter="route"]').fill("route")
+        page.locator('[data-request-filter="provider"]').fill("openai")
+        page.locator('[data-request-filter="status"]').fill("200")
+        page.locator('[data-request-action="apply"]').click()
+        page.wait_for_timeout(100)
+        expect(
+            any(
+                target.startswith("/management/requests?")
+                and "route=route" in target
+                and "provider=openai" in target
+                and "status=200" in target
+                for target in STATE.get_targets
+            ),
+            "request filters were not sent to the management API",
+        )
+        page.locator('[data-request-id="pool-request-browser-1"]').click()
+        page.wait_for_selector("text=Timeline pool-request-browser-1")
+        expect(
+            "/management/requests/pool-request-browser-1/timeline"
+            in STATE.get_targets,
+            "request timeline was not loaded by logical request ID",
+        )
+        timeline_text = page.locator(".view-requests").inner_text()
+        expect(
+            "admission" in timeline_text
+            and "completion" in timeline_text
+            and "provider_quota" in timeline_text,
+            "request timeline omitted lifecycle phases or bounded effects",
+        )
+        page.locator('[data-request-action="more"]').click()
+        page.wait_for_timeout(100)
+        expect(
+            any("cursor=5" in target for target in STATE.get_targets),
+            "request pagination did not use the server cursor",
+        )
+        with page.expect_download() as request_export:
+            page.locator('[data-request-action="export"]').click()
+        expect(
+            request_export.value.suggested_filename.startswith(
+                "pooler-request-history-"
+            )
+            and any(
+                target.startswith("/management/requests/export?")
+                and "limit=4096" in target
+                for target in STATE.get_targets
+            ),
+            "request export did not use the bounded redacted export path",
+        )
 
         page.locator('[data-route="usage"]').click()
         page.wait_for_selector(".view-usage")
@@ -819,8 +968,10 @@ def run_browser(playwright) -> None:
             "account connection guide omits credential-boundary disclosure",
         )
         expect(
-            connection_text.find("device code") >= 0
-            and connection_text.find("Operator registration is required") >= 0,
+            all(
+                connection_text.count(fragment)
+                for fragment in ("device code", "Operator registration is required")
+            ),
             "unavailable account login method is not explained",
         )
         posts_before_status_check = dict(STATE.posts)

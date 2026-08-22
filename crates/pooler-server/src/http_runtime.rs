@@ -4587,6 +4587,46 @@ mod tests {
         assert!(!String::from_utf8_lossy(&response).contains("static-api-secret"));
         assert!(!String::from_utf8_lossy(&response).contains("chatgpt-subscription-account"));
 
+        let events = server
+            .pooling()
+            .request_events()
+            .expect("request history is readable");
+        let request_id = events
+            .first()
+            .expect("request history is populated")
+            .request_id
+            .clone();
+        assert!(events.iter().all(|event| event.request_id == request_id));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == pooler_store::RequestEventKind::Retry));
+        assert!(events.iter().any(|event| {
+            event.kind == pooler_store::RequestEventKind::Selection
+                && event.provider.as_deref() == Some("subscription")
+                && event.attempt == Some(1)
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == pooler_store::RequestEventKind::Selection
+                && event.provider.as_deref() == Some("api")
+                && event.attempt == Some(2)
+        }));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == pooler_store::RequestEventKind::Commitment));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == pooler_store::RequestEventKind::Completion));
+        let history_json = serde_json::to_string(&events).expect("request history serializes");
+        for secret in [
+            "subscription-access-token",
+            "subscription-refresh-token",
+            "static-api-secret",
+            "chatgpt-subscription-account",
+            "hello",
+        ] {
+            assert!(!history_json.contains(secret));
+        }
+
         stop_server(&server, runner).await;
     }
 
@@ -4682,6 +4722,39 @@ mod tests {
         )
         .await;
         assert_eq!(response_body(&first), b"management-first");
+        let requests_before = send_request(
+            management_address,
+            b"GET /requests HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&requests_before), 200);
+        let requests_before: serde_json::Value =
+            serde_json::from_slice(response_body(&requests_before)).expect("request history json");
+        let request_id = requests_before["requests"][0]["request_id"]
+            .as_str()
+            .expect("logical request id")
+            .to_owned();
+        assert_eq!(requests_before["requests"][0]["route"], "route");
+        assert_eq!(
+            requests_before["requests"][0]["configuration_generation"],
+            1
+        );
+        let timeline_request = format!(
+            "GET /requests/{request_id}/timeline HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        );
+        let timeline = send_request(management_address, timeline_request.as_bytes()).await;
+        let timeline: serde_json::Value =
+            serde_json::from_slice(response_body(&timeline)).expect("timeline json");
+        let timeline = timeline["timeline"].as_array().expect("timeline events");
+        assert!(timeline.len() >= 5);
+        assert!(timeline
+            .iter()
+            .all(|event| event["request_id"] == request_id));
+        assert!(timeline.iter().any(|event| event["kind"] == "admission"));
+        assert!(timeline.iter().any(|event| event["kind"] == "selection"));
+        assert!(timeline.iter().any(|event| event["kind"] == "attempt"));
+        assert!(timeline.iter().any(|event| event["kind"] == "commitment"));
+        assert!(timeline.iter().any(|event| event["kind"] == "completion"));
         let traces_before = send_request(
             management_address,
             b"GET /traces HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -4729,6 +4802,22 @@ mod tests {
         )
         .await;
         assert_eq!(response_body(&second), b"management-second");
+        let requests_after = send_request(
+            management_address,
+            b"GET /requests HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let requests_after: serde_json::Value =
+            serde_json::from_slice(response_body(&requests_after)).expect("request history json");
+        assert_eq!(
+            requests_after["requests"]
+                .as_array()
+                .expect("request summaries")
+                .len(),
+            2
+        );
+        assert_eq!(requests_after["requests"][0]["configuration_generation"], 2);
+        assert_ne!(requests_after["requests"][0]["request_id"], request_id);
         let traces_after = send_request(
             management_address,
             b"GET /traces HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",

@@ -8,7 +8,7 @@ Pooler's management listener exposes bounded, redacted runtime state separately 
 - Read endpoints may use the existing loopback policy. Every mutation requires a configured bearer secret, even on loopback.
 - Operational control mutations accept no body. Typed configuration mutations accept only a bounded JSON body with an ETag precondition. Both reject a mismatched `Origin` and never put the bearer token in a URL.
 - Responses use `Cache-Control: no-store`, a restrictive CSP, frame denial, MIME sniffing protection, and no-referrer policy.
-- Accounts, traces, audit events, and exports contain metadata only. Credential payloads, secret references, request bodies, and authorization headers are never exported.
+- Accounts, request history, traces, audit events, and exports contain metadata only. Credential payloads, secret references, raw prompts or responses, request bodies, and authorization headers are never exported.
 
 Example:
 
@@ -33,12 +33,22 @@ Send the token as `Authorization: Bearer ...`.
 | `/quota` | Typed quota windows plus active cooldowns |
 | `/metrics`, `/metrics/prometheus` | Bounded route/provider/model token usage and provider-reported cost ticks |
 | `/decisions` | Recent redacted routing decisions |
+| `/requests`, `/requests/{id}`, `/requests/{id}/timeline` | Paginated, filterable request summaries and one-ID admission-to-completion timelines |
+| `/requests/export` | Bounded versioned export of filtered redacted request history |
 | `/traces` | Bounded redacted runtime traces shared by listeners and reload generations |
 | `/audit` | Bounded process-local management mutation audit events |
 | `/reloads` | Bounded correlated status for accepted configuration and catalog reload requests |
 | `/export` | Versioned redacted diagnostic export |
 
 `/export` is a diagnostic backup, not a credential backup. It intentionally cannot restore tokens or secret references. Audit and trace retention is process-local and resets when the process restarts.
+
+## Redacted request explorer
+
+The dashboard **Requests** view correlates admission, route selection and eligibility, every upstream attempt, retry or failover, commitment, first-event/TTFT, semantic degradation, and completion under one logical request ID. The list accepts bounded `route`, `listener`, `provider`, `model`, `status`, `since`, and `until` filters plus an opaque descending `cursor`; the dashboard exposes the common route/provider/status filters and cursor pagination. Detail and timeline lookups validate the identifier and return `404` after retention evicts the request.
+
+Request history contains bounded metadata only: listener and route identifiers, public and upstream model names, provider, a non-secret account pseudonym, attempt count, eligibility outcome, retry reason, commitment, TTFT and latency, status or error class, quota/cooldown effects, semantic-loss decisions, configuration/catalog generations, and only explicitly supplied body hashes. Pooler never derives or stores raw prompts, responses, credentials, authorization headers, or secret references in this history. The normal request path does not enable body hashing.
+
+Memory storage applies deterministic global, per-request, and TTL bounds. Persistent request history is accepted only by the encrypted SQLite store: each event is an authenticated encrypted envelope bound to its row identity, survives restart, and is pruned by the same deterministic retention policy. An unencrypted SQLite store rejects request-history persistence rather than writing metadata in plaintext. `/requests/export` applies the same filters and strict redaction policy, caps the exported record count, and contains no restore material.
 
 ## First-run setup
 

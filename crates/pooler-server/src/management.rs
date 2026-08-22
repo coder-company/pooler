@@ -54,6 +54,9 @@ use crate::{merged_model_catalog_value, CatalogRuntime, ConfigSnapshot, ConfigSt
 
 const DEFAULT_DECISION_LIMIT: usize = 20;
 const MAX_DECISION_LIMIT: usize = 100;
+const DEFAULT_REQUEST_LIMIT: usize = 20;
+const MAX_REQUEST_LIMIT: usize = 100;
+const MAX_REQUEST_EXPORT: usize = 4_096;
 const MAX_MANAGEMENT_AUDIT_EVENTS: usize = 256;
 const MAX_MANAGEMENT_RELOADS: usize = 256;
 const MAX_PENDING_MANAGEMENT_RELOADS: usize = 16;
@@ -1762,6 +1765,9 @@ impl ManagementApi {
                 let limit = uri.as_ref().and_then(|uri| uri.query()).map(parse_limit);
                 self.decisions(limit, snapshot.generation().value(), pooling)
             }
+            "/requests" => self.requests(uri.as_ref().and_then(Uri::query), pooling, false),
+            "/requests/export" => self.requests(uri.as_ref().and_then(Uri::query), pooling, true),
+            path if path.starts_with("/requests/") => self.request_detail(path, pooling),
             "/traces" => self.traces(snapshot.generation().value()),
             "/audit" => self.audit(snapshot.generation().value()),
             "/reloads" => self.reloads(snapshot.generation().value()),
@@ -2510,6 +2516,241 @@ impl ManagementApi {
             ),
         }
     }
+
+    fn requests(
+        &self,
+        query: Option<&str>,
+        pooling: &PoolingCoordinator,
+        export: bool,
+    ) -> ManagementResponse {
+        let query = parse_request_query(query);
+        let events = match pooling.request_events() {
+            Ok(events) => events,
+            Err(_) => return state_unavailable(),
+        };
+        let mut summaries = summarize_request_events(&events);
+        summaries.retain(|summary| request_summary_matches(summary, &query));
+        if let Some(cursor) = query.cursor {
+            summaries.retain(|summary| {
+                summary["last_event_id"]
+                    .as_u64()
+                    .is_some_and(|id| id < cursor)
+            });
+        }
+        let limit = if export {
+            query
+                .limit
+                .unwrap_or(MAX_REQUEST_EXPORT)
+                .min(MAX_REQUEST_EXPORT)
+        } else {
+            query
+                .limit
+                .unwrap_or(DEFAULT_REQUEST_LIMIT)
+                .min(MAX_REQUEST_LIMIT)
+        };
+        let has_more = summaries.len() > limit;
+        summaries.truncate(limit);
+        let next_cursor = has_more
+            .then(|| summaries.last())
+            .flatten()
+            .and_then(|summary| summary["last_event_id"].as_u64());
+        let value = json!({
+            "schema_version": 1,
+            "requests": summaries,
+            "limit": limit,
+            "next_cursor": next_cursor,
+            "retention": {
+                "max_events": pooling.store().retention().max_request_events,
+                "max_events_per_request": pooler_store::MAX_REQUEST_EVENTS_PER_REQUEST,
+                "ttl_ms": pooling.store().retention().request_history_ttl_ms,
+            },
+        });
+        ManagementResponse::json(
+            StatusCode::OK,
+            pooler_observe::RedactionPolicy::strict().sanitize_json(&value),
+            false,
+        )
+    }
+
+    fn request_detail(&self, path: &str, pooling: &PoolingCoordinator) -> ManagementResponse {
+        let suffix = path.strip_prefix("/requests/").unwrap_or_default();
+        let (request_id, timeline) = suffix
+            .strip_suffix("/timeline")
+            .map_or((suffix, false), |request_id| (request_id, true));
+        if request_id.is_empty()
+            || request_id.len() > 128
+            || !request_id
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+        {
+            return ManagementResponse::json(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "request identifier is invalid"}),
+                false,
+            );
+        }
+        let events = match pooling.request_events_for(request_id) {
+            Ok(events) => events,
+            Err(_) => return state_unavailable(),
+        };
+        if events.is_empty() {
+            return ManagementResponse::json(
+                StatusCode::NOT_FOUND,
+                json!({"error": "request history was not found"}),
+                false,
+            );
+        }
+        let value = if timeline {
+            json!({
+                "schema_version": 1,
+                "request_id": request_id,
+                "timeline": events,
+            })
+        } else {
+            let summary = summarize_request_events(&events)
+                .into_iter()
+                .next()
+                .expect("non-empty request events produce a summary");
+            json!({
+                "schema_version": 1,
+                "request": summary,
+            })
+        };
+        ManagementResponse::json(
+            StatusCode::OK,
+            pooler_observe::RedactionPolicy::strict().sanitize_json(&value),
+            false,
+        )
+    }
+}
+
+#[derive(Default)]
+struct RequestQuery {
+    cursor: Option<u64>,
+    limit: Option<usize>,
+    route: Option<String>,
+    listener: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    status: Option<String>,
+    since: Option<u64>,
+    until: Option<u64>,
+}
+
+fn parse_request_query(query: Option<&str>) -> RequestQuery {
+    let mut parsed = RequestQuery::default();
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        let value = value.into_owned();
+        match key.as_ref() {
+            "cursor" => parsed.cursor = value.parse().ok(),
+            "limit" => parsed.limit = value.parse().ok(),
+            "route" if value.len() <= 128 => parsed.route = Some(value),
+            "listener" if value.len() <= 128 => parsed.listener = Some(value),
+            "provider" if value.len() <= 128 => parsed.provider = Some(value),
+            "model" if value.len() <= 256 => parsed.model = Some(value),
+            "status" if value.len() <= 64 => parsed.status = Some(value),
+            "since" => parsed.since = value.parse().ok(),
+            "until" => parsed.until = value.parse().ok(),
+            _ => {}
+        }
+    }
+    parsed
+}
+
+fn summarize_request_events(events: &[pooler_store::RequestEvent]) -> Vec<Value> {
+    let mut grouped = BTreeMap::<String, Vec<&pooler_store::RequestEvent>>::new();
+    for event in events {
+        grouped
+            .entry(event.request_id.clone())
+            .or_default()
+            .push(event);
+    }
+    let mut summaries = grouped
+        .into_values()
+        .filter_map(|mut events| {
+            events.sort_by_key(|event| (event.event_index, event.id));
+            let first = *events.first()?;
+            let last = *events.last()?;
+            let latest_string = |select: fn(&pooler_store::RequestEvent) -> Option<&String>| {
+                events.iter().rev().find_map(|event| select(event).cloned())
+            };
+            let attempts = events.iter().filter_map(|event| event.attempt).max();
+            let status = events.iter().rev().find_map(|event| event.status);
+            let ttft_ms = events.iter().rev().find_map(|event| event.ttft_ms);
+            let latency_ms = events.iter().rev().find_map(|event| event.latency_ms);
+            let committed = events
+                .iter()
+                .any(|event| event.kind == pooler_store::RequestEventKind::Commitment);
+            let mut semantic_losses = events
+                .iter()
+                .flat_map(|event| event.semantic_losses.iter().cloned())
+                .collect::<Vec<_>>();
+            semantic_losses.sort();
+            semantic_losses.dedup();
+            Some(json!({
+                "request_id": first.request_id,
+                "first_event_id": first.id,
+                "last_event_id": last.id,
+                "started_at": first.recorded_at,
+                "updated_at": last.recorded_at,
+                "listener": first.listener,
+                "route": first.route_id,
+                "public_model": latest_string(|event| event.public_model.as_ref()),
+                "upstream_model": latest_string(|event| event.upstream_model.as_ref()),
+                "provider": latest_string(|event| event.provider.as_ref()),
+                "account_pseudonym": latest_string(|event| event.account_pseudonym.as_ref()),
+                "attempts": attempts,
+                "committed": committed,
+                "ttft_ms": ttft_ms,
+                "latency_ms": latency_ms,
+                "status": status,
+                "error_class": latest_string(|event| event.error_class.as_ref()),
+                "quota_effect": latest_string(|event| event.quota_effect.as_ref()),
+                "cooldown_effect": latest_string(|event| event.cooldown_effect.as_ref()),
+                "semantic_losses": semantic_losses,
+                "configuration_generation": last.configuration_generation,
+                "catalog_generation": last.catalog_generation,
+                "body_hashes_present": events.iter().any(|event| {
+                    event.request_body_sha256.is_some() || event.response_body_sha256.is_some()
+                }),
+            }))
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by_key(|summary| std::cmp::Reverse(summary["last_event_id"].as_u64()));
+    summaries
+}
+
+fn request_summary_matches(summary: &Value, query: &RequestQuery) -> bool {
+    let matches_string = |field: &str, expected: &Option<String>| {
+        expected.as_ref().is_none_or(|expected| {
+            summary[field]
+                .as_str()
+                .is_some_and(|actual| actual == expected)
+        })
+    };
+    matches_string("route", &query.route)
+        && matches_string("listener", &query.listener)
+        && matches_string("provider", &query.provider)
+        && query.model.as_ref().is_none_or(|expected| {
+            summary["public_model"].as_str() == Some(expected)
+                || summary["upstream_model"].as_str() == Some(expected)
+        })
+        && query.status.as_ref().is_none_or(|expected| {
+            summary["status"]
+                .as_u64()
+                .is_some_and(|status| status.to_string() == *expected)
+                || summary["error_class"].as_str() == Some(expected)
+        })
+        && query.since.is_none_or(|since| {
+            summary["updated_at"]
+                .as_u64()
+                .is_some_and(|updated| updated >= since)
+        })
+        && query.until.is_none_or(|until| {
+            summary["started_at"]
+                .as_u64()
+                .is_some_and(|started| started <= until)
+        })
 }
 
 /// Errors raised while binding or serving a management listener.
@@ -3362,7 +3603,8 @@ mod tests {
     use pooler_core::ConfigGeneration;
     use pooler_store::{
         CooldownState, CredentialHealthState, CredentialState, DecisionRecord, MemoryStore,
-        PruneReport, RetentionPolicy, SessionAffinity, Store, StoreError, StoreResult, Timestamp,
+        PruneReport, RequestEvent, RetentionPolicy, SessionAffinity, Store, StoreError,
+        StoreResult, Timestamp,
     };
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicBool;
@@ -3531,6 +3773,26 @@ mod tests {
 
         fn recent_decisions(&self, limit: usize) -> StoreResult<Vec<DecisionRecord>> {
             self.inner.recent_decisions(limit)
+        }
+
+        fn append_request_event(&self, event: RequestEvent) -> StoreResult<RequestEvent> {
+            self.inner.append_request_event(event)
+        }
+
+        fn request_events(&self) -> StoreResult<Vec<RequestEvent>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.request_events()
+            }
+        }
+
+        fn request_events_for(&self, request_id: &str) -> StoreResult<Vec<RequestEvent>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.request_events_for(request_id)
+            }
         }
 
         fn prune(&self, now: Timestamp) -> StoreResult<PruneReport> {
@@ -3753,7 +4015,8 @@ routes:
         assert!(js_body.contains("confirmation_token"));
         assert!(js_body.contains("Authorization"));
         assert!(js_body.contains("downloadExport"));
-        assert!(js_body.contains("`${BASE}/export`"));
+        assert!(js_body.contains("`${BASE}${path}`"));
+        assert!(js_body.contains("/requests/export?"));
         assert!(!js_body.contains("localStorage"));
         assert!(!js_body.contains("sessionStorage"));
         assert!(!js_body.contains("?token="));
@@ -4534,6 +4797,103 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         assert_eq!(
             stale["checks"][4]["status"], "failed",
             "an older successful reload must not bypass a newer failed reload"
+        );
+    }
+
+    #[test]
+    fn request_explorer_is_paginated_filterable_redacted_and_timeline_consistent() {
+        let api = api();
+        let pooling = api.state.load_full().pooling.clone();
+        let store = pooling.store();
+        for (index, kind) in [
+            pooler_store::RequestEventKind::Admission,
+            pooler_store::RequestEventKind::Selection,
+            pooler_store::RequestEventKind::Attempt,
+            pooler_store::RequestEventKind::Retry,
+            pooler_store::RequestEventKind::Commitment,
+            pooler_store::RequestEventKind::Completion,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = pooler_store::RequestEvent::new(
+                "pool-request-1",
+                u32::try_from(index).expect("event index"),
+                kind,
+                "local",
+                "route-a",
+                100 + u64::try_from(index).expect("timestamp"),
+            );
+            event.public_model = Some("public-model".to_owned());
+            event.provider = Some("provider-a".to_owned());
+            event.attempt = Some(1);
+            if kind == pooler_store::RequestEventKind::Retry {
+                event.retry_reason = Some("Authorization: Bearer raw-secret-sentinel".to_owned());
+                event.cooldown_effect = Some("credential".to_owned());
+            }
+            if kind == pooler_store::RequestEventKind::Commitment {
+                event.commitment = Some("response_headers".to_owned());
+                event.status = Some(200);
+            }
+            if kind == pooler_store::RequestEventKind::Completion {
+                event.status = Some(200);
+                event.error_class = Some("success".to_owned());
+                event.ttft_ms = Some(12);
+                event.latency_ms = Some(30);
+            }
+            store.append_request_event(event).expect("request event");
+        }
+        store
+            .append_request_event(pooler_store::RequestEvent::new(
+                "pool-request-2",
+                0,
+                pooler_store::RequestEventKind::Admission,
+                "local",
+                "other-route",
+                200,
+            ))
+            .expect("second request");
+
+        let headers = loopback_headers();
+        let listed = api.handle(
+            &Method::GET,
+            "/requests?limit=1&route=route-a&provider=provider-a&status=200",
+            &headers,
+        );
+        assert_eq!(listed.status, StatusCode::OK);
+        let listed_text = String::from_utf8(listed.body.clone()).expect("request list text");
+        assert!(!listed_text.contains("raw-secret-sentinel"));
+        let listed = response_value(listed);
+        assert_eq!(listed["requests"].as_array().expect("requests").len(), 1);
+        assert_eq!(listed["requests"][0]["request_id"], "pool-request-1");
+        assert_eq!(listed["requests"][0]["attempts"], 1);
+        assert_eq!(listed["requests"][0]["committed"], true);
+        assert_eq!(listed["requests"][0]["ttft_ms"], 12);
+
+        let detail = response_value(api.handle(&Method::GET, "/requests/pool-request-1", &headers));
+        assert_eq!(detail["request"]["route"], "route-a");
+        let timeline =
+            response_value(api.handle(&Method::GET, "/requests/pool-request-1/timeline", &headers));
+        let timeline = timeline["timeline"].as_array().expect("timeline");
+        assert_eq!(timeline.len(), 6);
+        assert!(timeline
+            .iter()
+            .all(|event| event["request_id"] == "pool-request-1"));
+
+        let exported = api.handle(&Method::GET, "/requests/export", &headers);
+        assert_eq!(exported.status, StatusCode::OK);
+        assert!(!String::from_utf8(exported.body)
+            .expect("request export text")
+            .contains("raw-secret-sentinel"));
+        assert_eq!(
+            api.handle(&Method::GET, "/requests/missing", &headers)
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            api.handle(&Method::GET, "/requests/bad%2Fid", &headers)
+                .status,
+            StatusCode::BAD_REQUEST
         );
     }
 

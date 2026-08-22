@@ -31,6 +31,13 @@
     lastSuccessfulRefresh: null,
     pending: new Set(),
     connectionAccount: "",
+    requestExplorer: {
+      route: "",
+      provider: "",
+      status: "",
+      timeline: {},
+      busy: false,
+    },
     configuration: {
       draftId: null,
       etag: "",
@@ -191,8 +198,12 @@
     return detail || {};
   }
 
-  async function downloadExport(sessionGeneration) {
-    const response = await fetch(`${BASE}/export`, {
+  async function downloadExport(
+    sessionGeneration,
+    path = "/export",
+    filenamePrefix = "pooler-management-export",
+  ) {
+    const response = await fetch(`${BASE}${path}`, {
       headers: requestHeaders(),
       cache: "no-store",
     });
@@ -212,7 +223,7 @@
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `pooler-management-export-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    link.download = `${filenamePrefix}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
     link.hidden = true;
     document.body.append(link);
     link.click();
@@ -271,6 +282,11 @@
       state.endpointMeta = {};
       state.lastSuccessfulRefresh = null;
       state.connectionAccount = "";
+      state.requestExplorer.route = "";
+      state.requestExplorer.provider = "";
+      state.requestExplorer.status = "";
+      state.requestExplorer.timeline = {};
+      state.requestExplorer.busy = false;
     }
   }
 
@@ -588,7 +604,9 @@
       keys.map(async (key) => {
         const spec = ENDPOINTS[key];
         try {
-          const payload = await readJson(spec.path, controller.signal);
+          const path =
+            typeof spec.path === "function" ? spec.path() : spec.path;
+          const payload = await readJson(path, controller.signal);
           if (generation !== state.requestGeneration) return undefined;
           state.data[key] = payload;
           state.errors[key] = null;
@@ -646,6 +664,7 @@
     quota: { path: "/quota" },
     metrics: { path: "/metrics" },
     decisions: { path: "/decisions?limit=50" },
+    requests: { path: () => requestExplorerPath() },
     traces: { path: "/traces" },
     audit: { path: "/audit" },
     reloads: { path: "/reloads" },
@@ -750,6 +769,13 @@
         "Token usage, provider-reported cost, rate-limit windows, and latency.",
       endpoints: ["metrics", "quota"],
       render: renderUsage,
+    },
+    requests: {
+      title: "Request explorer",
+      subtitle:
+        "One redacted logical request timeline across selection, attempts, retries, commitment, and completion.",
+      endpoints: ["requests"],
+      render: renderRequests,
     },
     operations: {
       title: "Operations",
@@ -2147,6 +2173,241 @@
 
   /* ---------------- Operations ---------------- */
 
+  function requestExplorerPath(cursor = "", limit = 50) {
+    const filters = state.requestExplorer;
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (filters.route) query.set("route", filters.route);
+    if (filters.provider) query.set("provider", filters.provider);
+    if (filters.status) query.set("status", filters.status);
+    if (cursor) query.set("cursor", cursor);
+    return `/requests?${query.toString()}`;
+  }
+
+  async function refreshRequestExplorer({ append = false } = {}) {
+    const explorer = state.requestExplorer;
+    if (explorer.busy) return;
+    explorer.busy = true;
+    renderRequests($("#view"));
+    try {
+      const current = state.data.requests || { requests: [] };
+      const page = await readJson(
+        requestExplorerPath(append ? current.next_cursor : ""),
+      );
+      state.data.requests = append
+        ? {
+            ...page,
+            requests: [...(current.requests || []), ...(page.requests || [])],
+          }
+        : page;
+      state.errors.requests = null;
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else state.errors.requests = error.message;
+    } finally {
+      explorer.busy = false;
+      if (state.route === "requests") renderRequests($("#view"));
+    }
+  }
+
+  async function loadRequestTimeline(requestId) {
+    const explorer = state.requestExplorer;
+    if (explorer.busy) return;
+    explorer.busy = true;
+    renderRequests($("#view"));
+    try {
+      const result = await readJson(
+        `/requests/${encodeURIComponent(requestId)}/timeline`,
+      );
+      explorer.timeline = { [requestId]: result.timeline || [] };
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else notify("error", esc(error.message));
+    } finally {
+      explorer.busy = false;
+      if (state.route === "requests") renderRequests($("#view"));
+    }
+  }
+
+  async function exportRequestExplorer() {
+    const explorer = state.requestExplorer;
+    if (explorer.busy) return;
+    explorer.busy = true;
+    renderRequests($("#view"));
+    try {
+      const path = requestExplorerPath("", 4096).replace(
+        "/requests?",
+        "/requests/export?",
+      );
+      await downloadExport(
+        state.sessionGeneration,
+        path,
+        "pooler-request-history",
+      );
+      notify("success", "Redacted request history exported.");
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else notify("error", esc(error.message));
+    } finally {
+      explorer.busy = false;
+      if (state.route === "requests") renderRequests($("#view"));
+    }
+  }
+
+  function renderRequests(root) {
+    const explorer = state.requestExplorer;
+    const page = state.data.requests || {};
+    const requests = page.requests || [];
+    const timelineEntries = Object.entries(explorer.timeline);
+    const filters = `
+      <div class="panel">
+        <div class="form-grid">
+          <label class="field"><span class="field-label">Route</span><input data-request-filter="route" value="${esc(explorer.route)}" maxlength="128" autocomplete="off"></label>
+          <label class="field"><span class="field-label">Provider</span><input data-request-filter="provider" value="${esc(explorer.provider)}" maxlength="128" autocomplete="off"></label>
+          <label class="field"><span class="field-label">Status or class</span><input data-request-filter="status" value="${esc(explorer.status)}" maxlength="64" autocomplete="off" placeholder="200 or upstream_error"></label>
+        </div>
+        <div class="toolbar spaced-top-sm">
+          <button class="btn btn-primary btn-sm" type="button" data-request-action="apply"${explorer.busy ? ' disabled aria-busy="true"' : ""}>Apply filters</button>
+          <button class="btn btn-outline btn-sm" type="button" data-request-action="clear"${explorer.busy ? " disabled" : ""}>Clear</button>
+          <span class="spacer"></span>
+          <button class="btn btn-outline btn-sm" type="button" data-request-action="export"${explorer.busy ? " disabled" : ""}>${ic("cloud-download", 15)} Export redacted requests</button>
+        </div>
+      </div>`;
+    const requestTable = tableWrap(
+      [
+        {
+          label: "Updated",
+          render: (request) =>
+            `<span class="num muted" title="${esc(fmtTime(request.updated_at))}">${esc(relTime(request.updated_at))}</span>`,
+        },
+        {
+          label: "Request",
+          mono: true,
+          render: (request) =>
+            `<button class="link-button mono" type="button" data-request-id="${esc(request.request_id)}" aria-label="Load timeline for ${esc(request.request_id)}">${esc(shortId(request.request_id, 16))}</button>`,
+        },
+        {
+          label: "Route",
+          mono: true,
+          render: (request) => esc(text(request.route)),
+        },
+        {
+          label: "Model",
+          mono: true,
+          render: (request) => esc(text(request.public_model)),
+        },
+        {
+          label: "Provider",
+          mono: true,
+          render: (request) => providerCell(request.provider),
+        },
+        {
+          label: "Account",
+          mono: true,
+          render: (request) => esc(text(request.account_pseudonym)),
+        },
+        {
+          label: "Attempts",
+          align: "right",
+          render: (request) =>
+            `<span class="num">${fmtInt(request.attempts)}</span>`,
+        },
+        {
+          label: "Status",
+          render: (request) =>
+            statusBadge(request.status ?? request.error_class),
+        },
+        {
+          label: "TTFT",
+          align: "right",
+          render: (request) =>
+            `<span class="num">${request.ttft_ms == null ? "—" : `${fmtInt(request.ttft_ms)} ms`}</span>`,
+        },
+        {
+          label: "Latency",
+          align: "right",
+          render: (request) =>
+            `<span class="num">${request.latency_ms == null ? "—" : `${fmtInt(request.latency_ms)} ms`}</span>`,
+        },
+      ],
+      requests,
+      {
+        loading: state.loading && !state.data.requests,
+        error: endpointError("requests"),
+        emptyTitle: "No retained requests",
+        emptyDescription:
+          "Metadata-only request timelines appear here. Prompts and responses are never retained.",
+      },
+    );
+    const timelines = timelineEntries.length
+      ? timelineEntries
+          .map(([requestId, events]) =>
+            section(
+              `Timeline ${shortId(requestId, 24)}`,
+              tableWrap(
+                [
+                  {
+                    label: "Phase",
+                    render: (event) =>
+                      `<span class="badge badge-neutral">${esc(text(event.kind))}</span>`,
+                  },
+                  {
+                    label: "Time",
+                    render: (event) =>
+                      `<span class="num muted">${esc(fmtTime(event.recorded_at))}</span>`,
+                  },
+                  {
+                    label: "Provider",
+                    mono: true,
+                    render: (event) => providerCell(event.provider),
+                  },
+                  {
+                    label: "Attempt",
+                    align: "right",
+                    render: (event) =>
+                      `<span class="num">${fmtInt(event.attempt)}</span>`,
+                  },
+                  {
+                    label: "Status",
+                    render: (event) =>
+                      statusBadge(event.status ?? event.error_class),
+                  },
+                  {
+                    label: "Retry / effects",
+                    nowrap: false,
+                    render: (event) =>
+                      esc(
+                        [
+                          event.retry_reason,
+                          event.quota_effect,
+                          event.cooldown_effect,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ") || "—",
+                      ),
+                  },
+                  {
+                    label: "Latency",
+                    align: "right",
+                    render: (event) =>
+                      `<span class="num">${event.latency_ms == null ? "—" : `${fmtInt(event.latency_ms)} ms`}</span>`,
+                  },
+                ],
+                events,
+                { emptyTitle: "Timeline is empty" },
+              ),
+              "All phases use the same logical request ID. Values are metadata-only and server-redacted.",
+            ),
+          )
+          .join("")
+      : `<div class="panel empty"><h2 class="section-title">Select a request</h2><p class="muted">Load its admission-to-completion timeline without exposing request or response content.</p></div>`;
+    root.innerHTML = `
+      ${viewHeader("Request explorer", views.requests.subtitle)}
+      ${filters}
+      ${section("Retained requests", requestTable, `${fmtInt(page.retention?.max_events)} total events · ${fmtInt(page.retention?.max_events_per_request)} per request · ${fmtInt(page.retention?.ttl_ms)} ms retention`)}
+      ${page.next_cursor ? `<div class="toolbar"><button class="btn btn-outline btn-sm" type="button" data-request-action="more"${explorer.busy ? ' disabled aria-busy="true"' : ""}>Load more</button></div>` : ""}
+      ${timelines}`;
+  }
+
   function renderOperations(root) {
     const health = state.data.health || {};
     const decisions = state.data.decisions?.decisions || [];
@@ -2782,6 +3043,27 @@
         return;
       }
 
+      const requestId = event.target.closest("[data-request-id]");
+      if (requestId) {
+        loadRequestTimeline(requestId.dataset.requestId);
+        return;
+      }
+      const requestAction = event.target.closest("[data-request-action]");
+      if (requestAction) {
+        const action = requestAction.dataset.requestAction;
+        if (action === "apply") refreshRequestExplorer();
+        else if (action === "more") refreshRequestExplorer({ append: true });
+        else if (action === "export") exportRequestExplorer();
+        else if (action === "clear") {
+          state.requestExplorer.route = "";
+          state.requestExplorer.provider = "";
+          state.requestExplorer.status = "";
+          state.requestExplorer.timeline = {};
+          refreshRequestExplorer();
+        }
+        return;
+      }
+
       const setupButton = event.target.closest("[data-setup-action]");
       if (setupButton) {
         setupAction(setupButton.dataset.setupAction);
@@ -2852,6 +3134,12 @@
     });
 
     $("#view").addEventListener("input", (event) => {
+      const requestFilter = event.target.closest("[data-request-filter]");
+      if (requestFilter && state.route === "requests") {
+        state.requestExplorer[requestFilter.dataset.requestFilter] =
+          requestFilter.value;
+        return;
+      }
       const configField = event.target.closest("[data-config-field]");
       if (configField && state.route === "configuration") {
         state.configuration[configField.dataset.configField] =

@@ -10,7 +10,10 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll},
     time::{Duration, Instant as StdInstant},
 };
@@ -44,6 +47,7 @@ use pooler_observe::{
 };
 use pooler_policy::{CommitmentState, QuotaObservation, ReplayCheck, SelectionLease};
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
+use pooler_store::{RequestEvent, RequestEventKind, Store};
 use ring::rand::SecureRandom;
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use thiserror::Error;
@@ -444,6 +448,191 @@ pub enum ProxyError {
     WebSocketHandshakeStatus(u16),
 }
 
+struct RequestLifecycleState {
+    public_model: Option<String>,
+    upstream_model: Option<String>,
+    provider: Option<String>,
+    account_pseudonym: Option<String>,
+    attempt: Option<u32>,
+    ttft_ms: Option<u64>,
+    semantic_losses: Vec<String>,
+}
+
+#[derive(Clone)]
+struct RequestLifecycle {
+    store: Arc<dyn Store>,
+    request_id: Arc<str>,
+    listener: Arc<str>,
+    route: Arc<str>,
+    configuration_generation: u64,
+    catalog_generation: Option<u64>,
+    started: StdInstant,
+    next_event: Arc<AtomicU32>,
+    completed: Arc<AtomicBool>,
+    state: Arc<Mutex<RequestLifecycleState>>,
+}
+
+impl RequestLifecycle {
+    fn new(
+        store: Arc<dyn Store>,
+        request_id: impl Into<Arc<str>>,
+        listener: Arc<str>,
+        route: impl Into<Arc<str>>,
+        configuration_generation: u64,
+        catalog_generation: Option<u64>,
+    ) -> Self {
+        let lifecycle = Self {
+            store,
+            request_id: request_id.into(),
+            listener,
+            route: route.into(),
+            configuration_generation,
+            catalog_generation,
+            started: StdInstant::now(),
+            next_event: Arc::new(AtomicU32::new(0)),
+            completed: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(RequestLifecycleState {
+                public_model: None,
+                upstream_model: None,
+                provider: None,
+                account_pseudonym: None,
+                attempt: None,
+                ttft_ms: None,
+                semantic_losses: Vec::new(),
+            })),
+        };
+        lifecycle.record(RequestEventKind::Admission, |_| {});
+        lifecycle
+    }
+
+    fn record(&self, kind: RequestEventKind, update: impl FnOnce(&mut RequestEvent)) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut event = RequestEvent::new(
+            self.request_id.as_ref(),
+            self.next_event.fetch_add(1, Ordering::Relaxed),
+            kind,
+            self.listener.as_ref(),
+            self.route.as_ref(),
+            request_timestamp_now(),
+        );
+        event.public_model = state.public_model.clone();
+        event.upstream_model = state.upstream_model.clone();
+        event.provider = state.provider.clone();
+        event.account_pseudonym = state.account_pseudonym.clone();
+        event.attempt = state.attempt;
+        event.ttft_ms = state.ttft_ms;
+        event.semantic_losses = state.semantic_losses.clone();
+        event.configuration_generation = self.configuration_generation;
+        event.catalog_generation = self.catalog_generation;
+        drop(state);
+        update(&mut event);
+        if self.store.append_request_event(event).is_err() {
+            tracing::warn!(request_id = %self.request_id, "request history event was not persisted");
+        }
+    }
+
+    fn selected(&self, selection: &PoolSelection, attempt: u32) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.public_model = Some(selection.model().as_str().to_owned());
+            state.upstream_model = selection.upstream_model().map(str::to_owned);
+            state.provider = Some(selection.provider().as_str().to_owned());
+            state.account_pseudonym = selection
+                .explanation()
+                .and_then(|value| value.selected_credential_pseudonym())
+                .map(|value| value.as_str().to_owned());
+            state.attempt = Some(attempt);
+        }
+        self.record(RequestEventKind::Selection, |event| {
+            event.eligible = Some(true);
+        });
+    }
+
+    fn attempt(&self, attempt: u32, result: AttemptResult, duration: Duration) {
+        self.record(RequestEventKind::Attempt, |event| {
+            event.attempt = Some(attempt);
+            event.latency_ms = Some(duration_to_history_millis(duration));
+            event.error_class = (result != AttemptResult::Success).then(|| result.to_string());
+        });
+    }
+
+    fn retry(
+        &self,
+        attempt: u32,
+        reason: impl Into<String>,
+        delay: Duration,
+        quota_effect: Option<String>,
+        cooldown_effect: Option<String>,
+    ) {
+        self.record(RequestEventKind::Retry, |event| {
+            event.attempt = Some(attempt);
+            event.retry_reason = Some(reason.into());
+            event.latency_ms = Some(duration_to_history_millis(delay));
+            event.quota_effect = quota_effect;
+            event.cooldown_effect = cooldown_effect;
+        });
+    }
+
+    fn semantic_loss(&self, parameter: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.semantic_losses.len() < 16
+            && !state.semantic_losses.iter().any(|value| value == parameter)
+        {
+            state.semantic_losses.push(parameter.to_owned());
+        }
+    }
+
+    fn committed(&self, status: u16) {
+        self.record(RequestEventKind::Commitment, |event| {
+            event.commitment = Some("response_headers".to_owned());
+            event.status = Some(status);
+        });
+    }
+
+    fn mark_first_event(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.ttft_ms.is_none() {
+            state.ttft_ms = Some(duration_to_history_millis(self.started.elapsed()));
+        }
+    }
+
+    fn complete(&self, class: CompletionClass, status: Option<u16>) {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.record(RequestEventKind::Completion, |event| {
+            event.status = status;
+            event.error_class = Some(class.to_string());
+            event.latency_ms = Some(duration_to_history_millis(self.started.elapsed()));
+        });
+    }
+}
+
+fn request_timestamp_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn duration_to_history_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
 /// A compiled route table and shared Hyper client for one listener.
 #[derive(Clone)]
 pub struct HttpProxy<A = NoSemanticAdapter> {
@@ -720,6 +909,14 @@ where
             path = request.uri().path(),
             "request routed"
         );
+        let lifecycle = RequestLifecycle::new(
+            self.pooling.store(),
+            self.pooling.next_logical_request_id(),
+            Arc::clone(&self.listener),
+            route.id(),
+            self.config.generation(),
+            self.pooling.catalog_generation(),
+        );
         let mut observation = Some(self.observability.begin_request(route.id()));
         let request_span = self.traces.span(TraceStage::Request, Some(route.id()));
         tracing::debug!(parent: &request_span, listener = %self.listener, route = route.id(), "request span");
@@ -731,6 +928,10 @@ where
 
         if let Err(status) = self.validate_request(route, &request) {
             drop(guard);
+            lifecycle.complete(
+                CompletionClass::InvalidRequest,
+                Some(status.status().as_u16()),
+            );
             return observe_response(status, observation.take(), CompletionClass::InvalidRequest);
         }
 
@@ -748,6 +949,10 @@ where
                     "authentication unavailable",
                 ),
             };
+            lifecycle.complete(
+                CompletionClass::DownstreamError,
+                Some(response.status().as_u16()),
+            );
             return observe_response(
                 response,
                 observation.take(),
@@ -770,14 +975,16 @@ where
             } else {
                 CompletionClass::InternalError
             };
+            lifecycle.complete(class.clone(), Some(response.status().as_u16()));
             return observe_response(response, observation.take(), class);
         }
         let is_websocket = route.matcher().websocket() == Some(true);
         let result = if is_websocket {
-            self.forward_websocket(route, request, guard, &mut observation)
+            self.forward_websocket(route, request, guard, &mut observation, &lifecycle)
                 .await
         } else {
-            self.forward(route, request, guard, &mut observation).await
+            self.forward(route, request, guard, &mut observation, &lifecycle)
+                .await
         };
         match result {
             Ok(response) => {
@@ -797,7 +1004,9 @@ where
                     "request failed"
                 );
                 let class = completion_class_for_error(&error);
-                observe_response(error_response(error), observation.take(), class)
+                let response = error_response(error);
+                lifecycle.complete(class.clone(), Some(response.status().as_u16()));
+                observe_response(response, observation.take(), class)
             }
         }
     }
@@ -887,6 +1096,7 @@ where
         mut request: Request<Incoming>,
         guard: DrainGuard,
         observation: &mut Option<RequestObservation>,
+        lifecycle: &RequestLifecycle,
     ) -> Result<Response<ProxyBody>, ProxyError> {
         let key = validate_websocket_request(&request)?;
         let offered_protocols = websocket_protocols(request.headers())
@@ -917,10 +1127,22 @@ where
             headers.insert("sec-websocket-protocol", protocols);
         }
 
-        let mut selection = self
-            .pooling
-            .select(&self.config, route, None, &headers, 1, started)
-            .map_err(pool_selection_error)?;
+        let mut selection =
+            match self
+                .pooling
+                .select(&self.config, route, None, &headers, 1, started)
+            {
+                Ok(selection) => selection,
+                Err(error) => {
+                    lifecycle.record(RequestEventKind::Selection, |event| {
+                        event.attempt = Some(1);
+                        event.eligible = Some(false);
+                        event.error_class = Some(error.to_string());
+                    });
+                    return Err(pool_selection_error(error));
+                }
+            };
+        lifecycle.selected(&selection, 1);
         let upstream = self
             .config
             .upstreams()
@@ -974,6 +1196,7 @@ where
         let upstream_key = generate_websocket_key()?;
         let deadline = started + request_timeout(route.limits(), upstream);
         let connect = connect_websocket(&uri, &headers, &upstream_key, &offered_protocols);
+        let attempt_started = StdInstant::now();
         let (upstream_socket, upstream_response) = tokio::select! {
             result = time::timeout_at(Instant::from_std(deadline), connect) => {
                 result.map_err(|_| ProxyError::Timeout)?
@@ -982,6 +1205,8 @@ where
             () = cancellation.cancelled() => return Err(ProxyError::Timeout),
         };
 
+        lifecycle.attempt(1, AttemptResult::Success, attempt_started.elapsed());
+        lifecycle.committed(StatusCode::SWITCHING_PROTOCOLS.as_u16());
         let downstream_upgrade = hyper::upgrade::on(&mut request);
         let downstream_body = request.into_body();
         drop(downstream_body);
@@ -1013,6 +1238,7 @@ where
         let lease = selection.take_lease();
         let max_frame_bytes = route.limits().max_frame_bytes;
         let task = self.resources.task();
+        let lifecycle = lifecycle.clone();
         tokio::spawn(async move {
             let _task = task;
             run_websocket_tunnel(
@@ -1029,6 +1255,10 @@ where
                 },
             )
             .await;
+            lifecycle.complete(
+                CompletionClass::Success,
+                Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
+            );
         });
         Ok(response)
     }
@@ -1069,6 +1299,7 @@ where
         request: Request<Incoming>,
         guard: DrainGuard,
         observation: &mut Option<RequestObservation>,
+        lifecycle: &RequestLifecycle,
     ) -> Result<Response<ProxyBody>, ProxyError> {
         let started = StdInstant::now();
         let fallback_upstream = self
@@ -1398,7 +1629,7 @@ where
                 });
                 if let Some(cached) = cache.get(&key, StdInstant::now()) {
                     return self
-                        .finish_cached_response(route, cached, guard, observation)
+                        .finish_cached_response(route, cached, guard, observation, lifecycle)
                         .await;
                 }
                 loop {
@@ -1411,7 +1642,13 @@ where
                         CacheLookup::Follower(follower) => {
                             if let Some(cached) = follower.wait(&cancellation).await {
                                 return self
-                                    .finish_cached_response(route, cached, guard, observation)
+                                    .finish_cached_response(
+                                        route,
+                                        cached,
+                                        guard,
+                                        observation,
+                                        lifecycle,
+                                    )
                                     .await;
                             }
                             if cancellation.is_cancelled() {
@@ -1444,17 +1681,27 @@ where
             let mut selection = if let Some(selection) = forced_selection.take() {
                 selection
             } else {
-                self.pooling
-                    .select_with_context(
-                        &self.config,
-                        route,
-                        selected_model.as_deref(),
-                        &headers,
-                        &selection_context,
-                        SelectionTiming::new(attempt, started),
-                    )
-                    .map_err(pool_selection_error)?
+                match self.pooling.select_with_context(
+                    &self.config,
+                    route,
+                    selected_model.as_deref(),
+                    &headers,
+                    &selection_context,
+                    SelectionTiming::new(attempt, started),
+                ) {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        lifecycle.record(RequestEventKind::Selection, |event| {
+                            event.public_model = selected_model.clone();
+                            event.attempt = Some(attempt);
+                            event.eligible = Some(false);
+                            event.error_class = Some(error.to_string());
+                        });
+                        return Err(pool_selection_error(error));
+                    }
+                }
             };
+            lifecycle.selected(&selection, attempt);
             if let Some(explanation) = selection.explanation() {
                 let decision = DecisionRecord::from(explanation);
                 self.observability.record_decision(&decision);
@@ -1538,7 +1785,7 @@ where
                 matches!(upstream.transport(), "ws" | "wss"),
             ) {
                 (Some(transport), true) => {
-                    match prepared.buffered_bytes_for_attempt(route, &selection) {
+                    match prepared.buffered_bytes_for_attempt(route, &selection, lifecycle) {
                         Ok(bytes) => {
                             self.send_openai_responses_websocket_attempt(
                                 attempt_request,
@@ -1550,7 +1797,7 @@ where
                         Err(error) => Err(error),
                     }
                 }
-                _ => match prepared.body_for_attempt(route, &selection) {
+                _ => match prepared.body_for_attempt(route, &selection, lifecycle) {
                     Ok(attempt_body) => self.send_attempt(attempt_request, attempt_body).await,
                     Err(error) => Err(error),
                 },
@@ -1561,9 +1808,11 @@ where
                 Err(ProxyError::Timeout) => AttemptResult::Cancelled,
                 Err(_) => AttemptResult::Error,
             };
+            let attempt_duration = attempt_started.elapsed();
+            lifecycle.attempt(attempt, attempt_result, attempt_duration);
             self.observability.record_attempt(
                 AttemptRecord::new(route.id(), selection.provider().as_str(), attempt_result)
-                    .duration(attempt_started.elapsed()),
+                    .duration(attempt_duration),
             );
             self.traces.record(
                 TraceRecord::new(TraceStage::Attempt)
@@ -1599,6 +1848,13 @@ where
                             .await
                         {
                             Ok(_) => {
+                                lifecycle.retry(
+                                    attempt,
+                                    "native_authorization_refresh",
+                                    Duration::ZERO,
+                                    None,
+                                    None,
+                                );
                                 forced_selection = Some(selection);
                                 attempt = attempt.saturating_add(1);
                                 continue;
@@ -1637,6 +1893,17 @@ where
                         if failure.decision.is_retry() {
                             forced_selection = failure.take_replacement();
                             let delay = failure.decision.delay();
+                            lifecycle.retry(
+                                attempt,
+                                format!("{:?}", failure.decision),
+                                delay,
+                                None,
+                                failure
+                                    .classification
+                                    .cooldown
+                                    .as_ref()
+                                    .map(|cooldown| format!("{:?}", cooldown.scope)),
+                            );
                             if delay > retry_deadline.saturating_duration_since(Instant::now()) {
                                 return Err(ProxyError::Timeout);
                             }
@@ -1707,6 +1974,13 @@ where
                     .await
                 {
                     Ok(_) => {
+                        lifecycle.retry(
+                            attempt,
+                            "native_authorization_refresh",
+                            Duration::ZERO,
+                            None,
+                            None,
+                        );
                         forced_selection = Some(selection);
                         attempt = attempt.saturating_add(1);
                         continue;
@@ -1717,6 +1991,13 @@ where
                             .policy()
                             .is_some_and(|policy| attempt < policy.retry().maximum_attempts());
                         if can_fail_over {
+                            lifecycle.retry(
+                                attempt,
+                                "native_account_requires_reauthentication",
+                                Duration::ZERO,
+                                None,
+                                Some("credential_disabled".to_owned()),
+                            );
                             attempt = attempt.saturating_add(1);
                             continue;
                         }
@@ -1752,6 +2033,17 @@ where
                     self.drain_retry_response(response, limits, &cancellation, retry_deadline)
                         .await?;
                     let delay = failure.decision.delay();
+                    lifecycle.retry(
+                        attempt,
+                        format!("{:?}", failure.decision),
+                        delay,
+                        (!quota_observations.is_empty()).then(|| "provider_quota".to_owned()),
+                        failure
+                            .classification
+                            .cooldown
+                            .as_ref()
+                            .map(|cooldown| format!("{:?}", cooldown.scope)),
+                    );
                     if delay > retry_deadline.saturating_duration_since(Instant::now()) {
                         return Err(ProxyError::Timeout);
                     }
@@ -1783,6 +2075,7 @@ where
                         request_headers: downstream_headers,
                         semantic_response_hint,
                         cache_leader,
+                        lifecycle: lifecycle.clone(),
                     },
                 )
                 .await;
@@ -2104,6 +2397,7 @@ where
         cached: Arc<CachedResponse>,
         guard: DrainGuard,
         observation: &mut Option<RequestObservation>,
+        lifecycle: &RequestLifecycle,
     ) -> Result<Response<ProxyBody>, ProxyError> {
         let mut observation = observation
             .take()
@@ -2117,10 +2411,17 @@ where
         let body = Full::new(cached.body().clone())
             .map_err(|never: Infallible| match never {})
             .boxed();
-        let body = ObservedBody::new(
+        lifecycle.record(RequestEventKind::Selection, |event| {
+            event.provider = Some("response_cache".to_owned());
+            event.eligible = Some(true);
+        });
+        lifecycle.committed(cached.status().as_u16());
+        let body = ObservedBody::new_tracked(
             body,
             observation,
             completion_class_for_status(cached.status()),
+            lifecycle.clone(),
+            cached.status().as_u16(),
         );
         let body = DrainedBody::new(body, guard).boxed();
         let mut response = Response::new(body);
@@ -2145,6 +2446,7 @@ where
             request_headers,
             semantic_response_hint,
             mut cache_leader,
+            lifecycle,
         } = context;
         let (parts, body) = response.into_parts();
         let semantic_websocket = parts
@@ -2243,8 +2545,16 @@ where
                 .provider(selection.provider().as_str())
                 .outcome("response_ready"),
         );
+        lifecycle.committed(parts.status.as_u16());
         let completion = completion_class_for_status(parts.status);
-        let body = ObservedBody::new_for_target(body, observation, completion, usage_target);
+        let body = ObservedBody::new_for_target(
+            body,
+            observation,
+            completion,
+            usage_target,
+            lifecycle,
+            parts.status.as_u16(),
+        );
         let body = DrainedBody::new(body, guard).boxed();
         let mut response = Response::new(body);
         *response.status_mut() = parts.status;
@@ -2282,6 +2592,7 @@ struct FinishResponseContext {
     request_headers: HeaderMap,
     semantic_response_hint: SemanticResponseHint,
     cache_leader: Option<CacheLeader>,
+    lifecycle: RequestLifecycle,
 }
 
 struct InspectedFailureResponse {
@@ -2296,6 +2607,7 @@ impl PreparedBody {
         &self,
         route: &RoutePlan,
         selection: &PoolSelection,
+        lifecycle: &RequestLifecycle,
     ) -> Result<Bytes, ProxyError> {
         let Self::Buffered { bytes, patch_model } = self else {
             return Err(ProxyError::SemanticRequest(
@@ -2304,7 +2616,7 @@ impl PreparedBody {
         };
         if *patch_model {
             if let Some(model) = selection.upstream_model() {
-                return patch_body_for_target(bytes, route, model, selection);
+                return patch_body_for_target(bytes, route, model, selection, lifecycle);
             }
         }
         Ok(bytes.clone())
@@ -2314,6 +2626,7 @@ impl PreparedBody {
         &mut self,
         route: &RoutePlan,
         selection: &PoolSelection,
+        lifecycle: &RequestLifecycle,
     ) -> Result<ProxyBody, ProxyError> {
         match self {
             Self::Streaming(body) => {
@@ -2325,7 +2638,7 @@ impl PreparedBody {
             Self::Buffered { bytes, patch_model } => {
                 let bytes = if *patch_model {
                     if let Some(model) = selection.upstream_model() {
-                        patch_body_for_target(bytes, route, model, selection)?
+                        patch_body_for_target(bytes, route, model, selection, lifecycle)?
                     } else {
                         bytes.clone()
                     }
@@ -2392,6 +2705,8 @@ struct ObservedBody {
     inner: Pin<Box<ProxyBody>>,
     observation: Option<RequestObservation>,
     completion: CompletionClass,
+    lifecycle: Option<RequestLifecycle>,
+    status: Option<u16>,
     usage_target: Option<UsageTarget>,
     usage_bytes: Vec<u8>,
     usage_overflowed: bool,
@@ -2403,6 +2718,27 @@ impl ObservedBody {
             inner: Box::pin(inner),
             observation: Some(observation),
             completion,
+            lifecycle: None,
+            status: None,
+            usage_target: None,
+            usage_bytes: Vec::new(),
+            usage_overflowed: false,
+        }
+    }
+
+    fn new_tracked(
+        inner: ProxyBody,
+        observation: RequestObservation,
+        completion: CompletionClass,
+        lifecycle: RequestLifecycle,
+        status: u16,
+    ) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            observation: Some(observation),
+            completion,
+            lifecycle: Some(lifecycle),
+            status: Some(status),
             usage_target: None,
             usage_bytes: Vec::new(),
             usage_overflowed: false,
@@ -2414,11 +2750,15 @@ impl ObservedBody {
         observation: RequestObservation,
         completion: CompletionClass,
         usage_target: UsageTarget,
+        lifecycle: RequestLifecycle,
+        status: u16,
     ) -> Self {
         Self {
             inner: Box::pin(inner),
             observation: Some(observation),
             completion,
+            lifecycle: Some(lifecycle),
+            status: Some(status),
             usage_target: Some(usage_target),
             usage_bytes: Vec::new(),
             usage_overflowed: false,
@@ -2429,6 +2769,9 @@ impl ObservedBody {
         let Some(mut observation) = self.observation.take() else {
             return;
         };
+        if let Some(lifecycle) = self.lifecycle.as_ref() {
+            lifecycle.complete(completion.clone(), self.status);
+        }
         let usage = (!self.usage_overflowed)
             .then(|| extract_observed_usage(&self.usage_bytes))
             .flatten();
@@ -2468,6 +2811,9 @@ impl Body for ObservedBody {
                 }
                 if let Some(observation) = self.observation.as_mut() {
                     observation.mark_first_event();
+                    if let Some(lifecycle) = self.lifecycle.as_ref() {
+                        lifecycle.mark_first_event();
+                    }
                 }
                 if self.inner.is_end_stream() {
                     let completion = self.completion.clone();
@@ -2736,6 +3082,7 @@ fn patch_body_for_target(
     route: &RoutePlan,
     model: &str,
     selection: &PoolSelection,
+    lifecycle: &RequestLifecycle,
 ) -> Result<Bytes, ProxyError> {
     let profile = selection.profile();
     let dialect = profile.dialect;
@@ -2759,12 +3106,27 @@ fn patch_body_for_target(
             .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
     }
     if !dialect.temperature.is_accepted() {
-        drop_unsupported_parameter(&mut document, route, model, "/temperature", "temperature")?;
-    }
-    if profile.reasoning.is_unsupported() {
-        drop_unsupported_parameter(&mut document, route, model, "/reasoning", "reasoning")?;
         drop_unsupported_parameter(
             &mut document,
+            lifecycle,
+            route,
+            model,
+            "/temperature",
+            "temperature",
+        )?;
+    }
+    if profile.reasoning.is_unsupported() {
+        drop_unsupported_parameter(
+            &mut document,
+            lifecycle,
+            route,
+            model,
+            "/reasoning",
+            "reasoning",
+        )?;
+        drop_unsupported_parameter(
+            &mut document,
+            lifecycle,
             route,
             model,
             "/reasoning_effort",
@@ -2777,6 +3139,7 @@ fn patch_body_for_target(
         if !profile.reasoning_efforts.allows(effort) {
             drop_unsupported_parameter(
                 &mut document,
+                lifecycle,
                 route,
                 model,
                 "/reasoning_effort",
@@ -2790,11 +3153,12 @@ fn patch_body_for_target(
             ("/tool_choice", "tool_choice"),
             ("/parallel_tool_calls", "parallel_tool_calls"),
         ] {
-            drop_unsupported_parameter(&mut document, route, model, pointer, parameter)?;
+            drop_unsupported_parameter(&mut document, lifecycle, route, model, pointer, parameter)?;
         }
     } else if profile.parallel_tools.is_unsupported() {
         drop_unsupported_parameter(
             &mut document,
+            lifecycle,
             route,
             model,
             "/parallel_tool_calls",
@@ -2804,6 +3168,7 @@ fn patch_body_for_target(
     if profile.structured_output.is_unsupported() {
         drop_unsupported_parameter(
             &mut document,
+            lifecycle,
             route,
             model,
             "/response_format",
@@ -2824,6 +3189,7 @@ fn patch_body_for_target(
 
 fn drop_unsupported_parameter(
     document: &mut PreservedJson,
+    lifecycle: &RequestLifecycle,
     route: &RoutePlan,
     model: &str,
     pointer: &str,
@@ -2843,6 +3209,7 @@ fn drop_unsupported_parameter(
     document
         .remove(pointer)
         .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+    lifecycle.semantic_loss(parameter);
     tracing::warn!(
         route = route.id(),
         upstream_model = model,

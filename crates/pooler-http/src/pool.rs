@@ -7,10 +7,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
-    },
+    sync::{Arc, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,7 +21,7 @@ use pooler_config::{
 };
 use pooler_core::{
     Capability, CapabilitySet, ConfigGeneration, CredentialId, ErrorClass, ModelDialect, ModelId,
-    ModelProfile, ProviderId, RouteId,
+    ModelProfile, ProviderId, RequestId, RouteId,
 };
 use pooler_model_catalog::{CatalogService, CatalogSnapshot, RequestOverlay};
 use pooler_policy::{
@@ -411,7 +408,6 @@ pub struct PoolingCoordinator {
     registries: Arc<BTreeMap<String, Arc<CredentialRegistry>>>,
     accounts: Arc<BTreeMap<String, AccountPlan>>,
     store: Arc<dyn Store>,
-    request_sequence: Arc<AtomicU64>,
     catalog: Option<Arc<CatalogService>>,
     disabled_models: Arc<RwLock<BTreeSet<String>>>,
 }
@@ -476,7 +472,6 @@ impl PoolingCoordinator {
             registries: Arc::new(registries),
             accounts: Arc::new(accounts),
             store,
-            request_sequence: Arc::new(AtomicU64::new(0)),
             catalog: None,
             disabled_models: Arc::new(RwLock::new(BTreeSet::new())),
         };
@@ -490,7 +485,6 @@ impl PoolingCoordinator {
     /// survive a successful configuration generation swap.
     pub fn reconfigure(&self, config: &CompiledConfig) -> Result<Self, PoolError> {
         let mut coordinator = Self::with_store(config, Arc::clone(&self.store))?;
-        coordinator.request_sequence = Arc::clone(&self.request_sequence);
         coordinator.catalog.clone_from(&self.catalog);
         coordinator.disabled_models = Arc::clone(&self.disabled_models);
         Ok(coordinator)
@@ -514,6 +508,36 @@ impl PoolingCoordinator {
     #[must_use]
     pub fn store(&self) -> Arc<dyn Store> {
         Arc::clone(&self.store)
+    }
+
+    /// Allocate one process-unique logical request identifier. The caller owns
+    /// this identity through admission, attempts, retries, commitment, and completion.
+    #[must_use]
+    pub fn next_logical_request_id(&self) -> String {
+        self.next_request_id()
+    }
+
+    /// Current published model-catalog generation, when a catalog is mounted.
+    #[must_use]
+    pub fn catalog_generation(&self) -> Option<u64> {
+        self.catalog
+            .as_ref()
+            .map(|catalog| catalog.snapshot().generation())
+    }
+
+    /// Return all bounded metadata-only request lifecycle events.
+    pub fn request_events(&self) -> Result<Vec<pooler_store::RequestEvent>, PoolError> {
+        self.store.request_events().map_err(|_| PoolError::Store)
+    }
+
+    /// Return one bounded logical request timeline.
+    pub fn request_events_for(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<pooler_store::RequestEvent>, PoolError> {
+        self.store
+            .request_events_for(request_id)
+            .map_err(|_| PoolError::Store)
     }
 
     /// Number of persisted decisions, useful for diagnostics and tests.
@@ -1619,11 +1643,7 @@ impl PoolingCoordinator {
     }
 
     fn next_request_id(&self) -> String {
-        let sequence = self
-            .request_sequence
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        format!("pool-request-{sequence}")
+        RequestId::new().to_string()
     }
 }
 
@@ -2306,6 +2326,18 @@ routes:
             elapsed_recovery_wait: Duration::ZERO,
             started: Instant::now(),
         })
+    }
+
+    #[test]
+    fn logical_request_ids_are_unique_across_coordinators() {
+        let config = pooled_config(false);
+        let first = PoolingCoordinator::new(&config).expect("first coordinator");
+        let second = PoolingCoordinator::new(&config).expect("second coordinator");
+        let first_id = first.next_logical_request_id();
+        let second_id = second.next_logical_request_id();
+        assert_ne!(first_id, second_id);
+        assert!(RequestId::parse(&first_id).is_ok());
+        assert!(RequestId::parse(&second_id).is_ok());
     }
 
     #[test]
