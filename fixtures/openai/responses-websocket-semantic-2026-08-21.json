@@ -1,0 +1,99 @@
+{
+  "fixture_version": "2026-08-21",
+  "provenance": "Sanitized OpenAI Responses WebSocket request and event shapes replayed through Pooler's mounted gateway against a strict local WebSocket; no live credential or provider response is included.",
+  "session_id": "mounted-session",
+  "downstream_turns": [
+    {
+      "model": "gpt-4o",
+      "input": [
+        {
+          "role": "user",
+          "content": [{"type": "input_text", "text": "weather"}]
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "name": "weather",
+          "description": "Weather lookup",
+          "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+          }
+        }
+      ],
+      "reasoning": {"effort": "high", "summary": "auto"},
+      "stream": true
+    },
+    {
+      "model": "gpt-4o",
+      "input": [
+        {
+          "role": "user",
+          "content": [{"type": "input_text", "text": "weather"}]
+        },
+        {
+          "id": "fc_weather",
+          "type": "function_call",
+          "call_id": "call_weather",
+          "name": "weather",
+          "arguments": "{\"city\":\"Paris\"}",
+          "status": "completed"
+        },
+        {
+          "type": "function_call_output",
+          "call_id": "call_weather",
+          "output": "sunny"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "name": "weather",
+          "description": "Weather lookup",
+          "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"]
+          }
+        }
+      ],
+      "reasoning": {"effort": "high", "summary": "auto"},
+      "stream": true
+    }
+  ],
+  "provider_turns": [
+    [
+      {"type": "response.created", "response": {"id": "resp_1", "model": "gpt-4o", "status": "in_progress", "output": []}},
+      {"type": "response.output_item.added", "output_index": 0, "item": {"id": "fc_weather", "type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "", "status": "in_progress"}},
+      {"type": "response.function_call_arguments.delta", "item_id": "fc_weather", "output_index": 0, "delta": "{\"city\":\"Paris\"}"},
+      {"type": "response.function_call_arguments.done", "item_id": "fc_weather", "output_index": 0, "name": "weather", "arguments": "{\"city\":\"Paris\"}"},
+      {"type": "response.output_item.done", "output_index": 0, "item": {"id": "fc_weather", "type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{\"city\":\"Paris\"}", "status": "completed"}},
+      {"type": "response.completed", "response": {"id": "resp_1", "model": "gpt-4o", "status": "completed", "usage": {"input_tokens": 8, "output_tokens": 5, "total_tokens": 13}}}
+    ],
+    [
+      {"type": "response.created", "response": {"id": "resp_2", "model": "gpt-4o", "status": "in_progress", "output": []}},
+      {"type": "response.output_item.added", "output_index": 0, "item": {"id": "msg_2", "type": "message", "role": "assistant", "status": "in_progress", "content": []}},
+      {"type": "response.content_part.added", "item_id": "msg_2", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}},
+      {"type": "response.output_text.delta", "item_id": "msg_2", "output_index": 0, "content_index": 0, "delta": "Sunny"},
+      {"type": "response.output_text.done", "item_id": "msg_2", "output_index": 0, "content_index": 0, "text": "Sunny"},
+      {"type": "response.content_part.done", "item_id": "msg_2", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "Sunny", "annotations": []}},
+      {"type": "response.output_item.done", "output_index": 0, "item": {"id": "msg_2", "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "Sunny", "annotations": []}]}},
+      {"type": "response.completed", "response": {"id": "resp_2", "model": "gpt-4o", "status": "completed", "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}}}
+    ]
+  ],
+  "expected_second_upstream": {
+    "previous_response_id": "resp_1",
+    "input_types": ["function_call_output"]
+  },
+  "coverage": [
+    "provider_authentication",
+    "tools",
+    "reasoning",
+    "usage",
+    "terminal_state",
+    "session_scoped_reuse",
+    "continuation_delta"
+  ]
+}

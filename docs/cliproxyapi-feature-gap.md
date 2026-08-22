@@ -91,7 +91,7 @@ Build the missing integration layer in this order:
 5. A secure management UI over the existing authenticated management API.
 6. A signed extension registry and provider plugin catalog that retain the
    current process/WASM isolation boundary.
-7. Replace the opaque Responses WebSocket tunnel and expand remaining xAI/media semantics only when strict fixtures establish their required behavior; keep Gemini Interactions same-wire until live evidence supports stronger claims.
+7. Promote the mounted semantic Responses WebSocket transport from strict-loopback evidence to credential-gated live OpenAI/xAI conformance; keep the native downstream WebSocket upgrade and Gemini Interactions same-wire until evidence supports stronger claims.
 
 That path closes CLIProxyAPI's usability advantage without sacrificing the
 properties that make Pooler a safer protocol runtime.

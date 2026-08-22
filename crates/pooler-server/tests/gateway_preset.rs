@@ -4,22 +4,28 @@
 //! Per-provider wire conformance lives in `gateway_provider_auth.rs`, which
 //! judges every request with a strict provider fake. This file covers what is
 //! specific to the preset itself: an unknown caller field surviving a patch
-//! route, and the Responses WebSocket tunnel.
+//! route, the semantic Responses WebSocket transport, and the bounded native
+//! WebSocket tunnel.
 
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
+use http::{header, HeaderValue};
 use pooler_auth::MemoryOAuthTokenStore;
 use pooler_http::NativeRuntime;
 use pooler_server::HttpProxyServer;
 use pooler_testkit::{ProviderContract, StrictProvider};
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_async, accept_hdr_async,
+    tungstenite::{handshake::server::Request, Message},
+};
 
 const SECRET: &str = "gateway-test-key";
 
@@ -49,6 +55,94 @@ async fn spawn_websocket_upstream() -> (SocketAddr, JoinHandle<Vec<String>>) {
         observed
     });
     (address, task)
+}
+
+/// A strict OpenAI Responses WebSocket that serves two fixture turns on one connection.
+async fn spawn_semantic_responses_upstream(
+    provider_turns: Vec<Vec<Value>>,
+) -> (SocketAddr, JoinHandle<(bool, Value, Value)>) {
+    let mut provider_turns = provider_turns.into_iter();
+    let first_events = provider_turns.next().expect("first provider turn");
+    let second_events = provider_turns.next().expect("second provider turn");
+    assert!(
+        provider_turns.next().is_none(),
+        "exactly two provider turns"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("semantic websocket upstream bind");
+    let address = listener.local_addr().expect("semantic upstream address");
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("semantic upstream accepts");
+        let mut authorized = false;
+        let mut socket = accept_hdr_async(stream, |request: &Request, response| {
+            authorized = request.headers().get(header::AUTHORIZATION)
+                == Some(&HeaderValue::from_static("Bearer gateway-test-key"))
+                && request.headers().get("openai-beta")
+                    == Some(&HeaderValue::from_static("responses_websockets=2026-02-06"));
+            Ok(response)
+        })
+        .await
+        .expect("semantic websocket handshake");
+
+        let first = socket
+            .next()
+            .await
+            .expect("first response.create")
+            .expect("first websocket message")
+            .into_text()
+            .expect("first request text");
+        let first: Value = serde_json::from_str(&first).expect("first request JSON");
+        for event in first_events {
+            socket
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .expect("first-turn provider event");
+        }
+
+        let second = socket
+            .next()
+            .await
+            .expect("second response.create")
+            .expect("second websocket message")
+            .into_text()
+            .expect("second request text");
+        let second: Value = serde_json::from_str(&second).expect("second request JSON");
+        for event in second_events {
+            socket
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .expect("second-turn provider event");
+        }
+        let _ = socket.close(None).await;
+        (authorized, first, second)
+    });
+    (address, task)
+}
+
+async fn send_responses_request(proxy: &str, body: &[u8]) -> String {
+    let mut downstream = TcpStream::connect(proxy).await.expect("proxy connection");
+    downstream
+        .write_all(
+            format!(
+                "POST /v1/responses HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\nsession-id: mounted-session\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("Responses request headers");
+    downstream
+        .write_all(body)
+        .await
+        .expect("Responses request body");
+    let mut response = Vec::new();
+    downstream
+        .read_to_end(&mut response)
+        .await
+        .expect("Responses response");
+    String::from_utf8(response).expect("Responses response UTF-8")
 }
 
 /// Compile the shipped preset the way an operator imports it, with the sample
@@ -148,6 +242,89 @@ async fn the_gateway_preset_preserves_the_caller_body_and_rewrites_only_the_mode
         "the model must resolve to the requested target: {}",
         request.body
     );
+}
+
+#[tokio::test]
+async fn the_gateway_preset_uses_semantic_responses_websocket_with_continuation() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/openai/responses-websocket-semantic-2026-08-21.json");
+    let fixture: Value =
+        serde_json::from_str(MANIFEST_FIXTURE).expect("semantic Responses fixture");
+    let downstream_turns = fixture["downstream_turns"]
+        .as_array()
+        .expect("downstream fixture turns")
+        .clone();
+    let provider_turns = fixture["provider_turns"]
+        .as_array()
+        .expect("provider fixture turns")
+        .iter()
+        .map(|turn| turn.as_array().expect("provider events").clone())
+        .collect();
+
+    let upstream = StrictProvider::start(ProviderContract::openai(), SECRET).await;
+    let (websocket_address, websocket_task) =
+        spawn_semantic_responses_upstream(provider_turns).await;
+    let directory = TempDir::new().expect("config directory");
+    let config = gateway_config(&directory, upstream.address(), websocket_address);
+    let server = bind_gateway(config).await;
+    let proxy = server.listener_addresses()[0].address().to_owned();
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+
+    let first_body = serde_json::to_vec(&downstream_turns[0]).expect("first request JSON");
+    let first_response = send_responses_request(&proxy, &first_body).await;
+    assert!(
+        first_response.starts_with("HTTP/1.1 200"),
+        "{first_response}"
+    );
+    assert!(
+        first_response.contains("response.function_call_arguments.delta"),
+        "tool event must survive semantic transport: {first_response}"
+    );
+    assert!(
+        first_response.contains("\"total_tokens\":13"),
+        "terminal usage must survive semantic transport: {first_response}"
+    );
+
+    let second_body = serde_json::to_vec(&downstream_turns[1]).expect("second request JSON");
+    let second_response = send_responses_request(&proxy, &second_body).await;
+    assert!(
+        second_response.contains("response.output_text.delta") && second_response.contains("Sunny"),
+        "second semantic turn must complete: {second_response}"
+    );
+
+    let (authorized, first, second) = websocket_task.await.expect("semantic websocket task");
+    server.begin_drain();
+    runner.await.expect("server task").expect("server shutdown");
+    let log = upstream.finish().await;
+
+    log.assert_accepted_everything();
+    assert!(
+        authorized,
+        "Pooler must place OpenAI authentication and beta headers"
+    );
+    assert_eq!(first["type"], "response.create");
+    assert_eq!(first["store"], false);
+    assert_eq!(first["stream"], true);
+    assert_eq!(first["tools"][0]["name"], "weather");
+    assert_eq!(first["reasoning"]["effort"], "high");
+    assert_eq!(second["type"], "response.create");
+    assert_eq!(
+        second["previous_response_id"], fixture["expected_second_upstream"]["previous_response_id"],
+        "{second}"
+    );
+    let expected_types = fixture["expected_second_upstream"]["input_types"]
+        .as_array()
+        .expect("expected input types");
+    let actual_types: Vec<&Value> = second["input"]
+        .as_array()
+        .expect("continuation delta input")
+        .iter()
+        .map(|item| &item["type"])
+        .collect();
+    assert_eq!(actual_types, expected_types.iter().collect::<Vec<_>>());
 }
 
 #[tokio::test]

@@ -241,6 +241,32 @@
       ]
     },
     {
+      "adapter": "codex",
+      "protocol": "openai-responses-websocket",
+      "version": "2026-02-06",
+      "fixture": "../openai/responses-websocket-semantic-2026-08-21.json",
+      "equivalence": "event_semantic",
+      "status": "sanitized_local_reference",
+      "source": "Sanitized OpenAI Responses WebSocket turns replayed through the mounted gateway against a strict local WebSocket provider",
+      "supported_capabilities": [
+        "provider_authentication",
+        "tools",
+        "reasoning",
+        "usage",
+        "terminal_state",
+        "session_scoped_reuse",
+        "continuation_delta"
+      ],
+      "unsupported_capabilities": [
+        "live_provider"
+      ],
+      "notes": [
+        "This fixture proves the mounted REST-to-WebSocket semantic transport against a strict loopback provider, not live OpenAI authorization or conformance.",
+        "Cancellation, retry commitment, credential isolation, and age/queue bounds are covered by pooler-http unit tests rather than claimed by this fixture row.",
+        "Replay: cargo test -p pooler-server --test gateway_preset the_gateway_preset_uses_semantic_responses_websocket_with_continuation --locked."
+      ]
+    },
+    {
       "adapter": "gemini",
       "protocol": "models-actions-interactions",
       "version": "2026-08-21",

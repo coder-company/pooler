@@ -97,6 +97,10 @@ routes:
     response:
       mode: opaque
 
+  # REST callers use Pooler's semantic Responses transport. Pooler selects and
+  # authenticates an account, sends `response.create` over the provider's
+  # bounded WebSocket, and returns a validated Responses SSE stream. Connections
+  # are reusable only inside an explicit downstream session identity.
   - id: responses
     listen: gateway
     match:
@@ -110,14 +114,18 @@ routes:
       max_queue_bytes: 8388608
       max_queue_items: 256
     ingress:
-      mode: patch
-      inspectors: [inspect.openai.model]
+      mode: semantic
+      decoder: decode.openai.responses
+      encoder: encode.openai.responses
     target:
       endpoint_family: responses
-      provider: gateway
-      model_from: request.model
+      provider: gateway-websocket
+      path: /v1/responses
     response:
-      mode: opaque
+      mode: semantic
+      decoder: decode.openai.responses.events
+      encoder: encode.openai.responses.events
+    loss_policy: reject
 
   - id: responses-compact
     listen: gateway
@@ -138,9 +146,9 @@ routes:
     response:
       mode: opaque
 
-  # A Responses WebSocket carries many turns on one connection. Pooler tunnels
-  # its frames under the same ceiling the REST routes enforce; it does not
-  # interpret them.
+  # Native WebSocket clients may still use the same-wire upgrade surface. The
+  # semantic, pooled transport above is the default for ordinary REST callers;
+  # this route remains a bounded provider-wire tunnel rather than a translation.
   - id: responses-websocket
     listen: gateway
     match:

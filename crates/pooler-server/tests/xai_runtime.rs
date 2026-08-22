@@ -209,11 +209,15 @@ async fn xai_responses_http_client_uses_semantic_realtime_websocket_upstream() {
         .iter()
         .any(|event| event.event.as_deref() == Some("response.completed")));
 
-    let (path, upstream_request) = timeout(TEST_TIMEOUT, upstream_task)
+    let (path, upstream_request, openai_beta_present) = timeout(TEST_TIMEOUT, upstream_task)
         .await
         .expect("xAI realtime upstream timeout")
         .expect("xAI realtime upstream task");
     assert_eq!(path, "/v1/responses");
+    assert!(
+        !openai_beta_present,
+        "xAI must not receive OpenAI beta headers"
+    );
     let upstream_request: Value =
         serde_json::from_slice(&upstream_request).expect("response.create JSON");
     assert_eq!(upstream_request["type"], "response.create");
@@ -285,11 +289,15 @@ async fn xai_responses_websocket_stays_raw_bounded_and_satisfies_codec_lifecycle
     decoder.finish().expect("terminal xAI realtime lifecycle");
     assert_eq!(text, "Hello from Grok.");
 
-    let (path, upstream_request) = timeout(TEST_TIMEOUT, upstream_task)
+    let (path, upstream_request, openai_beta_present) = timeout(TEST_TIMEOUT, upstream_task)
         .await
         .expect("xAI WebSocket upstream timeout")
         .expect("xAI WebSocket upstream task");
     assert_eq!(path, "/v1/responses");
+    assert!(
+        !openai_beta_present,
+        "xAI must not receive OpenAI beta headers"
+    );
     assert_eq!(
         serde_json::from_slice::<Value>(&upstream_request).expect("upstream response.create JSON"),
         serde_json::from_slice::<Value>(&encoded.body).expect("encoded response.create JSON")
@@ -404,7 +412,7 @@ async fn spawn_http_upstream(
     (address, task)
 }
 
-async fn spawn_xai_websocket_upstream() -> (SocketAddr, JoinHandle<(String, Vec<u8>)>) {
+async fn spawn_xai_websocket_upstream() -> (SocketAddr, JoinHandle<(String, Vec<u8>, bool)>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("xAI WebSocket upstream binds");
@@ -412,8 +420,10 @@ async fn spawn_xai_websocket_upstream() -> (SocketAddr, JoinHandle<(String, Vec<
     let task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("xAI upstream accepts");
         let mut path = String::new();
+        let mut openai_beta_present = false;
         let mut socket = accept_hdr_async(stream, |request: &Request, response| {
             path = request.uri().path().to_owned();
+            openai_beta_present = request.headers().contains_key("openai-beta");
             Ok(response)
         })
         .await
@@ -437,7 +447,7 @@ async fn spawn_xai_websocket_upstream() -> (SocketAddr, JoinHandle<(String, Vec<
                 .expect("xAI upstream event");
         }
         socket.close(None).await.expect("xAI upstream close");
-        (path, request)
+        (path, request, openai_beta_present)
     });
     (address, task)
 }

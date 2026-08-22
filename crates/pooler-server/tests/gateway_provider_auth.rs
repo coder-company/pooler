@@ -177,7 +177,6 @@ async fn openai_routes_satisfy_a_strict_openai_endpoint() {
                 "/v1/chat/completions",
                 br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
             ),
-            post("/v1/responses", br#"{"model":"gpt-4o","input":"hi"}"#),
             post(
                 "/v1/responses/compact",
                 br#"{"model":"gpt-4o","response_id":"resp_1"}"#,

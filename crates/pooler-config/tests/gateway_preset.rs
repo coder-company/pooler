@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use pooler_config::ModelSource;
 use pooler_config::{load_path, render_path};
-use pooler_core::{BodyMode, Capability};
+use pooler_core::{BodyMode, Capability, LossPolicy};
 use tempfile::TempDir;
 
 fn example_path() -> PathBuf {
@@ -49,7 +49,7 @@ fn the_checked_in_gateway_example_mounts_every_promised_endpoint_family() {
 }
 
 #[test]
-fn the_gateway_preset_selects_models_through_the_catalog_and_preserves_other_bodies() {
+fn the_gateway_preset_selects_models_and_mounts_semantic_responses_transport() {
     let config = load_path(example_path())
         .expect("gateway example loads")
         .compile()
@@ -65,6 +65,20 @@ fn the_gateway_preset_selects_models_through_the_catalog_and_preserves_other_bod
     assert!(chat.response().mode().preserves_original());
     assert_eq!(chat.limits().max_request_body_bytes, 8 * 1024 * 1024);
 
+    let responses = config.route("gateway-responses").expect("Responses route");
+    assert_eq!(responses.ingress().mode(), BodyMode::Semantic);
+    assert_eq!(
+        responses.ingress().decoder(),
+        Some("decode.openai.responses")
+    );
+    assert_eq!(
+        responses.response().decoder(),
+        Some("decode.openai.responses.events")
+    );
+    assert_eq!(responses.target().upstream(), "gateway-websocket");
+    assert_eq!(responses.target().path(), Some("/v1/responses"));
+    assert_eq!(responses.loss_policy(), LossPolicy::Reject);
+
     // Discovery stays opaque and selects no model.
     let models = config.route("gateway-models").expect("models route");
     assert!(models.ingress().mode().preserves_original());
@@ -72,11 +86,16 @@ fn the_gateway_preset_selects_models_through_the_catalog_and_preserves_other_bod
 }
 
 #[test]
-fn the_gateway_websocket_route_uses_the_websocket_upstream() {
+fn the_gateway_websocket_routes_use_the_websocket_upstream() {
     let config = load_path(example_path())
         .expect("gateway example loads")
         .compile()
         .expect("gateway example compiles");
+
+    let semantic = config
+        .route("gateway-responses")
+        .expect("semantic Responses route");
+    assert_eq!(semantic.target().upstream(), "gateway-websocket");
 
     let socket = config
         .route("gateway-responses-websocket")
@@ -220,6 +239,29 @@ fn each_provider_mounts_only_its_documented_endpoint_families() {
             assert!(mounted.contains(route), "{provider} must mount {route}");
         }
     }
+}
+
+#[test]
+fn xai_gateway_uses_xai_semantics_for_the_responses_websocket_transport() {
+    let directory = TempDir::new().expect("config directory");
+    let path = directory.path().join("gateway.yaml");
+    std::fs::write(
+        &path,
+        "imports:\n  - preset: gateway\n    as: gw\n    with: {bind: 127.0.0.1:0, provider: xai, websocket_url: 'wss://api.x.ai', secret: 'env:K'}\n\nversion: 1\n",
+    )
+    .expect("config contents");
+    let config = load_path(&path)
+        .expect("xAI gateway loads")
+        .compile()
+        .expect("xAI gateway compiles");
+    let responses = config.route("gw-responses").expect("Responses route");
+
+    assert_eq!(responses.ingress().decoder(), Some("decode.xai.responses"));
+    assert_eq!(
+        responses.response().decoder(),
+        Some("decode.xai.responses.events")
+    );
+    assert_eq!(responses.target().upstream(), "gw-websocket");
 }
 
 /// An endpoint family the provider does not document is a configuration error,

@@ -141,6 +141,19 @@ VERIFIERS: dict[EntryKey, Verifier] = {
         "not_established",
     ): ConfigCheck(),
     (
+        "codex",
+        "openai-responses-websocket",
+        "2026-02-06",
+        "../openai/responses-websocket-semantic-2026-08-21.json",
+        "event_semantic",
+        "sanitized_local_reference",
+    ): CargoTest(
+        package="pooler-server",
+        target="gateway_preset",
+        source="crates/pooler-server/tests/gateway_preset.rs",
+        test_name="the_gateway_preset_uses_semantic_responses_websocket_with_continuation",
+    ),
+    (
         "gemini",
         "models-actions-interactions",
         "2026-08-21",

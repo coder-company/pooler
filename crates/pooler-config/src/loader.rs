@@ -884,6 +884,65 @@ fn retain_supported_gateway_routes(
     Ok(())
 }
 
+fn configure_gateway_responses_codecs(
+    root: &mut Value,
+    provider_id: &str,
+    path: &Path,
+) -> Result<(), ConfigError> {
+    let routes = root
+        .as_mapping_mut()
+        .and_then(|mapping| mapping.get_mut(Value::String("routes".to_owned())))
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| load_error(path, "gateway preset routes are invalid"))?;
+    let Some(route) = routes
+        .iter_mut()
+        .find(|route| {
+            route
+                .as_mapping()
+                .and_then(|route| route.get(Value::String("id".to_owned())))
+                .and_then(Value::as_str)
+                == Some("responses")
+        })
+        .and_then(Value::as_mapping_mut)
+    else {
+        return Ok(());
+    };
+    if provider_id == "openai" {
+        return Ok(());
+    }
+    if provider_id != "xai" {
+        return Err(load_error(
+            path,
+            &format!(
+                "gateway preset provider `{provider_id}` does not support Pooler's semantic Responses WebSocket transport"
+            ),
+        ));
+    }
+
+    for (section, decoder, encoder) in [
+        ("ingress", "decode.xai.responses", "encode.xai.responses"),
+        (
+            "response",
+            "decode.xai.responses.events",
+            "encode.xai.responses.events",
+        ),
+    ] {
+        let mapping = route
+            .get_mut(Value::String(section.to_owned()))
+            .and_then(Value::as_mapping_mut)
+            .ok_or_else(|| load_error(path, "gateway Responses codecs are invalid"))?;
+        mapping.insert(
+            Value::String("decoder".to_owned()),
+            Value::String(decoder.to_owned()),
+        );
+        mapping.insert(
+            Value::String("encoder".to_owned()),
+            Value::String(encoder.to_owned()),
+        );
+    }
+    Ok(())
+}
+
 fn expand_gateway_preset(import: &ImportSpec, path: &Path) -> Result<Value, ConfigError> {
     for key in import.parameters.keys() {
         if !matches!(
@@ -910,6 +969,7 @@ fn expand_gateway_preset(import: &ImportSpec, path: &Path) -> Result<Value, Conf
         .transpose()?
         .unwrap_or_else(|| "openai".to_owned());
     retain_supported_gateway_routes(&mut preset, &provider_id, path)?;
+    configure_gateway_responses_codecs(&mut preset, &provider_id, path)?;
     let websocket_alias = format!("{alias}-websocket");
     rename_named_key(&mut preset, "listeners", "gateway", alias, path)?;
     rename_named_key(

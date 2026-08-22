@@ -18,7 +18,11 @@ use pooler_protocol::{
 };
 use serde_json::{Map, Value};
 use thiserror::Error;
-use tokio::{net::TcpStream, sync::mpsc, sync::Mutex, time};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, Mutex, Notify},
+    time,
+};
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{
@@ -35,6 +39,7 @@ use crate::{BoxError, RuntimeResources, SseEncoder, SseEvent, SseLimits};
 pub(crate) const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(55 * 60);
+const DEFAULT_MAX_IDLE_CONNECTIONS: usize = 128;
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -108,22 +113,42 @@ struct CachedConnection {
 #[derive(Debug, Default)]
 struct PoolState {
     connections: BTreeMap<ConnectionIdentity, CachedConnection>,
+    cleanup_running: bool,
+}
+
+#[derive(Debug)]
+struct PoolCleanup {
+    cancellation: CancellationToken,
+    wake: Arc<Notify>,
+}
+
+impl Drop for PoolCleanup {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 /// Process-local pool of serial, reusable Responses connections.
 #[derive(Clone, Debug)]
 pub(crate) struct OpenAiResponsesWebSocketPool {
     state: Arc<Mutex<PoolState>>,
+    cleanup: Arc<PoolCleanup>,
     idle_ttl: Duration,
     max_age: Duration,
+    max_idle_connections: usize,
 }
 
 impl Default for OpenAiResponsesWebSocketPool {
     fn default() -> Self {
         Self {
             state: Arc::new(Mutex::new(PoolState::default())),
+            cleanup: Arc::new(PoolCleanup {
+                cancellation: CancellationToken::new(),
+                wake: Arc::new(Notify::new()),
+            }),
             idle_ttl: DEFAULT_IDLE_TTL,
             max_age: DEFAULT_MAX_AGE,
+            max_idle_connections: DEFAULT_MAX_IDLE_CONNECTIONS,
         }
     }
 }
@@ -251,6 +276,23 @@ enum Terminal {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BodySendStop {
+    DownstreamClosed,
+    Cancelled,
+    Deadline,
+}
+
+impl BodySendStop {
+    const fn close_reason(self) -> &'static str {
+        match self {
+            Self::DownstreamClosed => "downstream_closed",
+            Self::Cancelled => "cancelled",
+            Self::Deadline => "max_age",
+        }
+    }
+}
+
 struct EncodedProviderEvent {
     bytes: Bytes,
     terminal: Terminal,
@@ -263,6 +305,9 @@ struct TurnCodec {
     loss_policy: LossPolicy,
     sse: SseEncoder,
     response_items: Vec<Value>,
+    response_items_bytes: u64,
+    max_response_items: u32,
+    max_response_items_bytes: u64,
 }
 
 impl TurnCodec {
@@ -276,6 +321,9 @@ impl TurnCodec {
                 bounded_usize(limits.max_event_bytes),
             )),
             response_items: Vec::new(),
+            response_items_bytes: 0,
+            max_response_items: limits.max_queue_items,
+            max_response_items_bytes: limits.max_queue_bytes,
         }
     }
 
@@ -347,6 +395,24 @@ impl TurnCodec {
             if let Ok(value) = serde_json::from_slice::<Value>(&encoded.body) {
                 if value.get("type").and_then(Value::as_str) == Some("response.output_item.done") {
                     if let Some(item) = value.get("item") {
+                        let item_bytes = serde_json::to_vec(item)
+                            .map_err(|_| OpenAiResponsesWebSocketError::Protocol)?;
+                        let item_bytes = u64::try_from(item_bytes.len())
+                            .map_err(|_| OpenAiResponsesWebSocketError::MessageTooLarge)?;
+                        let next_bytes = self
+                            .response_items_bytes
+                            .checked_add(item_bytes)
+                            .ok_or(OpenAiResponsesWebSocketError::MessageTooLarge)?;
+                        let next_items = u32::try_from(self.response_items.len())
+                            .ok()
+                            .and_then(|count| count.checked_add(1))
+                            .ok_or(OpenAiResponsesWebSocketError::MessageTooLarge)?;
+                        if next_items > self.max_response_items
+                            || next_bytes > self.max_response_items_bytes
+                        {
+                            return Err(OpenAiResponsesWebSocketError::MessageTooLarge);
+                        }
+                        self.response_items_bytes = next_bytes;
                         self.response_items.push(item.clone());
                     }
                 }
@@ -388,10 +454,15 @@ impl OpenAiResponsesWebSocketPool {
                 &identity,
                 &headers,
                 &limits,
+                flavor,
                 connect_deadline,
                 &cancellation,
             )
             .await?;
+        let connection_deadline =
+            bounded_connection_deadline(connection.created_at, request_deadline, self.max_age);
+        let request_deadline = connection_deadline;
+        let first_event_deadline = first_event_deadline.min(connection_deadline);
         let full_request = prepare_full_request(&request_body, flavor)?;
         let request = request_for_connection(&full_request, connection.continuation.take());
         let request = serde_json::to_string(&request)
@@ -412,14 +483,6 @@ impl OpenAiResponsesWebSocketPool {
             &CancellationToken::new(),
         )
         .await?;
-        limits
-            .check_bootstrap(
-                u64::try_from(serde_json::to_vec(&first).map_or(usize::MAX, |bytes| bytes.len()))
-                    .unwrap_or(u64::MAX),
-                1,
-            )
-            .map_err(|_| OpenAiResponsesWebSocketError::MessageTooLarge)?;
-
         let body_cancellation = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(1);
         let body = OpenAiResponsesWebSocketBody {
@@ -436,6 +499,13 @@ impl OpenAiResponsesWebSocketPool {
                 return Ok(body);
             }
         };
+        if check_bootstrap_event(&limits, &first).is_err()
+            || check_queued_event(&limits, &first).is_err()
+        {
+            let _ = sender.try_send(Err(OpenAiResponsesWebSocketError::MessageTooLarge));
+            close_socket(connection.socket, "queue_limit").await;
+            return Ok(body);
+        }
 
         if first.terminal != Terminal::None {
             if !first.bytes.is_empty() {
@@ -449,7 +519,8 @@ impl OpenAiResponsesWebSocketPool {
                 codec.response_items,
             );
             let keep = first.terminal != Terminal::Other;
-            self.release(identity, connection, continuation, keep).await;
+            self.release(identity, connection, continuation, keep, resources.clone())
+                .await;
             return Ok(body);
         }
 
@@ -458,9 +529,19 @@ impl OpenAiResponsesWebSocketPool {
         let task = resources.task();
         tokio::spawn(async move {
             let _task = task;
-            if !first.bytes.is_empty() && sender.send(Ok(first.bytes)).await.is_err() {
-                close_socket(connection.socket, "downstream_closed").await;
-                return;
+            if !first.bytes.is_empty() {
+                if let Err(stop) = send_body_item(
+                    &sender,
+                    Ok(first.bytes),
+                    request_deadline,
+                    &cancellation,
+                    &body_cancellation,
+                )
+                .await
+                {
+                    close_socket(connection.socket, stop.close_reason()).await;
+                    return;
+                }
             }
             loop {
                 let value = match read_provider_event(
@@ -474,7 +555,14 @@ impl OpenAiResponsesWebSocketPool {
                 {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = sender.send(Err(error)).await;
+                        let _ = send_body_item(
+                            &sender,
+                            Err(error),
+                            request_deadline,
+                            &cancellation,
+                            &body_cancellation,
+                        )
+                        .await;
                         close_socket(connection.socket, "stream_error").await;
                         return;
                     }
@@ -482,14 +570,43 @@ impl OpenAiResponsesWebSocketPool {
                 let event = match codec.encode(value) {
                     Ok(event) => event,
                     Err(error) => {
-                        let _ = sender.send(Err(error)).await;
+                        let _ = send_body_item(
+                            &sender,
+                            Err(error),
+                            request_deadline,
+                            &cancellation,
+                            &body_cancellation,
+                        )
+                        .await;
                         close_socket(connection.socket, "protocol_error").await;
                         return;
                     }
                 };
-                if !event.bytes.is_empty() && sender.send(Ok(event.bytes)).await.is_err() {
-                    close_socket(connection.socket, "downstream_closed").await;
+                if check_queued_event(&limits, &event).is_err() {
+                    let _ = send_body_item(
+                        &sender,
+                        Err(OpenAiResponsesWebSocketError::MessageTooLarge),
+                        request_deadline,
+                        &cancellation,
+                        &body_cancellation,
+                    )
+                    .await;
+                    close_socket(connection.socket, "queue_limit").await;
                     return;
+                }
+                if !event.bytes.is_empty() {
+                    if let Err(stop) = send_body_item(
+                        &sender,
+                        Ok(event.bytes),
+                        request_deadline,
+                        &cancellation,
+                        &body_cancellation,
+                    )
+                    .await
+                    {
+                        close_socket(connection.socket, stop.close_reason()).await;
+                        return;
+                    }
                 }
                 if event.terminal != Terminal::None {
                     let continuation = continuation_after_terminal(
@@ -499,7 +616,7 @@ impl OpenAiResponsesWebSocketPool {
                         codec.response_items,
                     );
                     let keep = event.terminal != Terminal::Other;
-                    pool.release(task_identity, connection, continuation, keep)
+                    pool.release(task_identity, connection, continuation, keep, resources)
                         .await;
                     return;
                 }
@@ -513,6 +630,7 @@ impl OpenAiResponsesWebSocketPool {
         identity: &ConnectionIdentity,
         headers: &HeaderMap,
         limits: &RouteLimits,
+        flavor: ResponsesWebSocketFlavor,
         connect_deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<ActiveConnection, OpenAiResponsesWebSocketError> {
@@ -559,6 +677,7 @@ impl OpenAiResponsesWebSocketPool {
             identity.endpoint(),
             headers,
             limits,
+            flavor,
             connect_deadline,
             cancellation,
         )
@@ -576,6 +695,7 @@ impl OpenAiResponsesWebSocketPool {
         connection: ActiveConnection,
         continuation: Option<Continuation>,
         keep: bool,
+        resources: RuntimeResources,
     ) {
         let now = Instant::now();
         if !identity.cacheable()
@@ -591,10 +711,50 @@ impl OpenAiResponsesWebSocketPool {
             last_used_at: now,
             continuation,
         };
-        let replaced = self.state.lock().await.connections.insert(identity, cached);
+        let (replaced, evicted, start_cleanup) = {
+            let mut state = self.state.lock().await;
+            let replaced = state.connections.insert(identity, cached);
+            let mut evicted = Vec::new();
+            while state.connections.len() > self.max_idle_connections {
+                let Some(oldest) = state
+                    .connections
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.last_used_at)
+                    .map(|(identity, _)| identity.clone())
+                else {
+                    break;
+                };
+                if let Some(connection) = state.connections.remove(&oldest) {
+                    evicted.push(connection);
+                }
+            }
+            let start_cleanup = !state.connections.is_empty() && !state.cleanup_running;
+            state.cleanup_running |= !state.connections.is_empty();
+            (replaced, evicted, start_cleanup)
+        };
+        self.cleanup.wake.notify_one();
         if let Some(replaced) = replaced {
             close_socket(replaced.socket, "duplicate_idle_connection").await;
         }
+        for evicted in evicted {
+            close_socket(evicted.socket, "idle_pool_capacity").await;
+        }
+        if start_cleanup {
+            let state = Arc::downgrade(&self.state);
+            let cancellation = self.cleanup.cancellation.clone();
+            let wake = Arc::clone(&self.cleanup.wake);
+            let idle_ttl = self.idle_ttl;
+            let max_age = self.max_age;
+            let task = resources.task();
+            tokio::spawn(async move {
+                let _task = task;
+                cleanup_cached_connections(state, idle_ttl, max_age, cancellation, wake).await;
+            });
+        }
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        self.cleanup.cancellation.cancel();
     }
 }
 
@@ -658,10 +818,29 @@ fn continuation_delta(full: &Value, continuation: &Continuation) -> Option<Vec<V
     if current[..previous.len()] != previous[..] {
         return None;
     }
-    if current[previous.len()..baseline_len] != continuation.response_items[..] {
+    if !current[previous.len()..baseline_len]
+        .iter()
+        .zip(&continuation.response_items)
+        .all(|(current, response)| continuation_item_eq(current, response))
+    {
         return None;
     }
     Some(current[baseline_len..].to_vec())
+}
+
+fn continuation_item_eq(current: &Value, response: &Value) -> bool {
+    fn normalized(value: &Value) -> Value {
+        let mut value = value.clone();
+        if let Some(object) = value.as_object_mut() {
+            object.remove("status");
+            if object.get("type").and_then(Value::as_str) == Some("function_call") {
+                object.remove("id");
+            }
+        }
+        value
+    }
+
+    normalized(current) == normalized(response)
 }
 
 fn request_parameters(value: &Value) -> Option<Map<String, Value>> {
@@ -692,6 +871,7 @@ async fn connect(
     endpoint: &str,
     headers: &HeaderMap,
     limits: &RouteLimits,
+    flavor: ResponsesWebSocketFlavor,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<Socket, OpenAiResponsesWebSocketError> {
@@ -699,15 +879,17 @@ async fn connect(
         .into_client_request()
         .map_err(|_| OpenAiResponsesWebSocketError::InvalidRequest)?;
     for (name, value) in headers {
-        if is_handshake_header(name.as_str()) {
+        if is_handshake_header(name.as_str()) || name.as_str() == "openai-beta" {
             continue;
         }
         request.headers_mut().append(name, value.clone());
     }
-    request.headers_mut().insert(
-        "openai-beta",
-        HeaderValue::from_static(RESPONSES_WEBSOCKET_BETA),
-    );
+    if flavor == ResponsesWebSocketFlavor::OpenAi {
+        request.headers_mut().insert(
+            "openai-beta",
+            HeaderValue::from_static(RESPONSES_WEBSOCKET_BETA),
+        );
+    }
     let config = WebSocketConfig::default()
         .max_frame_size(Some(bounded_usize(limits.max_frame_bytes)))
         .max_message_size(Some(bounded_usize(
@@ -750,6 +932,22 @@ async fn send_request(
     }
 }
 
+async fn send_body_item(
+    sender: &mpsc::Sender<Result<Bytes, OpenAiResponsesWebSocketError>>,
+    item: Result<Bytes, OpenAiResponsesWebSocketError>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    body_cancellation: &CancellationToken,
+) -> Result<(), BodySendStop> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(BodySendStop::Cancelled),
+        () = body_cancellation.cancelled() => Err(BodySendStop::DownstreamClosed),
+        () = time::sleep_until(time::Instant::from_std(deadline)) => Err(BodySendStop::Deadline),
+        result = sender.send(item) => result.map_err(|_| BodySendStop::DownstreamClosed),
+    }
+}
+
 async fn read_provider_event(
     socket: &mut Socket,
     hard_deadline: Instant,
@@ -779,16 +977,92 @@ async fn read_provider_event(
             Message::Text(text) => text.as_bytes().to_vec(),
             Message::Binary(bytes) => bytes.to_vec(),
             Message::Ping(_) | Message::Pong(_) => {
-                socket
-                    .flush()
-                    .await
-                    .map_err(|_| OpenAiResponsesWebSocketError::Incomplete)?;
+                let flush_deadline = Instant::now()
+                    .checked_add(idle_timeout)
+                    .unwrap_or(hard_deadline)
+                    .min(hard_deadline);
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        return Err(OpenAiResponsesWebSocketError::Cancelled);
+                    }
+                    () = body_cancellation.cancelled() => {
+                        return Err(OpenAiResponsesWebSocketError::Cancelled);
+                    }
+                    result = time::timeout_at(
+                        time::Instant::from_std(flush_deadline),
+                        socket.flush(),
+                    ) => {
+                        result
+                            .map_err(|_| OpenAiResponsesWebSocketError::Timeout)?
+                            .map_err(|_| OpenAiResponsesWebSocketError::Incomplete)?;
+                    }
+                }
                 continue;
             }
             Message::Close(_) => return Err(OpenAiResponsesWebSocketError::Incomplete),
             Message::Frame(_) => continue,
         };
         return serde_json::from_slice(&bytes).map_err(|_| OpenAiResponsesWebSocketError::Protocol);
+    }
+}
+
+async fn cleanup_cached_connections(
+    state: std::sync::Weak<Mutex<PoolState>>,
+    idle_ttl: Duration,
+    max_age: Duration,
+    cancellation: CancellationToken,
+    wake: Arc<Notify>,
+) {
+    loop {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let now = Instant::now();
+        let (expired, next_deadline) = {
+            let mut state = state.lock().await;
+            let expired_keys = state
+                .connections
+                .iter()
+                .filter(|(_, cached)| {
+                    cancellation.is_cancelled()
+                        || !within_reuse_bounds(
+                            cached.created_at,
+                            cached.last_used_at,
+                            now,
+                            idle_ttl,
+                            max_age,
+                        )
+                })
+                .map(|(identity, _)| identity.clone())
+                .collect::<Vec<_>>();
+            let expired = expired_keys
+                .into_iter()
+                .filter_map(|identity| state.connections.remove(&identity))
+                .collect::<Vec<_>>();
+            let next_deadline = state
+                .connections
+                .values()
+                .map(|cached| {
+                    let idle = cached.last_used_at.checked_add(idle_ttl).unwrap_or(now);
+                    let absolute = cached.created_at.checked_add(max_age).unwrap_or(now);
+                    idle.min(absolute)
+                })
+                .min();
+            if next_deadline.is_none() {
+                state.cleanup_running = false;
+            }
+            (expired, next_deadline)
+        };
+        drop(expired);
+        let Some(next_deadline) = next_deadline else {
+            return;
+        };
+        tokio::select! {
+            () = time::sleep_until(time::Instant::from_std(next_deadline)) => {}
+            () = cancellation.cancelled() => {}
+            () = wake.notified() => {}
+        }
     }
 }
 
@@ -869,6 +1143,42 @@ pub(crate) fn materialized_authorization_generation(
 
 fn bounded_usize(value: u64) -> usize {
     value.min(usize::MAX as u64) as usize
+}
+
+fn bounded_connection_deadline(
+    created_at: Instant,
+    requested: Instant,
+    max_age: Duration,
+) -> Instant {
+    created_at
+        .checked_add(max_age)
+        .map_or(requested, |deadline| requested.min(deadline))
+}
+
+// `TurnCodec` enforces `max_event_bytes` for every SSE event. The concatenated
+// bytes from one provider frame are delivered as one body/channel queue item.
+fn check_bootstrap_event(
+    limits: &RouteLimits,
+    event: &EncodedProviderEvent,
+) -> Result<(), OpenAiResponsesWebSocketError> {
+    limits
+        .check_bootstrap(
+            u64::try_from(event.bytes.len()).unwrap_or(u64::MAX),
+            u32::from(!event.bytes.is_empty()),
+        )
+        .map_err(|_| OpenAiResponsesWebSocketError::MessageTooLarge)
+}
+
+fn check_queued_event(
+    limits: &RouteLimits,
+    event: &EncodedProviderEvent,
+) -> Result<(), OpenAiResponsesWebSocketError> {
+    limits
+        .check_queue(
+            u64::try_from(event.bytes.len()).unwrap_or(u64::MAX),
+            u32::from(!event.bytes.is_empty()),
+        )
+        .map_err(|_| OpenAiResponsesWebSocketError::MessageTooLarge)
 }
 
 fn within_reuse_bounds(
@@ -1011,6 +1321,34 @@ mod tests {
     }
 
     #[test]
+    fn active_connections_and_output_queue_obey_absolute_bounds() {
+        let created_at = Instant::now();
+        let requested = created_at + Duration::from_secs(10);
+        assert_eq!(
+            bounded_connection_deadline(created_at, requested, Duration::from_secs(3)),
+            created_at + Duration::from_secs(3)
+        );
+        assert_eq!(
+            bounded_connection_deadline(created_at, requested, Duration::from_secs(20)),
+            requested
+        );
+
+        let limits = RouteLimits {
+            max_queue_bytes: 1,
+            ..RouteLimits::default()
+        };
+        let event = EncodedProviderEvent {
+            bytes: Bytes::from_static(b"too large"),
+            terminal: Terminal::None,
+            response_id: None,
+        };
+        assert!(matches!(
+            check_queued_event(&limits, &event),
+            Err(OpenAiResponsesWebSocketError::MessageTooLarge)
+        ));
+    }
+
+    #[test]
     fn continuation_requires_matching_parameters_and_exact_request_response_prefix() {
         let request = json!({
             "model":"gpt-test",
@@ -1045,6 +1383,37 @@ mod tests {
         assert_eq!(
             continuation_delta(&matching, &continuation),
             Some(vec![json!({"role":"user","content":"second"})])
+        );
+
+        let function_response = json!({
+            "id":"fc_provider",
+            "type":"function_call",
+            "status":"completed",
+            "call_id":"call_weather",
+            "name":"weather",
+            "arguments":"{\"city\":\"Paris\"}"
+        });
+        let function_continuation = Continuation {
+            request: request.clone(),
+            response_id: "resp_tool".to_owned(),
+            response_items: vec![function_response],
+        };
+        let canonical_history = json!({
+            "model":"gpt-test",
+            "stream":true,
+            "store":false,
+            "reasoning":{"effort":"high"},
+            "input":[
+                {"role":"user","content":"first"},
+                {"type":"function_call","call_id":"call_weather","name":"weather","arguments":"{\"city\":\"Paris\"}"},
+                {"type":"function_call_output","call_id":"call_weather","output":"sunny"}
+            ]
+        });
+        assert_eq!(
+            continuation_delta(&canonical_history, &function_continuation),
+            Some(vec![
+                json!({"type":"function_call_output","call_id":"call_weather","output":"sunny"})
+            ])
         );
 
         let mut changed = matching.clone();
@@ -1084,6 +1453,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpolled_body_cannot_hold_an_active_connection_past_max_age() {
+        let (url, server_task) = spawn_backpressure_server().await;
+        let resources = RuntimeResources::new();
+        let pool = OpenAiResponsesWebSocketPool {
+            idle_ttl: Duration::from_secs(1),
+            max_age: Duration::from_millis(40),
+            ..OpenAiResponsesWebSocketPool::default()
+        };
+        let mut request = attempt(&url, Arc::new(AtomicBool::new(false)));
+        request.resources = resources.clone();
+        let body = pool
+            .execute(request)
+            .await
+            .expect("first event commits the unpolled body");
+
+        assert!(
+            time::timeout(Duration::from_secs(2), server_task)
+                .await
+                .expect("absolute age closes backpressured socket")
+                .expect("backpressure server joins"),
+            "downstream backpressure must not bypass active max_age"
+        );
+        for _ in 0..32 {
+            if resources.snapshot().tasks == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(resources.snapshot().tasks, 0);
+        drop(body);
+    }
+
+    #[tokio::test]
     async fn provider_event_is_the_retry_commitment_boundary() {
         let (pre_url, pre_headers, pre_task) = spawn_test_server(false).await;
         let pre = attempt(&pre_url, pre_headers);
@@ -1106,6 +1508,148 @@ mod tests {
         );
         post_task.await.expect("post-commit server joins");
         assert!(post_headers.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn idle_pool_cardinality_is_bounded_across_caller_sessions() {
+        let (first_url, first_server) = spawn_completed_server().await;
+        let (second_url, second_server) = spawn_completed_server().await;
+        let resources = RuntimeResources::new();
+        let pool = OpenAiResponsesWebSocketPool {
+            idle_ttl: Duration::from_secs(1),
+            max_age: Duration::from_secs(2),
+            max_idle_connections: 1,
+            ..OpenAiResponsesWebSocketPool::default()
+        };
+
+        let mut first = attempt(&first_url, Arc::new(AtomicBool::new(false)));
+        first.resources = resources.clone();
+        pool.execute(first)
+            .await
+            .expect("first session commits")
+            .collect()
+            .await
+            .expect("first session completes");
+
+        let mut second = attempt(&second_url, Arc::new(AtomicBool::new(false)));
+        second.identity = ConnectionIdentity::new(
+            "openai_api_key",
+            "account-a",
+            second_url.as_str(),
+            CredentialGeneration::Native(1),
+            Some(Arc::from("session-b")),
+        );
+        second.resources = resources.clone();
+        pool.execute(second)
+            .await
+            .expect("second session commits")
+            .collect()
+            .await
+            .expect("second session completes");
+
+        assert!(time::timeout(Duration::from_secs(2), first_server)
+            .await
+            .expect("capacity eviction reaches oldest provider")
+            .expect("first completion server joins"));
+        assert_eq!(pool.state.lock().await.connections.len(), 1);
+        pool.cancel_all();
+        assert!(time::timeout(Duration::from_secs(2), second_server)
+            .await
+            .expect("pool cancellation reaches remaining provider")
+            .expect("second completion server joins"));
+    }
+
+    #[tokio::test]
+    async fn idle_cached_connections_are_evicted_without_another_acquire() {
+        let (url, server_task) = spawn_completed_server().await;
+        let resources = RuntimeResources::new();
+        let pool = OpenAiResponsesWebSocketPool {
+            idle_ttl: Duration::from_millis(20),
+            max_age: Duration::from_secs(1),
+            ..OpenAiResponsesWebSocketPool::default()
+        };
+        let mut request = attempt(&url, Arc::new(AtomicBool::new(false)));
+        request.resources = resources.clone();
+        pool.execute(request)
+            .await
+            .expect("first event commits the body")
+            .collect()
+            .await
+            .expect("completed body collects");
+
+        assert!(
+            time::timeout(Duration::from_secs(2), server_task)
+                .await
+                .expect("idle cleanup reaches provider")
+                .expect("cleanup server joins"),
+            "idle cached socket must close without a later acquire"
+        );
+        for _ in 0..32 {
+            if resources.snapshot().tasks == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(resources.snapshot().tasks, 0);
+        assert!(pool.state.lock().await.connections.is_empty());
+    }
+
+    #[test]
+    fn continuation_state_obeys_cumulative_queue_bounds() {
+        let limits = RouteLimits {
+            max_queue_bytes: 1,
+            ..RouteLimits::default()
+        };
+        let mut codec = TurnCodec::new(&limits, LossPolicy::Reject);
+        codec
+            .encode(json!({"type":"response.created","response":{"id":"resp_limit","model":"gpt-test","status":"in_progress","output":[]}}))
+            .expect("response starts");
+        codec
+            .encode(json!({"type":"response.output_item.added","output_index":0,"item":{"id":"fc_limit","type":"function_call","call_id":"call_limit","name":"read","arguments":"","status":"in_progress"}}))
+            .expect("function call starts");
+        let error = match codec.encode(json!({"type":"response.output_item.done","output_index":0,"item":{"id":"fc_limit","type":"function_call","call_id":"call_limit","name":"read","arguments":"{}","status":"completed"}})) {
+            Err(error) => error,
+            Ok(_) => panic!("retained continuation item exceeds cumulative bound"),
+        };
+        assert!(matches!(
+            error,
+            OpenAiResponsesWebSocketError::MessageTooLarge
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_committed_body_cancels_the_provider_reader() {
+        let (url, server_task) = spawn_cancellation_server().await;
+        let resources = RuntimeResources::new();
+        let mut request = attempt(&url, Arc::new(AtomicBool::new(false)));
+        request.resources = resources.clone();
+        let body = OpenAiResponsesWebSocketPool::default()
+            .execute(request)
+            .await
+            .expect("first event commits the body");
+        for _ in 0..32 {
+            if resources.snapshot().tasks == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(resources.snapshot().tasks, 1);
+
+        drop(body);
+        assert!(
+            time::timeout(Duration::from_secs(2), server_task)
+                .await
+                .expect("provider observes cancellation")
+                .expect("cancellation server joins"),
+            "Pooler must close the provider WebSocket after downstream cancellation"
+        );
+        for _ in 0..32 {
+            if resources.snapshot().tasks == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(resources.snapshot().tasks, 0);
     }
 
     fn attempt(
@@ -1141,6 +1685,105 @@ mod tests {
             cancellation: CancellationToken::new(),
             resources: RuntimeResources::new(),
         }
+    }
+
+    async fn spawn_backpressure_server() -> (String, JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("backpressure server binds");
+        let address = listener.local_addr().expect("backpressure server address");
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("backpressure server accepts");
+            let mut socket = accept_hdr_async(stream, |_request: &Request, response| Ok(response))
+                .await
+                .expect("backpressure handshake");
+            socket
+                .next()
+                .await
+                .expect("response.create arrives")
+                .expect("response.create is valid");
+            for event in [
+                json!({"type":"response.created","response":{"id":"resp_backpressure","model":"gpt-test","status":"in_progress","output":[]}}),
+                json!({"type":"response.output_item.added","output_index":0,"item":{"id":"fc_backpressure","type":"function_call","call_id":"call_backpressure","name":"read","arguments":"","status":"in_progress"}}),
+            ] {
+                socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .expect("provider event");
+            }
+            time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .is_ok()
+        });
+        (format!("ws://{address}/v1/responses"), task)
+    }
+
+    async fn spawn_completed_server() -> (String, JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("completion server binds");
+        let address = listener.local_addr().expect("completion server address");
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("completion server accepts");
+            let mut socket = accept_hdr_async(stream, |_request: &Request, response| Ok(response))
+                .await
+                .expect("completion handshake");
+            socket
+                .next()
+                .await
+                .expect("response.create arrives")
+                .expect("response.create is valid");
+            for event in [
+                json!({"type":"response.created","response":{"id":"resp_idle","model":"gpt-test","status":"in_progress","output":[]}}),
+                json!({"type":"response.completed","response":{"id":"resp_idle","model":"gpt-test","status":"completed","output":[]}}),
+            ] {
+                socket
+                    .send(Message::Text(event.to_string().into()))
+                    .await
+                    .expect("provider event");
+            }
+            time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .is_ok()
+        });
+        (format!("ws://{address}/v1/responses"), task)
+    }
+
+    async fn spawn_cancellation_server() -> (String, JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("cancellation server binds");
+        let address = listener.local_addr().expect("cancellation server address");
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("cancellation server accepts");
+            let mut socket = accept_hdr_async(stream, |_request: &Request, response| Ok(response))
+                .await
+                .expect("cancellation handshake");
+            socket
+                .next()
+                .await
+                .expect("response.create arrives")
+                .expect("response.create is valid");
+            socket
+                .send(Message::Text(
+                    json!({"type":"response.created","response":{"id":"resp_cancel","model":"gpt-test","status":"in_progress","output":[]}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("commit event");
+            matches!(
+                time::timeout(Duration::from_secs(2), socket.next()).await,
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None)
+            )
+        });
+        (format!("ws://{address}/v1/responses"), task)
     }
 
     async fn spawn_test_server(

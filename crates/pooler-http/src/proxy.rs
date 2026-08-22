@@ -797,6 +797,7 @@ where
     /// Begin graceful drain. New requests receive `503`; active streams keep
     /// their permits until their response body ends or is dropped.
     pub fn begin_drain(&self) {
+        self.openai_websockets.cancel_all();
         self.drain.begin_drain();
     }
 

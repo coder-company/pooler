@@ -28,7 +28,7 @@ POOLER_GATEWAY_KEY=... pooler serve --config config/gateway.example.yaml
 | `bind` | `127.0.0.1:8400` | Listener address. |
 | `provider` | `openai` | A provider this build ships an endpoint for. Run `pooler providers` for the list. |
 | `upstream_url` | shipped provider base URL | Overrides the base URL for a private deployment or a test loopback. |
-| `websocket_url` | `wss://api.openai.com` | `ws`/`wss` upstream for the Responses WebSocket route, which is mounted only for providers documenting the `responses` family. Set this whenever that route is mounted and `provider` is not `openai`; `provider` selects the REST base URL only, and a WebSocket route requires an explicit `ws`/`wss` transport. |
+| `websocket_url` | `wss://api.openai.com` | `ws`/`wss` upstream used by the semantic `POST /v1/responses` transport and the same-wire WebSocket upgrade route. These are mounted only for providers documenting the `responses` family. Set this whenever they are mounted and `provider` is not `openai`; `provider` selects the REST base URL only, while these routes require an explicit `ws`/`wss` transport. |
 | `secret` | `env:POOLER_GATEWAY_KEY` | Secret reference for both upstreams. A reference only; never a literal. Only the reference is overridden: the provider's documented authentication kind, header name, and value prefix are preserved, so Anthropic receives `x-api-key` and Gemini receives `x-goog-api-key` rather than a bearer token. |
 
 `as:` namespaces every listener, upstream, and route, so several gateways can
@@ -51,7 +51,7 @@ absent rather than present and broken.
 | --- | --- | --- | --- |
 | `models` | `GET /v1/models` | `models` | served by Pooler |
 | `chat-completions` | `POST /v1/chat/completions` | `chat_completions` | patch |
-| `responses` | `POST /v1/responses` | `responses` | patch |
+| `responses` | `POST /v1/responses` | `responses` | semantic Responses-over-WebSocket transport |
 | `responses-compact` | `POST /v1/responses/compact` | `responses` | patch |
 | `responses-websocket` | `GET /v1/responses` (upgrade) | `responses` | opaque tunnel |
 | `messages` | `POST /v1/messages` | `messages` | patch |
@@ -126,13 +126,36 @@ is what makes catalog aliases, account pooling, capability filtering, and the
 vendored request-facts dialect apply to a request. A model the catalog does not
 know is rejected before any upstream call.
 
+The `responses` route is semantic. It decodes the OpenAI-compatible request,
+performs normal model/account/capability selection, sends a bounded
+`response.create` message to the provider WebSocket, validates every provider
+event, and emits Responses SSE to the REST caller. OpenAI and xAI select their
+respective request/event codecs. Tools, reasoning, usage, failures, incomplete
+terminals, and completed terminals pass through the semantic lifecycle rather
+than an unchecked frame tunnel.
+
+A reusable provider connection requires an explicit downstream session identity
+(`session-id`, `session_id`, `x-session-id`, `x-thread-id`, `x-conversation-id`,
+`prompt_cache_key`, or supported metadata). Its identity also includes profile,
+account, endpoint, and credential generation. A completed turn may use
+`previous_response_id` only when request parameters and the exact canonical
+request/response history prefix match; otherwise Pooler sends the full request.
+Provider failures before the first event remain retryable, while the first event
+commits the attempt. Cancellation closes active transport, and idle, absolute
+age, frame, event, bootstrap, queue-byte, and queue-item bounds are enforced.
+Retained continuation output shares the queue byte/item ceilings. The process-local
+idle cache is capped at 128 connections and evicts the least recently used entry
+when distinct caller sessions reach that cap.
+
 `opaque` forwards bytes or frames without semantic decoding. Media, file, and
 batch surfaces keep provider-specific fields exactly, and upload bytes are
 streamed once so the retry policy cannot replay them.
 
-**Opaque forwarding is not provider-native semantic compatibility.** No route in
-this preset translates between protocols. Routes that do that are configured
-explicitly with a decoder and an encoder, and their compatibility claims live in
+**Opaque forwarding is not provider-native semantic compatibility.** The raw
+`GET /v1/responses` WebSocket upgrade remains a same-wire tunnel. The semantic
+`POST /v1/responses` route uses explicit request/event codecs but remains the
+OpenAI-compatible Responses protocol on both sides; it is not cross-protocol
+translation. Executable compatibility claims live in
 `fixtures/compatibility/MATRIX.md`.
 
 Gemini carries the model in a model-action path, except for Interactions create,
@@ -179,7 +202,10 @@ will fail authorization before any transport; use
 
 Every route declares explicit bounds. JSON routes cap the request body at
 8 MiB; media, file, batch, and Gemini action routes cap it at 32 MiB. Streaming
-routes additionally bound frame size, event size, queue bytes, and queue items.
+routes additionally bound frame size, event size, bootstrap state, queue bytes,
+and queue items. Semantic Responses connections also enforce per-turn idle and
+request deadlines, cumulatively bound retained continuation state, cap the idle
+pool, and enforce process-local idle-reuse and absolute-age ceilings.
 
 ## Evidence
 
@@ -195,7 +221,9 @@ Each claim above is backed by an executable test.
 | The credential reaches no management surface | `gateway_provider_auth.rs::the_upstream_credential_never_reaches_a_management_surface` |
 | `/v1/models` serves the active view and hides routing | `crates/pooler-server/tests/gateway_models.rs` |
 | A disabled or capability-mismatched model is not advertised | `gateway_models.rs::an_operator_disabled_model_leaves_the_published_view`, `::a_model_lacking_a_required_capability_is_not_published` |
-| Caller body preservation and the WebSocket tunnel | `crates/pooler-server/tests/gateway_preset.rs` |
+| Caller body preservation and the bounded raw WebSocket tunnel | `crates/pooler-server/tests/gateway_preset.rs` |
+| Mounted semantic Responses WebSocket authentication, tools, reasoning, usage, terminal state, session reuse, and continuation | `gateway_preset.rs::the_gateway_preset_uses_semantic_responses_websocket_with_continuation` |
+| Credential/session isolation, cancellation commitment, age ceilings, and bootstrap/queue bounds | `crates/pooler-http/src/openai_websocket.rs` unit tests |
 | Strict Gemini model/action/Interactions paths and credentials | `gateway_provider_auth.rs::gemini_routes_satisfy_a_strict_gemini_endpoint` |
 | Invalid Gemini actions and encoded separators never reach the provider | `gateway_provider_auth.rs::gemini_gateway_rejects_unknown_actions_and_encoded_model_separators_locally` |
 | Gemini alias rewriting, capability context, and query preservation | `crates/pooler-server/tests/gemini_runtime.rs`, `crates/adapter-gemini/src/runtime.rs` unit tests |
@@ -209,6 +237,8 @@ was generous.
 
 ## Not yet claimed
 
-The Responses WebSocket route is an opaque tunnel, not a semantic
-implementation. Live-provider conformance for the preset is a separate gate and
-has not been run.
+The native `GET /v1/responses` upgrade remains a bounded same-wire tunnel; Pooler
+does not translate arbitrary downstream WebSocket frames. The committed semantic
+fixture is strict-loopback evidence for the REST-to-WebSocket transport, not
+live OpenAI or xAI provider conformance. Live-provider conformance for the preset
+is a separate gate and has not been run.
