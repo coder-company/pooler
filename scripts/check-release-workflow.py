@@ -26,6 +26,7 @@ CHECKOUT_REF = "${{ inputs.checkout-ref || github.ref }}"
 RELEASE_SHA = "${{ needs.resolve.outputs.sha }}"
 RELEASE_TAG_REF = "${{ inputs.tag || github.ref }}"
 CUSTOM_LINUX_LABELS = ["self-hosted", "Linux", "X64", "palantir-actions"]
+CI_MACOS_RUNNER = "macos-15"
 CUSTOM_MACOS_X64_LABELS = ["self-hosted", "macOS", "X64", "palantir-actions"]
 CUSTOM_MACOS_ARM64_LABELS = ["self-hosted", "macOS", "ARM64", "palantir-actions"]
 REQUIRED_RELEASE_JOBS = {
@@ -124,6 +125,32 @@ def workflow_call_input(workflow: dict[str, Any], path: Path) -> None:
             or include_macos.get("default") != "false"
         ):
             fail(f"{path} include-macos must be an optional boolean input defaulting to false")
+
+        dispatch = mapping(events.get("workflow_dispatch"), f"{path}.on.workflow_dispatch")
+        dispatch_inputs = mapping(
+            dispatch.get("inputs"), f"{path}.on.workflow_dispatch.inputs"
+        )
+        dispatch_checkout = mapping(
+            dispatch_inputs.get("checkout-ref"), f"{path} dispatch checkout-ref input"
+        )
+        if (
+            dispatch_checkout.get("type") != "string"
+            or dispatch_checkout.get("required") != "false"
+        ):
+            fail(f"{path} dispatch checkout-ref must be an optional string input")
+        dispatch_macos = mapping(
+            dispatch_inputs.get("include-macos"),
+            f"{path} dispatch include-macos input",
+        )
+        if (
+            dispatch_macos.get("type") != "boolean"
+            or dispatch_macos.get("required") != "false"
+            or dispatch_macos.get("default") != "true"
+        ):
+            fail(
+                f"{path} dispatch include-macos must be an optional boolean "
+                "input defaulting to true"
+            )
     elif "include-macos" in inputs:
         fail(f"{path} must not define the CI-only include-macos input")
 
@@ -168,11 +195,10 @@ def require_runner(
 
 
 def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
-    """Keep Linux work on the labeled custom organization runners.
+    """Keep Linux work on custom runners and CI macOS work on macOS.
 
-    The organization currently exposes Linux self-hosted runners only.  The
-    macOS rows remain explicit self-hosted platform requirements so this check
-    cannot accidentally turn an unavailable macOS lane into a Linux success.
+    Release artifact rows retain explicit architecture labels. The CI macOS
+    lane uses hosted macOS capacity and cannot degrade into a Linux success.
     """
 
     ci = workflows["ci.yml"]
@@ -186,7 +212,7 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
         fail("ci.yml.jobs.quality-macos must be gated by inputs.include-macos")
     require_runner(
         quality_macos,
-        CUSTOM_MACOS_X64_LABELS,
+        CI_MACOS_RUNNER,
         "ci.yml.jobs.quality-macos",
     )
     for job_id in ("fixtures-and-properties", "supply-chain"):

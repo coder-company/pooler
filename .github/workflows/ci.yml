@@ -2,6 +2,16 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      checkout-ref:
+        description: Git ref or commit to verify
+        required: false
+        type: string
+      include-macos:
+        description: Run the macOS quality lane
+        required: false
+        default: true
+        type: boolean
   workflow_call:
     inputs:
       checkout-ref:
@@ -9,7 +19,7 @@ on:
         required: false
         type: string
       include-macos:
-        description: Run the macOS quality lane when matching self-hosted capacity exists
+        description: Run the macOS quality lane
         required: false
         default: false
         type: boolean
@@ -36,14 +46,14 @@ jobs:
         with:
           ref: ${{ inputs.checkout-ref || github.ref }}
           persist-credentials: false
-      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
         with:
           python-version: "3.12"
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: cargo fmt --all --check
       - run: bash scripts/check-release-workflow.sh
       - run: ./scripts/check-config-schema.sh
@@ -56,14 +66,16 @@ jobs:
       - name: Run management dashboard browser QA
         run: python3 scripts/test-management-ui-browser.py --require-playwright
       - run: cargo check --workspace --all-targets --all-features --locked
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: >-
+          cargo clippy --workspace --all-targets --all-features --locked --
+          -D warnings
       - run: cargo test --workspace --all-features --locked
       - run: cargo test --workspace --all-features --locked --doc
 
   quality-macos:
     name: Quality (macOS)
     if: ${{ inputs.include-macos }}
-    runs-on: [self-hosted, macOS, X64, palantir-actions]
+    runs-on: macos-15
     steps:
       # Action references are immutable commit pins. Dependabot updates them
       # weekly after checking the corresponding release tag.
@@ -75,12 +87,14 @@ jobs:
         with:
           toolchain: 1.88.0
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
       - run: cargo fmt --all --check
       - run: bash scripts/check-release-workflow.sh
       - run: ./scripts/check-config-schema.sh
       - run: cargo check --workspace --all-targets --all-features --locked
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: >-
+          cargo clippy --workspace --all-targets --all-features --locked --
+          -D warnings
       - run: cargo test --workspace --all-features --locked
       - run: cargo test --workspace --all-features --locked --doc
 
@@ -95,7 +109,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: cargo test --workspace --all-features --locked -- --test-threads=1
       - run: ./scripts/verify-compatibility-fixtures.py
       - run: cargo test --manifest-path fuzz/Cargo.toml --locked --no-run
@@ -104,7 +118,9 @@ jobs:
           --manifest fixtures/compatibility/manifest.json
           --format markdown
           --output "$RUNNER_TEMP/compatibility.md"
-      - run: diff -u fixtures/compatibility/MATRIX.md "$RUNNER_TEMP/compatibility.md"
+      - run: >-
+          diff -u fixtures/compatibility/MATRIX.md
+          "$RUNNER_TEMP/compatibility.md"
 
   supply-chain:
     name: Dependency and license policy
@@ -120,7 +136,7 @@ jobs:
           # as security-framework; keep the product MSRV separate from the
           # toolchain used solely for dependency auditing.
           toolchain: 1.88.0
-      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20
         with:
           tool: cargo-audit,cargo-deny
       - name: Record dependency and license evidence
@@ -130,13 +146,14 @@ jobs:
           evidence="$RUNNER_TEMP/supply-chain-evidence"
           mkdir -p "$evidence"
           cargo audit --deny warnings 2>&1 | tee "$evidence/root-audit.log"
-          cargo audit --deny warnings --file fuzz/Cargo.lock 2>&1 | tee "$evidence/fuzz-audit.log"
+          cargo audit --deny warnings --file fuzz/Cargo.lock 2>&1 \
+            | tee "$evidence/fuzz-audit.log"
           cargo deny check 2>&1 | tee "$evidence/deny.log"
           git rev-parse HEAD > "$evidence/commit.txt"
           rustc --version --verbose > "$evidence/rustc.txt"
       - name: Upload dependency and license evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: supply-chain-evidence-${{ github.run_id }}
           path: ${{ runner.temp }}/supply-chain-evidence
