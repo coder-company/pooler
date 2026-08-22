@@ -6,3 +6,4 @@ self-hosted-runner:
     - macOS
     - ARM64
     - palantir-actions
+    - blacksmith-6vcpu-macos-15

@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       include-macos:
-        description: Run the macOS quality lane
+        description: Run the macOS quality lane on Blacksmith
         required: false
         default: true
         type: boolean
@@ -19,7 +19,7 @@ on:
         required: false
         type: string
       include-macos:
-        description: Run the macOS quality lane
+        description: Run the macOS quality lane on Blacksmith
         required: false
         default: false
         type: boolean
@@ -75,7 +75,7 @@ jobs:
   quality-macos:
     name: Quality (macOS)
     if: ${{ inputs.include-macos }}
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     steps:
       # Action references are immutable commit pins. Dependabot updates them
       # weekly after checking the corresponding release tag.
