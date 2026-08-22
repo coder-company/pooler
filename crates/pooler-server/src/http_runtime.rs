@@ -1214,36 +1214,105 @@ async fn run_native_account_commands(
                 None => break,
             },
         };
-        let _reload_guard = reload_lock.lock().await;
-        let generation = dispatch.load_full();
-        let outcome = if generation.config.generation() != command.generation {
-            "stale_generation"
-        } else {
-            let succeeded = match command.action {
-                NativeAccountAction::Refresh => native
-                    .refresh_account(
-                        generation.config.as_ref(),
-                        &command.account,
-                        cancellation.child_token(),
-                    )
-                    .await
-                    .is_ok(),
-                NativeAccountAction::Revoke => {
-                    let revoked = native
-                        .revoke_account(generation.config.as_ref(), &command.account)
-                        .await
-                        .is_ok();
-                    revoked
-                        && generation
-                            .pooling
-                            .set_account_enabled(&command.account, false)
-                            .is_ok()
+        let outcome = match command.action {
+            NativeAccountAction::DeviceLogin { request_id } => {
+                let native = Arc::clone(&native);
+                let dispatch = Arc::clone(&dispatch);
+                let management = management.clone();
+                let reload_lock = Arc::clone(&reload_lock);
+                let cancellation = cancellation.child_token();
+                let account = command.account.clone();
+                let expected_generation = command.generation;
+                tokio::spawn(async move {
+                    let generation = dispatch.load_full();
+                    let outcome = if generation.config.generation() != expected_generation {
+                        "stale_generation"
+                    } else if let Some(management_api) = management.upgrade() {
+                        match native
+                            .start_device_login(
+                                generation.config.as_ref(),
+                                &account,
+                                cancellation.child_token(),
+                            )
+                            .await
+                        {
+                            Ok((prompt, session)) => {
+                                management_api.record_oauth_device_prompt(
+                                    request_id,
+                                    prompt.verification_uri(),
+                                    prompt.verification_uri_complete(),
+                                    prompt.user_code(),
+                                    prompt.expires_in_seconds(),
+                                );
+                                match native.poll_device_login(session, cancellation).await {
+                                    Ok(result) => {
+                                        let _reload_guard = reload_lock.lock().await;
+                                        if dispatch.load().config.generation()
+                                            != expected_generation
+                                        {
+                                            "stale_generation"
+                                        } else if native.persist_device_login(result).is_ok() {
+                                            "succeeded"
+                                        } else {
+                                            "failed"
+                                        }
+                                    }
+                                    Err(_) => "failed",
+                                }
+                            }
+                            Err(_) => "failed",
+                        }
+                    } else {
+                        "failed"
+                    };
+                    if let Some(management_api) = management.upgrade() {
+                        management_api.record_oauth_device_result(request_id, outcome);
+                        management_api.record_native_result(
+                            NativeAccountAction::DeviceLogin { request_id },
+                            &account,
+                            expected_generation,
+                            outcome,
+                        );
+                    }
+                });
+                continue;
+            }
+            NativeAccountAction::Refresh | NativeAccountAction::Revoke => {
+                let _reload_guard = reload_lock.lock().await;
+                let generation = dispatch.load_full();
+                if generation.config.generation() != command.generation {
+                    "stale_generation"
+                } else {
+                    let succeeded = match command.action {
+                        NativeAccountAction::Refresh => native
+                            .refresh_account(
+                                generation.config.as_ref(),
+                                &command.account,
+                                cancellation.child_token(),
+                            )
+                            .await
+                            .is_ok(),
+                        NativeAccountAction::Revoke => {
+                            let revoked = native
+                                .revoke_account(generation.config.as_ref(), &command.account)
+                                .await
+                                .is_ok();
+                            revoked
+                                && generation
+                                    .pooling
+                                    .set_account_enabled(&command.account, false)
+                                    .is_ok()
+                        }
+                        NativeAccountAction::DeviceLogin { .. } => {
+                            unreachable!("device login handled separately")
+                        }
+                    };
+                    if succeeded {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    }
                 }
-            };
-            if succeeded {
-                "succeeded"
-            } else {
-                "failed"
             }
         };
         if let Some(management) = management.upgrade() {

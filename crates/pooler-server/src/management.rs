@@ -36,6 +36,7 @@ use pooler_config::{compile_yaml, CompiledConfig, ManagementPlan};
 use pooler_http::{PoolError, PoolingCoordinator};
 use pooler_model_catalog::ProviderCatalog;
 use pooler_store::{CredentialHealthState, CredentialHealthStatus, CredentialState};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
@@ -61,6 +62,7 @@ const MAX_REQUEST_EXPORT: usize = 4_096;
 const MAX_MANAGEMENT_AUDIT_EVENTS: usize = 256;
 const MAX_MANAGEMENT_RELOADS: usize = 256;
 const MAX_PENDING_MANAGEMENT_RELOADS: usize = 16;
+const MAX_OAUTH_DEVICE_RECORDS: usize = 32;
 const MAX_MANAGEMENT_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_MUTATION_BODY_BYTES: usize = 256 * 1024;
 const MANAGEMENT_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -68,6 +70,111 @@ const MANAGEMENT_BODY_GUARD_TIMEOUT: Duration = Duration::from_millis(50);
 const MANAGEMENT_CONFIG_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOPBACK_HOST_ERROR: &str =
     "management Host header must name localhost or a loopback address";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountDraftRequest {
+    id: String,
+    provider: String,
+    auth_kind: AccountDraftAuthKind,
+    secret: Option<AccountSecretReference>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AccountDraftAuthKind {
+    ApiKey,
+    OAuth,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum AccountSecretReference {
+    Env { name: String },
+    File { path: String },
+    Keyring { service: String, account: String },
+}
+
+impl AccountSecretReference {
+    fn render(self) -> Result<String, ConfigManagementError> {
+        let value = match self {
+            Self::Env { name } if valid_secret_component(&name, 128) => format!("env:{name}"),
+            Self::File { path }
+                if valid_secret_component(&path, 1024) && Path::new(&path).is_absolute() =>
+            {
+                format!("file:{path}")
+            }
+            Self::Keyring { service, account }
+                if valid_secret_component(&service, 128)
+                    && valid_secret_component(&account, 128) =>
+            {
+                format!("keyring:{service}/{account}")
+            }
+            _ => return Err(ConfigManagementError::UnsupportedPatch),
+        };
+        Ok(value)
+    }
+}
+
+fn valid_secret_component(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && !value.chars().any(|character| character.is_control())
+}
+
+fn create_account_draft(
+    manager: &ConfigManagement,
+    active: &CompiledConfig,
+    generation: u64,
+    body: &[u8],
+) -> Result<Value, ConfigManagementError> {
+    let request = serde_json::from_slice::<AccountDraftRequest>(body)
+        .map_err(|_| ConfigManagementError::UnsupportedPatch)?;
+    if !active.upstreams().contains_key(request.provider.as_str()) {
+        return Err(ConfigManagementError::UnsupportedPatch);
+    }
+    let mut value = json!({
+        "provider": request.provider,
+        "auth_kind": match request.auth_kind {
+            AccountDraftAuthKind::ApiKey => "api_key",
+            AccountDraftAuthKind::OAuth => "oauth",
+        }
+    });
+    match (request.auth_kind, request.secret) {
+        (AccountDraftAuthKind::ApiKey, Some(secret)) => {
+            value
+                .as_object_mut()
+                .expect("account draft is an object")
+                .insert("secret".to_owned(), Value::String(secret.render()?));
+        }
+        (AccountDraftAuthKind::OAuth, None) => {}
+        _ => return Err(ConfigManagementError::UnsupportedPatch),
+    }
+
+    let created = manager.create(generation)?;
+    let id = created
+        .get("draft_id")
+        .and_then(Value::as_u64)
+        .ok_or(ConfigManagementError::Persistence)?;
+    let etag = created
+        .get("etag")
+        .and_then(Value::as_str)
+        .ok_or(ConfigManagementError::Persistence)?;
+    let applied = manager.apply(
+        id,
+        etag,
+        TypedConfigPatch::Upsert {
+            section: "accounts".to_owned(),
+            id: request.id,
+            value,
+        },
+    )?;
+    let etag = applied
+        .get("etag")
+        .and_then(Value::as_str)
+        .ok_or(ConfigManagementError::Persistence)?;
+    manager.validate(id, etag)
+}
 
 #[derive(Clone, Copy)]
 enum UsageRepresentation {
@@ -541,7 +648,7 @@ fn management_account_action(path: &str) -> Option<(String, &str)> {
         && !account.contains('/')
         && matches!(
             action,
-            "enable" | "disable" | "switch" | "refresh" | "revoke"
+            "enable" | "disable" | "switch" | "refresh" | "revoke" | "oauth-device"
         ))
     .then_some((account, action))
 }
@@ -562,7 +669,10 @@ fn management_model_action(path: &str) -> Option<(String, &str)> {
 }
 
 fn is_config_request(path: &str) -> bool {
-    path == "/config/drafts" || path == "/config/rollback" || path.starts_with("/config/drafts/")
+    path == "/config/drafts"
+        || path == "/config/accounts/draft"
+        || path == "/config/rollback"
+        || path.starts_with("/config/drafts/")
 }
 
 fn is_config_mutation(method: &Method, path: &str) -> bool {
@@ -697,6 +807,7 @@ pub(crate) struct ManagementSnapshot {
 pub(crate) enum NativeAccountAction {
     Refresh,
     Revoke,
+    DeviceLogin { request_id: u64 },
 }
 
 #[derive(Debug)]
@@ -742,6 +853,12 @@ struct ReloadControl {
     notify: Arc<Notify>,
 }
 
+#[derive(Debug, Default)]
+struct OAuthDeviceControl {
+    next_id: AtomicU64,
+    records: Mutex<VecDeque<Value>>,
+}
+
 pub(crate) struct ManagementRuntimeServices {
     pub(crate) metrics: pooler_observe::MetricsRegistry,
     pub(crate) traces: pooler_observe::TraceRecorder,
@@ -759,6 +876,7 @@ pub struct ManagementApi {
     traces: pooler_observe::TraceRecorder,
     audit: Arc<Mutex<VecDeque<Value>>>,
     reload: Arc<ReloadControl>,
+    oauth_device: Arc<OAuthDeviceControl>,
     native_commands: Option<mpsc::Sender<NativeAccountCommand>>,
     config_management: Arc<Mutex<Option<Arc<ConfigManagement>>>>,
     configuration_reload_serial: Arc<Mutex<()>>,
@@ -819,6 +937,7 @@ impl ManagementApi {
             traces: pooler_observe::TraceRecorder::default(),
             audit: Arc::new(Mutex::new(VecDeque::new())),
             reload: Arc::new(ReloadControl::default()),
+            oauth_device: Arc::new(OAuthDeviceControl::default()),
             native_commands: None,
             config_management: Arc::new(Mutex::new(None)),
             configuration_reload_serial: Arc::new(Mutex::new(())),
@@ -862,6 +981,7 @@ impl ManagementApi {
             traces: services.traces,
             audit: Arc::new(Mutex::new(VecDeque::new())),
             reload: Arc::new(ReloadControl::default()),
+            oauth_device: Arc::new(OAuthDeviceControl::default()),
             native_commands: Some(services.native_commands),
             config_management: Arc::new(Mutex::new(None)),
             configuration_reload_serial: Arc::new(Mutex::new(())),
@@ -934,6 +1054,7 @@ impl ManagementApi {
         let action = match action {
             NativeAccountAction::Refresh => "refresh",
             NativeAccountAction::Revoke => "revoke",
+            NativeAccountAction::DeviceLogin { .. } => "oauth_device",
         };
         self.record_audit_with_fields(
             action,
@@ -941,6 +1062,89 @@ impl ManagementApi {
             outcome,
             &[("generation", json!(generation))],
         );
+    }
+
+    pub(crate) fn record_oauth_device_prompt(
+        &self,
+        request_id: u64,
+        verification_uri: &str,
+        verification_uri_complete: Option<&str>,
+        user_code: &str,
+        expires_in_seconds: u64,
+    ) {
+        let mut records = self
+            .oauth_device
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = records
+            .iter_mut()
+            .find(|record| record["request_id"].as_u64() == Some(request_id))
+        {
+            record["status"] = json!("authorization_required");
+            record["verification_uri"] = json!(verification_uri);
+            record["verification_uri_complete"] =
+                verification_uri_complete.map_or(Value::Null, |value| json!(value));
+            record["user_code"] = json!(user_code);
+            record["expires_in_seconds"] = json!(expires_in_seconds);
+        }
+    }
+
+    pub(crate) fn record_oauth_device_result(&self, request_id: u64, outcome: &str) {
+        let mut records = self
+            .oauth_device
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = records
+            .iter_mut()
+            .find(|record| record["request_id"].as_u64() == Some(request_id))
+        {
+            record["status"] = json!(outcome);
+            record["completed_at_ms"] = json!(unix_timestamp_ms());
+            if outcome == "succeeded" {
+                record
+                    .as_object_mut()
+                    .expect("device record object")
+                    .remove("user_code");
+                record
+                    .as_object_mut()
+                    .expect("device record object")
+                    .remove("verification_uri_complete");
+            }
+        }
+    }
+
+    fn oauth_device_status(&self, path: &str) -> ManagementResponse {
+        let Some(request_id) = path
+            .strip_prefix("/oauth/device/")
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return ManagementResponse::json(
+                StatusCode::NOT_FOUND,
+                json!({"error": "OAuth device request not found"}),
+                false,
+            );
+        };
+        let records = self
+            .oauth_device
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        records
+            .iter()
+            .find(|record| record["request_id"].as_u64() == Some(request_id))
+            .cloned()
+            .map_or_else(
+                || {
+                    ManagementResponse::json(
+                        StatusCode::NOT_FOUND,
+                        json!({"error": "OAuth device request not found"}),
+                        false,
+                    )
+                },
+                |record| ManagementResponse::json(StatusCode::OK, record, false),
+            )
     }
 
     /// Shared activity counters used by the serving runtime.
@@ -1173,7 +1377,7 @@ impl ManagementApi {
                 false,
             );
         };
-        if matches!(action, "refresh" | "revoke") {
+        if matches!(action, "refresh" | "revoke" | "oauth-device") {
             if account_plan.auth_kind() != pooler_config::AccountAuthKind::OAuth {
                 self.record_audit(action, Some(&account), "unsupported_auth_kind");
                 return ManagementResponse::json(
@@ -1182,16 +1386,77 @@ impl ManagementApi {
                     false,
                 );
             }
+            if action == "oauth-device" {
+                let supports_device_login = snapshot
+                    .config()
+                    .upstreams()
+                    .get(account_plan.provider())
+                    .is_some_and(|upstream| {
+                        upstream
+                            .native()
+                            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+                    });
+                if !supports_device_login {
+                    self.record_audit(action, Some(&account), "unsupported_provider");
+                    return ManagementResponse::json(
+                        StatusCode::CONFLICT,
+                        json!({"error": "account provider has no documented brokered device flow"}),
+                        false,
+                    );
+                }
+            }
             let Some(commands) = self.native_commands.as_ref() else {
                 self.record_audit(action, Some(&account), "unavailable");
                 return state_unavailable();
             };
+            let request_id = if action == "oauth-device" {
+                let mut records = self
+                    .oauth_device
+                    .records
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if records.iter().any(|record| {
+                    matches!(
+                        record["status"].as_str(),
+                        Some("starting" | "authorization_required")
+                    )
+                }) {
+                    self.record_audit(action, Some(&account), "already_active");
+                    return ManagementResponse::json(
+                        StatusCode::CONFLICT,
+                        json!({"error": "a brokered OAuth device authorization is already active"}),
+                        false,
+                    );
+                }
+                let request_id = self
+                    .oauth_device
+                    .next_id
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                records.push_back(json!({
+                    "schema_version": 1,
+                    "request_id": request_id,
+                    "account": account,
+                    "generation": snapshot.generation().value(),
+                    "status": "starting",
+                    "created_at_ms": unix_timestamp_ms(),
+                }));
+                while records.len() > MAX_OAUTH_DEVICE_RECORDS {
+                    records.pop_front();
+                }
+                Some(request_id)
+            } else {
+                None
+            };
             let command = NativeAccountCommand {
                 account: account.clone(),
-                action: if action == "refresh" {
-                    NativeAccountAction::Refresh
-                } else {
-                    NativeAccountAction::Revoke
+                action: match action {
+                    "refresh" => NativeAccountAction::Refresh,
+                    "revoke" => NativeAccountAction::Revoke,
+                    "oauth-device" => NativeAccountAction::DeviceLogin {
+                        request_id: request_id.expect("device request ID"),
+                    },
+                    _ => unreachable!("validated native account action"),
                 },
                 generation: snapshot.generation().value(),
             };
@@ -1204,12 +1469,16 @@ impl ManagementApi {
                             "generation": snapshot.generation().value(),
                             "account": account,
                             "action": action,
+                            "request_id": request_id,
                             "status": "queued"
                         }),
                         false,
                     )
                 }
                 Err(_) => {
+                    if let Some(request_id) = request_id {
+                        self.record_oauth_device_result(request_id, "failed");
+                    }
                     self.record_audit(action, Some(&account), "queue_unavailable");
                     state_unavailable()
                 }
@@ -1472,6 +1741,7 @@ impl ManagementApi {
         path: &str,
         headers: &HeaderMap,
         body: &[u8],
+        active: &CompiledConfig,
         active_generation: u64,
     ) -> ManagementResponse {
         let Some(manager) = self.config_manager() else {
@@ -1496,6 +1766,9 @@ impl ManagementApi {
         let result = match (method, path, config_draft_action(path)) {
             (&Method::POST, "/config/drafts", _) if body.is_empty() => {
                 manager.create(active_generation)
+            }
+            (&Method::POST, "/config/accounts/draft", _) => {
+                create_account_draft(&manager, active, active_generation, body)
             }
             (&Method::GET, _, Some((id, None))) if body.is_empty() => manager.view(id),
             (&Method::GET, _, Some((id, Some("diff")))) if body.is_empty() => manager.diff(id),
@@ -1596,7 +1869,9 @@ impl ManagementApi {
         };
         match result {
             Ok(value) => {
-                let status = if *method == Method::POST && path == "/config/drafts" {
+                let status = if *method == Method::POST
+                    && matches!(path, "/config/drafts" | "/config/accounts/draft")
+                {
                     StatusCode::CREATED
                 } else {
                     StatusCode::OK
@@ -1744,6 +2019,7 @@ impl ManagementApi {
                 path,
                 headers,
                 body,
+                snapshot.config(),
                 snapshot.generation().value(),
             ),
             "/config" | "/config/generation" => self.config_generation(snapshot),
@@ -1762,6 +2038,7 @@ impl ManagementApi {
             "/health/providers" | "/providers/health" => self.providers(snapshot, pooling),
             "/health/credentials" | "/credentials/health" => self.credentials(snapshot, pooling),
             "/accounts" => self.accounts(snapshot, pooling),
+            path if path.starts_with("/oauth/device/") => self.oauth_device_status(path),
             "/quota" => self.quota(snapshot, pooling),
             "/metrics" => self.metrics_view(snapshot),
             "/metrics/prometheus" => ManagementResponse::body(
@@ -2444,6 +2721,15 @@ impl ManagementApi {
                         && self.native_commands.is_some()
                     {
                         available_actions.extend(["refresh", "revoke"]);
+                        if snapshot
+                            .config()
+                            .upstreams()
+                            .get(account.provider())
+                            .and_then(|upstream| upstream.native())
+                            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+                        {
+                            available_actions.push("oauth_device");
+                        }
                     }
                 }
                 credential_health_value(
@@ -5074,6 +5360,166 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         assert!(!String::from_utf8(export.body)
             .expect("usage export text")
             .contains("raw-usage-secret"));
+    }
+
+    #[test]
+    fn brokered_device_oauth_exposes_only_operator_prompt_and_keeps_result_server_side() {
+        const MANAGEMENT_ENV: &str = "POOLER_DEVICE_OAUTH_MANAGEMENT_KEY";
+        std::env::set_var(MANAGEMENT_ENV, "device-oauth-management-secret");
+        let config = pooler_config::compile_yaml(
+            "device-oauth-management.yaml",
+            &format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{MANAGEMENT_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{openai: {{known_provider: openai, native: {{kind: codex}}}}}}\naccounts: {{personal: {{provider: openai, auth_kind: oauth}}}}\nmodels: [{{id: public-model, targets: [{{provider: openai, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: openai, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+            ),
+        )
+        .expect("device OAuth configuration");
+        let plan = config.management().cloned().expect("management plan");
+        let pooling = Arc::new(PoolingCoordinator::new(&config).expect("pooling coordinator"));
+        let store = Arc::new(ConfigStore::with_generation(
+            ConfigGeneration::new(config.generation()),
+            config,
+        ));
+        let (commands, mut receiver) = mpsc::channel(2);
+        let mut api = ManagementApi::new(plan, store, pooling, ActiveCounts::new());
+        api.native_commands = Some(commands);
+        let mut headers = loopback_headers();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer device-oauth-management-secret"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://localhost"),
+        );
+        let queued = api.handle(&Method::POST, "/accounts/personal/oauth-device", &headers);
+        assert_eq!(queued.status, StatusCode::ACCEPTED);
+        let queued = response_value(queued);
+        let request_id = queued["request_id"].as_u64().expect("request ID");
+        let duplicate = api.handle(&Method::POST, "/accounts/personal/oauth-device", &headers);
+        assert_eq!(duplicate.status, StatusCode::CONFLICT);
+        let command = receiver.try_recv().expect("device command");
+        assert_eq!(command.account, "personal");
+        assert_eq!(
+            command.action,
+            NativeAccountAction::DeviceLogin { request_id }
+        );
+        api.record_oauth_device_prompt(
+            request_id,
+            "https://provider.example/device",
+            Some("https://provider.example/device?code=safe-user-code"),
+            "SAFE-CODE",
+            600,
+        );
+        let status = api.handle(
+            &Method::GET,
+            &format!("/oauth/device/{request_id}"),
+            &headers,
+        );
+        assert_eq!(status.status, StatusCode::OK);
+        let text = String::from_utf8(status.body.clone()).expect("device status text");
+        assert!(text.contains("SAFE-CODE"));
+        assert!(!text.contains("access_token"));
+        assert!(!text.contains("refresh_token"));
+        assert!(!text.contains("device_code"));
+        let status = response_value(status);
+        assert_eq!(status["status"], "authorization_required");
+        api.record_oauth_device_result(request_id, "succeeded");
+        let completed = response_value(api.handle(
+            &Method::GET,
+            &format!("/oauth/device/{request_id}"),
+            &headers,
+        ));
+        assert_eq!(completed["status"], "succeeded");
+        assert!(completed.get("user_code").is_none());
+        assert!(completed.get("verification_uri_complete").is_none());
+        std::env::remove_var(MANAGEMENT_ENV);
+    }
+
+    #[test]
+    fn typed_account_draft_supports_env_file_and_keyring_without_echoing_references() {
+        const MANAGEMENT_ENV: &str = "POOLER_ACCOUNT_DRAFT_MANAGEMENT_KEY";
+        std::env::set_var(MANAGEMENT_ENV, "account-draft-management-secret");
+        let directory = tempfile::tempdir().expect("configuration directory");
+        let source = directory.path().join("gateway.yaml");
+        std::fs::write(
+            &source,
+            format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{MANAGEMENT_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\nmodels: [{{id: public-model, targets: [{{provider: provider-a, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+            ),
+        )
+        .expect("source configuration");
+        let api = authenticated_api(MANAGEMENT_ENV);
+        api.enable_config_management(&source)
+            .expect("typed management enabled");
+        let mut headers = loopback_headers();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer account-draft-management-secret"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://localhost"),
+        );
+        for (kind, fields) in [
+            ("env", json!({"name": "POOLER_PROVIDER_KEY"})),
+            ("file", json!({"path": "/run/secrets/provider-key"})),
+            (
+                "keyring",
+                json!({"service": "pooler", "account": "provider-a"}),
+            ),
+        ] {
+            let mut secret = fields.as_object().expect("secret fields").clone();
+            secret.insert("kind".to_owned(), json!(kind));
+            let body = serde_json::to_vec(&json!({
+                "id": format!("account-{kind}"),
+                "provider": "provider-a",
+                "auth_kind": "api_key",
+                "secret": secret,
+            }))
+            .expect("account draft JSON");
+            let response =
+                api.handle_with_body(&Method::POST, "/config/accounts/draft", &headers, &body);
+            assert_eq!(response.status, StatusCode::CREATED);
+            let text = String::from_utf8(response.body.clone()).expect("response text");
+            assert!(!text.contains("POOLER_PROVIDER_KEY"));
+            assert!(!text.contains("/run/secrets"));
+            assert!(!text.contains("env:"));
+            assert!(!text.contains("file:"));
+            assert!(!text.contains("keyring:"));
+            let value = response_value(response);
+            assert_eq!(value["valid"], true);
+            assert_eq!(value["semantic_diff"][0]["section"], "accounts");
+            assert!(value["semantic_diff"][0].get("value").is_none());
+        }
+        let relative_file = serde_json::to_vec(&json!({
+            "id": "relative-file-account",
+            "provider": "provider-a",
+            "auth_kind": "api_key",
+            "secret": {"kind": "file", "path": "relative/provider.key"},
+        }))
+        .expect("relative file JSON");
+        let rejected_relative = api.handle_with_body(
+            &Method::POST,
+            "/config/accounts/draft",
+            &headers,
+            &relative_file,
+        );
+        assert_eq!(rejected_relative.status, StatusCode::BAD_REQUEST);
+
+        let literal = serde_json::to_vec(&json!({
+            "id": "literal-account",
+            "provider": "provider-a",
+            "auth_kind": "api_key",
+            "secret": {"kind": "literal", "value": "forbidden"},
+        }))
+        .expect("literal JSON");
+        let rejected =
+            api.handle_with_body(&Method::POST, "/config/accounts/draft", &headers, &literal);
+        assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+        assert!(!String::from_utf8(rejected.body)
+            .expect("error text")
+            .contains("forbidden"));
+        std::env::remove_var(MANAGEMENT_ENV);
     }
 
     #[tokio::test]

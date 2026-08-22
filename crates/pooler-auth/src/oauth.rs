@@ -36,6 +36,7 @@ use super::{
 
 const DEVICE_POLL_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const DEVICE_POLL_MAX_INTERVAL: Duration = Duration::from_secs(60);
+const DEVICE_AUTHORIZATION_MAX_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
 /// A boxed asynchronous OAuth operation.
 pub type OAuthFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, OAuthError>> + Send + 'a>>;
@@ -977,6 +978,7 @@ impl DeviceAuthorization {
             || user_code.is_empty()
             || !valid_endpoint(&verification_uri)
             || expires_in.is_zero()
+            || expires_in > DEVICE_AUTHORIZATION_MAX_LIFETIME
         {
             return Err(OAuthError::InvalidResponse);
         }
@@ -2679,6 +2681,18 @@ mod tests {
             )
             .is_ok());
         }
+    }
+
+    #[test]
+    fn device_authorization_rejects_excessive_provider_lifetimes() {
+        let result = DeviceAuthorization::new(
+            "device",
+            "user",
+            "https://provider.example/device".parse().unwrap(),
+            DEVICE_AUTHORIZATION_MAX_LIFETIME + Duration::from_secs(1),
+            Duration::from_secs(5),
+        );
+        assert_eq!(result, Err(OAuthError::InvalidResponse));
     }
 
     #[tokio::test]

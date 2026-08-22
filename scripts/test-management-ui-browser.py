@@ -79,8 +79,8 @@ def payload(path: str) -> dict:
                         },
                         {
                             "method": "device_code",
-                            "support": "requires_explicit_configuration",
-                            "note": "Operator registration is required.",
+                            "support": "supported",
+                            "note": "Documented built-in device flow.",
                         },
                     ],
                     "discovery": {
@@ -140,6 +140,17 @@ def payload(path: str) -> dict:
                 },
             ],
         },
+        "/management/oauth/device/77": {
+            "schema_version": 1,
+            "request_id": 77,
+            "account": "primary",
+            "generation": 7,
+            "status": "authorization_required",
+            "verification_uri": "https://provider.example/device",
+            "verification_uri_complete": "https://provider.example/device/complete",
+            "user_code": "BROWSER-CODE",
+            "expires_in_seconds": 600,
+        },
         "/management/config": {
             **generation,
             "etag": "generation-7",
@@ -175,11 +186,28 @@ def payload(path: str) -> dict:
                     "enabled": True,
                     "selected": False,
                     "auth_kind": "oauth",
-                    "available_actions": ["switch", "disable", "refresh", "revoke"],
+                    "available_actions": [
+                        "switch",
+                        "disable",
+                        "refresh",
+                        "revoke",
+                        "oauth_device",
+                    ],
                     "status": "available",
                     "failure_count": 0,
                     "cooldown_until": None,
-                }
+                },
+                {
+                    "id": "custom-codex",
+                    "provider": "custom-codex-native",
+                    "enabled": True,
+                    "selected": True,
+                    "auth_kind": "oauth",
+                    "available_actions": ["oauth_device"],
+                    "status": "available",
+                    "failure_count": 0,
+                    "cooldown_until": None,
+                },
             ],
         },
         "/management/quota": {**generation, "windows": [], "cooldowns": []},
@@ -497,6 +525,18 @@ class Handler(BaseHTTPRequestHandler):
                 {"status": "pending", "request_id": STATE.reload_request_id}
             ).encode()
             self.send_bytes(202, body, "application/json")
+        elif route == "/management/config/accounts/draft":
+            self.send_bytes(
+                201,
+                b'{"draft_id":12,"base_generation":7,"etag":"account-draft","valid":true,"semantic_diff":[{"section":"accounts","id":"browser-account","change":"added"}],"confirmation_token":"confirm-account"}',
+                "application/json",
+            )
+        elif route == "/management/accounts/primary/oauth-device":
+            self.send_bytes(
+                202,
+                b'{"status":"queued","request_id":77,"generation":7,"account":"primary","action":"oauth-device"}',
+                "application/json",
+            )
         elif route == "/management/config/drafts":
             self.send_bytes(
                 201,
@@ -648,15 +688,8 @@ def run_browser(playwright) -> None:
         )
         page.locator('[data-setup-action="next"]').click()
         expect(
-            not page.locator('#setup-auth option[value="device_code"]').count(),
-            "explicit-registration flow was offered as runnable",
-        )
-        expect(
-            page.locator(".view-setup")
-            .inner_text()
-            .count("Operator registration is required")
-            > 0,
-            "unavailable authentication method lacks an accessible explanation",
+            page.locator('#setup-auth option[value="device_code"]').count() == 1,
+            "documented device flow was not offered",
         )
         expect(
             "pooler.setup.yaml" not in page.locator(".view-setup").inner_text(),
@@ -884,7 +917,6 @@ def run_browser(playwright) -> None:
                 f"{route} rendered an inline style under strict CSP",
             )
 
-
         page.locator('[data-route="usage"]').click()
         page.wait_for_selector("text=Historical usage ledger")
         usage_text = page.locator(".view-usage").inner_text()
@@ -1013,6 +1045,32 @@ def run_browser(playwright) -> None:
         )
         STATE.slow_models = False
 
+        page.locator('[data-account-draft-field="id"]').fill("browser-account")
+        page.locator('[data-account-draft-field="envName"]').fill(
+            "BROWSER_PROVIDER_KEY"
+        )
+        page.locator('[data-account-draft-action="create"]').click()
+        page.wait_for_selector(".view-configuration")
+        account_draft_body = json.loads(
+            STATE.post_bodies["/management/config/accounts/draft"]
+        )
+        expect(
+            account_draft_body
+            == {
+                "id": "browser-account",
+                "provider": "openai-upstream",
+                "auth_kind": "api_key",
+                "secret": {"kind": "env", "name": "BROWSER_PROVIDER_KEY"},
+            },
+            "typed account form did not send the bounded secret-reference shape",
+        )
+        expect(
+            b"literal" not in STATE.post_bodies["/management/config/accounts/draft"],
+            "typed account form accepted a literal credential",
+        )
+        page.get_by_text("Draft 12", exact=True).wait_for()
+        page.locator('[data-route="accounts"]').click()
+        page.wait_for_selector(".view-accounts")
         page.locator('[data-account-connect="primary"]').click()
         page.wait_for_selector(".connection-panel")
         connection_text = page.locator(".connection-panel").inner_text()
@@ -1030,11 +1088,27 @@ def run_browser(playwright) -> None:
             "account connection guide omits credential-boundary disclosure",
         )
         expect(
-            all(
-                connection_text.count(fragment)
-                for fragment in ("device code", "Operator registration is required")
-            ),
-            "unavailable account login method is not explained",
+            "Brokered device OAuth" in connection_text,
+            "documented device flow was not offered through the server-side broker",
+        )
+        page.locator('[data-account-oauth-device="primary"]').click()
+        page.wait_for_timeout(3_000)
+        expect(
+            STATE.posts.get("/management/accounts/primary/oauth-device") == 1,
+            "brokered device OAuth did not use the management mutation",
+        )
+        expect(
+            STATE.post_bodies["/management/accounts/primary/oauth-device"] == b"",
+            "brokered device OAuth sent a browser body",
+        )
+        expect(
+            STATE.get_authorization.get("/management/oauth/device/77")
+            == "Bearer good-token",
+            "device OAuth status was not read with authenticated fetch",
+        )
+        expect(
+            "BROWSER-CODE" in page.locator(".connection-panel").inner_text(),
+            "device OAuth operator prompt was not rendered",
         )
         posts_before_status_check = dict(STATE.posts)
         page.locator("[data-account-connect-check]").click()
@@ -1052,6 +1126,13 @@ def run_browser(playwright) -> None:
             not page.locator(".connection-panel").count(),
             "account connection guide did not close",
         )
+        page.locator('[data-account-connect="custom-codex"]').click()
+        page.wait_for_selector(".connection-panel")
+        expect(
+            "Brokered device OAuth" in page.locator(".connection-panel").inner_text(),
+            "custom Codex-native broker availability was not API-authoritative",
+        )
+        page.locator("[data-account-connect-close]").click()
 
         switch = page.locator('[data-account-action="switch"]')
         switch.click()

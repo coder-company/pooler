@@ -30,6 +30,7 @@ Send the token as `Authorization: Bearer ...`.
 | `/setup/options`, `/setup/config`, `/setup/test` | Catalog-derived first-run choices, compiler-validated sidecar generation, and truthful active-runtime checks |
 | `/listeners`, `/routes`, `/models` | Active compiled plan and published model view |
 | `/health/providers`, `/accounts` | Provider and redacted account health |
+| `/oauth/device/{request-id}` | Bounded server-side device-flow status and operator prompt; never token material |
 | `/quota` | Typed quota windows plus active cooldowns |
 | `/metrics`, `/metrics/prometheus` | Bounded process-local compatibility counters |
 | `/usage`, `/usage/aggregate` | Paginated retained usage records and bounded multidimensional time-range aggregates |
@@ -65,15 +66,17 @@ The browser never accepts a provider API key, OAuth client secret, or token. `/s
 5. Start the generated configuration with `pooler --config pooler.setup.yaml --credential-key-ref env:POOLER_STORE_KEY serve`.
 6. Reopen or reconnect the dashboard and verify that running instance.
 
-**Verify running instance** requests a catalog-only reload, requires that correlated request to succeed, and then reads `/setup/test` with the reload request ID. A connection is reported as `verified` only when the active provider/account/model match, the configuration and catalog generations match the completed reload, and a matching discovery observation is newer than the reload request. Retained last-good discovery is never fresh verification. The wizard does not send a potentially billable inference request.
+**Verify running instance** is the bounded provider test console. It requests a catalog-only reload, requires that correlated request to succeed, and then reads `/setup/test` with the reload request ID. A connection is reported as `verified` only when the active provider/account/model match, the configuration and catalog generations match the completed reload, and a matching discovery observation is newer than the reload request. Retained last-good discovery is never fresh verification. The console does not send a potentially billable inference request. Bootstrap, dashboard, preflight, migration, TUI, and client instructions are documented in [secure onboarding](onboarding.md).
 
 Setup selections may appear in same-origin query strings, but credential values never do. Generated sidecars and downloads use authenticated `fetch` and remain local to the current browser action.
 
 ## Connecting configured accounts
 
-The **Accounts** view combines the redacted `/accounts` state with the catalog-derived `/setup/options` authentication facts. **Connect** shows an exact `pooler auth login <configured-upstream> --profile <provider-profile> --account <account-id>` command for supported methods. The configured upstream is the positional selector; the account is always passed with `--account`. Methods that require operator-owned registration are explained instead of being presented as controls that cannot work safely.
+The **Accounts** view combines the redacted `/accounts` state with the catalog-derived `/setup/options` authentication facts. Its typed account form sends only an account ID, configured upstream, authentication kind, and structured `env`, `file`, or `keyring` reference metadata to `/config/accounts/draft`. Literal secret values and unrestricted YAML are rejected. The server creates and validates an ordinary configuration draft and returns only its ETag, value-free semantic diff, and one-time confirmation token; activation still requires explicit commit from **Configuration**.
 
-Connection remains terminal-only. API keys stay in environment variables or another protected reference, while OAuth codes and tokens stay in Pooler's encrypted credential store. The dashboard has no credential field and does not place credentials in URLs, request bodies, browser storage, or generated configuration. **Check redacted account status** performs authenticated reads only; it does not send inference traffic and an `available` local credential is not labelled as verified provider connectivity.
+**Connect** shows an exact `pooler auth login <configured-upstream> --profile <provider-profile> --account <account-id>` command for supported methods. For the documented OpenAI/Codex device flow it can instead queue `POST /accounts/{id}/oauth-device`: the native runtime starts and polls the provider flow, the browser receives only the provider HTTPS page, short user code, expiry, and status, and token responses are persisted directly to encrypted SQLite. Only one brokered flow is active at a time, polling is bounded, and a generation change prevents persistence. Methods requiring operator-owned registration remain terminal-only and are explained instead of guessed.
+
+API keys stay in environment variables or another protected reference, while OAuth device credentials and tokens remain server-side. No bearer, code-exchange response, or token is placed in dashboard URLs, API responses, logs, exports, or browser storage. **Check redacted account status** performs authenticated reads only; it does not send inference traffic and an `available` local credential is not labelled as verified provider connectivity.
 
 ## Mutations
 
@@ -85,13 +88,14 @@ POST /accounts/{id}/disable
 POST /accounts/{id}/switch
 POST /accounts/{id}/refresh
 POST /accounts/{id}/revoke
+POST /accounts/{id}/oauth-device
 POST /models/{public-model-id}/enable
 POST /models/{public-model-id}/disable
 POST /reload
 POST /models/reload
 ```
 
-Account enable, disable, and switch operations update the live selection registries and persisted credential state. A switch enables the selected account and disables its same-provider siblings atomically in SQLite. OAuth refresh and revoke requests enter a bounded native-runtime command queue and return `202 Accepted`; their eventual result is written to the audit view. Revocation removes only Pooler's local credential payload and disables the account. It does not claim provider-side revocation unless the provider flow explicitly performs it.
+Account enable, disable, and switch operations update the live selection registries and persisted credential state. A switch enables the selected account and disables its same-provider siblings atomically in SQLite. OAuth refresh, revoke, and documented device-login requests enter the bounded native-runtime command queue and return `202 Accepted`; their eventual result is written to the audit view. Device polling runs independently so it cannot starve refresh, revoke, or reload controls. Revocation removes only Pooler's local credential payload and disables the account. It does not claim provider-side revocation unless the provider flow explicitly performs it.
 
 Model enablement is a runtime operator control. It is shared across configuration reload generations in the running process, but is not a replacement for a durable catalog override. For durable model policy, declare `catalog.overrides` in configuration and request a reload.
 

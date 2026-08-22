@@ -6,26 +6,29 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use adapter_codex::{CodexCredential, CodexQuotaParser, CodexRequestMetadata, SESSION_ID_HEADER};
 use adapter_providers::AuthPlacement;
 use http::{HeaderMap, HeaderName};
 use pooler_auth::{
-    refresh_with_store_if_generation, CredentialId, HyperOAuthTransport, MemoryOAuthTokenStore,
-    OAuthClientConfig, OAuthError, OAuthRefresher, OAuthTokenStore, ProviderLoginMethod,
-    ProviderLoginRegistry, ProviderOAuthSettings, RefreshCoordinator, SecretRef as AuthSecretRef,
+    refresh_with_store_if_generation, CredentialId, DeviceAuthorization, HyperOAuthTransport,
+    MemoryOAuthTokenStore, OAuthClientConfig, OAuthCredentialProfile, OAuthDeviceFlow, OAuthError,
+    OAuthRefresher, OAuthTokenStore, OAuthTokens, ProviderLoginMethod, ProviderLoginRegistry,
+    ProviderOAuthClient, ProviderOAuthSettings, RefreshCoordinator, SecretRef as AuthSecretRef,
     SecretValue, StandardOAuthProvider, TokenSnapshot,
 };
 use pooler_config::{
     AccountAuthKind, AuthPlan, CompiledConfig, OAuthPlan, SecretRef, UpstreamPlan,
     DEFAULT_OAUTH_CALLBACK,
 };
-use pooler_store::SqliteOAuthTokenStore;
+use pooler_store::{CredentialState, SqliteOAuthTokenStore, Store};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::{RuntimeResourceSnapshot, RuntimeResources};
+
+const DEVICE_AUTHORIZATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Native runtime errors are intentionally coarse and never carry token
 /// material, response bodies, or authorization headers.
@@ -49,6 +52,75 @@ pub enum NativeRuntimeError {
     /// The configured native OAuth provider is invalid.
     #[error("native provider configuration is invalid")]
     Configuration,
+}
+
+/// Non-secret device authorization details safe to present to an authenticated operator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeDeviceAuthorization {
+    verification_uri: String,
+    verification_uri_complete: Option<String>,
+    user_code: String,
+    expires_in_seconds: u64,
+}
+
+impl NativeDeviceAuthorization {
+    /// Provider page where the operator completes authorization.
+    #[must_use]
+    pub fn verification_uri(&self) -> &str {
+        &self.verification_uri
+    }
+
+    /// Provider page with the short code embedded, when supplied by the provider.
+    #[must_use]
+    pub fn verification_uri_complete(&self) -> Option<&str> {
+        self.verification_uri_complete.as_deref()
+    }
+
+    /// User-facing short code. The provider's device credential is never exposed.
+    #[must_use]
+    pub fn user_code(&self) -> &str {
+        &self.user_code
+    }
+
+    /// Provider-supplied authorization lifetime.
+    #[must_use]
+    pub const fn expires_in_seconds(&self) -> u64 {
+        self.expires_in_seconds
+    }
+}
+
+/// Opaque server-side continuation for one device authorization.
+pub struct NativeDeviceLoginSession {
+    provider: ProviderOAuthClient,
+    authorization: DeviceAuthorization,
+    credential: CredentialId,
+    account_id: String,
+    upstream_id: String,
+    enabled: bool,
+}
+
+impl std::fmt::Debug for NativeDeviceLoginSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeDeviceLoginSession")
+            .field("profile", &self.provider.definition().id())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque completed device exchange awaiting generation-serialized persistence.
+pub struct NativeDeviceLoginResult {
+    session: NativeDeviceLoginSession,
+    tokens: OAuthTokens,
+}
+
+impl std::fmt::Debug for NativeDeviceLoginResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeDeviceLoginResult")
+            .field("profile", &self.session.provider.definition().id())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Authorization material retained only for the duration of one attempt.
@@ -222,6 +294,7 @@ impl<'a> NativeAuthorizationRequest<'a> {
 #[derive(Clone)]
 pub struct NativeRuntime {
     token_store: Arc<dyn OAuthTokenStore>,
+    sqlite_token_store: Option<Arc<SqliteOAuthTokenStore>>,
     refresh: RefreshCoordinator,
     bindings: Arc<BTreeMap<String, Arc<dyn NativeProviderBinding>>>,
     account_ids: Arc<BTreeMap<String, String>>,
@@ -288,6 +361,7 @@ impl NativeRuntime {
         }
         Ok(Self {
             token_store,
+            sqlite_token_store: None,
             refresh: RefreshCoordinator::new(),
             bindings: Arc::new(bindings),
             account_ids: Arc::new(BTreeMap::new()),
@@ -302,6 +376,7 @@ impl NativeRuntime {
         token_store: Arc<SqliteOAuthTokenStore>,
     ) -> Result<Self, NativeRuntimeError> {
         let mut runtime = Self::new(config, token_store.clone())?;
+        runtime.sqlite_token_store = Some(Arc::clone(&token_store));
         hydrate_account_ids(&mut runtime, config, |credential| {
             token_store
                 .account_id(credential)
@@ -324,6 +399,7 @@ impl NativeRuntime {
         );
         Self {
             token_store,
+            sqlite_token_store: None,
             refresh: RefreshCoordinator::new(),
             bindings: Arc::new(bindings),
             account_ids: Arc::new(BTreeMap::new()),
@@ -338,6 +414,7 @@ impl NativeRuntime {
     pub fn disabled() -> Self {
         Self {
             token_store: Arc::new(MemoryOAuthTokenStore::new()),
+            sqlite_token_store: None,
             refresh: RefreshCoordinator::new(),
             bindings: Arc::new(BTreeMap::new()),
             account_ids: Arc::new(BTreeMap::new()),
@@ -528,10 +605,15 @@ impl NativeRuntime {
             .await
             .map_err(map_refresh_error)?;
         }
+        let persisted_account_id = self
+            .sqlite_token_store
+            .as_ref()
+            .and_then(|store| store.account_id(credential).ok().flatten());
         let account_id = self
             .account_ids
             .get(credential.as_str())
-            .map(String::as_str);
+            .map(String::as_str)
+            .or(persisted_account_id.as_deref());
         let authorization =
             binding.materialize_oauth_authorization(&snapshot, account_id, request_headers)?;
         if cancellation.is_cancelled() {
@@ -585,6 +667,146 @@ impl NativeRuntime {
         )
         .await
         .map_err(map_refresh_error)
+    }
+
+    /// Start a documented device-code login without exposing its device credential.
+    pub async fn start_device_login(
+        &self,
+        config: &CompiledConfig,
+        account_id: &str,
+        cancellation: CancellationToken,
+    ) -> Result<(NativeDeviceAuthorization, NativeDeviceLoginSession), NativeRuntimeError> {
+        if self.sqlite_token_store.is_none() {
+            return Err(NativeRuntimeError::CredentialUnavailable);
+        }
+        let account = config
+            .accounts()
+            .get(account_id)
+            .ok_or(NativeRuntimeError::CredentialUnavailable)?;
+        if account.auth_kind() != AccountAuthKind::OAuth {
+            return Err(NativeRuntimeError::Unsupported);
+        }
+        let upstream = config
+            .upstreams()
+            .get(account.provider())
+            .ok_or(NativeRuntimeError::Unsupported)?;
+        let is_codex = upstream
+            .native()
+            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"));
+        if !is_codex {
+            return Err(NativeRuntimeError::Unsupported);
+        }
+        let definition = ProviderLoginRegistry::builtin()
+            .require("openai")
+            .map_err(|_| NativeRuntimeError::Configuration)?;
+        let callback = DEFAULT_OAUTH_CALLBACK
+            .parse()
+            .map_err(|_| NativeRuntimeError::Configuration)?;
+        let transport = Arc::new(
+            HyperOAuthTransport::new(64 * 1024).map_err(|_| NativeRuntimeError::Configuration)?,
+        );
+        let provider = definition
+            .build_oauth_provider(
+                ProviderLoginMethod::DeviceCode,
+                ProviderOAuthSettings::new(String::new(), callback),
+                transport,
+            )
+            .map_err(|_| NativeRuntimeError::Configuration)?;
+        let authorization = tokio::time::timeout(
+            DEVICE_AUTHORIZATION_REQUEST_TIMEOUT,
+            provider.start_device_authorization(cancellation),
+        )
+        .await
+        .map_err(|_| NativeRuntimeError::Refresh)?
+        .map_err(|_| NativeRuntimeError::Refresh)?;
+        let prompt = NativeDeviceAuthorization {
+            verification_uri: authorization.verification_uri().to_string(),
+            verification_uri_complete: authorization
+                .verification_uri_complete()
+                .map(ToString::to_string),
+            user_code: authorization.user_code().to_owned(),
+            expires_in_seconds: authorization.expires_in().as_secs(),
+        };
+        let credential = CredentialId::new(account.id().to_owned())
+            .map_err(|_| NativeRuntimeError::Configuration)?;
+        Ok((
+            prompt,
+            NativeDeviceLoginSession {
+                provider,
+                authorization,
+                credential,
+                account_id: account.id().to_owned(),
+                upstream_id: account.provider().to_owned(),
+                enabled: account.enabled(),
+            },
+        ))
+    }
+
+    /// Poll a device-code exchange without crossing the token persistence boundary.
+    pub async fn poll_device_login(
+        &self,
+        session: NativeDeviceLoginSession,
+        cancellation: CancellationToken,
+    ) -> Result<NativeDeviceLoginResult, NativeRuntimeError> {
+        let tokens = session
+            .provider
+            .poll_device(&session.authorization, cancellation)
+            .await
+            .map_err(|_| NativeRuntimeError::Refresh)?;
+        Ok(NativeDeviceLoginResult { session, tokens })
+    }
+
+    /// Persist a completed exchange while the caller holds the reload serialization lock.
+    pub fn persist_device_login(
+        &self,
+        result: NativeDeviceLoginResult,
+    ) -> Result<TokenSnapshot, NativeRuntimeError> {
+        let NativeDeviceLoginResult { session, tokens } = result;
+        let store = self
+            .sqlite_token_store
+            .as_ref()
+            .ok_or(NativeRuntimeError::CredentialUnavailable)?;
+        let id_token = tokens
+            .id_token()
+            .cloned()
+            .ok_or(NativeRuntimeError::Authorization)?;
+        let provider_account_id = CodexCredential::account_id_from_id_token(&id_token)
+            .map_err(|_| NativeRuntimeError::Authorization)?;
+        let profile = OAuthCredentialProfile::new("openai", tokens)
+            .with_id_token(Some(id_token))
+            .with_account_id(provider_account_id);
+        let expected_generation = match store
+            .store()
+            .credential_state(&session.account_id)
+            .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
+        {
+            Some(state) => {
+                if state.provider_id != session.upstream_id {
+                    return Err(NativeRuntimeError::CredentialUnavailable);
+                }
+                state.revision
+            }
+            None => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                store
+                    .store()
+                    .upsert_credential_state(CredentialState::new(
+                        &session.account_id,
+                        &session.upstream_id,
+                        session.enabled,
+                        now,
+                    ))
+                    .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
+                    .revision
+            }
+        };
+        store
+            .compare_and_swap_profile(&session.credential, expected_generation, &profile)
+            .map_err(|_| NativeRuntimeError::CredentialUnavailable)
     }
 
     /// Refresh one configured OAuth account using its persisted generation.

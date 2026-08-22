@@ -31,6 +31,26 @@
     lastSuccessfulRefresh: null,
     pending: new Set(),
     connectionAccount: "",
+    oauthDevice: {
+      account: "",
+      requestId: null,
+      status: "",
+      verificationUri: "",
+      verificationUriComplete: "",
+      userCode: "",
+      busy: false,
+    },
+    accountDraft: {
+      id: "",
+      provider: "",
+      authKind: "api_key",
+      secretKind: "env",
+      envName: "",
+      filePath: "",
+      keyringService: "pooler",
+      keyringAccount: "",
+      busy: false,
+    },
     usageRange: "24h",
     requestExplorer: {
       route: "",
@@ -1862,6 +1882,21 @@
       })
       .join("");
     const environments = provider?.credential_environment_variables || [];
+    const deviceSupported = (account.available_actions || []).includes(
+      "oauth_device",
+    );
+    const device =
+      state.oauthDevice.account === account.id ? state.oauthDevice : null;
+    const deviceTarget =
+      device?.verificationUriComplete || device?.verificationUri;
+    const devicePanel =
+      account.auth_kind === "oauth" && deviceSupported
+        ? `<div class="callout"><strong>Brokered device OAuth</strong><p>Pooler starts and polls the documented provider flow on the server. The browser receives only the provider page and short user code; token responses remain in the encrypted server-side store.</p>${
+            device
+              ? `<p>Status: ${statusBadge(device.status || "starting")}</p>${deviceTarget && deviceTarget.startsWith("https://") ? `<p><a class="btn btn-outline btn-sm" href="${esc(deviceTarget)}" target="_blank" rel="noreferrer">Open provider authorization</a></p>` : ""}${device.userCode ? `<p>Enter code <code class="mono">${esc(device.userCode)}</code> if prompted.</p>` : ""}`
+              : ""
+          }<button class="btn btn-primary btn-sm" type="button" data-account-oauth-device="${esc(account.id)}"${state.oauthDevice.busy ? " disabled" : ""}>${device ? "Restart device authorization" : "Start device authorization"}</button></div>`
+        : "";
     const keyInstructions =
       account.auth_kind === "api_key"
         ? `<p>Set the provider key outside this browser using ${environments.length ? environments.map((name) => `<code class="mono">${esc(name)}</code>`).join(" or ") : "the protected secret reference already declared in configuration"}. The API-key command prints provider-safe guidance and never accepts the key as an argument.</p>`
@@ -1869,12 +1904,164 @@
     return `<section class="panel connection-panel" aria-labelledby="connection-title">
       <div class="toolbar"><h2 class="section-title" id="connection-title" tabindex="-1">Connect ${esc(account.id)}</h2><span class="spacer"></span><button class="btn btn-ghost btn-sm" type="button" data-account-connect-close>Close</button></div>
       ${keyInstructions}
+      ${devicePanel}
       ${commands || '<div class="callout callout-warning"><strong>No safe built-in connection command is available.</strong> Keep using the protected secret or OAuth registration already declared by the operator.</div>'}
       ${unavailable.length ? `<div class="callout callout-warning"><strong>Not offered</strong><ul class="check-list">${unavailable.map((method) => `<li><span class="mono">${esc(method.method.replaceAll("_", " "))}</span> — ${esc(method.note)}</li>`).join("")}</ul></div>` : ""}
       ${provider?.documentation_url ? `<p><a class="text-link" href="${esc(provider.documentation_url)}" target="_blank" rel="noreferrer">Open provider authentication documentation</a></p>` : ""}
       <div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-account-connect-check>Check redacted account status</button></div>
       <p class="muted">Current local state: ${statusBadge(account.status)}. An available credential is not a provider connectivity probe.</p>
     </section>`;
+  }
+
+  async function pollOAuthDevice(requestId, account, sessionGeneration) {
+    for (let attempt = 0; attempt < 450; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      if (
+        sessionGeneration !== state.sessionGeneration ||
+        state.oauthDevice.requestId !== requestId ||
+        state.oauthDevice.account !== account
+      )
+        return;
+      try {
+        const result = await readJson(
+          `/oauth/device/${encodeURIComponent(requestId)}`,
+        );
+        state.oauthDevice.status = result.status || "failed";
+        state.oauthDevice.verificationUri = result.verification_uri || "";
+        state.oauthDevice.verificationUriComplete =
+          result.verification_uri_complete || "";
+        state.oauthDevice.userCode = result.user_code || "";
+        if (state.route === "accounts") renderAccounts($("#view"));
+        if (
+          ["succeeded", "failed", "stale_generation"].includes(result.status)
+        ) {
+          state.oauthDevice.busy = false;
+          notify(
+            result.status === "succeeded" ? "success" : "error",
+            result.status === "succeeded"
+              ? "OAuth credential stored server-side."
+              : "OAuth device authorization did not complete.",
+          );
+          await refreshCurrentView();
+          return;
+        }
+      } catch (error) {
+        state.oauthDevice.busy = false;
+        if (error.status === 401) authRequired();
+        else notify("error", `OAuth status failed: ${error.message}`);
+        return;
+      }
+    }
+    state.oauthDevice.busy = false;
+    state.oauthDevice.status = "expired";
+    if (state.route === "accounts") renderAccounts($("#view"));
+    notify("warning", "OAuth device authorization polling expired.");
+  }
+
+  async function startOAuthDevice(account, trigger) {
+    if (state.oauthDevice.busy) return;
+    state.oauthDevice = {
+      account,
+      requestId: null,
+      status: "starting",
+      verificationUri: "",
+      verificationUriComplete: "",
+      userCode: "",
+      busy: true,
+    };
+    if (trigger) trigger.disabled = true;
+    try {
+      const result = await mutate(
+        `/accounts/${encodeURIComponent(account)}/oauth-device`,
+      );
+      state.oauthDevice.requestId = result.request_id;
+      if (!Number.isSafeInteger(result.request_id))
+        throw new Error("server did not return a bounded OAuth request ID");
+      renderAccounts($("#view"));
+      pollOAuthDevice(result.request_id, account, state.sessionGeneration);
+    } catch (error) {
+      state.oauthDevice.busy = false;
+      state.oauthDevice.status = "failed";
+      notify("error", `OAuth device authorization failed: ${error.message}`);
+      if (state.route === "accounts") renderAccounts($("#view"));
+    }
+  }
+
+  function accountDraftForm() {
+    const draft = state.accountDraft;
+    const upstreams = Array.from(
+      new Set(
+        (state.data.setupOptions?.providers || []).flatMap(
+          (provider) => provider.configured_upstreams || [],
+        ),
+      ),
+    ).sort();
+    if (!draft.provider && upstreams.length) draft.provider = upstreams[0];
+    const secretFields =
+      draft.authKind === "oauth"
+        ? '<p class="muted">OAuth tokens are connected after the account draft is committed and remain server-side.</p>'
+        : `<label>Secret source<select data-account-draft-field="secretKind"><option value="env"${draft.secretKind === "env" ? " selected" : ""}>Environment variable</option><option value="file"${draft.secretKind === "file" ? " selected" : ""}>Owner-private file</option><option value="keyring"${draft.secretKind === "keyring" ? " selected" : ""}>OS keyring</option></select></label>
+          ${
+            draft.secretKind === "env"
+              ? `<label>Environment name<input data-account-draft-field="envName" value="${esc(draft.envName)}" placeholder="PROVIDER_API_KEY" autocomplete="off" /></label>`
+              : draft.secretKind === "file"
+                ? `<label>Secret file path<input data-account-draft-field="filePath" value="${esc(draft.filePath)}" placeholder="/run/secrets/provider-key" autocomplete="off" /></label>`
+                : `<div class="form-grid"><label>Keyring service<input data-account-draft-field="keyringService" value="${esc(draft.keyringService)}" autocomplete="off" /></label><label>Keyring account<input data-account-draft-field="keyringAccount" value="${esc(draft.keyringAccount)}" autocomplete="off" /></label></div>`
+          }`;
+    return `<section class="panel" aria-labelledby="account-draft-title">
+      <div class="panel-head"><div><h2 class="panel-title" id="account-draft-title">Create typed account draft</h2><p class="muted">Creates a compiler-validated draft only. Review its value-free semantic diff and confirm it from Configuration before activation.</p></div></div>
+      ${
+        upstreams.length
+          ? `<div class="form-grid"><label>Account ID<input data-account-draft-field="id" value="${esc(draft.id)}" placeholder="primary" autocomplete="off" /></label><label>Configured upstream<select data-account-draft-field="provider">${upstreams.map((provider) => `<option value="${esc(provider)}"${provider === draft.provider ? " selected" : ""}>${esc(provider)}</option>`).join("")}</select></label><label>Authentication<select data-account-draft-field="authKind"><option value="api_key"${draft.authKind === "api_key" ? " selected" : ""}>API key</option><option value="oauth"${draft.authKind === "oauth" ? " selected" : ""}>OAuth</option></select></label></div>${secretFields}<div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-account-draft-action="create"${draft.busy ? " disabled" : ""}>Create and validate draft</button></div>`
+          : '<div class="empty-state"><p class="empty-title">No configured upstream is available</p><p class="empty-description">Add an upstream through the typed Configuration editor before creating its account.</p></div>'
+      }
+      <p class="muted">The request carries only typed reference metadata. Secret values are never accepted or returned.</p>
+    </section>`;
+  }
+
+  async function createAccountDraft(trigger) {
+    const draft = state.accountDraft;
+    if (draft.busy) return;
+    const secret =
+      draft.authKind === "oauth"
+        ? undefined
+        : draft.secretKind === "env"
+          ? { kind: "env", name: draft.envName }
+          : draft.secretKind === "file"
+            ? { kind: "file", path: draft.filePath }
+            : {
+                kind: "keyring",
+                service: draft.keyringService,
+                account: draft.keyringAccount,
+              };
+    if (!draft.id.trim() || !draft.provider) {
+      notify("error", "Account ID and configured upstream are required.");
+      return;
+    }
+    draft.busy = true;
+    if (trigger) trigger.disabled = true;
+    try {
+      const result = await mutateJson("/config/accounts/draft", "POST", {
+        id: draft.id.trim(),
+        provider: draft.provider,
+        auth_kind: draft.authKind,
+        ...(secret ? { secret } : {}),
+      });
+      state.configuration.draftId = result.draft_id;
+      state.configuration.etag = result.etag;
+      state.configuration.diff = result.semantic_diff || [];
+      state.configuration.confirmationToken = result.confirmation_token || "";
+      notify(
+        "success",
+        "Account draft validated. Review and explicitly commit it.",
+      );
+      window.location.hash = "configuration";
+    } catch (error) {
+      notify("error", `Account draft failed: ${error.message}`);
+    } finally {
+      draft.busy = false;
+      if (state.route === "accounts") renderAccounts($("#view"));
+    }
   }
 
   function renderAccounts(root) {
@@ -1975,6 +2162,7 @@
     root.innerHTML = `
       ${viewHeader("Accounts", views.accounts.subtitle)}
       <section class="grid-stats grid-stats-4">${stats}</section>
+      ${accountDraftForm()}
       ${section("Accounts", accountTable, "Switch enables the account and disables its same-provider siblings atomically.")}
       ${accountConnectionGuide(connectionAccount)}
       <div class="banner banner-info">
@@ -2070,22 +2258,26 @@
         {
           label: "Requests",
           align: "right",
-          render: (row) => `<span class="num">${fmtInt(row.totals?.records)}</span>`,
+          render: (row) =>
+            `<span class="num">${fmtInt(row.totals?.records)}</span>`,
         },
         {
           label: "Input / output",
           align: "right",
-          render: (row) => `<span class="num">${fmtInt(row.totals?.input_tokens)} / ${fmtInt(row.totals?.output_tokens)}</span>`,
+          render: (row) =>
+            `<span class="num">${fmtInt(row.totals?.input_tokens)} / ${fmtInt(row.totals?.output_tokens)}</span>`,
         },
         {
           label: "Reasoning / cache",
           align: "right",
-          render: (row) => `<span class="num">${fmtInt(row.totals?.reasoning_tokens)} / ${fmtInt(row.totals?.cache_tokens)}</span>`,
+          render: (row) =>
+            `<span class="num">${fmtInt(row.totals?.reasoning_tokens)} / ${fmtInt(row.totals?.cache_tokens)}</span>`,
         },
         {
           label: "Media I/A/V",
           align: "right",
-          render: (row) => `<span class="num">${fmtInt(row.totals?.image_units)} / ${fmtInt(row.totals?.audio_units)} / ${fmtInt(row.totals?.video_units)}</span>`,
+          render: (row) =>
+            `<span class="num">${fmtInt(row.totals?.image_units)} / ${fmtInt(row.totals?.audio_units)} / ${fmtInt(row.totals?.video_units)}</span>`,
         },
         {
           label: "Latency / TTFT",
@@ -2093,15 +2285,20 @@
           render: (row) => {
             const count = Number(row.totals?.records) || 0;
             const ttftCount = Number(row.totals?.ttft_records) || 0;
-            const latency = count ? Math.round(Number(row.totals?.latency_ms || 0) / count) : null;
-            const ttft = ttftCount ? Math.round(Number(row.totals?.ttft_ms || 0) / ttftCount) : null;
+            const latency = count
+              ? Math.round(Number(row.totals?.latency_ms || 0) / count)
+              : null;
+            const ttft = ttftCount
+              ? Math.round(Number(row.totals?.ttft_ms || 0) / ttftCount)
+              : null;
             return `<span class="num">${latency === null ? "—" : `${fmtInt(latency)} ms`} / ${ttft === null ? "—" : `${fmtInt(ttft)} ms`}</span>`;
           },
         },
         {
           label: "Cost",
           align: "right",
-          render: (row) => `<span class="num">${fmtInt(row.totals?.cost_in_usd_ticks)}</span><span class="muted"> ${esc(text(row.dimensions?.cost_provenance))}${row.dimensions?.price_book_version ? ` · ${esc(row.dimensions.price_book_version)}` : ""}</span>`,
+          render: (row) =>
+            `<span class="num">${fmtInt(row.totals?.cost_in_usd_ticks)}</span><span class="muted"> ${esc(text(row.dimensions?.cost_provenance))}${row.dimensions?.price_book_version ? ` · ${esc(row.dimensions.price_book_version)}` : ""}</span>`,
         },
       ],
       retained,
@@ -2109,7 +2306,8 @@
         loading: state.loading && !state.data.usageAggregate,
         error: endpointError("usageAggregate"),
         emptyTitle: "No retained usage in this range",
-        emptyDescription: "Completed requests appear here after usage metadata is recorded.",
+        emptyDescription:
+          "Completed requests appear here after usage metadata is recorded.",
       },
     );
 
@@ -2264,7 +2462,18 @@
       ${viewHeader("Usage", views.usage.subtitle)}
       <div class="toolbar">
         <label class="field"><span class="field-label">Time range</span><select id="usage-range">
-          ${[["1h", "Last hour"], ["24h", "Last 24 hours"], ["7d", "Last 7 days"], ["30d", "Last 30 days"], ["all", "All retained"]].map(([value, label]) => `<option value="${value}"${value === state.usageRange ? " selected" : ""}>${label}</option>`).join("")}
+          ${[
+            ["1h", "Last hour"],
+            ["24h", "Last 24 hours"],
+            ["7d", "Last 7 days"],
+            ["30d", "Last 30 days"],
+            ["all", "All retained"],
+          ]
+            .map(
+              ([value, label]) =>
+                `<option value="${value}"${value === state.usageRange ? " selected" : ""}>${label}</option>`,
+            )
+            .join("")}
         </select></label>
         <button class="btn btn-secondary btn-sm" type="button" id="usage-export">${ic("cloud-download", 15)} Export JSON</button>
       </div>
@@ -3214,6 +3423,25 @@
         return;
       }
 
+      const oauthDeviceButton = event.target.closest(
+        "[data-account-oauth-device]",
+      );
+      if (oauthDeviceButton) {
+        startOAuthDevice(
+          oauthDeviceButton.dataset.accountOauthDevice,
+          oauthDeviceButton,
+        );
+        return;
+      }
+
+      const accountDraftButton = event.target.closest(
+        "[data-account-draft-action]",
+      );
+      if (accountDraftButton) {
+        createAccountDraft(accountDraftButton);
+        return;
+      }
+
       const connectionButton = event.target.closest("[data-account-connect]");
       if (connectionButton) {
         state.connectionAccount = connectionButton.dataset.accountConnect;
@@ -3278,6 +3506,14 @@
           requestFilter.value;
         return;
       }
+      const accountDraftField = event.target.closest(
+        "[data-account-draft-field]",
+      );
+      if (accountDraftField && state.route === "accounts") {
+        state.accountDraft[accountDraftField.dataset.accountDraftField] =
+          accountDraftField.value;
+        return;
+      }
       const configField = event.target.closest("[data-config-field]");
       if (configField && state.route === "configuration") {
         state.configuration[configField.dataset.configField] =
@@ -3292,6 +3528,19 @@
       if (next) next.disabled = !setupReadyForStep(state.setup.step);
     });
     $("#view").addEventListener("change", (event) => {
+      const accountDraftField = event.target.closest(
+        "[data-account-draft-field]",
+      );
+      if (
+        accountDraftField &&
+        state.route === "accounts" &&
+        accountDraftField.tagName === "SELECT"
+      ) {
+        state.accountDraft[accountDraftField.dataset.accountDraftField] =
+          accountDraftField.value;
+        renderAccounts($("#view"));
+        return;
+      }
       const configField = event.target.closest("[data-config-field]");
       if (
         configField &&

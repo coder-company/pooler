@@ -35,6 +35,12 @@ Run the opaque proxy with:
 POOLER_UPSTREAM_KEY=... cargo run -p pooler-cli -- serve --config config/pooler.example.yaml
 ```
 
+Create an owner-private first deployment with `pooler init`, run non-billable
+provider checks with `pooler preflight`, launch the dashboard with `pooler
+dashboard`, or use the management-API-backed `pooler tui`. Secure bootstrap,
+typed account creation, brokered device OAuth, client instructions, migration,
+and provider verification are documented in [onboarding](docs/onboarding.md).
+
 Inspect provider login support, aliases, and API-key guidance with `pooler auth
 providers`; the secure profile, OAuth override, device-flow, and status UX is
 documented in [provider login](docs/provider-login.md). The authenticated account controls,

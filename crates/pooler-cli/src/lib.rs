@@ -12,9 +12,14 @@ use pooler_http::{NativeRuntime, PoolingCoordinator};
 use pooler_store::{SqliteOAuthTokenStore, SqliteStore};
 
 mod auth;
+mod bootstrap;
 mod catalog;
+mod dashboard;
 mod doctor;
 mod fixture_replay;
+mod migrate;
+mod preflight;
+mod tui;
 pub use auth::{AuthCommand, AuthLoginMethod, OAuthEncodingArgument, OAuthOverrideArgs};
 pub use catalog::{CatalogCommand, VENDORED_MODEL_FACTS_PATH};
 
@@ -45,6 +50,39 @@ pub struct Cli {
 /// Supported commands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Create a compiler-validated owner-private starter deployment.
+    Init {
+        /// New directory to create. Existing paths are never modified.
+        #[arg(long, default_value = "pooler-starter")]
+        output: PathBuf,
+        /// Emit the redacted bootstrap report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open a thin terminal view backed entirely by the management API.
+    Tui {
+        /// Management listener origin. Cleartext is accepted only on loopback.
+        #[arg(long, default_value = "http://127.0.0.1:18477")]
+        endpoint: String,
+        /// Bearer token reference: env:, owner-private file:, or keyring:.
+        #[arg(long)]
+        token_ref: String,
+        /// Render one snapshot and exit.
+        #[arg(long)]
+        once: bool,
+        /// Refresh interval for the live view.
+        #[arg(long, default_value_t = 5)]
+        interval_secs: u64,
+    },
+    /// Open or print the authenticated management dashboard URL.
+    Dashboard {
+        /// Explicit trusted remote dashboard URL. Local URLs are derived from configuration.
+        #[arg(long)]
+        url: Option<String>,
+        /// Print the URL without invoking the platform browser opener.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Parse and validate the configuration.
     Check,
     /// Print the validated configuration without resolving secrets.
@@ -59,6 +97,8 @@ pub enum Command {
     Serve,
     /// Run local diagnostics.
     Doctor,
+    /// Probe DNS, TLS, authentication, discovery, endpoint reachability, and quota support without inference.
+    Preflight,
     /// List configured public models.
     Models {
         /// Emit merged targets, source policy, and provenance as JSON.
@@ -86,11 +126,33 @@ pub enum Command {
         #[command(subcommand)]
         command: FixtureCommand,
     },
+    /// Convert supported legacy configurations without retaining secret values.
+    Migrate {
+        /// Legacy configuration format.
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
     /// Manage provider credentials.
     Auth {
         /// Credential-management operation.
         #[command(subcommand)]
         command: AuthCommand,
+    },
+}
+
+/// Legacy configuration migration operations.
+#[derive(Debug, Subcommand)]
+pub enum MigrateCommand {
+    /// Translate the pinned CLIProxyAPI Plus configuration shape.
+    Cliproxy {
+        /// CLIProxyAPI YAML configuration to inspect.
+        input: PathBuf,
+        /// Report the redacted proposal without writing any file.
+        #[arg(long)]
+        dry_run: bool,
+        /// New owner-private Pooler configuration path for a non-dry migration.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -158,6 +220,33 @@ pub enum ConfigCommand {
 /// Runs one CLI command.
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Init { output, json } => {
+            let report = bootstrap::init(&output)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Created private Pooler starter at {}",
+                    report.directory.display()
+                );
+                println!("Configuration: {}", report.config.display());
+                println!("Dashboard: {}", report.management_url);
+                println!("Credential-store key: {}", report.credential_key_ref);
+                for step in report.next_steps {
+                    println!("- {step}");
+                }
+            }
+            Ok(())
+        }
+        Command::Tui {
+            endpoint,
+            token_ref,
+            once,
+            interval_secs,
+        } => tui::run(&endpoint, &token_ref, once, interval_secs),
+        Command::Dashboard { url, no_open } => {
+            dashboard::launch(&cli.config, url.as_deref(), no_open)
+        }
         Command::Check => {
             load(&cli.config)?;
             println!("configuration is valid");
@@ -202,6 +291,11 @@ pub fn run(cli: Cli) -> Result<()> {
             cli.credential_store.as_deref(),
             cli.credential_key_ref.as_deref(),
         ),
+        Command::Preflight => preflight::run(
+            &cli.config,
+            cli.credential_store.as_deref(),
+            cli.credential_key_ref.as_deref(),
+        ),
         Command::Models { json } => models(
             &cli.config,
             cli.credential_store.as_deref(),
@@ -211,6 +305,14 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Catalog { command } => catalog::run(command),
         Command::Providers { search, json } => catalog::providers(search.as_deref(), json),
         Command::Fixture { command } => fixture_replay::run(command),
+        Command::Migrate {
+            command:
+                MigrateCommand::Cliproxy {
+                    input,
+                    dry_run,
+                    output,
+                },
+        } => migrate::cliproxy(&input, dry_run, output.as_deref()),
         Command::Auth { command } => auth::run(
             command,
             &cli.config,
@@ -630,6 +732,75 @@ mod tests {
             .expect("command should parse");
         assert!(matches!(cli.command, Command::Check));
         assert_eq!(cli.config, PathBuf::from("example.yaml"));
+    }
+
+    #[test]
+    fn init_command_accepts_a_new_output_directory() {
+        let cli = Cli::try_parse_from(["pooler", "init", "--output", "starter", "--json"])
+            .expect("init command should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Init { output, json: true } if output == PathBuf::from("starter")
+        ));
+    }
+
+    #[test]
+    fn dashboard_command_can_print_without_opening_a_browser() {
+        let cli = Cli::try_parse_from(["pooler", "dashboard", "--no-open"])
+            .expect("dashboard command should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Dashboard {
+                url: None,
+                no_open: true
+            }
+        ));
+    }
+
+    #[test]
+    fn tui_requires_a_secret_reference_and_supports_one_snapshot() {
+        let cli = Cli::try_parse_from([
+            "pooler",
+            "tui",
+            "--token-ref",
+            "env:POOLER_MANAGEMENT_TOKEN",
+            "--once",
+        ])
+        .expect("TUI command should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Tui {
+                endpoint,
+                token_ref,
+                once: true,
+                interval_secs: 5,
+            } if endpoint == "http://127.0.0.1:18477"
+                && token_ref == "env:POOLER_MANAGEMENT_TOKEN"
+        ));
+    }
+
+    #[test]
+    fn preflight_command_is_available() {
+        let cli =
+            Cli::try_parse_from(["pooler", "preflight"]).expect("preflight command should parse");
+        assert!(matches!(cli.command, Command::Preflight));
+    }
+
+    #[test]
+    fn cliproxy_migration_dry_run_is_available() {
+        let cli =
+            Cli::try_parse_from(["pooler", "migrate", "cliproxy", "legacy.yaml", "--dry-run"])
+                .expect("migration command should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Migrate {
+                command: MigrateCommand::Cliproxy {
+                    input,
+                    dry_run: true,
+                    output: None
+                }
+            } if input == PathBuf::from("legacy.yaml")
+        ));
     }
 
     #[test]
