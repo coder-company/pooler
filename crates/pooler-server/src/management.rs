@@ -3989,6 +3989,20 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
+    fn private_configuration_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("temporary configuration directory");
+        #[cfg(unix)]
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private configuration directory");
+        directory
+    }
+
+    fn make_configuration_private(path: &Path) {
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("private configuration source");
+    }
+
     struct FailingDiagnosticsStore {
         inner: MemoryStore,
         fail_reads: AtomicBool,
@@ -5443,7 +5457,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
     fn typed_account_draft_supports_env_file_and_keyring_without_echoing_references() {
         const MANAGEMENT_ENV: &str = "POOLER_ACCOUNT_DRAFT_MANAGEMENT_KEY";
         std::env::set_var(MANAGEMENT_ENV, "account-draft-management-secret");
-        let directory = tempfile::tempdir().expect("configuration directory");
+        let directory = private_configuration_tempdir();
         let source = directory.path().join("gateway.yaml");
         std::fs::write(
             &source,
@@ -5452,6 +5466,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             ),
         )
         .expect("source configuration");
+        make_configuration_private(&source);
         let api = authenticated_api(MANAGEMENT_ENV);
         api.enable_config_management(&source)
             .expect("typed management enabled");
@@ -5530,7 +5545,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
     async fn typed_configuration_api_requires_etags_and_activates_only_after_reload() {
         const SECRET_ENV: &str = "POOLER_MANAGEMENT_CONFIG_TEST_KEY";
         std::env::set_var(SECRET_ENV, "managed-config-secret");
-        let directory = tempfile::tempdir().expect("temporary configuration directory");
+        let directory = private_configuration_tempdir();
         let source = directory.path().join("gateway.yaml");
         std::fs::write(
             &source,
@@ -5539,6 +5554,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             ),
         )
         .expect("source configuration written");
+        make_configuration_private(&source);
         let api = authenticated_api(SECRET_ENV);
         api.enable_config_management(&source)
             .expect("typed management enabled");
@@ -5668,7 +5684,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         ));
 
         std::env::set_var(SECRET_ENV, "typed-body-secret");
-        let directory = tempfile::tempdir().expect("temporary configuration directory");
+        let directory = private_configuration_tempdir();
         let source = directory.path().join("gateway.yaml");
         std::fs::write(
             &source,
@@ -5677,6 +5693,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             ),
         )
         .expect("source configuration written");
+        make_configuration_private(&source);
         let api = Arc::new(authenticated_api(SECRET_ENV));
         api.enable_config_management(&source)
             .expect("typed management enabled");

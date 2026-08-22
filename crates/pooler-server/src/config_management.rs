@@ -25,6 +25,7 @@ const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 const DRAFT_TTL: Duration = Duration::from_secs(30 * 60);
 const GENERATED_HEADER: &[u8] =
     b"# Generated and exclusively managed by Pooler. Do not edit by hand.\n";
+const RECOVERY_MARKER: &[u8] = b"pooler-managed-config-transaction-v1\n";
 
 #[cfg(test)]
 thread_local! {
@@ -116,6 +117,7 @@ pub(crate) enum ConfigManagementError {
 
 pub(crate) fn serving_source(source: impl AsRef<Path>) -> Result<PathBuf, ConfigManagementError> {
     let (original, managed) = managed_paths(source.as_ref())?;
+    ensure_no_recovery_marker(&managed)?;
     if validate_existing_managed(&managed)? {
         Ok(managed)
     } else {
@@ -126,6 +128,7 @@ pub(crate) fn serving_source(source: impl AsRef<Path>) -> Result<PathBuf, Config
 impl ConfigManagement {
     pub(crate) fn new(source: impl AsRef<Path>) -> Result<Self, ConfigManagementError> {
         let (original_source, managed_path) = managed_paths(source.as_ref())?;
+        ensure_no_recovery_marker(&managed_path)?;
         let active_source = if validate_existing_managed(&managed_path)? {
             managed_path.clone()
         } else {
@@ -367,11 +370,18 @@ impl ConfigManagement {
             return Ok(());
         };
         debug_assert_eq!(pending.request_id, request_id);
+        let completion = if succeeded {
+            clear_recovery_marker(&pending.managed_path)
+        } else {
+            restore_persistence(&pending.managed_path, &pending.persistence)
+                .and_then(|()| verify_persistence(&pending.managed_path, &pending.persistence))
+                .and_then(|()| clear_recovery_marker(&pending.managed_path))
+        };
+        if completion.is_err() {
+            state.pending.insert(request_id, pending);
+            return Err(ConfigManagementError::RecoveryRequired);
+        }
         if !succeeded {
-            if restore_persistence(&pending.managed_path, &pending.persistence).is_err() {
-                state.pending.insert(request_id, pending);
-                return Err(ConfigManagementError::Persistence);
-            }
             state.active_source = pending.previous_source;
         }
         Ok(())
@@ -391,18 +401,32 @@ impl ConfigManagement {
         {
             return Err(ConfigManagementError::Precondition);
         }
-        let backup = backup_path(&self.managed_path);
-        if !validate_existing_managed(&backup)? {
-            return Err(ConfigManagementError::NotFound);
+        if let Err(error) = acquire_recovery_marker(&self.managed_path) {
+            state.commit_in_progress = matches!(error, ConfigManagementError::RecoveryRequired);
+            return Err(error);
         }
-        let prior = fs::read(&backup).map_err(|_| ConfigManagementError::Persistence)?;
-        let prior_text = std::str::from_utf8(&prior)
-            .map_err(|_| ConfigManagementError::Invalid("rollback is not UTF-8".into()))?;
-        Config::from_yaml(backup.display().to_string(), prior_text)
-            .and_then(|config| config.compile_with_generation(active_generation.saturating_add(1)))
-            .map_err(|error| ConfigManagementError::Invalid(error.to_string()))?;
+        let backup = backup_path(&self.managed_path);
+        let prepared = (|| {
+            let prior = read_existing_managed(&backup)?.ok_or(ConfigManagementError::NotFound)?;
+            let prior_text = std::str::from_utf8(&prior)
+                .map_err(|_| ConfigManagementError::Invalid("rollback is not UTF-8".into()))?;
+            Config::from_yaml(backup.display().to_string(), prior_text)
+                .and_then(|config| {
+                    config.compile_with_generation(active_generation.saturating_add(1))
+                })
+                .map_err(|error| ConfigManagementError::Invalid(error.to_string()))?;
+            Ok(prior)
+        })();
+        let prior = match prepared {
+            Ok(prior) => prior,
+            Err(error) => {
+                let error = clear_marker_or_recovery_required(&self.managed_path, error);
+                state.commit_in_progress = matches!(error, ConfigManagementError::RecoveryRequired);
+                return Err(error);
+            }
+        };
         let previous_source = state.active_source.clone();
-        let persistence = match persist_atomic(&self.managed_path, &prior) {
+        let persistence = match persist_atomic_marked(&self.managed_path, &prior) {
             Ok(persistence) => persistence,
             Err(error) => {
                 state.commit_in_progress = matches!(error, ConfigManagementError::RecoveryRequired);
@@ -704,22 +728,153 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_extension("backup.yaml")
 }
 
-fn persist_atomic(path: &Path, bytes: &[u8]) -> Result<PersistenceState, ConfigManagementError> {
+fn recovery_marker_path(path: &Path) -> PathBuf {
+    path.with_extension("recovery-required")
+}
+
+fn completed_recovery_marker_path(path: &Path) -> PathBuf {
+    path.with_extension("recovery-completed")
+}
+
+fn ensure_no_recovery_marker(path: &Path) -> Result<(), ConfigManagementError> {
+    cleanup_completed_recovery_marker(path)?;
+    if validate_existing_recovery_marker(&recovery_marker_path(path))? {
+        Err(ConfigManagementError::RecoveryRequired)
+    } else {
+        Ok(())
+    }
+}
+
+fn cleanup_completed_recovery_marker(path: &Path) -> Result<(), ConfigManagementError> {
+    let completed = completed_recovery_marker_path(path);
+    if !validate_existing_recovery_marker(&completed)? {
+        return Ok(());
+    }
     let parent = path.parent().ok_or(ConfigManagementError::Persistence)?;
-    let parent = parent
-        .canonicalize()
+    remove_file_synced(parent, &completed)
+}
+
+fn validate_existing_recovery_marker(path: &Path) -> Result<bool, ConfigManagementError> {
+    let Some(mut file) = open_validated_file(path, true)? else {
+        return Ok(false);
+    };
+    let metadata = file
+        .metadata()
         .map_err(|_| ConfigManagementError::Persistence)?;
+    if metadata.len() != RECOVERY_MARKER.len() as u64 {
+        return Err(ConfigManagementError::RecoveryRequired);
+    }
+    let mut bytes = Vec::with_capacity(RECOVERY_MARKER.len());
+    file.read_to_end(&mut bytes)
+        .map_err(|_| ConfigManagementError::Persistence)?;
+    if bytes == RECOVERY_MARKER {
+        Ok(true)
+    } else {
+        Err(ConfigManagementError::RecoveryRequired)
+    }
+}
+
+fn acquire_recovery_marker(path: &Path) -> Result<(), ConfigManagementError> {
+    ensure_no_recovery_marker(path)?;
+    let parent = path.parent().ok_or(ConfigManagementError::Persistence)?;
+    let marker = recovery_marker_path(path);
+    for _ in 0..3 {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = match options.open(&marker) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if validate_existing_recovery_marker(&marker)? {
+                    return Err(ConfigManagementError::RecoveryRequired);
+                }
+                continue;
+            }
+            Err(_) => return Err(ConfigManagementError::Persistence),
+        };
+        let result = (|| -> io::Result<()> {
+            let metadata = file.metadata()?;
+            if !metadata.file_type().is_file() {
+                return Err(io::Error::other("recovery marker is not a regular file"));
+            }
+            #[cfg(unix)]
+            if metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.mode() & 0o077 != 0
+                || metadata.nlink() != 1
+            {
+                return Err(io::Error::other("recovery marker is not owner-private"));
+            }
+            file.write_all(RECOVERY_MARKER)?;
+            file.sync_all()?;
+            File::open(parent)?.sync_all()
+        })();
+        return result.map_err(|_| ConfigManagementError::RecoveryRequired);
+    }
+    Err(ConfigManagementError::Persistence)
+}
+
+fn clear_recovery_marker(path: &Path) -> Result<(), ConfigManagementError> {
+    cleanup_completed_recovery_marker(path)?;
+    let parent = path.parent().ok_or(ConfigManagementError::Persistence)?;
+    let marker = recovery_marker_path(path);
+    let completed = completed_recovery_marker_path(path);
+    if !validate_existing_recovery_marker(&marker)? {
+        return Err(ConfigManagementError::Persistence);
+    }
+    fs::rename(&marker, &completed).map_err(|_| ConfigManagementError::Persistence)?;
+    if File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .is_err()
+    {
+        let _ = fs::rename(&completed, &marker);
+        let _ = File::open(parent).and_then(|directory| directory.sync_all());
+        return Err(ConfigManagementError::RecoveryRequired);
+    }
+    // The durable rename records completed recovery. Removing that completion
+    // marker is only cleanup: either its presence or absence is safe at restart.
+    let _ = remove_file_synced(parent, &completed);
+    Ok(())
+}
+
+fn clear_marker_or_recovery_required(
+    path: &Path,
+    original: ConfigManagementError,
+) -> ConfigManagementError {
+    if clear_recovery_marker(path).is_ok() {
+        original
+    } else {
+        ConfigManagementError::RecoveryRequired
+    }
+}
+
+fn persist_atomic(path: &Path, bytes: &[u8]) -> Result<PersistenceState, ConfigManagementError> {
+    acquire_recovery_marker(path)?;
+    persist_atomic_marked(path, bytes)
+}
+
+fn persist_atomic_marked(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<PersistenceState, ConfigManagementError> {
+    let parent = match path.parent().and_then(|parent| parent.canonicalize().ok()) {
+        Some(parent) => parent,
+        None => {
+            return Err(clear_marker_or_recovery_required(
+                path,
+                ConfigManagementError::Persistence,
+            ));
+        }
+    };
     let backup = backup_path(path);
-    let previous_managed = if validate_existing_managed(path)? {
-        Some(fs::read(path).map_err(|_| ConfigManagementError::Persistence)?)
-    } else {
-        None
-    };
-    let previous_backup = if validate_existing_managed(&backup)? {
-        Some(fs::read(&backup).map_err(|_| ConfigManagementError::Persistence)?)
-    } else {
-        None
-    };
+    let previous_managed = read_optional_managed(path)
+        .map_err(|error| clear_marker_or_recovery_required(path, error))?;
+    let previous_backup = read_optional_managed(&backup)
+        .map_err(|error| clear_marker_or_recovery_required(path, error))?;
     let persistence = PersistenceState {
         previous_managed,
         previous_backup,
@@ -732,12 +887,19 @@ fn persist_atomic(path: &Path, bytes: &[u8]) -> Result<PersistenceState, ConfigM
         write_atomic(&parent, path, bytes)
     })();
     if mutation.is_err() {
-        return match restore_persistence(path, &persistence) {
+        return match restore_persistence(path, &persistence)
+            .and_then(|()| verify_persistence(path, &persistence))
+            .and_then(|()| clear_recovery_marker(path))
+        {
             Ok(()) => Err(ConfigManagementError::Persistence),
             Err(_) => Err(ConfigManagementError::RecoveryRequired),
         };
     }
     Ok(persistence)
+}
+
+fn read_optional_managed(path: &Path) -> Result<Option<Vec<u8>>, ConfigManagementError> {
+    read_existing_managed(path)
 }
 
 fn restore_persistence(
@@ -757,6 +919,19 @@ fn restore_persistence(
     } else {
         remove_file_synced(parent, &backup)
     }
+}
+
+fn verify_persistence(
+    path: &Path,
+    persistence: &PersistenceState,
+) -> Result<(), ConfigManagementError> {
+    if read_optional_managed(path)? != persistence.previous_managed {
+        return Err(ConfigManagementError::Persistence);
+    }
+    if read_optional_managed(&backup_path(path))? != persistence.previous_backup {
+        return Err(ConfigManagementError::Persistence);
+    }
+    Ok(())
 }
 
 fn remove_file_synced(parent: &Path, path: &Path) -> Result<(), ConfigManagementError> {
@@ -809,10 +984,20 @@ fn write_atomic(parent: &Path, path: &Path, bytes: &[u8]) -> Result<(), ConfigMa
 }
 
 fn managed_paths(source: &Path) -> Result<(PathBuf, PathBuf), ConfigManagementError> {
-    reject_symlink(source)?;
+    let source_metadata =
+        fs::symlink_metadata(source).map_err(|_| ConfigManagementError::Persistence)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.file_type().is_file() {
+        return Err(ConfigManagementError::Persistence);
+    }
     let original = source
         .canonicalize()
         .map_err(|_| ConfigManagementError::Persistence)?;
+    validate_source_file(&original)?;
+    validate_parent_directory(
+        original
+            .parent()
+            .ok_or(ConfigManagementError::Persistence)?,
+    )?;
     let file_name = original
         .file_stem()
         .and_then(|name| name.to_str())
@@ -821,56 +1006,100 @@ fn managed_paths(source: &Path) -> Result<(PathBuf, PathBuf), ConfigManagementEr
     Ok((original, managed))
 }
 
-fn validate_existing_managed(path: &Path) -> Result<bool, ConfigManagementError> {
-    reject_existing_unsafe(path)?;
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(_) => return Err(ConfigManagementError::Persistence),
-    };
-    if metadata.len() > MAX_DOCUMENT_BYTES as u64 {
-        return Err(ConfigManagementError::TooLarge);
-    }
-    let mut file = File::open(path).map_err(|_| ConfigManagementError::Persistence)?;
-    let mut header = vec![0; GENERATED_HEADER.len()];
-    file.read_exact(&mut header)
-        .map_err(|_| ConfigManagementError::Persistence)?;
-    if header != GENERATED_HEADER {
-        return Err(ConfigManagementError::Persistence);
-    }
-    Ok(true)
+fn validate_source_file(path: &Path) -> Result<(), ConfigManagementError> {
+    open_validated_file(path, false)?
+        .map(|_| ())
+        .ok_or(ConfigManagementError::Persistence)
 }
 
-fn reject_symlink(path: &Path) -> Result<(), ConfigManagementError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| ConfigManagementError::Persistence)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+fn validate_existing_managed(path: &Path) -> Result<bool, ConfigManagementError> {
+    Ok(read_existing_managed(path)?.is_some())
+}
+
+fn read_existing_managed(path: &Path) -> Result<Option<Vec<u8>>, ConfigManagementError> {
+    let Some(mut file) = open_validated_file(path, true)? else {
+        return Ok(None);
+    };
+    if file
+        .metadata()
+        .map_err(|_| ConfigManagementError::Persistence)?
+        .len()
+        > MAX_DOCUMENT_BYTES as u64
+    {
+        return Err(ConfigManagementError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_DOCUMENT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ConfigManagementError::Persistence)?;
+    if bytes.len() > MAX_DOCUMENT_BYTES || !bytes.starts_with(GENERATED_HEADER) {
+        return Err(ConfigManagementError::Persistence);
+    }
+    Ok(Some(bytes))
+}
+
+fn open_validated_file(
+    path: &Path,
+    owner_private: bool,
+) -> Result<Option<File>, ConfigManagementError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ConfigManagementError::Persistence),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|_| ConfigManagementError::Persistence)?;
+    if !metadata.file_type().is_file() {
         return Err(ConfigManagementError::Persistence);
     }
     #[cfg(unix)]
-    if metadata.uid() != rustix::process::geteuid().as_raw() {
+    if metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+        || if owner_private {
+            metadata.mode() & 0o077 != 0
+        } else {
+            metadata.mode() & 0o022 != 0
+        }
+    {
         return Err(ConfigManagementError::Persistence);
     }
-    Ok(())
+    Ok(Some(file))
 }
 
-fn reject_existing_unsafe(path: &Path) -> Result<(), ConfigManagementError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(ConfigManagementError::Persistence);
-            }
-            #[cfg(unix)]
-            if metadata.uid() != rustix::process::geteuid().as_raw()
-                || metadata.mode() & 0o077 != 0
-                || metadata.nlink() != 1
-            {
-                return Err(ConfigManagementError::Persistence);
-            }
-            Ok(())
+fn validate_parent_directory(path: &Path) -> Result<(), ConfigManagementError> {
+    let mut current = path;
+    let mut immediate = true;
+    loop {
+        let metadata = fs::metadata(current).map_err(|_| ConfigManagementError::Persistence)?;
+        if !metadata.is_dir() {
+            return Err(ConfigManagementError::Persistence);
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(ConfigManagementError::Persistence),
+        #[cfg(unix)]
+        {
+            let owner = metadata.uid();
+            let effective = rustix::process::geteuid().as_raw();
+            let root_owned_sticky = !immediate && owner == 0 && metadata.mode() & 0o1000 != 0;
+            let trusted_owner = owner == effective || (!immediate && owner == 0);
+            if !trusted_owner || (metadata.mode() & 0o022 != 0 && !root_owned_sticky) {
+                return Err(ConfigManagementError::Persistence);
+            }
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent;
+        immediate = false;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -880,12 +1109,18 @@ mod tests {
 
     fn source() -> (tempfile::TempDir, PathBuf) {
         let directory = tempdir().expect("tempdir");
+        #[cfg(unix)]
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private configuration directory");
         let path = directory.path().join("pooler.yaml");
         fs::write(
             &path,
             "version: 1\nlisteners: {}\nupstreams: {}\nmodels: []\naccounts: {}\naccount_pools: {}\npolicies: {}\nroutes: []\nextensions: {}\nmanagement: {}\n",
         )
         .expect("source");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("private configuration source");
         (directory, path)
     }
 
@@ -964,8 +1199,19 @@ mod tests {
 
         let first = commit_listener(1, "127.0.0.1:1001");
         let managed = first.managed_path.clone();
+        let marker = recovery_marker_path(&managed);
         manager.register_commit(1, first);
+        assert!(marker.is_file());
+        assert!(matches!(
+            serving_source(&path),
+            Err(ConfigManagementError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            ConfigManagement::new(&path),
+            Err(ConfigManagementError::RecoveryRequired)
+        ));
         manager.complete_commit(1, true).expect("first completion");
+        assert!(!marker.exists());
         assert_eq!(
             serving_source(&path).expect("managed source selected after restart"),
             managed
@@ -1001,6 +1247,7 @@ mod tests {
         manager
             .complete_commit(4, false)
             .expect("failed commit restoration");
+        assert!(!marker.exists());
         assert_eq!(
             manager.state.lock().expect("state lock").active_source,
             managed
@@ -1127,6 +1374,23 @@ mod tests {
             .expect("leased commit restoration");
     }
 
+    #[test]
+    fn rollback_recovery_marker_blocks_all_reload_classes() {
+        let (_directory, path) = source();
+        let manager = ConfigManagement::new(&path).expect("manager");
+        let marker = recovery_marker_path(&manager.managed_path);
+        fs::write(&marker, RECOVERY_MARKER).expect("recovery marker");
+        #[cfg(unix)]
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
+            .expect("private recovery marker");
+
+        assert!(matches!(
+            manager.rollback(1),
+            Err(ConfigManagementError::RecoveryRequired)
+        ));
+        assert!(!manager.try_begin_unmanaged_reload());
+    }
+
     #[cfg(unix)]
     #[test]
     fn source_and_managed_destination_symlinks_fail_closed() {
@@ -1152,6 +1416,66 @@ mod tests {
             .expect("unmarked file made private");
         assert!(matches!(
             serving_source(&path),
+            Err(ConfigManagementError::Persistence)
+        ));
+        fs::remove_file(&managed).expect("unmarked managed file removed");
+
+        let marker = recovery_marker_path(&managed);
+        let completed = completed_recovery_marker_path(&managed);
+        fs::write(&completed, RECOVERY_MARKER).expect("completed marker written");
+        fs::set_permissions(&completed, fs::Permissions::from_mode(0o600))
+            .expect("completed marker made private");
+        assert_eq!(
+            serving_source(&path).expect("completed transaction marker is safe"),
+            path.canonicalize().expect("canonical source")
+        );
+        assert!(!completed.exists());
+
+        symlink(&path, &marker).expect("recovery marker symlink");
+        assert!(matches!(
+            serving_source(&path),
+            Err(ConfigManagementError::Persistence)
+        ));
+        fs::remove_file(&marker).expect("marker symlink removed");
+        fs::write(&marker, RECOVERY_MARKER).expect("recovery marker written");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644))
+            .expect("marker permissions changed");
+        assert!(matches!(
+            ConfigManagement::new(&path),
+            Err(ConfigManagementError::Persistence)
+        ));
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
+            .expect("marker made private");
+        let marked = ConfigManagement::new(&path);
+        assert!(
+            matches!(marked, Err(ConfigManagementError::RecoveryRequired)),
+            "unexpected marked-source result: {:?}",
+            marked.err()
+        );
+        fs::remove_file(&marker).expect("valid marker removed");
+        let linked_marker = marker.with_extension("linked");
+        fs::write(&linked_marker, RECOVERY_MARKER).expect("hard-link source written");
+        fs::set_permissions(&linked_marker, fs::Permissions::from_mode(0o600))
+            .expect("hard-link source made private");
+        fs::hard_link(&linked_marker, &marker).expect("marker hard link");
+        assert!(matches!(
+            serving_source(&path),
+            Err(ConfigManagementError::Persistence)
+        ));
+
+        let (_writable_source_directory, writable_source) = source();
+        fs::set_permissions(&writable_source, fs::Permissions::from_mode(0o666))
+            .expect("source made writable");
+        assert!(matches!(
+            ConfigManagement::new(&writable_source),
+            Err(ConfigManagementError::Persistence)
+        ));
+
+        let (writable_directory, writable_source) = source();
+        fs::set_permissions(writable_directory.path(), fs::Permissions::from_mode(0o777))
+            .expect("source parent made writable");
+        assert!(matches!(
+            ConfigManagement::new(&writable_source),
             Err(ConfigManagementError::Persistence)
         ));
     }
