@@ -44,7 +44,9 @@ class UniqueLoader(yaml.BaseLoader):
     """Preserve GitHub's ``on`` key and reject duplicate YAML mappings."""
 
 
-def construct_unique_mapping(loader: UniqueLoader, node: yaml.MappingNode, deep: bool = False) -> dict[str, Any]:
+def construct_unique_mapping(
+    loader: UniqueLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[str, Any]:
     mapping: dict[str, Any] = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
@@ -123,9 +125,13 @@ def workflow_call_input(workflow: dict[str, Any], path: Path) -> None:
             or include_macos.get("required") != "false"
             or include_macos.get("default") != "false"
         ):
-            fail(f"{path} include-macos must be an optional boolean input defaulting to false")
+            fail(
+                f"{path} include-macos must be an optional boolean input defaulting to false"
+            )
 
-        dispatch = mapping(events.get("workflow_dispatch"), f"{path}.on.workflow_dispatch")
+        dispatch = mapping(
+            events.get("workflow_dispatch"), f"{path}.on.workflow_dispatch"
+        )
         dispatch_inputs = mapping(
             dispatch.get("inputs"), f"{path}.on.workflow_dispatch.inputs"
         )
@@ -172,11 +178,11 @@ def checkout_steps(workflow: dict[str, Any], path: Path) -> None:
                 step.get("with"), f"{path}.jobs.{job_id} checkout.with"
             )
             if with_values.get("ref") != CHECKOUT_REF:
-                fail(
-                    f"{path}.jobs.{job_id} checkout ref must be {CHECKOUT_REF!r}"
-                )
+                fail(f"{path}.jobs.{job_id} checkout ref must be {CHECKOUT_REF!r}")
             if with_values.get("persist-credentials") != "false":
-                fail(f"{path}.jobs.{job_id} checkout must disable persisted credentials")
+                fail(
+                    f"{path}.jobs.{job_id} checkout must disable persisted credentials"
+                )
 
 
 def validate_reusable_workflow(path: Path) -> dict[str, Any]:
@@ -215,7 +221,9 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
         "ci.yml.jobs.quality-macos",
     )
     for job_id in ("fixtures-and-properties", "supply-chain"):
-        require_runner(ci_jobs[job_id], BLACKSMITH_LINUX_X64_RUNNER, f"ci.yml.jobs.{job_id}")
+        require_runner(
+            ci_jobs[job_id], BLACKSMITH_LINUX_X64_RUNNER, f"ci.yml.jobs.{job_id}"
+        )
 
     hardening = workflows["hardening.yml"]
     hardening_jobs = mapping(hardening["jobs"], "hardening.yml.jobs")
@@ -228,18 +236,28 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
 
     secret_scan = workflows["secret-scan.yml"]
     secret_jobs = mapping(secret_scan["jobs"], "secret-scan.yml.jobs")
-    require_runner(secret_jobs["gitleaks"], BLACKSMITH_LINUX_X64_RUNNER, "secret-scan.yml.jobs.gitleaks")
+    require_runner(
+        secret_jobs["gitleaks"],
+        BLACKSMITH_LINUX_X64_RUNNER,
+        "secret-scan.yml.jobs.gitleaks",
+    )
 
     release = workflows["release.yml"]
     release_jobs = mapping(release["jobs"], "release.yml.jobs")
     for job_id in ("resolve", "gates", "assemble", "publish"):
-        require_runner(release_jobs[job_id], BLACKSMITH_LINUX_X64_RUNNER, f"release.yml.jobs.{job_id}")
+        require_runner(
+            release_jobs[job_id],
+            BLACKSMITH_LINUX_X64_RUNNER,
+            f"release.yml.jobs.{job_id}",
+        )
 
     build = mapping(release_jobs["build"], "release.yml.jobs.build")
     if build.get("runs-on") != "${{ matrix.runner }}":
         fail("release.yml.jobs.build.runs-on must use matrix.runner")
     build_strategy = mapping(build.get("strategy"), "release.yml.jobs.build.strategy")
-    build_matrix = mapping(build_strategy.get("matrix"), "release.yml.jobs.build.strategy.matrix")
+    build_matrix = mapping(
+        build_strategy.get("matrix"), "release.yml.jobs.build.strategy.matrix"
+    )
     build_include = sequence(
         build_matrix.get("include"), "release.yml.jobs.build.strategy.matrix.include"
     )
@@ -251,7 +269,9 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
     }
     seen_targets: set[str] = set()
     for index, raw_row in enumerate(build_include):
-        row = mapping(raw_row, f"release.yml.jobs.build.strategy.matrix.include[{index}]")
+        row = mapping(
+            raw_row, f"release.yml.jobs.build.strategy.matrix.include[{index}]"
+        )
         target = required_string(
             row, "target", f"release.yml.jobs.build.strategy.matrix.include[{index}]"
         )
@@ -270,9 +290,7 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
         fail("release.yml build matrix must retain all Linux and macOS release targets")
 
 
-def validate_rust_setup(
-    workflows: dict[str, dict[str, Any]], root: Path
-) -> None:
+def validate_rust_setup(workflows: dict[str, dict[str, Any]], root: Path) -> None:
     action_root = root / ".github" / "actions" / "setup-rust"
     for name in ("action.yml", "setup.sh"):
         if not (action_root / name).is_file():
@@ -290,7 +308,9 @@ def validate_rust_setup(
                 step_map = mapping(step, f"{workflow_name}.jobs.{job_id}.step")
                 uses = step_map.get("uses")
                 if isinstance(uses, str) and "dtolnay/rust-toolchain" in uses:
-                    fail(f"{workflow_name}.jobs.{job_id} must not use global rustup state")
+                    fail(
+                        f"{workflow_name}.jobs.{job_id} must not use global rustup state"
+                    )
                 if uses == "./.github/actions/setup-rust":
                     inputs = mapping(
                         step_map.get("with"),
@@ -315,7 +335,9 @@ def validate_sanitizer_runner(root: Path) -> None:
 
     try:
         function_start = next(
-            index for index, line in enumerate(lines) if line.strip() == "run_sanitizer() {"
+            index
+            for index, line in enumerate(lines)
+            if line.strip() == "run_sanitizer() {"
         )
         function_end = next(
             index
@@ -407,11 +429,15 @@ def validate_release(path: Path, workflows: dict[str, dict[str, Any]]) -> None:
 
     resolve_checkout = find_step(
         resolve,
-        lambda step: isinstance(step.get("uses"), str)
-        and step["uses"].startswith("actions/checkout@"),
+        lambda step: (
+            isinstance(step.get("uses"), str)
+            and step["uses"].startswith("actions/checkout@")
+        ),
         f"{path}.jobs.resolve",
     )
-    resolve_with = mapping(resolve_checkout.get("with"), f"{path}.jobs.resolve checkout.with")
+    resolve_with = mapping(
+        resolve_checkout.get("with"), f"{path}.jobs.resolve checkout.with"
+    )
     if resolve_with.get("ref") != RELEASE_TAG_REF:
         fail(f"{path}.jobs.resolve must check out the requested tag/ref")
     if resolve_with.get("persist-credentials") != "false":
@@ -445,22 +471,43 @@ def validate_release(path: Path, workflows: dict[str, dict[str, Any]]) -> None:
         job = mapping(jobs[job_id], f"{path}.jobs.{job_id}")
         checkout = find_step(
             job,
-            lambda step: isinstance(step.get("uses"), str)
-            and step["uses"].startswith("actions/checkout@"),
+            lambda step: (
+                isinstance(step.get("uses"), str)
+                and step["uses"].startswith("actions/checkout@")
+            ),
             f"{path}.jobs.{job_id}",
         )
-        with_values = mapping(checkout.get("with"), f"{path}.jobs.{job_id} checkout.with")
+        with_values = mapping(
+            checkout.get("with"), f"{path}.jobs.{job_id} checkout.with"
+        )
         if with_values.get("ref") != RELEASE_SHA:
             fail(f"{path}.jobs.{job_id} must check out the resolved SHA")
         if with_values.get("persist-credentials") != "false":
             fail(f"{path}.jobs.{job_id} checkout must disable persisted credentials")
 
     required_upstream = {"resolve", "build", "gates", "ci", "hardening", "secret_scan"}
-    if needs_set(mapping(jobs["assemble"], f"{path}.jobs.assemble"), "assemble") != required_upstream:
-        fail("release assemble must depend on build, local gates, and all required acceptance workflows")
-    required_publish = {"resolve", "assemble", "gates", "ci", "hardening", "secret_scan"}
-    if needs_set(mapping(jobs["publish"], f"{path}.jobs.publish"), "publish") != required_publish:
-        fail("release publish must depend on assemble, local gates, and all required acceptance workflows")
+    if (
+        needs_set(mapping(jobs["assemble"], f"{path}.jobs.assemble"), "assemble")
+        != required_upstream
+    ):
+        fail(
+            "release assemble must depend on build, local gates, and all required acceptance workflows"
+        )
+    required_publish = {
+        "resolve",
+        "assemble",
+        "gates",
+        "ci",
+        "hardening",
+        "secret_scan",
+    }
+    if (
+        needs_set(mapping(jobs["publish"], f"{path}.jobs.publish"), "publish")
+        != required_publish
+    ):
+        fail(
+            "release publish must depend on assemble, local gates, and all required acceptance workflows"
+        )
 
     hardening_jobs = mapping(workflows["hardening.yml"]["jobs"], "hardening.yml.jobs")
     for job_id in ("fuzz", "sanitizer"):
@@ -472,7 +519,9 @@ def validate_release(path: Path, workflows: dict[str, dict[str, Any]]) -> None:
 
     # Keep this helper explicit: it ensures the release-local gate still runs
     # executable checks, rather than merely carrying job labels.
-    if "scripts/deep-test.sh" not in run_contents(hardening_jobs["fuzz"], "hardening.yml.jobs.fuzz"):
+    if "scripts/deep-test.sh" not in run_contents(
+        hardening_jobs["fuzz"], "hardening.yml.jobs.fuzz"
+    ):
         fail("hardening.yml fuzz job must run scripts/deep-test.sh")
     sanitizer_run = run_contents(
         hardening_jobs["sanitizer"], "hardening.yml.jobs.sanitizer"
@@ -486,21 +535,26 @@ def validate_release(path: Path, workflows: dict[str, dict[str, Any]]) -> None:
         fail("hardening.yml sanitizer job must require the address sanitizer gate")
     install_gitleaks = find_step(
         secret_jobs["gitleaks"],
-        lambda step: isinstance(step.get("run"), str)
-        and "gitleaks_8.24.2_linux_x64.tar.gz" in step["run"]
-        and "fa0500f6b7e41d28791ebc680f5dd9899cd42b58629218a5f041efa899151a8e" in step["run"]
-        and "sha256sum --check --strict" in step["run"]
-        and '>> "$GITHUB_PATH"' in step["run"],
+        lambda step: (
+            isinstance(step.get("run"), str)
+            and "gitleaks_8.24.2_linux_x64.tar.gz" in step["run"]
+            and "fa0500f6b7e41d28791ebc680f5dd9899cd42b58629218a5f041efa899151a8e"
+            in step["run"]
+            and "sha256sum --check --strict" in step["run"]
+            and '>> "$GITHUB_PATH"' in step["run"]
+        ),
         "secret-scan.yml.jobs.gitleaks",
     )
     if not install_gitleaks:
         fail("secret-scan.yml must install a checksum-verified pinned Gitleaks CLI")
     gitleaks_step = find_step(
         secret_jobs["gitleaks"],
-        lambda step: isinstance(step.get("run"), str)
-        and "gitleaks git" in step["run"]
-        and ".gitleaks.toml" in step["run"]
-        and "--redact" in step["run"],
+        lambda step: (
+            isinstance(step.get("run"), str)
+            and "gitleaks git" in step["run"]
+            and ".gitleaks.toml" in step["run"]
+            and "--redact" in step["run"]
+        ),
         "secret-scan.yml.jobs.gitleaks",
     )
     if not gitleaks_step:

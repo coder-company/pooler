@@ -356,9 +356,9 @@ impl Sandbox {
     fn discover() -> Result<Self, ExtensionError> {
         #[cfg(not(target_os = "linux"))]
         {
-            return Err(ExtensionError::SandboxUnavailable(
+            Err(ExtensionError::SandboxUnavailable(
                 "the supervised external boundary currently requires Linux bubblewrap".to_owned(),
-            ));
+            ))
         }
 
         #[cfg(target_os = "linux")]
