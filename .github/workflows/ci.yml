@@ -1,17 +1,7 @@
 name: CI
 
 on:
-  workflow_dispatch:
-    inputs:
-      checkout-ref:
-        description: Git ref or commit to verify
-        required: false
-        type: string
-      include-macos:
-        description: Run the macOS quality lane on Blacksmith
-        required: false
-        default: true
-        type: boolean
+  push: {}
   workflow_call:
     inputs:
       checkout-ref:
@@ -44,7 +34,7 @@ jobs:
       # weekly after checking the corresponding release tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout-ref || github.ref }}
+          ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
         with:
@@ -76,14 +66,14 @@ jobs:
 
   quality-macos:
     name: Quality (macOS)
-    if: ${{ inputs.include-macos }}
+    if: ${{ github.event_name == 'push' || inputs.include-macos }}
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       # Action references are immutable commit pins. Dependabot updates them
       # weekly after checking the corresponding release tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout-ref || github.ref }}
+          ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
         with:
@@ -111,7 +101,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout-ref || github.ref }}
+          ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
@@ -135,7 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout-ref || github.ref }}
+          ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:

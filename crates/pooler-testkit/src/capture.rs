@@ -962,7 +962,8 @@ mod tests {
             0o600
         );
         assert_eq!(
-            fs::metadata(root.join("nested")).expect("directory metadata")
+            fs::metadata(root.join("nested"))
+                .expect("directory metadata")
                 .permissions()
                 .mode()
                 & 0o777,

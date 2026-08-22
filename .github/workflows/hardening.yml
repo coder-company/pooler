@@ -1,13 +1,14 @@
 name: Hardening
 
+# Commit-triggered by default; release verification reuses this workflow.
 on:
+  push: {}
   workflow_call:
     inputs:
       checkout-ref:
         description: Git ref or commit to verify
         required: false
         type: string
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -27,12 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout-ref || github.ref }}
+          ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: scripts/deep-test.sh --no-fuzz
 
   fuzz:
@@ -41,16 +42,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout-ref || github.ref }}
+          ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: >-
           RUSTUP_TOOLCHAIN=nightly POOLER_FUZZ_TOOLCHAIN=nightly
           POOLER_REQUIRE_FUZZ=1
@@ -63,19 +64,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout-ref || github.ref }}
+          ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Run bounded smoke workload
         shell: bash
         run: >-
           cargo run --locked --release -p pooler-bench --
           --mode all --short --runs 1 --json
           --output "$RUNNER_TEMP/pooler-benchmark-smoke.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: benchmark-smoke-report
           path: ${{ runner.temp }}/pooler-benchmark-smoke.json
@@ -87,13 +88,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.checkout-ref || github.ref }}
+          ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
           components: rust-src
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: >-
           POOLER_REQUIRE_SANITIZER=1 POOLER_SANITIZER=address
           scripts/deep-test.sh --sanitize --no-fuzz

@@ -8,8 +8,10 @@ job targets an explicit Blacksmith runner class: Linux x86_64 uses
 `blacksmith-4vcpu-ubuntu-2404`, Linux ARM64 release builds use
 `blacksmith-4vcpu-ubuntu-2404-arm`, and macOS quality and release builds use
 `blacksmith-6vcpu-macos-15`. A queued or failed macOS lane is not a passing
-result. Manual CI dispatch defaults `include-macos` to true; reusable callers
-default it to false, while release CI explicitly sets it to true.
+result. CI, Hardening, and Secret Scan run automatically for each pushed commit
+and do not expose manual dispatch. Push CI always includes macOS; reusable
+callers default `include-macos` to false, while release CI explicitly sets it to
+true.
 
 ## Local quality gates
 
@@ -40,7 +42,7 @@ compiler check for every manifest row and rejects skipped or unmapped rows.
 | Compatibility | Every committed fixture replays with zero unexplained differences; `fixtures/compatibility/MATRIX.md` is regenerated. | Sanitized local/cross-language rows do not claim current-client compatibility. |
 | Client conformance | Current Cursor, Factory, and Devin client conversations are captured, sanitized, replayed, and linked to matrix rows. | Exercised current-client rows pass; structural/reference-only rows remain explicitly narrower claims. |
 | Provider conformance | Live authorization and provider-policy evidence is recorded without secrets. | No live provider authorization is committed. |
-| Security | Secret-redaction, owner-only storage, cancellation, dependency, license, and vulnerability gates pass. | Local root/fuzz audit and deny gates pass; Blacksmith CI persists supply-chain logs when explicitly dispatched. |
+| Security | Secret-redaction, owner-only storage, cancellation, dependency, license, and vulnerability gates pass. | Local root/fuzz audit and deny gates pass; Blacksmith CI persists supply-chain logs for every pushed commit. |
 | Performance | Three consecutive documented 1 MiB benchmark runs meet opaque p95 < 2 ms and semantic p95 < 5 ms. | Passed for implementation commit `47f68b2`; see `docs/benchmark-evidence-2026-08-20.md`. |
 | Stress | Reproducible 15-minute mixed-protocol run processes at least 10,000 requests at 100 clients with 20% deterministic failures, drains cleanly, and meets RSS budget. | Passed with 1,172,800 requests and all invariants true for `47f68b2`. |
 | Artifacts | Linux x86_64/ARM64 and macOS ARM64/x86_64 binaries, checksums, signatures, SBOM, and provenance are published. | Linux x86_64 is locally reproduced; Linux ARM64, both macOS targets, signatures, and hosted provenance remain pending. |

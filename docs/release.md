@@ -65,10 +65,11 @@ release targets use the ARM64 M4-backed `blacksmith-6vcpu-macos-15` image. Rust
 builds both `x86_64-apple-darwin` and `aarch64-apple-darwin` on that native macOS
 host, so neither platform row is a Linux proxy.
 
-The workflows run only by explicit dispatch or as reusable release gates, so
-ordinary pushes do not consume runner capacity. Manual CI dispatch defaults
-`include-macos` to `true`; reusable callers default it to `false`, and the
-release workflow explicitly passes `include-macos: true`.
+CI, Hardening, and Secret Scan run automatically for every pushed commit and
+check out the immutable `github.sha`; none exposes a manual-dispatch trigger.
+They also remain reusable release gates. Push CI always runs the macOS quality
+lane, while reusable callers default `include-macos` to `false`; the release
+workflow explicitly passes `include-macos: true`.
 
 The workflow uploads the archives, generates aggregate checksums, signs the
 checksum manifest with Cosign keyless signing, and attaches GitHub build

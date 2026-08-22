@@ -22,7 +22,7 @@ except ImportError as error:  # pragma: no cover - depends on the runner image
     ) from error
 
 
-CHECKOUT_REF = "${{ inputs.checkout-ref || github.ref }}"
+CHECKOUT_REF = "${{ inputs.checkout-ref || github.sha }}"
 RELEASE_SHA = "${{ needs.resolve.outputs.sha }}"
 RELEASE_TAG_REF = "${{ inputs.tag || github.ref }}"
 BLACKSMITH_LINUX_X64_RUNNER = "blacksmith-4vcpu-ubuntu-2404"
@@ -71,7 +71,11 @@ def fail(message: str) -> NoReturn:
 def load_workflow(path: Path) -> dict[str, Any]:
     try:
         with path.open(encoding="utf-8") as stream:
-            document = yaml.load(stream, Loader=UniqueLoader)
+            loader = UniqueLoader(stream)
+            try:
+                document = loader.get_single_data()
+            finally:
+                loader.dispose()
     except (OSError, yaml.YAMLError, ValueError) as error:
         fail(f"could not parse {path}: {error}")
     if not isinstance(document, dict):
@@ -111,6 +115,10 @@ def needs_set(job: dict[str, Any], job_id: str) -> set[str]:
 
 def workflow_call_input(workflow: dict[str, Any], path: Path) -> None:
     events = mapping(workflow.get("on"), f"{path}.on")
+    mapping(events.get("push"), f"{path}.on.push")
+    if "workflow_dispatch" in events:
+        fail(f"{path} must run on commits, not manual dispatch")
+
     call = mapping(events.get("workflow_call"), f"{path}.on.workflow_call")
     inputs = mapping(call.get("inputs"), f"{path}.on.workflow_call.inputs")
     checkout = mapping(inputs.get("checkout-ref"), f"{path} checkout-ref input")
@@ -127,34 +135,6 @@ def workflow_call_input(workflow: dict[str, Any], path: Path) -> None:
         ):
             fail(
                 f"{path} include-macos must be an optional boolean input defaulting to false"
-            )
-
-        dispatch = mapping(
-            events.get("workflow_dispatch"), f"{path}.on.workflow_dispatch"
-        )
-        dispatch_inputs = mapping(
-            dispatch.get("inputs"), f"{path}.on.workflow_dispatch.inputs"
-        )
-        dispatch_checkout = mapping(
-            dispatch_inputs.get("checkout-ref"), f"{path} dispatch checkout-ref input"
-        )
-        if (
-            dispatch_checkout.get("type") != "string"
-            or dispatch_checkout.get("required") != "false"
-        ):
-            fail(f"{path} dispatch checkout-ref must be an optional string input")
-        dispatch_macos = mapping(
-            dispatch_inputs.get("include-macos"),
-            f"{path} dispatch include-macos input",
-        )
-        if (
-            dispatch_macos.get("type") != "boolean"
-            or dispatch_macos.get("required") != "false"
-            or dispatch_macos.get("default") != "true"
-        ):
-            fail(
-                f"{path} dispatch include-macos must be an optional boolean "
-                "input defaulting to true"
             )
     elif "include-macos" in inputs:
         fail(f"{path} must not define the CI-only include-macos input")
@@ -213,8 +193,9 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
         fail("ci.yml.jobs.quality must be the single Linux quality job")
     require_runner(quality, BLACKSMITH_LINUX_X64_RUNNER, "ci.yml.jobs.quality")
     quality_macos = mapping(ci_jobs.get("quality-macos"), "ci.yml.jobs.quality-macos")
-    if quality_macos.get("if") != "${{ inputs.include-macos }}":
-        fail("ci.yml.jobs.quality-macos must be gated by inputs.include-macos")
+    expected_macos_gate = "${{ github.event_name == 'push' || inputs.include-macos }}"
+    if quality_macos.get("if") != expected_macos_gate:
+        fail("ci.yml.jobs.quality-macos must run on pushes and opted-in calls")
     require_runner(
         quality_macos,
         BLACKSMITH_MACOS_RUNNER,
