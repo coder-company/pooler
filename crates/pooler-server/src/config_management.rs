@@ -928,7 +928,10 @@ mod tests {
     #[test]
     fn successful_commits_create_a_reversible_owner_private_backup() {
         let (_directory, path) = source();
-        assert_eq!(serving_source(&path).expect("original selected"), path);
+        assert_eq!(
+            serving_source(&path).expect("original selected"),
+            path.canonicalize().expect("canonical source")
+        );
         let manager = ConfigManagement::new(&path).expect("manager");
 
         let commit_listener = |generation: u64, bind: &str| {

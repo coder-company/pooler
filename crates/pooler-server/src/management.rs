@@ -5627,8 +5627,9 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
 
         let request = api.next_reload_request().await;
         let managed = directory.path().join("gateway.managed.yaml");
-        assert_eq!(request.source.as_deref(), Some(managed.as_path()));
         assert!(managed.is_file());
+        let canonical_managed = managed.canonicalize().expect("canonical managed sidecar");
+        assert_eq!(request.source.as_deref(), Some(canonical_managed.as_path()));
         let generated = std::fs::read_to_string(&managed).expect("managed sidecar readable");
         assert!(generated.starts_with("# Generated and exclusively managed by Pooler."));
         assert!(generated.contains("provider-model-2"));

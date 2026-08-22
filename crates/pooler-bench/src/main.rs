@@ -1579,7 +1579,17 @@ async fn send_http_request(
 
 fn validate_factory_stream(status: u16, body: &[u8]) -> Result<()> {
     if status != 200 {
-        bail!("semantic stress request returned HTTP {status}")
+        let diagnostic = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .map(|value| value.chars().take(256).collect::<String>())
+            .unwrap_or_else(|| "unclassified bounded response".to_owned());
+        bail!("semantic stress request returned HTTP {status}: {diagnostic}")
     }
     let mut parser = SseParser::new();
     let events = parser.feed(body)?;
