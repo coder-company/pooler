@@ -1,9 +1,6 @@
-# Custom labels used by the organization's self-hosted Runnit runners.
+# Custom labels provisioned by Blacksmith's ephemeral runner service.
 self-hosted-runner:
   labels:
-    - Linux
-    - X64
-    - macOS
-    - ARM64
-    - palantir-actions
+    - blacksmith-4vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404-arm
     - blacksmith-6vcpu-macos-15

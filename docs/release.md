@@ -58,21 +58,17 @@ it before publication:
 (cd dist && sha256sum -c SHA256SUMS)
 ```
 
-The tag workflow in `.github/workflows/release.yml` runs its Linux jobs on the
-organization's custom self-hosted runners. Each Linux job requires all four
-labels `[self-hosted, Linux, X64, palantir-actions]`; there is no fallback to a
-paid GitHub-hosted Linux runner. The macOS quality lane and the two macOS
-release targets remain explicit platform requirements, using
-`[self-hosted, macOS, X64, palantir-actions]` for x86_64 and
-`[self-hosted, macOS, ARM64, palantir-actions]` for arm64. The configured custom
-capacity is currently Linux-only, so matching macOS lanes remain
-queued/unavailable and their platform evidence must not be reported as passing.
-The custom-runner workflows run only by explicit dispatch or as reusable
-release gates, so ordinary pushes do not consume the shared runners. Manual CI
-dispatch omits `include-macos`, so the gated job is skipped; reusable callers
-default the boolean to `false`. The release workflow passes
-`include-macos: true`; release acceptance is therefore
-still blocked until the required macOS runners are online.
+Every workflow job uses a pinned Blacksmith ephemeral runner class. Linux x86_64
+jobs use `blacksmith-4vcpu-ubuntu-2404`; the Linux ARM64 release row uses the
+matching `blacksmith-4vcpu-ubuntu-2404-arm` image. macOS quality and both Apple
+release targets use the ARM64 M4-backed `blacksmith-6vcpu-macos-15` image. Rust
+builds both `x86_64-apple-darwin` and `aarch64-apple-darwin` on that native macOS
+host, so neither platform row is a Linux proxy.
+
+The workflows run only by explicit dispatch or as reusable release gates, so
+ordinary pushes do not consume runner capacity. Manual CI dispatch defaults
+`include-macos` to `true`; reusable callers default it to `false`, and the
+release workflow explicitly passes `include-macos: true`.
 
 The workflow uploads the archives, generates aggregate checksums, signs the
 checksum manifest with Cosign keyless signing, and attaches GitHub build

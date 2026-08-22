@@ -25,10 +25,9 @@ except ImportError as error:  # pragma: no cover - depends on the runner image
 CHECKOUT_REF = "${{ inputs.checkout-ref || github.ref }}"
 RELEASE_SHA = "${{ needs.resolve.outputs.sha }}"
 RELEASE_TAG_REF = "${{ inputs.tag || github.ref }}"
-CUSTOM_LINUX_LABELS = ["self-hosted", "Linux", "X64", "palantir-actions"]
-CI_MACOS_RUNNER = "blacksmith-6vcpu-macos-15"
-CUSTOM_MACOS_X64_LABELS = ["self-hosted", "macOS", "X64", "palantir-actions"]
-CUSTOM_MACOS_ARM64_LABELS = ["self-hosted", "macOS", "ARM64", "palantir-actions"]
+BLACKSMITH_LINUX_X64_RUNNER = "blacksmith-4vcpu-ubuntu-2404"
+BLACKSMITH_LINUX_ARM64_RUNNER = "blacksmith-4vcpu-ubuntu-2404-arm"
+BLACKSMITH_MACOS_RUNNER = "blacksmith-6vcpu-macos-15"
 REQUIRED_RELEASE_JOBS = {
     "resolve",
     "ci",
@@ -195,10 +194,10 @@ def require_runner(
 
 
 def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
-    """Keep Linux work on custom runners and CI macOS work on macOS.
+    """Keep every workflow job on an explicit Blacksmith runner class.
 
-    Release artifact rows retain explicit architecture labels. The CI macOS
-    lane uses hosted macOS capacity and cannot degrade into a Linux success.
+    Release artifact rows retain explicit target architectures. Blacksmith's
+    macOS runner is ARM64 but can build both supported Apple Rust targets.
     """
 
     ci = workflows["ci.yml"]
@@ -206,35 +205,35 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
     quality = mapping(ci_jobs["quality"], "ci.yml.jobs.quality")
     if "strategy" in quality:
         fail("ci.yml.jobs.quality must be the single Linux quality job")
-    require_runner(quality, CUSTOM_LINUX_LABELS, "ci.yml.jobs.quality")
+    require_runner(quality, BLACKSMITH_LINUX_X64_RUNNER, "ci.yml.jobs.quality")
     quality_macos = mapping(ci_jobs.get("quality-macos"), "ci.yml.jobs.quality-macos")
     if quality_macos.get("if") != "${{ inputs.include-macos }}":
         fail("ci.yml.jobs.quality-macos must be gated by inputs.include-macos")
     require_runner(
         quality_macos,
-        CI_MACOS_RUNNER,
+        BLACKSMITH_MACOS_RUNNER,
         "ci.yml.jobs.quality-macos",
     )
     for job_id in ("fixtures-and-properties", "supply-chain"):
-        require_runner(ci_jobs[job_id], CUSTOM_LINUX_LABELS, f"ci.yml.jobs.{job_id}")
+        require_runner(ci_jobs[job_id], BLACKSMITH_LINUX_X64_RUNNER, f"ci.yml.jobs.{job_id}")
 
     hardening = workflows["hardening.yml"]
     hardening_jobs = mapping(hardening["jobs"], "hardening.yml.jobs")
     for job_id, raw_job in hardening_jobs.items():
         require_runner(
             mapping(raw_job, f"hardening.yml.jobs.{job_id}"),
-            CUSTOM_LINUX_LABELS,
+            BLACKSMITH_LINUX_X64_RUNNER,
             f"hardening.yml.jobs.{job_id}",
         )
 
     secret_scan = workflows["secret-scan.yml"]
     secret_jobs = mapping(secret_scan["jobs"], "secret-scan.yml.jobs")
-    require_runner(secret_jobs["gitleaks"], CUSTOM_LINUX_LABELS, "secret-scan.yml.jobs.gitleaks")
+    require_runner(secret_jobs["gitleaks"], BLACKSMITH_LINUX_X64_RUNNER, "secret-scan.yml.jobs.gitleaks")
 
     release = workflows["release.yml"]
     release_jobs = mapping(release["jobs"], "release.yml.jobs")
     for job_id in ("resolve", "gates", "assemble", "publish"):
-        require_runner(release_jobs[job_id], CUSTOM_LINUX_LABELS, f"release.yml.jobs.{job_id}")
+        require_runner(release_jobs[job_id], BLACKSMITH_LINUX_X64_RUNNER, f"release.yml.jobs.{job_id}")
 
     build = mapping(release_jobs["build"], "release.yml.jobs.build")
     if build.get("runs-on") != "${{ matrix.runner }}":
@@ -245,10 +244,10 @@ def validate_runner_policy(workflows: dict[str, dict[str, Any]]) -> None:
         build_matrix.get("include"), "release.yml.jobs.build.strategy.matrix.include"
     )
     expected_build_runners = {
-        "x86_64-unknown-linux-gnu": CUSTOM_LINUX_LABELS,
-        "aarch64-unknown-linux-gnu": CUSTOM_LINUX_LABELS,
-        "x86_64-apple-darwin": CUSTOM_MACOS_X64_LABELS,
-        "aarch64-apple-darwin": CUSTOM_MACOS_ARM64_LABELS,
+        "x86_64-unknown-linux-gnu": BLACKSMITH_LINUX_X64_RUNNER,
+        "aarch64-unknown-linux-gnu": BLACKSMITH_LINUX_ARM64_RUNNER,
+        "x86_64-apple-darwin": BLACKSMITH_MACOS_RUNNER,
+        "aarch64-apple-darwin": BLACKSMITH_MACOS_RUNNER,
     }
     seen_targets: set[str] = set()
     for index, raw_row in enumerate(build_include):
