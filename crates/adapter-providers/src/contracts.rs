@@ -1,5 +1,7 @@
 //! Serializable provider metadata for configuration, diagnostics, and management.
 
+use pooler_core::Capability;
+
 use serde::{Deserialize, Serialize};
 
 /// CLIProxyAPI revision used to establish the compatibility-only contracts.
@@ -173,6 +175,225 @@ pub struct ContractEvidence {
     pub revision: Option<String>,
 }
 
+/// Provenance retained for one provider fact.
+///
+/// `Unknown` is intentional: a missing observation must not be presented as a
+/// verified provider capability by a later routing policy.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataProvenance {
+    /// Established by a provider-owned public contract or a pinned native
+    /// implementation that Pooler explicitly records as evidence.
+    Verified,
+    /// Declared by the operator for one custom provider instance.
+    OperatorDeclared,
+    /// No trustworthy fact is available.
+    #[default]
+    Unknown,
+}
+
+/// Backwards-compatible name for callers that refer to provider facts as
+/// generic provenance.
+pub type FactProvenance = MetadataProvenance;
+
+/// A value together with the evidence level that permits Pooler to use it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderFact<T> {
+    /// The value is absent when the fact is unknown.
+    pub value: Option<T>,
+    /// Evidence level for `value`.
+    pub provenance: MetadataProvenance,
+}
+
+impl<T> ProviderFact<T> {
+    /// Construct a fact backed by Pooler's verified provider evidence.
+    #[must_use]
+    pub fn verified(value: T) -> Self {
+        Self {
+            value: Some(value),
+            provenance: MetadataProvenance::Verified,
+        }
+    }
+
+    /// Construct a fact explicitly supplied by an operator.
+    #[must_use]
+    pub fn operator_declared(value: T) -> Self {
+        Self {
+            value: Some(value),
+            provenance: MetadataProvenance::OperatorDeclared,
+        }
+    }
+
+    /// Construct an intentionally unknown fact.
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            value: None,
+            provenance: MetadataProvenance::Unknown,
+        }
+    }
+
+    /// Whether this fact has a usable value at the declared provenance.
+    #[must_use]
+    pub const fn is_known(&self) -> bool {
+        self.value.is_some()
+    }
+}
+
+impl<T> Default for ProviderFact<T> {
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
+/// Wire dialect supported by a provider profile.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderWireFamily {
+    OpenAiChatCompletions,
+    OpenAiResponses,
+    AnthropicMessages,
+    VertexGenerateContent,
+    VertexPredict,
+    AntigravityInternal,
+}
+
+/// Bounded endpoint family advertised by a provider profile.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderEndpointFamily {
+    Models,
+    ChatCompletions,
+    Responses,
+    Messages,
+    Embeddings,
+    Images,
+    Audio,
+    GenerateContent,
+    Predict,
+}
+
+/// Fixed credential placement understood by the provider boundary.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPlacementKind {
+    None,
+    Bearer,
+    XApiKey,
+    XGoogApiKey,
+}
+
+/// Request parameter whose support can be established independently of a
+/// model's capability list.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderParameter {
+    Temperature,
+    TopP,
+    MaxTokens,
+    Tools,
+    ResponseFormat,
+    Reasoning,
+}
+
+/// Model weight representation reported by a provider.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderQuantization {
+    Fp32,
+    Fp16,
+    Bf16,
+    Int8,
+    Int4,
+    Gguf,
+}
+
+/// Provider privacy posture, only populated where evidence exists.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPrivacy {
+    Standard,
+    NoTraining,
+    NoRetention,
+}
+
+/// Data handling policy used by hard routing filters.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDataPolicy {
+    Standard,
+    TrainingDisallowed,
+    RetentionBounded,
+    ZeroDataRetention,
+}
+
+/// Bounded, integer-priced provider rates. Values are micro-units per one
+/// million tokens so floating-point prices never affect deterministic routing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderPricing {
+    pub input_micros_per_million: u64,
+    pub output_micros_per_million: u64,
+    pub currency: String,
+}
+
+/// Reusable facts associated with one provider surface.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderMetadata {
+    pub wire_family: ProviderFact<ProviderWireFamily>,
+    pub endpoint_families: ProviderFact<Vec<ProviderEndpointFamily>>,
+    pub auth_placement: ProviderFact<AuthPlacementKind>,
+    pub parameters: ProviderFact<Vec<ProviderParameter>>,
+    pub capabilities: ProviderFact<Vec<Capability>>,
+    pub context_window: ProviderFact<u32>,
+    pub quantization: ProviderFact<Vec<ProviderQuantization>>,
+    pub privacy: ProviderFact<ProviderPrivacy>,
+    pub zdr: ProviderFact<bool>,
+    pub data_policy: ProviderFact<ProviderDataPolicy>,
+    pub pricing: ProviderFact<ProviderPricing>,
+}
+
+impl ProviderMetadata {
+    /// Facts common to an OpenAI Chat Completions provider with no fabricated
+    /// model, price, privacy, or context claims.
+    #[must_use]
+    pub fn verified_openai_chat(auth: AuthPlacementKind, endpoints: Vec<ProviderEndpointFamily>) -> Self {
+        Self {
+            wire_family: ProviderFact::verified(ProviderWireFamily::OpenAiChatCompletions),
+            endpoint_families: ProviderFact::verified(endpoints),
+            auth_placement: ProviderFact::verified(auth),
+            ..Self::default()
+        }
+    }
+
+    /// Facts declared by an operator for a custom OpenAI-compatible profile.
+    #[must_use]
+    pub fn operator_openai(operations: &[ProviderOperation]) -> Self {
+        let endpoints = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                ProviderOperation::ListModels => Some(ProviderEndpointFamily::Models),
+                ProviderOperation::ChatCompletions => Some(ProviderEndpointFamily::ChatCompletions),
+                ProviderOperation::Responses | ProviderOperation::ResponsesCompact => {
+                    Some(ProviderEndpointFamily::Responses)
+                }
+                ProviderOperation::Embeddings => Some(ProviderEndpointFamily::Embeddings),
+                ProviderOperation::ImageGenerations | ProviderOperation::ImageEdits => {
+                    Some(ProviderEndpointFamily::Images)
+                }
+                ProviderOperation::AudioTranscriptions
+                | ProviderOperation::AudioTranslations
+                | ProviderOperation::AudioSpeech => Some(ProviderEndpointFamily::Audio),
+                _ => None,
+            })
+            .collect();
+        Self {
+            wire_family: ProviderFact::operator_declared(ProviderWireFamily::OpenAiChatCompletions),
+            endpoint_families: ProviderFact::operator_declared(endpoints),
+            ..Self::default()
+        }
+    }
+}
+
 impl ContractEvidence {
     fn official(source: &str) -> Self {
         Self {
@@ -217,6 +438,10 @@ pub struct ProviderProfile {
     pub discovery: DiscoveryMode,
     pub quota_signals: Vec<QuotaSignal>,
     pub evidence: Vec<ContractEvidence>,
+    /// Structured facts used by policy filters. Unknown values are omitted,
+    /// never inferred from a provider name.
+    #[serde(default)]
+    pub metadata: ProviderMetadata,
 }
 
 /// Official Kimi Open Platform API-key profile.
@@ -246,6 +471,10 @@ pub fn kimi_open_platform_profile() -> ProviderProfile {
             ContractEvidence::official("https://platform.kimi.ai/docs/api/list-models"),
             ContractEvidence::official("https://platform.kimi.ai/docs/introduction"),
         ],
+        metadata: ProviderMetadata::verified_openai_chat(
+            AuthPlacementKind::Bearer,
+            vec![ProviderEndpointFamily::Models, ProviderEndpointFamily::ChatCompletions],
+        ),
     }
 }
 
@@ -279,6 +508,10 @@ pub fn kimi_coding_profile() -> ProviderProfile {
             ContractEvidence::pinned("internal/auth/kimi/kimi.go"),
             ContractEvidence::pinned("internal/runtime/executor/kimi_executor.go"),
         ],
+        metadata: ProviderMetadata::verified_openai_chat(
+            AuthPlacementKind::Bearer,
+            vec![ProviderEndpointFamily::ChatCompletions],
+        ),
     }
 }
 
@@ -319,6 +552,16 @@ pub fn vertex_profile() -> ProviderProfile {
                 "https://cloud.google.com/vertex-ai/generative-ai/docs/resources/throughput-quota",
             ),
         ],
+        metadata: ProviderMetadata {
+            wire_family: ProviderFact::verified(ProviderWireFamily::VertexGenerateContent),
+            endpoint_families: ProviderFact::verified(vec![
+                ProviderEndpointFamily::GenerateContent,
+                ProviderEndpointFamily::Predict,
+            ]),
+            // This surface accepts both bearer and x-goog-api-key forms, so
+            // there is no single placement fact to publish.
+            ..ProviderMetadata::default()
+        },
     }
 }
 
@@ -375,6 +618,14 @@ pub fn antigravity_compatibility_profile() -> ProviderProfile {
             ContractEvidence::pinned("internal/runtime/executor/antigravity_executor_credits.go"),
             ContractEvidence::pinned("sdk/cliproxy/antigravity_models.go"),
         ],
+        metadata: ProviderMetadata {
+            wire_family: ProviderFact::verified(ProviderWireFamily::AntigravityInternal),
+            endpoint_families: ProviderFact::verified(vec![
+                ProviderEndpointFamily::GenerateContent,
+            ]),
+            auth_placement: ProviderFact::verified(AuthPlacementKind::Bearer),
+            ..ProviderMetadata::default()
+        },
     }
 }
 
@@ -404,6 +655,7 @@ pub fn openai_compatible_profile(operations: Vec<ProviderOperation>) -> Provider
     if operations.contains(&ProviderOperation::Embeddings) {
         protocols.push(WireProtocol::OpenAiEmbeddings);
     }
+    let metadata = ProviderMetadata::operator_openai(&operations);
     ProviderProfile {
         kind: ProviderKind::OpenAiCompatible,
         surface: ProviderSurface::OpenAiCompatible,
@@ -423,5 +675,6 @@ pub fn openai_compatible_profile(operations: Vec<ProviderOperation>) -> Provider
                 "https://developers.openai.com/api/reference/resources/models",
             ),
         ],
+        metadata,
     }
 }

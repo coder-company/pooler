@@ -73,6 +73,21 @@ class DashboardAssetProvenanceTests(unittest.TestCase):
         )
         self.assertIsNone(components["coder-company-marks"]["source"]["url"])
 
+    def test_provider_extractor_inputs_and_inventory_are_pinned(self) -> None:
+        extractor = (
+            ROOT / "scripts" / "extract-lobehub-icons.mjs"
+        ).read_text(encoding="utf-8")
+        for pinned in (
+            '"@lobehub/icons": "5.16.0"',
+            '"es-toolkit": "1.51.0"',
+            'react: "19.2.8"',
+            '"react-dom": "19.2.8"',
+            "const EXPECTED_ICON_COUNT = 319",
+            "0cf5f4673a80639ee5f37f2d741cfdad5524e0a3afd77d3a2601685137544bdd",
+        ):
+            self.assertIn(pinned, extractor)
+        self.assertNotIn("npm install", extractor)
+
     def test_non_cargo_components_are_emitted_in_both_sbom_formats(self) -> None:
         embedded = SBOM.read_embedded_components(MANIFEST)
         packages = [

@@ -1145,6 +1145,16 @@
         "client_id": {
           "type": "string"
         },
+        "client_secret": {
+          "$ref": "#/$defs/secret_ref"
+        },
+        "grant_type": {
+          "enum": [
+            "authorization_code",
+            "client_credentials"
+          ],
+          "type": "string"
+        },
         "identity_endpoint": {
           "type": "string"
         },

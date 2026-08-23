@@ -5,8 +5,9 @@
 //! typed configuration operations and body-free controls, and never serializes
 //! credential references.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -30,9 +31,9 @@ use hyper::{body::Incoming, service::service_fn, Request};
 use hyper_util::rt::TokioIo;
 use pooler_auth::{
     bearer_authorization_matches, ProviderLoginMethod, ProviderLoginRegistry, ProviderLoginSupport,
-    SecretRef as RuntimeSecretRef,
+    SecretRef as RuntimeSecretRef, PALANTIR_AIP_EXECUTE_SCOPE, PALANTIR_OFFLINE_ACCESS_SCOPE,
 };
-use pooler_config::{compile_yaml, CompiledConfig, ManagementPlan};
+use pooler_config::{compile_yaml, CompiledConfig, ManagementPlan, OAuthGrantType};
 use pooler_http::{PoolError, PoolingCoordinator};
 use pooler_model_catalog::ProviderCatalog;
 use pooler_store::{CredentialHealthState, CredentialHealthStatus, CredentialState};
@@ -51,6 +52,7 @@ use crate::config_management::{
 };
 use crate::http_runtime::RuntimeGeneration;
 use crate::management_ui;
+use crate::management_error::{ManagementError, ManagementErrorCode};
 use crate::usage_management::{usage_aggregate, usage_list, usage_otlp_json, usage_prometheus};
 use crate::{merged_model_catalog_value, CatalogRuntime, ConfigSnapshot, ConfigStore};
 
@@ -63,6 +65,12 @@ const MAX_MANAGEMENT_AUDIT_EVENTS: usize = 256;
 const MAX_MANAGEMENT_RELOADS: usize = 256;
 const MAX_PENDING_MANAGEMENT_RELOADS: usize = 16;
 const MAX_OAUTH_DEVICE_RECORDS: usize = 32;
+const MAX_BROWSER_OAUTH_RECORDS: usize = 32;
+const MAX_ACTIVE_BROWSER_OAUTH_SESSIONS: usize = 8;
+const MAX_ACTIVE_CLIENT_CREDENTIALS: usize = 8;
+const BROWSER_OAUTH_SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_PALANTIR_SETUP_BODY_BYTES: usize = 16 * 1024;
+const MAX_OAUTH_CALLBACK_QUERY_BYTES: usize = 8 * 1024;
 const MAX_MANAGEMENT_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_MUTATION_BODY_BYTES: usize = 256 * 1024;
 const MANAGEMENT_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -93,6 +101,17 @@ enum AccountSecretReference {
     Env { name: String },
     File { path: String },
     Keyring { service: String, account: String },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PalantirSetupRequest {
+    enrollment: String,
+    client_id: String,
+    auth: String,
+    client_secret: Option<AccountSecretReference>,
+    account: String,
+    model: String,
 }
 
 impl AccountSecretReference {
@@ -294,6 +313,17 @@ impl ManagementResponse {
         Self::body(status, "application/json", encoded, head)
     }
 
+    fn error(error: ManagementError, head: bool) -> Self {
+        let retry_after = error.retry_after_seconds();
+        let mut response = Self::json(error.status(), error.value(), head);
+        if let Some(seconds) = retry_after.and_then(|seconds| {
+            header::HeaderValue::from_str(&seconds.to_string()).ok()
+        }) {
+            response.headers.insert(header::RETRY_AFTER, seconds);
+        }
+        response
+    }
+
     fn body(status: StatusCode, content_type: &'static str, encoded: Vec<u8>, head: bool) -> Self {
         let content_length = encoded.len().to_string();
         let mut headers = HeaderMap::new();
@@ -436,6 +466,27 @@ fn management_query_value(query: Option<&str>, key: &str) -> Option<String> {
         })
 }
 
+fn unique_bounded_query_value(query: &str, key: &str, maximum: usize) -> Option<String> {
+    let mut values = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned());
+    let value = values.next()?;
+    (values.next().is_none()
+        && !value.is_empty()
+        && value.len() <= maximum
+        && !value.chars().any(char::is_control))
+    .then_some(value)
+}
+
+fn oauth_browser_callback_host<'a>(api: &ManagementApi, headers: &'a HeaderMap) -> Option<&'a str> {
+    if !management_bind_is_loopback(api.bind()) {
+        return None;
+    }
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let host = hosts.next()?.to_str().ok()?;
+    (hosts.next().is_none() && safe_loopback_host_value(host)).then_some(host)
+}
+
 fn valid_setup_component(value: &str, maximum: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum
@@ -446,6 +497,86 @@ fn valid_setup_component(value: &str, maximum: usize) -> bool {
 
 fn valid_setup_model(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn valid_palantir_model_rid(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("ri.language-model-service..language-model.") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && value.len() <= 512
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn generate_palantir_setup_config(body: &[u8]) -> Result<String, &'static str> {
+    if body.len() > MAX_PALANTIR_SETUP_BODY_BYTES {
+        return Err("Palantir setup request is too large");
+    }
+    let request = serde_json::from_slice::<PalantirSetupRequest>(body)
+        .map_err(|_| "Palantir setup request is invalid")?;
+    let auth_method = [
+        ProviderLoginMethod::AuthorizationCodePkce,
+        ProviderLoginMethod::ClientCredentials,
+    ]
+    .into_iter()
+    .find(|method| method.to_string() == request.auth)
+    .ok_or("Palantir setup authentication method is invalid")?;
+    if ProviderLoginRegistry::builtin()
+        .require("palantir_aip")
+        .map_err(|_| "Palantir login profile is unavailable")?
+        .support(auth_method)
+        == ProviderLoginSupport::Unsupported
+    {
+        return Err("Palantir setup authentication method is unsupported");
+    }
+    let grant_type = match auth_method {
+        ProviderLoginMethod::AuthorizationCodePkce => OAuthGrantType::AuthorizationCode,
+        ProviderLoginMethod::ClientCredentials => OAuthGrantType::ClientCredentials,
+        ProviderLoginMethod::ApiKey | ProviderLoginMethod::DeviceCode => {
+            return Err("Palantir setup authentication method is invalid");
+        }
+    };
+    if !valid_setup_component(&request.account, 128)
+        || !valid_secret_component(&request.client_id, 256)
+        || request.client_id.trim() != request.client_id
+        || !valid_secret_component(&request.enrollment, 512)
+        || request.enrollment.trim() != request.enrollment
+        || !valid_palantir_model_rid(&request.model)
+    {
+        return Err("Palantir setup selection contains an invalid identifier");
+    }
+    let secret_reference = request
+        .client_secret
+        .map(AccountSecretReference::render)
+        .transpose()
+        .map_err(|_| "Palantir client-secret reference is invalid")?;
+    let quoted =
+        |value: &str| serde_json::to_string(value).map_err(|_| "Palantir setup value is invalid");
+    let enrollment = quoted(&request.enrollment)?;
+    let client_id = quoted(&request.client_id)?;
+    let account = &request.account;
+    let model = quoted(&request.model)?;
+    let client_secret = secret_reference.map_or_else(String::new, |reference| {
+        format!(
+            "      client_secret: {}\n",
+            serde_json::to_string(&reference).expect("validated secret reference is serializable")
+        )
+    });
+    let scopes = match grant_type {
+        OAuthGrantType::AuthorizationCode => {
+            format!("[{PALANTIR_AIP_EXECUTE_SCOPE}, {PALANTIR_OFFLINE_ACCESS_SCOPE}]")
+        }
+        OAuthGrantType::ClientCredentials => format!("[{PALANTIR_AIP_EXECUTE_SCOPE}]"),
+    };
+    let config = format!(
+        "version: 1\n\nlisteners:\n  gateway:\n    bind: 127.0.0.1:8319\n\nupstreams:\n  palantir-aip:\n    url: {enrollment}\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: {client_id}\n{client_secret}      grant_type: {}\n      scopes: {scopes}\n      callback: http://127.0.0.1:18477/management/oauth/browser/callback\n\naccounts:\n  {account}:\n    provider: palantir-aip\n    auth_kind: oauth\n\naccount_pools:\n  palantir-aip:\n    accounts: [{account}]\n\npolicies:\n  palantir-aip:\n    selection:\n      strategy: ordered_fallback\n      account_pool: palantir-aip\n\nmodels:\n  - id: {model}\n    targets:\n      - provider: palantir-aip\n        upstream_model: {model}\n\nroutes:\n  - id: palantir-aip-chat\n    listen: gateway\n    match: {{method: POST, path: /v1/chat/completions, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: palantir-aip, path: /api/v2/llm/proxy/openai/v1/chat/completions, policy: palantir-aip}}\n    response: {{mode: opaque}}\n  - id: palantir-aip-responses\n    listen: gateway\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: palantir-aip, path: /api/v2/llm/proxy/openai/v1/responses, policy: palantir-aip}}\n    response: {{mode: opaque}}\n  - id: palantir-aip-messages\n    listen: gateway\n    match: {{method: POST, path: /v1/messages, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: palantir-aip, path: /api/v2/llm/proxy/anthropic/v1/messages, policy: palantir-aip}}\n    response: {{mode: opaque}}\n\nmanagement:\n  bind: 127.0.0.1:18477\n  auth:\n    secret: env:POOLER_MANAGEMENT_TOKEN\n",
+        grant_type.as_str(),
+    );
+    compile_yaml("management-palantir-setup-generated.yaml", &config)
+        .map_err(|_| "generated Palantir configuration did not pass Pooler validation")?;
+    Ok(config)
 }
 
 fn setup_support_name(support: ProviderLoginSupport) -> &'static str {
@@ -653,6 +784,17 @@ fn management_account_action(path: &str) -> Option<(String, &str)> {
     .then_some((account, action))
 }
 
+fn management_oauth_account_action(path: &str) -> Option<(String, &str)> {
+    let suffix = path.strip_prefix("/accounts/")?;
+    let (account, action) = suffix.rsplit_once('/')?;
+    let account = percent_decode_path(account)?;
+    (!account.is_empty()
+        && account.len() <= 128
+        && !account.contains('/')
+        && matches!(action, "oauth-browser" | "oauth-client-credentials"))
+    .then_some((account, action))
+}
+
 fn management_model_action(path: &str) -> Option<(String, &str)> {
     let suffix = path.strip_prefix("/models/")?;
     for action in ["enable", "disable"] {
@@ -679,6 +821,11 @@ fn is_config_mutation(method: &Method, path: &str) -> bool {
     is_config_request(path) && (*method == Method::POST || *method == Method::PATCH)
 }
 
+fn is_bodied_management_mutation(method: &Method, path: &str) -> bool {
+    is_config_mutation(method, path)
+        || (*method == Method::POST && path == "/setup/palantir/config")
+}
+
 fn config_draft_action(path: &str) -> Option<(u64, Option<&str>)> {
     let suffix = path.strip_prefix("/config/drafts/")?;
     let (id, action) = suffix
@@ -690,10 +837,11 @@ fn config_draft_action(path: &str) -> Option<(u64, Option<&str>)> {
 }
 
 fn is_management_mutation(method: &Method, path: &str) -> bool {
-    is_config_mutation(method, path)
+    is_bodied_management_mutation(method, path)
         || (*method == Method::POST
             && (path == "/reload"
                 || path == "/models/reload"
+                || management_oauth_account_action(path).is_some()
                 || management_account_action(path).is_some()
                 || management_model_action(path).is_some()))
 }
@@ -818,6 +966,48 @@ pub(crate) struct NativeAccountCommand {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagementOAuthError {
+    Unsupported,
+    NotFound,
+    Authorization,
+    StaleGeneration,
+    Unavailable,
+}
+
+pub(crate) type ManagementOAuthFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), ManagementOAuthError>> + Send + 'a>>;
+
+pub(crate) trait ManagementOAuthBroker: Send + Sync {
+    fn start_browser(
+        &self,
+        config: &CompiledConfig,
+        account: &str,
+        request_id: u64,
+    ) -> Result<url::Url, ManagementOAuthError>;
+
+    fn state_matches(&self, request_id: u64, candidate: &str) -> bool;
+
+    fn callback_host_matches(&self, request_id: u64, candidate: &str) -> bool;
+
+    fn finish_browser<'a>(
+        &'a self,
+        request_id: u64,
+        callback_query: String,
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> ManagementOAuthFuture<'a>;
+
+    fn acquire_client_credentials<'a>(
+        &'a self,
+        account: &'a str,
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> ManagementOAuthFuture<'a>;
+
+    fn discard_browser(&self, request_id: u64);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ManagementReloadKind {
     Configuration,
     Catalog,
@@ -859,10 +1049,161 @@ struct OAuthDeviceControl {
     records: Mutex<VecDeque<Value>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserOAuthStatus {
+    Starting,
+    AuthorizationRequired,
+    Exchanging,
+    Succeeded,
+    Failed,
+    Expired,
+    StaleGeneration,
+}
+
+impl BrowserOAuthStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::AuthorizationRequired => "authorization_required",
+            Self::Exchanging => "exchanging",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Expired => "expired",
+            Self::StaleGeneration => "stale_generation",
+        }
+    }
+
+    const fn active(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::AuthorizationRequired | Self::Exchanging
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BrowserOAuthRecord {
+    request_id: u64,
+    account: String,
+    generation: u64,
+    status: BrowserOAuthStatus,
+    created_at_ms: u64,
+    expires_at_ms: u64,
+    expires_at: Instant,
+    completed_at_ms: Option<u64>,
+}
+
+impl BrowserOAuthRecord {
+    fn json(&self) -> Value {
+        json!({
+            "schema_version": 1,
+            "request_id": self.request_id,
+            "account": self.account,
+            "generation": self.generation,
+            "status": self.status.as_str(),
+            "created_at_ms": self.created_at_ms,
+            "expires_at_ms": self.expires_at_ms,
+            "completed_at_ms": self.completed_at_ms,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct BrowserOAuthState {
+    records: VecDeque<BrowserOAuthRecord>,
+    client_credentials_inflight: BTreeSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct BrowserOAuthControl {
+    next_id: AtomicU64,
+    state: Mutex<BrowserOAuthState>,
+}
+
+impl BrowserOAuthControl {
+    fn complete(&self, request_id: u64, status: BrowserOAuthStatus) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = state
+            .records
+            .iter_mut()
+            .find(|record| record.request_id == request_id)
+        {
+            record.status = status;
+            if !status.active() {
+                record.completed_at_ms = Some(unix_timestamp_ms());
+            }
+        }
+    }
+}
+
+struct BrowserExchangeGuard {
+    control: Arc<BrowserOAuthControl>,
+    request_id: u64,
+    complete: bool,
+}
+
+impl BrowserExchangeGuard {
+    fn finish(mut self, status: BrowserOAuthStatus) {
+        self.control.complete(self.request_id, status);
+        self.complete = true;
+    }
+}
+
+impl Drop for BrowserExchangeGuard {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.control
+                .complete(self.request_id, BrowserOAuthStatus::Failed);
+        }
+    }
+}
+
+struct ClientCredentialsGuard {
+    control: Arc<BrowserOAuthControl>,
+    account: String,
+}
+
+impl Drop for ClientCredentialsGuard {
+    fn drop(&mut self) {
+        self.control
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .client_credentials_inflight
+            .remove(&self.account);
+    }
+}
+
+fn oauth_status_response(
+    records: &VecDeque<Value>,
+    path: &str,
+    prefix: &str,
+    not_found: &str,
+) -> ManagementResponse {
+    let Some(request_id) = path
+        .strip_prefix(prefix)
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return ManagementResponse::json(StatusCode::NOT_FOUND, json!({"error": not_found}), false);
+    };
+    records
+        .iter()
+        .find(|record| record["request_id"].as_u64() == Some(request_id))
+        .cloned()
+        .map_or_else(
+            || ManagementResponse::json(StatusCode::NOT_FOUND, json!({"error": not_found}), false),
+            |record| ManagementResponse::json(StatusCode::OK, record, false),
+        )
+}
+
 pub(crate) struct ManagementRuntimeServices {
     pub(crate) metrics: pooler_observe::MetricsRegistry,
     pub(crate) traces: pooler_observe::TraceRecorder,
     pub(crate) native_commands: mpsc::Sender<NativeAccountCommand>,
+    pub(crate) browser_oauth: Option<Arc<dyn ManagementOAuthBroker>>,
 }
 
 /// Secure management API backed by immutable plans and bounded mutable state.
@@ -877,6 +1218,8 @@ pub struct ManagementApi {
     audit: Arc<Mutex<VecDeque<Value>>>,
     reload: Arc<ReloadControl>,
     oauth_device: Arc<OAuthDeviceControl>,
+    browser_oauth: Arc<BrowserOAuthControl>,
+    browser_oauth_broker: Option<Arc<dyn ManagementOAuthBroker>>,
     native_commands: Option<mpsc::Sender<NativeAccountCommand>>,
     config_management: Arc<Mutex<Option<Arc<ConfigManagement>>>>,
     configuration_reload_serial: Arc<Mutex<()>>,
@@ -938,6 +1281,8 @@ impl ManagementApi {
             audit: Arc::new(Mutex::new(VecDeque::new())),
             reload: Arc::new(ReloadControl::default()),
             oauth_device: Arc::new(OAuthDeviceControl::default()),
+            browser_oauth: Arc::new(BrowserOAuthControl::default()),
+            browser_oauth_broker: None,
             native_commands: None,
             config_management: Arc::new(Mutex::new(None)),
             configuration_reload_serial: Arc::new(Mutex::new(())),
@@ -982,6 +1327,8 @@ impl ManagementApi {
             audit: Arc::new(Mutex::new(VecDeque::new())),
             reload: Arc::new(ReloadControl::default()),
             oauth_device: Arc::new(OAuthDeviceControl::default()),
+            browser_oauth: Arc::new(BrowserOAuthControl::default()),
+            browser_oauth_broker: services.browser_oauth,
             native_commands: Some(services.native_commands),
             config_management: Arc::new(Mutex::new(None)),
             configuration_reload_serial: Arc::new(Mutex::new(())),
@@ -1116,35 +1463,496 @@ impl ManagementApi {
     }
 
     fn oauth_device_status(&self, path: &str) -> ManagementResponse {
-        let Some(request_id) = path
-            .strip_prefix("/oauth/device/")
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            return ManagementResponse::json(
-                StatusCode::NOT_FOUND,
-                json!({"error": "OAuth device request not found"}),
-                false,
-            );
-        };
         let records = self
             .oauth_device
             .records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        records
+        oauth_status_response(
+            &records,
+            path,
+            "/oauth/device/",
+            "OAuth device request not found",
+        )
+    }
+
+    fn active_config(&self) -> (Arc<CompiledConfig>, u64) {
+        if let Some(runtime) = self
+            .runtime_dispatch
+            .as_ref()
+            .map(|dispatch| dispatch.load_full())
+        {
+            let generation = runtime.config.generation();
+            return (Arc::clone(&runtime.config), generation);
+        }
+        let snapshot = self.state.load_full();
+        (
+            snapshot.config.config_arc(),
+            snapshot.config.generation().value(),
+        )
+    }
+
+    fn expire_browser_oauth_sessions(&self) {
+        let now = Instant::now();
+        let completed_at_ms = unix_timestamp_ms();
+        let expired = {
+            let mut state = self
+                .browser_oauth
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .records
+                .iter_mut()
+                .filter(|record| {
+                    matches!(
+                        record.status,
+                        BrowserOAuthStatus::Starting | BrowserOAuthStatus::AuthorizationRequired
+                    ) && record.expires_at <= now
+                })
+                .map(|record| {
+                    record.status = BrowserOAuthStatus::Expired;
+                    record.completed_at_ms = Some(completed_at_ms);
+                    record.request_id
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(broker) = self.browser_oauth_broker.as_ref() {
+            for request_id in expired {
+                broker.discard_browser(request_id);
+            }
+        }
+    }
+
+    fn browser_oauth_status(&self, path: &str) -> ManagementResponse {
+        self.expire_browser_oauth_sessions();
+        let Some(request_id) = path
+            .strip_prefix("/oauth/browser/")
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return ManagementResponse::json(
+                StatusCode::NOT_FOUND,
+                json!({"error": "browser OAuth request not found"}),
+                false,
+            );
+        };
+        let state = self
+            .browser_oauth
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .records
             .iter()
-            .find(|record| record["request_id"].as_u64() == Some(request_id))
-            .cloned()
+            .find(|record| record.request_id == request_id)
+            .map(BrowserOAuthRecord::json)
             .map_or_else(
                 || {
                     ManagementResponse::json(
                         StatusCode::NOT_FOUND,
-                        json!({"error": "OAuth device request not found"}),
+                        json!({"error": "browser OAuth request not found"}),
                         false,
                     )
                 },
                 |record| ManagementResponse::json(StatusCode::OK, record, false),
             )
+    }
+
+    fn reserve_browser_oauth_login(
+        &self,
+        account: &str,
+        generation: u64,
+    ) -> Result<u64, (StatusCode, &'static str)> {
+        self.expire_browser_oauth_sessions();
+        let mut state = self
+            .browser_oauth
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = state
+            .records
+            .iter()
+            .filter(|record| record.status.active())
+            .count();
+        if active >= MAX_ACTIVE_BROWSER_OAUTH_SESSIONS {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many browser OAuth requests are active",
+            ));
+        }
+        if state.client_credentials_inflight.contains(account)
+            || state
+                .records
+                .iter()
+                .any(|record| record.account == account && record.status.active())
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "an OAuth request is already active for this account",
+            ));
+        }
+        while state.records.len() >= MAX_BROWSER_OAUTH_RECORDS {
+            let index = state
+                .records
+                .iter()
+                .position(|record| !record.status.active())
+                .expect("the active browser OAuth bound is below record retention");
+            state.records.remove(index);
+        }
+        let request_id = self
+            .browser_oauth
+            .next_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let created_at_ms = unix_timestamp_ms();
+        let ttl_ms = u64::try_from(BROWSER_OAUTH_SESSION_TTL.as_millis()).unwrap_or(u64::MAX);
+        state.records.push_back(BrowserOAuthRecord {
+            request_id,
+            account: account.to_owned(),
+            generation,
+            status: BrowserOAuthStatus::Starting,
+            created_at_ms,
+            expires_at_ms: created_at_ms.saturating_add(ttl_ms),
+            expires_at: Instant::now() + BROWSER_OAUTH_SESSION_TTL,
+            completed_at_ms: None,
+        });
+        Ok(request_id)
+    }
+
+    fn oauth_runtime_error(error: ManagementOAuthError) -> ManagementResponse {
+        let (status, message) = match error {
+            ManagementOAuthError::Unsupported => (
+                StatusCode::CONFLICT,
+                "configured account does not support this OAuth flow",
+            ),
+            ManagementOAuthError::NotFound => {
+                (StatusCode::NOT_FOUND, "browser OAuth request not found")
+            }
+            ManagementOAuthError::Authorization => {
+                (StatusCode::BAD_REQUEST, "OAuth authorization was rejected")
+            }
+            ManagementOAuthError::StaleGeneration => (
+                StatusCode::CONFLICT,
+                "configuration changed during OAuth authorization",
+            ),
+            ManagementOAuthError::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "OAuth service is unavailable",
+            ),
+        };
+        ManagementResponse::json(status, json!({"error": message}), false)
+    }
+
+    async fn start_browser_oauth_login(&self, account: &str) -> ManagementResponse {
+        let Some(broker) = self.browser_oauth_broker.as_ref() else {
+            return state_unavailable();
+        };
+        let (config, generation) = self.active_config();
+        let request_id = match self.reserve_browser_oauth_login(account, generation) {
+            Ok(request_id) => request_id,
+            Err((status, error)) => {
+                return ManagementResponse::json(status, json!({"error": error}), false);
+            }
+        };
+        let authorization_url = match broker.start_browser(&config, account, request_id) {
+            Ok(url)
+                if url.scheme() == "https"
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.fragment().is_none() =>
+            {
+                url
+            }
+            Ok(_) => {
+                broker.discard_browser(request_id);
+                self.browser_oauth
+                    .complete(request_id, BrowserOAuthStatus::Failed);
+                self.record_audit_with_fields(
+                    "oauth_browser",
+                    Some(account),
+                    "invalid_authorization_url",
+                    &[
+                        ("request_id", json!(request_id)),
+                        ("generation", json!(generation)),
+                    ],
+                );
+                return Self::oauth_runtime_error(ManagementOAuthError::Unavailable);
+            }
+            Err(error) => {
+                broker.discard_browser(request_id);
+                self.browser_oauth
+                    .complete(request_id, BrowserOAuthStatus::Failed);
+                self.record_audit_with_fields(
+                    "oauth_browser",
+                    Some(account),
+                    "failed",
+                    &[
+                        ("request_id", json!(request_id)),
+                        ("generation", json!(generation)),
+                    ],
+                );
+                return Self::oauth_runtime_error(error);
+            }
+        };
+        self.browser_oauth
+            .complete(request_id, BrowserOAuthStatus::AuthorizationRequired);
+        self.record_audit_with_fields(
+            "oauth_browser",
+            Some(account),
+            "authorization_required",
+            &[
+                ("request_id", json!(request_id)),
+                ("generation", json!(generation)),
+            ],
+        );
+        ManagementResponse::json(
+            StatusCode::OK,
+            json!({
+                "request_id": request_id,
+                "authorization_url": authorization_url.as_str(),
+            }),
+            false,
+        )
+    }
+
+    async fn acquire_oauth_client_credentials(
+        &self,
+        account: &str,
+        cancellation: CancellationToken,
+    ) -> ManagementResponse {
+        let Some(broker) = self.browser_oauth_broker.as_ref() else {
+            return state_unavailable();
+        };
+        self.expire_browser_oauth_sessions();
+        let guard = {
+            let mut state = self
+                .browser_oauth
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.client_credentials_inflight.contains(account)
+                || state
+                    .records
+                    .iter()
+                    .any(|record| record.account == account && record.status.active())
+            {
+                return ManagementResponse::json(
+                    StatusCode::CONFLICT,
+                    json!({"error": "an OAuth request is already active for this account"}),
+                    false,
+                );
+            }
+            if state.client_credentials_inflight.len() >= MAX_ACTIVE_CLIENT_CREDENTIALS {
+                return ManagementResponse::json(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    json!({"error": "too many client-credentials requests are active"}),
+                    false,
+                );
+            }
+            state.client_credentials_inflight.insert(account.to_owned());
+            ClientCredentialsGuard {
+                control: Arc::clone(&self.browser_oauth),
+                account: account.to_owned(),
+            }
+        };
+        let (_, generation) = self.active_config();
+        let result = broker
+            .acquire_client_credentials(account, generation, cancellation)
+            .await;
+        drop(guard);
+        match result {
+            Ok(()) => {
+                self.record_audit_with_fields(
+                    "oauth_client_credentials",
+                    Some(account),
+                    "succeeded",
+                    &[("generation", json!(generation))],
+                );
+                ManagementResponse::json(
+                    StatusCode::OK,
+                    json!({"account": account, "status": "succeeded"}),
+                    false,
+                )
+            }
+            Err(error) => {
+                let outcome = if error == ManagementOAuthError::StaleGeneration {
+                    "stale_generation"
+                } else {
+                    "failed"
+                };
+                self.record_audit_with_fields(
+                    "oauth_client_credentials",
+                    Some(account),
+                    outcome,
+                    &[("generation", json!(generation))],
+                );
+                Self::oauth_runtime_error(error)
+            }
+        }
+    }
+
+    async fn finish_browser_oauth_login(
+        &self,
+        query: Option<&str>,
+        headers: &HeaderMap,
+        cancellation: CancellationToken,
+    ) -> ManagementResponse {
+        let Some(callback_host) = oauth_browser_callback_host(self, headers) else {
+            return ManagementResponse::json(
+                StatusCode::FORBIDDEN,
+                json!({"error": LOOPBACK_HOST_ERROR}),
+                false,
+            );
+        };
+        let Some(query) = query.filter(|query| query.len() <= MAX_OAUTH_CALLBACK_QUERY_BYTES)
+        else {
+            return ManagementResponse::json(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "OAuth callback is invalid"}),
+                false,
+            );
+        };
+        let Some(state_value) = unique_bounded_query_value(query, "state", 256) else {
+            return ManagementResponse::json(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "OAuth callback is invalid"}),
+                false,
+            );
+        };
+        self.expire_browser_oauth_sessions();
+        let Some(broker) = self.browser_oauth_broker.as_ref() else {
+            return state_unavailable();
+        };
+        let candidate_ids = self
+            .browser_oauth
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records
+            .iter()
+            .filter(|record| record.status == BrowserOAuthStatus::AuthorizationRequired)
+            .map(|record| record.request_id)
+            .collect::<Vec<_>>();
+        let matching_ids = candidate_ids
+            .into_iter()
+            .filter(|request_id| broker.state_matches(*request_id, &state_value))
+            .collect::<Vec<_>>();
+        if matching_ids.len() != 1 {
+            return ManagementResponse::json(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "OAuth callback is invalid or expired"}),
+                false,
+            );
+        }
+        let request_id = matching_ids[0];
+        if !broker.callback_host_matches(request_id, callback_host) {
+            return ManagementResponse::json(
+                StatusCode::FORBIDDEN,
+                json!({"error": "OAuth callback Host does not match its registered target"}),
+                false,
+            );
+        }
+        let record = {
+            let mut state = self
+                .browser_oauth
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(record) = state.records.iter_mut().find(|record| {
+                record.request_id == request_id
+                    && record.status == BrowserOAuthStatus::AuthorizationRequired
+            }) else {
+                return ManagementResponse::json(
+                    StatusCode::CONFLICT,
+                    json!({"error": "OAuth callback was already consumed"}),
+                    false,
+                );
+            };
+            record.status = BrowserOAuthStatus::Exchanging;
+            record.clone()
+        };
+        let exchange_guard = BrowserExchangeGuard {
+            control: Arc::clone(&self.browser_oauth),
+            request_id,
+            complete: false,
+        };
+        let result = broker
+            .finish_browser(
+                request_id,
+                query.to_owned(),
+                record.generation,
+                cancellation,
+            )
+            .await;
+        let (status, outcome) = match result {
+            Ok(()) => (BrowserOAuthStatus::Succeeded, "succeeded"),
+            Err(ManagementOAuthError::StaleGeneration) => {
+                (BrowserOAuthStatus::StaleGeneration, "stale_generation")
+            }
+            Err(_) => (BrowserOAuthStatus::Failed, "failed"),
+        };
+        exchange_guard.finish(status);
+        self.record_audit_with_fields(
+            "oauth_browser_callback",
+            Some(&record.account),
+            outcome,
+            &[
+                ("request_id", json!(request_id)),
+                ("generation", json!(record.generation)),
+            ],
+        );
+        match result {
+            Ok(()) => ManagementResponse::json(
+                StatusCode::OK,
+                json!({"request_id": request_id, "status": "succeeded"}),
+                false,
+            ),
+            Err(error) => Self::oauth_runtime_error(error),
+        }
+    }
+
+    async fn handle_browser_oauth_request(
+        &self,
+        method: &Method,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        cancellation: CancellationToken,
+    ) -> Option<ManagementResponse> {
+        let uri = path_and_query.parse::<Uri>().ok()?;
+        let path = uri
+            .path()
+            .strip_prefix("/management")
+            .filter(|path| path.is_empty() || path.starts_with('/'))
+            .unwrap_or_else(|| uri.path());
+        if *method == Method::GET && uri.path() == "/management/oauth/browser/callback" {
+            return Some(
+                self.finish_browser_oauth_login(uri.query(), headers, cancellation)
+                    .await,
+            );
+        }
+        if *method != Method::POST {
+            return None;
+        }
+        let (account, action) = management_oauth_account_action(path)?;
+        if !management_request_host_allowed(self, false, headers) {
+            return Some(ManagementResponse::json(
+                StatusCode::FORBIDDEN,
+                json!({"error": LOOPBACK_HOST_ERROR}),
+                false,
+            ));
+        }
+        if let Some(response) = self.config_mutation_authorization_rejection(path, headers) {
+            return Some(response);
+        }
+        Some(match action {
+            "oauth-browser" => self.start_browser_oauth_login(&account).await,
+            "oauth-client-credentials" => {
+                self.acquire_oauth_client_credentials(&account, cancellation)
+                    .await
+            }
+            _ => unreachable!("validated OAuth account action"),
+        })
     }
 
     /// Shared activity counters used by the serving runtime.
@@ -1949,7 +2757,7 @@ impl ManagementApi {
             );
         }
         let local_ui_shell = ui_asset && management_bind_is_loopback(self.bind());
-        if mutation && !is_config_mutation(method, path) {
+        if mutation && !is_bodied_management_mutation(method, path) {
             if let Some((status, message)) = mutation_body_rejection(headers) {
                 self.record_audit(path, None, "rejected_body");
                 return ManagementResponse::json(status, json!({"error": message}), false);
@@ -2030,6 +2838,7 @@ impl ManagementApi {
             ),
             "/config" | "/config/generation" => self.config_generation(snapshot),
             "/setup/options" => self.setup_options(snapshot),
+            "/setup/palantir/config" if mutation => self.palantir_setup_config(body),
             "/setup/config" => self.setup_config(uri.as_ref().and_then(Uri::query)),
             "/setup/test" => self.setup_test(
                 uri.as_ref().and_then(Uri::query),
@@ -2045,6 +2854,7 @@ impl ManagementApi {
             "/health/credentials" | "/credentials/health" => self.credentials(snapshot, pooling),
             "/accounts" => self.accounts(snapshot, pooling),
             path if path.starts_with("/oauth/device/") => self.oauth_device_status(path),
+            path if path.starts_with("/oauth/browser/") => self.browser_oauth_status(path),
             "/quota" => self.quota(snapshot, pooling),
             "/metrics" => self.metrics_view(snapshot),
             "/metrics/prometheus" => ManagementResponse::body(
@@ -2279,7 +3089,7 @@ impl ManagementApi {
     fn setup_options(&self, snapshot: &ConfigSnapshot<CompiledConfig>) -> ManagementResponse {
         let registry = ProviderLoginRegistry::builtin();
         let catalog = ProviderCatalog::builtin();
-        let providers = catalog
+        let mut providers = catalog
             .iter()
             .map(|(id, provider)| {
                 let definition = registry.resolve(id);
@@ -2356,6 +3166,52 @@ impl ManagementApi {
                 })
             })
             .collect::<Vec<_>>();
+        let configured_upstreams = snapshot
+            .config()
+            .upstreams()
+            .iter()
+            .filter(|(_, upstream)| {
+                upstream
+                    .native()
+                    .is_some_and(|native| native.kind().eq_ignore_ascii_case("palantir_aip"))
+            })
+            .map(|(upstream_id, _)| Arc::<str>::as_ref(upstream_id))
+            .collect::<Vec<_>>();
+        let palantir = registry
+            .require("palantir_aip")
+            .expect("built-in Palantir login profile");
+        let authentication = palantir
+            .capabilities()
+            .iter()
+            .map(|capability| {
+                json!({
+                    "method": capability.method().to_string(),
+                    "support": setup_support_name(capability.support()),
+                    "note": capability.note(),
+                })
+            })
+            .collect::<Vec<_>>();
+        providers.push(json!({
+            "id": "palantir-aip",
+            "name": palantir.display_name(),
+            "setup_profile": "palantir_aip",
+            "authentication": authentication,
+            "credential_environment_variables": [],
+            "documentation_url": palantir.documentation_url(),
+            "request_dialect": "provider_compatible",
+            "native_kind": palantir.id(),
+            "discovery": {
+                "available": false,
+                "parser": Value::Null,
+                "path": Value::Null,
+                "note": "Enter an enrollment-enabled model RID explicitly."
+            },
+            "configured_upstreams": configured_upstreams,
+            "clients": ["openai", "anthropic", "codex", "cursor", "droid", "native"],
+            "required_fields": [
+                "enrollment", "client_id", "auth", "account", "model"
+            ]
+        }));
         ManagementResponse::json(
             StatusCode::OK,
             json!({
@@ -2387,6 +3243,23 @@ impl ManagementApi {
             Ok(config) => ManagementResponse::json(
                 StatusCode::OK,
                 json!({"schema_version": 1, "validated": true, "configuration": config}),
+                false,
+            ),
+            Err(error) => {
+                ManagementResponse::json(StatusCode::BAD_REQUEST, json!({"error": error}), false)
+            }
+        }
+    }
+
+    fn palantir_setup_config(&self, body: &[u8]) -> ManagementResponse {
+        match generate_palantir_setup_config(body) {
+            Ok(config) => ManagementResponse::json(
+                StatusCode::OK,
+                json!({
+                    "schema_version": 1,
+                    "validated": true,
+                    "configuration": config
+                }),
                 false,
             ),
             Err(error) => {
@@ -3657,7 +4530,7 @@ fn raw_config_mutation_headers(prefix: &[u8]) -> Result<Option<(String, HeaderMa
     };
     let request_target = request.next().ok_or(())?;
     let management_path = raw_management_path(request_target).ok_or(())?;
-    if !is_config_mutation(&method, &management_path) {
+    if !is_bodied_management_mutation(&method, &management_path) {
         return Ok(None);
     }
 
@@ -3694,7 +4567,7 @@ fn raw_is_body_free_management_mutation(prefix: &[u8]) -> bool {
         return false;
     };
     is_management_mutation(&method, &management_path)
-        && !is_config_mutation(&method, &management_path)
+        && !is_bodied_management_mutation(&method, &management_path)
 }
 
 fn raw_mutation_body_rejection(prefix: &[u8]) -> Option<(StatusCode, &'static str)> {
@@ -3710,7 +4583,7 @@ fn raw_mutation_body_rejection(prefix: &[u8]) -> Option<(StatusCode, &'static st
     let request_target = request.next()?;
     let management_path = raw_management_path(request_target)?;
     if !is_management_mutation(&method, &management_path)
-        || is_config_mutation(&method, &management_path)
+        || is_bodied_management_mutation(&method, &management_path)
     {
         return None;
     }
@@ -3846,8 +4719,10 @@ async fn serve_management_connection<I>(
         return;
     }
     let io = TokioIo::new(PrefixedIo::new(prefix, io));
+    let request_cancellation = cancellation.clone();
     let service = service_fn(move |request: Request<Incoming>| {
         let api = Arc::clone(&api);
+        let request_cancellation = request_cancellation.child_token();
         async move {
             let request_path = request.uri().path();
             let management_path = request_path
@@ -3856,13 +4731,29 @@ async fn serve_management_connection<I>(
                 .unwrap_or(request_path);
             let ui_asset = management_ui::asset(management_path).is_some()
                 || (request_path.starts_with("/management") && management_path == "/");
-            let response = if !management_request_host_allowed(&api, ui_asset, request.headers()) {
+            let browser_callback = request.method() == Method::GET
+                && request_path == "/management/oauth/browser/callback";
+            let response = if browser_callback {
+                api.handle_browser_oauth_request(
+                    request.method(),
+                    request.uri().to_string().as_str(),
+                    request.headers(),
+                    request_cancellation,
+                )
+                .await
+                .unwrap_or_else(state_unavailable)
+            } else if !management_request_host_allowed(&api, ui_asset, request.headers()) {
                 ManagementResponse::json(
                     StatusCode::FORBIDDEN,
                     json!({"error": LOOPBACK_HOST_ERROR}),
                     false,
                 )
-            } else if is_config_mutation(request.method(), management_path) {
+            } else if is_bodied_management_mutation(request.method(), management_path) {
+                let body_limit = if management_path == "/setup/palantir/config" {
+                    MAX_PALANTIR_SETUP_BODY_BYTES
+                } else {
+                    MAX_CONFIG_MUTATION_BODY_BYTES
+                };
                 if let Some(response) =
                     api.config_mutation_authorization_rejection(management_path, request.headers())
                 {
@@ -3878,7 +4769,7 @@ async fn serve_management_connection<I>(
                     .get(header::CONTENT_LENGTH)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<usize>().ok())
-                    .is_some_and(|length| length > MAX_CONFIG_MUTATION_BODY_BYTES)
+                    .is_some_and(|length| length > body_limit)
                 {
                     ManagementResponse::json(
                         StatusCode::PAYLOAD_TOO_LARGE,
@@ -3889,7 +4780,7 @@ async fn serve_management_connection<I>(
                     let (parts, incoming) = request.into_parts();
                     match tokio::time::timeout(
                         MANAGEMENT_CONFIG_BODY_TIMEOUT,
-                        Limited::new(incoming, MAX_CONFIG_MUTATION_BODY_BYTES).collect(),
+                        Limited::new(incoming, body_limit).collect(),
                     )
                     .await
                     {
@@ -3926,11 +4817,16 @@ async fn serve_management_connection<I>(
                         false,
                     )
                 } else {
-                    api.handle(
-                        request.method(),
-                        request.uri().to_string().as_str(),
-                        request.headers(),
-                    )
+                    let method = request.method().clone();
+                    let uri = request.uri().to_string();
+                    let headers = request.headers().clone();
+                    match api
+                        .handle_browser_oauth_request(&method, &uri, &headers, request_cancellation)
+                        .await
+                    {
+                        Some(response) => response,
+                        None => api.handle(&method, &uri, &headers),
+                    }
                 }
             } else {
                 api.handle(
@@ -4067,6 +4963,100 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    #[derive(Default)]
+    struct FakeOAuthBroker {
+        sessions: Mutex<BTreeSet<u64>>,
+        callback_queries: Mutex<Vec<String>>,
+        client_calls: AtomicUsize,
+        block_client: AtomicBool,
+        client_started: Notify,
+        client_release: Notify,
+        block_browser: AtomicBool,
+        browser_started: Notify,
+        browser_release: Notify,
+    }
+
+    impl ManagementOAuthBroker for FakeOAuthBroker {
+        fn start_browser(
+            &self,
+            _config: &CompiledConfig,
+            _account: &str,
+            request_id: u64,
+        ) -> Result<url::Url, ManagementOAuthError> {
+            self.sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(request_id);
+            format!("https://provider.example/authorize?state=test-state-{request_id}")
+                .parse()
+                .map_err(|_| ManagementOAuthError::Unavailable)
+        }
+
+        fn state_matches(&self, request_id: u64, candidate: &str) -> bool {
+            candidate == format!("test-state-{request_id}")
+                && self
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&request_id)
+        }
+
+        fn callback_host_matches(&self, _request_id: u64, candidate: &str) -> bool {
+            safe_loopback_host_value(candidate)
+        }
+
+        fn finish_browser<'a>(
+            &'a self,
+            request_id: u64,
+            callback_query: String,
+            _generation: u64,
+            _cancellation: CancellationToken,
+        ) -> ManagementOAuthFuture<'a> {
+            Box::pin(async move {
+                if !self
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&request_id)
+                {
+                    return Err(ManagementOAuthError::NotFound);
+                }
+                self.callback_queries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(callback_query);
+                self.browser_started.notify_one();
+                if self.block_browser.load(Ordering::Acquire) {
+                    self.browser_release.notified().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn acquire_client_credentials<'a>(
+            &'a self,
+            _account: &'a str,
+            _generation: u64,
+            _cancellation: CancellationToken,
+        ) -> ManagementOAuthFuture<'a> {
+            Box::pin(async move {
+                self.client_calls.fetch_add(1, Ordering::Relaxed);
+                self.client_started.notify_one();
+                if self.block_client.load(Ordering::Acquire) {
+                    self.client_release.notified().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn discard_browser(&self, request_id: u64) {
+            self.sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&request_id);
+        }
+    }
 
     fn private_configuration_tempdir() -> tempfile::TempDir {
         let directory = tempfile::tempdir().expect("temporary configuration directory");
@@ -4327,6 +5317,42 @@ routes:
             config,
         ));
         ManagementApi::new(plan, store, pooling, ActiveCounts::new())
+    }
+
+    fn oauth_api(secret_env: &str) -> (ManagementApi, Arc<FakeOAuthBroker>) {
+        let config = pooler_config::compile_yaml(
+            "oauth-management-test.yaml",
+            &format!(
+                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{secret_env}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  foundry:\n    url: https://example.euw-3.palantirfoundry.co.uk\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: test-client\n      scopes: [api:use-language-models-execute, offline_access]\n      callback: http://127.0.0.1:18477/management/oauth/browser/callback\naccounts:\n  foundry: {{provider: foundry, auth_kind: oauth}}\n  foundry-alt: {{provider: foundry, auth_kind: oauth}}\n"
+            ),
+        )
+        .expect("OAuth management config compiles");
+        let plan = config.management().cloned().expect("management plan");
+        let pooling = Arc::new(PoolingCoordinator::new(&config).expect("pooling coordinator"));
+        let store = Arc::new(ConfigStore::with_generation(
+            ConfigGeneration::new(config.generation()),
+            config,
+        ));
+        let broker = Arc::new(FakeOAuthBroker::default());
+        let mut api = ManagementApi::new(plan, store, pooling, ActiveCounts::new());
+        api.browser_oauth_broker = Some(broker.clone());
+        (api, broker)
+    }
+
+    async fn raw_management_request(address: SocketAddr, request: &[u8]) -> String {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("management connects");
+        stream
+            .write_all(request)
+            .await
+            .expect("management request writes");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("management response arrives")
+            .expect("management response reads");
+        String::from_utf8(response).expect("management response is UTF-8")
     }
 
     fn loopback_headers() -> HeaderMap {
@@ -5134,6 +6160,25 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
                         && method["support"] == "requires_explicit_configuration"
                 })
             }));
+        let palantir = value["providers"]
+            .as_array()
+            .and_then(|providers| {
+                providers
+                    .iter()
+                    .find(|provider| provider["id"] == "palantir-aip")
+            })
+            .expect("Palantir setup profile");
+        assert_eq!(palantir["discovery"]["available"], false);
+        assert!(palantir["authentication"]
+            .as_array()
+            .is_some_and(|methods| {
+                methods.iter().any(|method| {
+                    method["method"] == "client_credentials"
+                        && method["support"] == "requires_explicit_configuration"
+                }) && methods.iter().any(|method| {
+                    method["method"] == "device_code" && method["support"] == "unsupported"
+                })
+            }));
         let body = String::from_utf8(response.body).expect("UTF-8 setup options");
         assert!(!body.contains("sk-"));
         assert!(!body.contains("\"client_secret\":"));
@@ -5209,6 +6254,75 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             &loopback_headers(),
         );
         assert_eq!(injected.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn palantir_setup_is_direct_explicit_and_compiler_validated() {
+        const MODEL: &str = "ri.language-model-service..language-model.anthropic-claude-4-6-opus";
+        let browser = serde_json::to_vec(&json!({
+            "enrollment": "https://example.euw-3.palantirfoundry.co.uk",
+            "client_id": "operator-client",
+            "auth": "authorization_code_pkce",
+            "account": "foundry",
+            "model": MODEL,
+        }))
+        .expect("browser setup request");
+        let generated = generate_palantir_setup_config(&browser).expect("Palantir setup compiles");
+        for path in [
+            "/api/v2/llm/proxy/openai/v1/chat/completions",
+            "/api/v2/llm/proxy/openai/v1/responses",
+            "/api/v2/llm/proxy/anthropic/v1/messages",
+        ] {
+            assert!(generated.contains(path), "missing direct route {path}");
+        }
+        assert!(generated.contains("native: {kind: palantir_aip}"));
+        assert!(generated.contains(MODEL));
+        assert!(generated.contains("/management/oauth/browser/callback"));
+        assert!(!generated.contains("device_code"));
+        assert!(!generated.contains("catalog:"));
+        let compiled = compile_yaml("palantir-setup-roundtrip.yaml", &generated)
+            .expect("generated Palantir YAML compiles again");
+        let oauth = compiled.upstreams()["palantir-aip"]
+            .oauth()
+            .expect("Palantir OAuth plan");
+        assert_eq!(
+            oauth.authorization_endpoint().path(),
+            "/multipass/api/oauth2/authorize"
+        );
+        assert_eq!(oauth.token_endpoint().path(), "/multipass/api/oauth2/token");
+
+        let client_credentials = serde_json::to_vec(&json!({
+            "enrollment": "https://example.euw-3.palantirfoundry.co.uk",
+            "client_id": "service-client",
+            "client_secret": {"kind": "env", "name": "PALANTIR_CLIENT_SECRET"},
+            "auth": "client_credentials",
+            "account": "foundry-service",
+            "model": MODEL,
+        }))
+        .expect("client-credentials setup request");
+        let generated = generate_palantir_setup_config(&client_credentials)
+            .expect("client-credentials setup compiles");
+        assert!(generated.contains("client_secret: \"env:PALANTIR_CLIENT_SECRET\""));
+        assert!(generated.contains("grant_type: client_credentials"));
+
+        let invalid = serde_json::to_vec(&json!({
+            "enrollment": "https://example.euw-3.palantirfoundry.co.uk",
+            "client_id": "operator-client",
+            "auth": "authorization_code_pkce",
+            "account": "foundry",
+            "model": "ri.language-model-service..language-model.",
+        }))
+        .expect("invalid setup request");
+        assert!(generate_palantir_setup_config(&invalid).is_err());
+        let invalid_enrollment = serde_json::to_vec(&json!({
+            "enrollment": "https://example.euw-3.palantirfoundry.co.uk/not-an-origin",
+            "client_id": "operator-client",
+            "auth": "authorization_code_pkce",
+            "account": "foundry",
+            "model": MODEL,
+        }))
+        .expect("invalid enrollment request");
+        assert!(generate_palantir_setup_config(&invalid_enrollment).is_err());
     }
 
     #[test]
@@ -5597,6 +6711,324 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         assert_eq!(completed["status"], "succeeded");
         assert!(completed.get("user_code").is_none());
         assert!(completed.get("verification_uri_complete").is_none());
+        std::env::remove_var(MANAGEMENT_ENV);
+    }
+
+    #[tokio::test]
+    async fn browser_oauth_http_boundary_is_one_time_and_redacted() {
+        const MANAGEMENT_ENV: &str = "POOLER_BROWSER_OAUTH_MANAGEMENT_KEY";
+        std::env::set_var(MANAGEMENT_ENV, "browser-oauth-management-secret");
+        let (api, broker) = oauth_api(MANAGEMENT_ENV);
+        let server = ManagementHttpServer::bind(Arc::new(api))
+            .await
+            .expect("management listener binds");
+        let address = server.address().parse().expect("management address");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let authorization = raw_management_request(
+            address,
+            b"POST /accounts/foundry/oauth-browser HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nAuthorization: Bearer browser-oauth-management-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(authorization.contains("200 OK"));
+        assert!(authorization.contains("https://provider.example/authorize?state=test-state-1"));
+        assert!(!authorization.contains("code_verifier"));
+
+        let second_account = raw_management_request(
+            address,
+            b"POST /accounts/foundry-alt/oauth-browser HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nAuthorization: Bearer browser-oauth-management-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(second_account.contains("200 OK"));
+        assert!(second_account.contains("test-state-2"));
+        let duplicate = raw_management_request(
+            address,
+            b"POST /accounts/foundry/oauth-browser HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nAuthorization: Bearer browser-oauth-management-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(duplicate.contains("409 Conflict"));
+
+        let pending = raw_management_request(
+            address,
+            b"GET /oauth/browser/1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer browser-oauth-management-secret\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(pending.contains("authorization_required"));
+        assert!(!pending.contains("authorization_url"));
+        assert!(!pending.contains("test-state-1"));
+
+        let callback_alias = raw_management_request(
+            address,
+            b"GET /oauth/browser/callback?state=test-state-1&code=provider-secret-code HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(callback_alias.contains("401 Unauthorized"));
+
+        let callback = raw_management_request(
+            address,
+            b"GET /management/oauth/browser/callback?state=test-state-1&code=provider-secret-code HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(callback.contains("200 OK"));
+        assert!(callback.contains("\"status\":\"succeeded\""));
+        assert!(!callback.contains("provider-secret-code"));
+        assert!(!callback.contains("test-state-1"));
+        assert_eq!(
+            broker
+                .callback_queries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            ["state=test-state-1&code=provider-secret-code"]
+        );
+
+        let replay = raw_management_request(
+            address,
+            b"GET /management/oauth/browser/callback?state=test-state-1&code=provider-secret-code HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(replay.contains("400 Bad Request"));
+        let completed = raw_management_request(
+            address,
+            b"GET /oauth/browser/1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer browser-oauth-management-secret\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(completed.contains("\"status\":\"succeeded\""));
+        assert!(!completed.contains("provider-secret-code"));
+
+        server.begin_shutdown();
+        runner
+            .await
+            .expect("management task does not panic")
+            .expect("management task shuts down");
+        std::env::remove_var(MANAGEMENT_ENV);
+    }
+
+    #[tokio::test]
+    async fn browser_exchange_cancellation_releases_account_and_slot() {
+        const MANAGEMENT_ENV: &str = "POOLER_BROWSER_CANCEL_MANAGEMENT_KEY";
+        std::env::set_var(MANAGEMENT_ENV, "browser-cancel-management-secret");
+        let (api, broker) = oauth_api(MANAGEMENT_ENV);
+        broker.block_browser.store(true, Ordering::Release);
+        let api = Arc::new(api);
+        let mut mutation_headers = loopback_headers();
+        mutation_headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer browser-cancel-management-secret"),
+        );
+        mutation_headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://localhost"),
+        );
+        let started = api
+            .handle_browser_oauth_request(
+                &Method::POST,
+                "/accounts/foundry/oauth-browser",
+                &mutation_headers,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("browser action");
+        assert_eq!(started.status, StatusCode::OK);
+
+        let exchange_started = broker.browser_started.notified();
+        let callback = {
+            let api = Arc::clone(&api);
+            tokio::spawn(async move {
+                api.handle_browser_oauth_request(
+                    &Method::GET,
+                    "/management/oauth/browser/callback?state=test-state-1&code=cancelled-code",
+                    &loopback_headers(),
+                    CancellationToken::new(),
+                )
+                .await
+            })
+        };
+        exchange_started.await;
+        callback.abort();
+        assert!(callback
+            .await
+            .expect_err("callback is cancelled")
+            .is_cancelled());
+        let status =
+            response_value(api.handle(&Method::GET, "/oauth/browser/1", &mutation_headers));
+        assert_eq!(status["status"], "failed");
+        assert!(status["completed_at_ms"].is_u64());
+
+        broker.block_browser.store(false, Ordering::Release);
+        let retry = api
+            .handle_browser_oauth_request(
+                &Method::POST,
+                "/accounts/foundry/oauth-browser",
+                &mutation_headers,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("browser retry");
+        assert_eq!(retry.status, StatusCode::OK);
+        std::env::remove_var(MANAGEMENT_ENV);
+    }
+
+    #[tokio::test]
+    async fn expired_browser_session_does_not_block_client_credentials() {
+        const MANAGEMENT_ENV: &str = "POOLER_BROWSER_EXPIRY_MANAGEMENT_KEY";
+        std::env::set_var(MANAGEMENT_ENV, "browser-expiry-management-secret");
+        let (api, broker) = oauth_api(MANAGEMENT_ENV);
+        let mut headers = loopback_headers();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer browser-expiry-management-secret"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://localhost"),
+        );
+        let started = api
+            .handle_browser_oauth_request(
+                &Method::POST,
+                "/accounts/foundry/oauth-browser",
+                &headers,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("browser action");
+        assert_eq!(started.status, StatusCode::OK);
+        api.browser_oauth
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records[0]
+            .expires_at = Instant::now() - Duration::from_secs(1);
+
+        let credentials = api
+            .handle_browser_oauth_request(
+                &Method::POST,
+                "/accounts/foundry/oauth-client-credentials",
+                &headers,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("client-credentials action");
+        assert_eq!(credentials.status, StatusCode::OK);
+        assert_eq!(broker.client_calls.load(Ordering::Acquire), 1);
+        assert!(!broker
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&1));
+        let status = response_value(api.handle(&Method::GET, "/oauth/browser/1", &headers));
+        assert_eq!(status["status"], "expired");
+        std::env::remove_var(MANAGEMENT_ENV);
+    }
+
+    #[tokio::test]
+    async fn client_credentials_are_per_account_and_cancellation_releases_guard() {
+        const MANAGEMENT_ENV: &str = "POOLER_CLIENT_CREDENTIALS_MANAGEMENT_KEY";
+        std::env::set_var(MANAGEMENT_ENV, "client-credentials-management-secret");
+        let (api, broker) = oauth_api(MANAGEMENT_ENV);
+        broker.block_client.store(true, Ordering::Release);
+        let api = Arc::new(api);
+        let mut headers = loopback_headers();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer client-credentials-management-secret"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://localhost"),
+        );
+        let started = broker.client_started.notified();
+        let first = {
+            let api = Arc::clone(&api);
+            let headers = headers.clone();
+            tokio::spawn(async move {
+                api.handle_browser_oauth_request(
+                    &Method::POST,
+                    "/accounts/foundry/oauth-client-credentials",
+                    &headers,
+                    CancellationToken::new(),
+                )
+                .await
+            })
+        };
+        started.await;
+        let second_started = broker.client_started.notified();
+        let second = {
+            let api = Arc::clone(&api);
+            let headers = headers.clone();
+            tokio::spawn(async move {
+                api.handle_browser_oauth_request(
+                    &Method::POST,
+                    "/accounts/foundry-alt/oauth-client-credentials",
+                    &headers,
+                    CancellationToken::new(),
+                )
+                .await
+            })
+        };
+        second_started.await;
+        let mut active = vec![first, second];
+        for index in 2..MAX_ACTIVE_CLIENT_CREDENTIALS {
+            let next_started = broker.client_started.notified();
+            let api = Arc::clone(&api);
+            let headers = headers.clone();
+            active.push(tokio::spawn(async move {
+                api.handle_browser_oauth_request(
+                    &Method::POST,
+                    &format!("/accounts/foundry-{index}/oauth-client-credentials"),
+                    &headers,
+                    CancellationToken::new(),
+                )
+                .await
+            }));
+            next_started.await;
+        }
+        assert_eq!(
+            broker.client_calls.load(Ordering::Acquire),
+            MAX_ACTIVE_CLIENT_CREDENTIALS
+        );
+        let duplicate = api
+            .handle_browser_oauth_request(
+                &Method::POST,
+                "/accounts/foundry/oauth-client-credentials",
+                &headers,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("client-credentials action");
+        assert_eq!(duplicate.status, StatusCode::CONFLICT);
+        let overflow = api
+            .handle_browser_oauth_request(
+                &Method::POST,
+                "/accounts/foundry-overflow/oauth-client-credentials",
+                &headers,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("bounded client-credentials action");
+        assert_eq!(overflow.status, StatusCode::TOO_MANY_REQUESTS);
+
+        for task in active {
+            task.abort();
+            assert!(task.await.expect_err("action is cancelled").is_cancelled());
+        }
+        broker.block_client.store(false, Ordering::Release);
+        let retry = api
+            .handle_browser_oauth_request(
+                &Method::POST,
+                "/accounts/foundry/oauth-client-credentials",
+                &headers,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("client-credentials retry");
+        assert_eq!(retry.status, StatusCode::OK);
+        assert_eq!(
+            broker.client_calls.load(Ordering::Acquire),
+            MAX_ACTIVE_CLIENT_CREDENTIALS + 1
+        );
         std::env::remove_var(MANAGEMENT_ENV);
     }
 

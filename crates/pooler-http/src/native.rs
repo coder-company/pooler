@@ -12,23 +12,27 @@ use adapter_codex::{CodexCredential, CodexQuotaParser, CodexRequestMetadata, SES
 use adapter_providers::AuthPlacement;
 use http::{HeaderMap, HeaderName};
 use pooler_auth::{
-    refresh_with_store_if_generation, CredentialId, DeviceAuthorization, HyperOAuthTransport,
-    MemoryOAuthTokenStore, OAuthClientConfig, OAuthCredentialProfile, OAuthDeviceFlow, OAuthError,
-    OAuthRefresher, OAuthTokenStore, OAuthTokens, ProviderLoginMethod, ProviderLoginRegistry,
-    ProviderOAuthClient, ProviderOAuthSettings, RefreshCoordinator, SecretRef as AuthSecretRef,
-    SecretValue, StandardOAuthProvider, TokenSnapshot,
+    renew_with_store_if_generation, AuthorizationAttempt, CredentialId, DeviceAuthorization,
+    HyperOAuthTransport, MemoryOAuthTokenStore, OAuthClientAuth, OAuthClientConfig,
+    OAuthClientCredentials, OAuthCodeExchange, OAuthCredentialProfile, OAuthDeviceFlow, OAuthError,
+    OAuthIdentity, OAuthIdentityProvider, OAuthProvider, OAuthRefresher, OAuthTokenStore,
+    OAuthTokens, ProviderLoginMethod, ProviderLoginRegistry, ProviderOAuthClient,
+    ProviderOAuthSettings, RefreshCoordinator, SecretRef as AuthSecretRef, SecretValue,
+    StandardOAuthProvider, TokenSnapshot,
 };
 use pooler_config::{
-    AccountAuthKind, AuthPlan, CompiledConfig, OAuthPlan, SecretRef, UpstreamPlan,
-    DEFAULT_OAUTH_CALLBACK,
+    AccountAuthKind, AccountPlan, AuthPlan, CompiledConfig, OAuthGrantType, OAuthPlan, SecretRef,
+    UpstreamPlan, DEFAULT_OAUTH_CALLBACK,
 };
 use pooler_store::{CredentialState, SqliteOAuthTokenStore, Store};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use crate::{RuntimeResourceSnapshot, RuntimeResources};
 
 const DEVICE_AUTHORIZATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const OAUTH_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Native runtime errors are intentionally coarse and never carry token
 /// material, response bodies, or authorization headers.
@@ -93,10 +97,7 @@ impl NativeDeviceAuthorization {
 pub struct NativeDeviceLoginSession {
     provider: ProviderOAuthClient,
     authorization: DeviceAuthorization,
-    credential: CredentialId,
-    account_id: String,
-    upstream_id: String,
-    enabled: bool,
+    target: NativeOAuthLoginTarget,
 }
 
 impl std::fmt::Debug for NativeDeviceLoginSession {
@@ -112,6 +113,75 @@ impl std::fmt::Debug for NativeDeviceLoginSession {
 pub struct NativeDeviceLoginResult {
     session: NativeDeviceLoginSession,
     tokens: OAuthTokens,
+}
+
+/// Non-secret browser authorization details safe to return to an authenticated operator.
+pub struct NativeBrowserAuthorization {
+    authorization_url: Url,
+}
+
+impl NativeBrowserAuthorization {
+    /// HTTPS provider page where the operator completes authorization.
+    #[must_use]
+    pub const fn authorization_url(&self) -> &Url {
+        &self.authorization_url
+    }
+}
+
+impl std::fmt::Debug for NativeBrowserAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeBrowserAuthorization")
+            .field("authorization_url", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Opaque server-held PKCE continuation for one configured browser login.
+pub struct NativeBrowserLoginSession {
+    provider: StandardOAuthProvider,
+    attempt: AuthorizationAttempt,
+    target: NativeOAuthLoginTarget,
+}
+
+impl NativeBrowserLoginSession {
+    /// Match callback state without exposing the server-held value.
+    #[must_use]
+    pub fn matches_state(&self, candidate: &str) -> bool {
+        self.attempt.state().matches(candidate)
+    }
+}
+
+impl std::fmt::Debug for NativeBrowserLoginSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeBrowserLoginSession")
+            .field("profile", &self.target.provider_profile)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque completed OAuth exchange awaiting generation-serialized persistence.
+pub struct NativeOAuthLoginResult {
+    target: NativeOAuthLoginTarget,
+    tokens: OAuthTokens,
+    identity: Option<OAuthIdentity>,
+}
+
+impl std::fmt::Debug for NativeOAuthLoginResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeOAuthLoginResult")
+            .field("profile", &self.target.provider_profile)
+            .field("identity_present", &self.identity.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+struct NativeOAuthLoginTarget {
+    credential: CredentialId,
+    provider_profile: String,
+    expected_generation: u64,
 }
 
 impl std::fmt::Debug for NativeDeviceLoginResult {
@@ -336,6 +406,7 @@ impl NativeRuntime {
             } else if is_configured_native_kind(native.kind()) {
                 let provider = if native.kind().eq_ignore_ascii_case("kimi")
                     || native.kind().eq_ignore_ascii_case("vertex")
+                    || native.kind().eq_ignore_ascii_case("palantir_aip")
                 {
                     upstream
                         .oauth()
@@ -595,7 +666,7 @@ impl NativeRuntime {
                 .refresh_provider()
                 .ok_or(NativeRuntimeError::Unsupported)?;
             let _lease = self.resources.refresh_lease();
-            snapshot = refresh_with_store_if_generation(
+            snapshot = renew_with_store_if_generation(
                 &self.refresh,
                 provider,
                 self.token_store.as_ref(),
@@ -658,7 +729,7 @@ impl NativeRuntime {
             .refresh_provider()
             .ok_or(NativeRuntimeError::Unsupported)?;
         let _lease = self.resources.refresh_lease();
-        refresh_with_store_if_generation(
+        renew_with_store_if_generation(
             &self.refresh,
             provider,
             self.token_store.as_ref(),
@@ -668,6 +739,218 @@ impl NativeRuntime {
         )
         .await
         .map_err(map_refresh_error)
+    }
+
+    /// Start a configured authorization-code login while retaining state and
+    /// the PKCE verifier inside the runtime-owned session.
+    pub fn start_browser_login(
+        &self,
+        config: &CompiledConfig,
+        account_id: &str,
+    ) -> Result<(NativeBrowserAuthorization, NativeBrowserLoginSession), NativeRuntimeError> {
+        let (provider, target) =
+            self.configured_oauth_provider(config, account_id, OAuthGrantType::AuthorizationCode)?;
+        let attempt = provider.begin_authorization().map_err(map_login_error)?;
+        if attempt.authorization_url().scheme() != "https" {
+            return Err(NativeRuntimeError::Configuration);
+        }
+        let prompt = NativeBrowserAuthorization {
+            authorization_url: attempt.authorization_url().clone(),
+        };
+        Ok((
+            prompt,
+            NativeBrowserLoginSession {
+                provider,
+                attempt,
+                target,
+            },
+        ))
+    }
+
+    /// Validate and exchange one browser callback without persisting tokens.
+    pub async fn exchange_browser_login(
+        &self,
+        session: NativeBrowserLoginSession,
+        callback: Url,
+        cancellation: CancellationToken,
+    ) -> Result<NativeOAuthLoginResult, NativeRuntimeError> {
+        let NativeBrowserLoginSession {
+            provider,
+            attempt,
+            target,
+        } = session;
+        let code = attempt
+            .validate_callback(&callback)
+            .map_err(map_login_error)?;
+        let tokens = tokio::time::timeout(
+            OAUTH_TOKEN_REQUEST_TIMEOUT,
+            provider.exchange_code(
+                &code,
+                attempt.pkce(),
+                attempt.redirect_uri(),
+                cancellation.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| NativeRuntimeError::Refresh)?
+        .map_err(map_login_error)?;
+        let identity = if provider.config().identity_endpoint.is_some() {
+            Some(
+                tokio::time::timeout(
+                    OAUTH_TOKEN_REQUEST_TIMEOUT,
+                    provider.identity(&tokens, cancellation),
+                )
+                .await
+                .map_err(|_| NativeRuntimeError::Refresh)?
+                .map_err(map_login_error)?,
+            )
+        } else {
+            None
+        };
+        Ok(NativeOAuthLoginResult {
+            target,
+            tokens,
+            identity,
+        })
+    }
+
+    /// Acquire a configured client-credentials token without persisting it.
+    pub async fn acquire_client_credentials(
+        &self,
+        config: &CompiledConfig,
+        account_id: &str,
+        cancellation: CancellationToken,
+    ) -> Result<NativeOAuthLoginResult, NativeRuntimeError> {
+        let (provider, target) =
+            self.configured_oauth_provider(config, account_id, OAuthGrantType::ClientCredentials)?;
+        let tokens = tokio::time::timeout(
+            OAUTH_TOKEN_REQUEST_TIMEOUT,
+            provider.acquire_client_credentials(cancellation),
+        )
+        .await
+        .map_err(|_| NativeRuntimeError::Refresh)?
+        .map_err(map_login_error)?;
+        Ok(NativeOAuthLoginResult {
+            target,
+            tokens,
+            identity: None,
+        })
+    }
+
+    /// Persist a completed browser or client-credentials exchange in the
+    /// encrypted token store while the caller holds reload serialization.
+    pub fn persist_oauth_login(
+        &self,
+        result: NativeOAuthLoginResult,
+    ) -> Result<TokenSnapshot, NativeRuntimeError> {
+        let NativeOAuthLoginResult {
+            target,
+            tokens,
+            identity,
+        } = result;
+        let id_token = tokens.id_token().cloned();
+        let mut profile =
+            OAuthCredentialProfile::new(&target.provider_profile, tokens).with_id_token(id_token);
+        if let Some(identity) = identity {
+            profile = profile.with_identity(identity);
+        }
+        self.persist_oauth_profile(&target, &profile)
+    }
+
+    fn configured_oauth_provider(
+        &self,
+        config: &CompiledConfig,
+        account_id: &str,
+        expected_grant: OAuthGrantType,
+    ) -> Result<(StandardOAuthProvider, NativeOAuthLoginTarget), NativeRuntimeError> {
+        if self.sqlite_token_store.is_none() {
+            return Err(NativeRuntimeError::CredentialUnavailable);
+        }
+        let account = config
+            .accounts()
+            .get(account_id)
+            .ok_or(NativeRuntimeError::CredentialUnavailable)?;
+        if account.auth_kind() != AccountAuthKind::OAuth {
+            return Err(NativeRuntimeError::Unsupported);
+        }
+        let upstream = config
+            .upstreams()
+            .get(account.provider())
+            .ok_or(NativeRuntimeError::Unsupported)?;
+        let native = upstream.native().ok_or(NativeRuntimeError::Unsupported)?;
+        if !is_configured_native_kind(native.kind()) || self.binding_for(upstream).is_none() {
+            return Err(NativeRuntimeError::Unsupported);
+        }
+        let oauth = upstream
+            .oauth()
+            .filter(|oauth| oauth.grant_type() == expected_grant)
+            .ok_or(NativeRuntimeError::Unsupported)?;
+        let transport = Arc::new(
+            HyperOAuthTransport::new(64 * 1024).map_err(|_| NativeRuntimeError::Configuration)?,
+        );
+        let provider = build_standard_oauth_provider(upstream.id(), oauth, transport)?;
+        let target = self.prepare_oauth_login_target(account, native.kind())?;
+        Ok((provider, target))
+    }
+
+    fn prepare_oauth_login_target(
+        &self,
+        account: &AccountPlan,
+        provider_profile: &str,
+    ) -> Result<NativeOAuthLoginTarget, NativeRuntimeError> {
+        let store = self
+            .sqlite_token_store
+            .as_ref()
+            .ok_or(NativeRuntimeError::CredentialUnavailable)?;
+        let expected_generation = match store
+            .store()
+            .credential_state(account.id())
+            .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
+        {
+            Some(state) => {
+                if state.provider_id != account.provider() {
+                    return Err(NativeRuntimeError::CredentialUnavailable);
+                }
+                state.revision
+            }
+            None => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                store
+                    .store()
+                    .upsert_credential_state(CredentialState::new(
+                        account.id(),
+                        account.provider(),
+                        account.enabled(),
+                        now,
+                    ))
+                    .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
+                    .revision
+            }
+        };
+        Ok(NativeOAuthLoginTarget {
+            credential: CredentialId::new(account.id())
+                .map_err(|_| NativeRuntimeError::Configuration)?,
+            provider_profile: provider_profile.to_ascii_lowercase(),
+            expected_generation,
+        })
+    }
+
+    fn persist_oauth_profile(
+        &self,
+        target: &NativeOAuthLoginTarget,
+        profile: &OAuthCredentialProfile,
+    ) -> Result<TokenSnapshot, NativeRuntimeError> {
+        let store = self
+            .sqlite_token_store
+            .as_ref()
+            .ok_or(NativeRuntimeError::CredentialUnavailable)?;
+        store
+            .compare_and_swap_profile(&target.credential, target.expected_generation, profile)
+            .map_err(|_| NativeRuntimeError::CredentialUnavailable)
     }
 
     /// Start a documented device-code login without exposing its device credential.
@@ -713,6 +996,7 @@ impl NativeRuntime {
                 transport,
             )
             .map_err(|_| NativeRuntimeError::Configuration)?;
+        let target = self.prepare_oauth_login_target(account, "openai")?;
         let authorization = tokio::time::timeout(
             DEVICE_AUTHORIZATION_REQUEST_TIMEOUT,
             provider.start_device_authorization(cancellation),
@@ -728,17 +1012,12 @@ impl NativeRuntime {
             user_code: authorization.user_code().to_owned(),
             expires_in_seconds: authorization.expires_in().as_secs(),
         };
-        let credential = CredentialId::new(account.id().to_owned())
-            .map_err(|_| NativeRuntimeError::Configuration)?;
         Ok((
             prompt,
             NativeDeviceLoginSession {
                 provider,
                 authorization,
-                credential,
-                account_id: account.id().to_owned(),
-                upstream_id: account.provider().to_owned(),
-                enabled: account.enabled(),
+                target,
             },
         ))
     }
@@ -763,10 +1042,6 @@ impl NativeRuntime {
         result: NativeDeviceLoginResult,
     ) -> Result<TokenSnapshot, NativeRuntimeError> {
         let NativeDeviceLoginResult { session, tokens } = result;
-        let store = self
-            .sqlite_token_store
-            .as_ref()
-            .ok_or(NativeRuntimeError::CredentialUnavailable)?;
         let id_token = tokens
             .id_token()
             .cloned()
@@ -776,38 +1051,7 @@ impl NativeRuntime {
         let profile = OAuthCredentialProfile::new("openai", tokens)
             .with_id_token(Some(id_token))
             .with_account_id(provider_account_id);
-        let expected_generation = match store
-            .store()
-            .credential_state(&session.account_id)
-            .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
-        {
-            Some(state) => {
-                if state.provider_id != session.upstream_id {
-                    return Err(NativeRuntimeError::CredentialUnavailable);
-                }
-                state.revision
-            }
-            None => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
-                store
-                    .store()
-                    .upsert_credential_state(CredentialState::new(
-                        &session.account_id,
-                        &session.upstream_id,
-                        session.enabled,
-                        now,
-                    ))
-                    .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
-                    .revision
-            }
-        };
-        store
-            .compare_and_swap_profile(&session.credential, expected_generation, &profile)
-            .map_err(|_| NativeRuntimeError::CredentialUnavailable)
+        self.persist_oauth_profile(&session.target, &profile)
     }
 
     /// Refresh one configured OAuth account using its persisted generation.
@@ -1101,6 +1345,7 @@ const CONFIGURED_NATIVE_KINDS: &[&str] = &[
     "antigravity",
     "compatible",
     "openai_compatible",
+    "palantir_aip",
 ];
 
 fn is_configured_native_kind(kind: &str) -> bool {
@@ -1165,6 +1410,14 @@ fn is_kimi_coding_upstream(upstream: &UpstreamPlan) -> bool {
 }
 
 fn resolve_secret(secret: &SecretRef) -> Result<SecretValue, NativeRuntimeError> {
+    let secret = resolve_protected_secret(secret)?;
+    if secret.expose_secret().chars().any(char::is_whitespace) {
+        return Err(NativeRuntimeError::CredentialUnavailable);
+    }
+    Ok(secret)
+}
+
+fn resolve_protected_secret(secret: &SecretRef) -> Result<SecretValue, NativeRuntimeError> {
     let reference = match secret {
         SecretRef::Env(name) => AuthSecretRef::Env(name.to_string()),
         SecretRef::File(path) => AuthSecretRef::File(path.as_ref().into()),
@@ -1176,9 +1429,6 @@ fn resolve_secret(secret: &SecretRef) -> Result<SecretValue, NativeRuntimeError>
     let secret = reference
         .resolve()
         .map_err(|_| NativeRuntimeError::CredentialUnavailable)?;
-    if secret.expose_secret().chars().any(char::is_whitespace) {
-        return Err(NativeRuntimeError::CredentialUnavailable);
-    }
     Ok(secret)
 }
 
@@ -1187,6 +1437,16 @@ fn build_configured_oauth_provider(
     oauth: &OAuthPlan,
     transport: Arc<HyperOAuthTransport>,
 ) -> Result<Arc<dyn OAuthRefresher>, NativeRuntimeError> {
+    Ok(Arc::new(build_standard_oauth_provider(
+        id, oauth, transport,
+    )?))
+}
+
+fn build_standard_oauth_provider(
+    id: &str,
+    oauth: &OAuthPlan,
+    transport: Arc<HyperOAuthTransport>,
+) -> Result<StandardOAuthProvider, NativeRuntimeError> {
     let mut config = OAuthClientConfig::new(
         oauth.client_id().to_owned(),
         oauth.callback().clone(),
@@ -1201,9 +1461,15 @@ fn build_configured_oauth_provider(
     if let Some(endpoint) = oauth.identity_endpoint() {
         config = config.with_identity_endpoint(endpoint.clone());
     }
-    let provider = StandardOAuthProvider::new(id, config, transport)
-        .map_err(|_| NativeRuntimeError::Configuration)?;
-    Ok(Arc::new(provider))
+    if let Some(client_secret) = oauth.client_secret() {
+        config = config.with_client_auth(OAuthClientAuth::RequestBody(resolve_protected_secret(
+            client_secret,
+        )?));
+    }
+    if oauth.grant_type() == OAuthGrantType::ClientCredentials {
+        config = config.with_client_credentials_grant();
+    }
+    StandardOAuthProvider::new(id, config, transport).map_err(|_| NativeRuntimeError::Configuration)
 }
 
 fn build_codex_provider(
@@ -1259,6 +1525,26 @@ fn map_refresh_error(error: OAuthError) -> NativeRuntimeError {
     }
 }
 
+fn map_login_error(error: OAuthError) -> NativeRuntimeError {
+    match error {
+        OAuthError::InvalidState
+        | OAuthError::RedirectMismatch
+        | OAuthError::MissingCode
+        | OAuthError::AuthorizationDenied => NativeRuntimeError::Authorization,
+        OAuthError::Cancelled => NativeRuntimeError::CredentialUnavailable,
+        OAuthError::InvalidConfiguration | OAuthError::Unsupported => {
+            NativeRuntimeError::Configuration
+        }
+        OAuthError::NeedsReauth
+        | OAuthError::Provider { .. }
+        | OAuthError::Transport(_)
+        | OAuthError::InvalidResponse => NativeRuntimeError::Refresh,
+        OAuthError::GenerationConflict | OAuthError::NoRefreshToken | OAuthError::Store(_) => {
+            NativeRuntimeError::CredentialUnavailable
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1269,6 +1555,7 @@ mod tests {
 
     use http::{header, HeaderValue};
     use pooler_auth::{OAuthFuture, OAuthStoreFuture, OAuthTokens};
+    use pooler_store::{MasterKey, SqliteStore};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -1446,6 +1733,40 @@ accounts:
         .expect("Vertex OAuth config")
     }
 
+    fn palantir_oauth_config(client_secret: &Path, grant_type: OAuthGrantType) -> CompiledConfig {
+        let (grant, scopes) = match grant_type {
+            OAuthGrantType::AuthorizationCode => (
+                "authorization_code",
+                "api:use-language-models-execute, offline_access",
+            ),
+            OAuthGrantType::ClientCredentials => {
+                ("client_credentials", "api:use-language-models-execute")
+            }
+        };
+        pooler_config::compile_yaml(
+            "native-palantir-oauth-test.yaml",
+            &format!(
+                "version: 1\nupstreams:\n  foundry:\n    url: https://example.euw-3.palantirfoundry.co.uk\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: operator-client\n      client_secret: 'file:{}'\n      grant_type: {grant}\n      scopes: [{scopes}]\n      callback: http://127.0.0.1:8765/oauth/callback\naccounts:\n  foundry-account: {{provider: foundry, auth_kind: oauth}}\n",
+                client_secret.display(),
+            ),
+        )
+        .expect("Palantir OAuth config")
+    }
+
+    fn sqlite_native_runtime(
+        config: &CompiledConfig,
+    ) -> (NativeRuntime, Arc<SqliteOAuthTokenStore>) {
+        let store = Arc::new(SqliteOAuthTokenStore::new(
+            SqliteStore::open_in_memory_encrypted(
+                MasterKey::from_bytes(b"pooler-http-palantir-test-key").expect("master key"),
+            )
+            .expect("encrypted store"),
+        ));
+        let runtime =
+            NativeRuntime::new_with_sqlite(config, Arc::clone(&store)).expect("native runtime");
+        (runtime, store)
+    }
+
     fn configured_without_auth_config() -> CompiledConfig {
         pooler_config::compile_yaml(
             "native-configured-without-auth-test.yaml",
@@ -1607,6 +1928,177 @@ accounts:
         }
         assert!(!runtime.supports(&config.upstreams()["unknown"]));
         assert!(!runtime.supports(&config.upstreams()["plain"]));
+    }
+
+    #[test]
+    fn configured_browser_login_keeps_pkce_state_and_client_secret_server_side() {
+        let client_secret = secret_file("client secret with spaces");
+        let config = palantir_oauth_config(client_secret.path(), OAuthGrantType::AuthorizationCode);
+        let (runtime, _) = sqlite_native_runtime(&config);
+        let (authorization, session) = runtime
+            .start_browser_login(&config, "foundry-account")
+            .expect("browser login");
+        let query = authorization
+            .authorization_url()
+            .query_pairs()
+            .collect::<BTreeMap<_, _>>();
+        let state = query.get("state").expect("OAuth state");
+
+        assert_eq!(authorization.authorization_url().scheme(), "https");
+        assert_eq!(
+            authorization.authorization_url().path(),
+            "/multipass/api/oauth2/authorize"
+        );
+        assert_eq!(
+            query.get("code_challenge_method").map(AsRef::as_ref),
+            Some("S256")
+        );
+        assert!(!query.contains_key("client_secret"));
+        assert!(session.matches_state(state));
+        assert!(!session.matches_state("wrong-state"));
+        let rendered = format!("{authorization:?}{session:?}{runtime:?}");
+        assert!(!rendered.contains(state.as_ref()));
+        assert!(!rendered.contains("client secret with spaces"));
+    }
+
+    #[tokio::test]
+    async fn configured_grants_are_flow_locked_and_client_secret_is_request_body_auth() {
+        let client_secret = secret_file("service secret with spaces");
+        let config = palantir_oauth_config(client_secret.path(), OAuthGrantType::ClientCredentials);
+        let (runtime, _) = sqlite_native_runtime(&config);
+        assert!(matches!(
+            runtime.start_browser_login(&config, "foundry-account"),
+            Err(NativeRuntimeError::Unsupported)
+        ));
+        let (provider, _) = runtime
+            .configured_oauth_provider(
+                &config,
+                "foundry-account",
+                OAuthGrantType::ClientCredentials,
+            )
+            .expect("client-credentials provider");
+        assert_eq!(
+            provider.config().grant_type,
+            pooler_auth::OAuthGrantType::ClientCredentials
+        );
+        assert!(matches!(
+            &provider.config().client_auth,
+            OAuthClientAuth::RequestBody(secret)
+                if secret.expose_secret() == "service secret with spaces"
+        ));
+        assert!(!format!("{provider:?}").contains("service secret with spaces"));
+
+        let browser_config =
+            palantir_oauth_config(client_secret.path(), OAuthGrantType::AuthorizationCode);
+        let (browser_runtime, _) = sqlite_native_runtime(&browser_config);
+        assert!(matches!(
+            browser_runtime
+                .acquire_client_credentials(
+                    &browser_config,
+                    "foundry-account",
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(NativeRuntimeError::Unsupported)
+        ));
+    }
+
+    #[tokio::test]
+    async fn palantir_tokens_persist_encrypted_without_identity_and_inject_sensitive_bearer() {
+        let client_secret = secret_file("operator-client-secret");
+        let config = palantir_oauth_config(client_secret.path(), OAuthGrantType::AuthorizationCode);
+        let (runtime, store) = sqlite_native_runtime(&config);
+        let account = &config.accounts()["foundry-account"];
+        let result = NativeOAuthLoginResult {
+            target: runtime
+                .prepare_oauth_login_target(account, "palantir_aip")
+                .expect("login target"),
+            tokens: OAuthTokens::bearer(
+                "palantir-access-token",
+                Some("palantir-refresh-token"),
+                Some(SystemTime::now() + Duration::from_secs(3600)),
+            ),
+            identity: None,
+        };
+        assert!(!format!("{result:?}").contains("palantir-access-token"));
+        let snapshot = runtime
+            .persist_oauth_login(result)
+            .expect("encrypted OAuth persistence");
+        assert!(snapshot.generation() > 0);
+        let credential = CredentialId::new("foundry-account").expect("credential");
+        let metadata = store
+            .profile_metadata(&credential)
+            .expect("profile metadata")
+            .expect("persisted profile");
+        assert_eq!(metadata.provider_profile, "palantir_aip");
+        assert!(!metadata.account_id_present);
+
+        let authorization = runtime
+            .authorize(
+                &config.upstreams()["foundry"],
+                &credential,
+                &HeaderMap::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("Palantir bearer authorization");
+        let mut headers = HeaderMap::new();
+        authorization
+            .apply_once(&mut headers)
+            .expect("apply authorization");
+        assert_header_value(
+            &headers,
+            header::AUTHORIZATION.as_str(),
+            b"Bearer palantir-access-token",
+        );
+        assert!(headers
+            .get(header::AUTHORIZATION)
+            .is_some_and(HeaderValue::is_sensitive));
+    }
+
+    #[tokio::test]
+    async fn concurrent_login_session_cannot_overwrite_a_newer_token_generation() {
+        let client_secret = secret_file("operator-client-secret");
+        let config = palantir_oauth_config(client_secret.path(), OAuthGrantType::AuthorizationCode);
+        let (runtime, store) = sqlite_native_runtime(&config);
+        let (_, first_target) = runtime
+            .configured_oauth_provider(
+                &config,
+                "foundry-account",
+                OAuthGrantType::AuthorizationCode,
+            )
+            .expect("first login session");
+        let (_, stale_target) = runtime
+            .configured_oauth_provider(
+                &config,
+                "foundry-account",
+                OAuthGrantType::AuthorizationCode,
+            )
+            .expect("concurrent login session");
+        runtime
+            .persist_oauth_login(NativeOAuthLoginResult {
+                target: first_target,
+                tokens: OAuthTokens::bearer("winner-access", Some("winner-refresh"), None),
+                identity: None,
+            })
+            .expect("winner persists");
+        assert_eq!(
+            runtime.persist_oauth_login(NativeOAuthLoginResult {
+                target: stale_target,
+                tokens: OAuthTokens::bearer("stale-access", Some("stale-refresh"), None),
+                identity: None,
+            }),
+            Err(NativeRuntimeError::CredentialUnavailable)
+        );
+        let persisted = store
+            .load(&CredentialId::new("foundry-account").expect("credential"))
+            .await
+            .expect("load winner")
+            .expect("persisted winner");
+        assert_secret_value(
+            persisted.tokens().access_token().expose_secret(),
+            "winner-access",
+        );
     }
 
     #[test]

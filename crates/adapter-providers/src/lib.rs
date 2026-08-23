@@ -15,8 +15,11 @@ mod models;
 pub use contracts::{
     antigravity_compatibility_profile, kimi_coding_profile, kimi_open_platform_profile,
     openai_compatible_profile, vertex_profile, AuthEndpointKind, AuthMode, ContractEvidence,
-    ContractStability, DiscoveryMode, ProviderAuthEndpoint, ProviderKind, ProviderOperation,
-    ProviderProfile, ProviderSurface, QuotaSignal, WireProtocol, CLI_PROXY_API_REFERENCE_REVISION,
+    AuthPlacementKind, ContractStability, DiscoveryMode, FactProvenance, MetadataProvenance,
+    ProviderAuthEndpoint, ProviderDataPolicy, ProviderEndpointFamily, ProviderFact, ProviderKind,
+    ProviderMetadata, ProviderOperation, ProviderParameter, ProviderPricing, ProviderPrivacy,
+    ProviderProfile, ProviderQuantization, ProviderSurface, ProviderWireFamily, QuotaSignal,
+    WireProtocol, CLI_PROXY_API_REFERENCE_REVISION,
 };
 pub use endpoint::{
     AdapterError, AntigravityAdapter, AntigravityCompatibilityConfig,

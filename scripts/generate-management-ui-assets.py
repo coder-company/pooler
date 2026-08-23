@@ -43,6 +43,14 @@ SIMPLE_ICONS_GAP_FILLS = [
     "gitlab",
     "docker",
     "digitalocean",
+    "amd",
+    "clarifai",
+    "modal",
+    "scaleway",
+    "hetzner",
+    "vultr",
+    "warp",
+    "ovh",
 ]
 
 # Provider logos larger than this are detailed illustrations, not glyphs;
@@ -84,6 +92,11 @@ PROVIDER_ALIASES = {
     "seedream": "bytedance",
     # Xiaomi
     "mimo": "xiaomimimo",
+    "xiaomi": "xiaomimimo",
+    # Kilo Code
+    "kilo": "kilocode",
+    # OVHcloud
+    "ovhcloud": "ovh",
     # 01.AI
     "lingyi": "yi",
     "01ai": "zeroone",
@@ -147,6 +160,7 @@ ICONS = [
     "graph-up",
     "tools",
     "activity",
+    "settings",
     # Status
     "check-circle",
     "warning-circle",
@@ -260,6 +274,9 @@ def write_icons_js(icons: dict[str, dict[str, object]]) -> Path:
 
 def _minify_svg_body(slug: str, body: str) -> str:
     body = re.sub(r">\s+<", "><", body.strip())
+    body = body.replace(' style="mask-type:alpha"', ' mask-type="alpha"')
+    if re.search(r"\sstyle=", body, re.IGNORECASE):
+        raise SystemExit(f"provider icon {slug} contains an unsupported inline style")
     ids = re.findall(r'id="([^"]+)"', body)
     for ident in ids:
         namespaced = f"pl-{slug}-{ident}"
@@ -338,6 +355,7 @@ def write_providers_js(registry: dict[str, dict[str, str]]) -> Path:
         '"use strict";',
         "",
         "const _PROVIDERS = " + payload + ";",
+        "let _providerLogoInstance = 0;",
         "",
         "const _PROVIDER_ALIASES = " + aliases + ";",
         "",
@@ -363,7 +381,9 @@ def write_providers_js(registry: dict[str, dict[str, str]]) -> Path:
         "  const slug = resolveProviderSlug(name);",
         "  if (!slug) return null;",
         "  const entry = _PROVIDERS[slug];",
-        '  return `<svg class="provider-logo" viewBox="${entry.viewBox}" width="${size}" height="${size}" fill="currentColor" aria-hidden="true">${entry.body}</svg>`;',
+        '  const prefix = `pl-instance-${++_providerLogoInstance}-`;',
+        '  const body = entry.body.replace(/\\bid="([^"]+)"/g, (_match, id) => `id="${prefix}${id}"`).replace(/url\\(#([^)]+)\\)/g, (_match, id) => `url(#${prefix}${id})`).replace(/(href|xlink:href)="#([^"]+)"/g, (_match, attr, id) => `${attr}="#${prefix}${id}"`);',
+        '  return `<svg class="provider-logo" data-provider-logo="${slug}" viewBox="${entry.viewBox}" width="${size}" height="${size}" fill="currentColor" aria-hidden="true">${body}</svg>`;',
         "}",
         "",
         "function providerBadge(name, size = 18) {",

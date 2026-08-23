@@ -757,6 +757,16 @@ pub enum OAuthClientAuth {
     RequestBody(SecretValue),
 }
 
+/// OAuth grant used to obtain and renew a provider credential.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OAuthGrantType {
+    /// Interactive authorization-code login followed by refresh-token renewal.
+    #[default]
+    AuthorizationCode,
+    /// Non-interactive service-account credentials reacquired when they expire.
+    ClientCredentials,
+}
+
 /// Encoding accepted by a provider's token and revocation endpoints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OAuthRequestEncoding {
@@ -802,6 +812,8 @@ pub struct OAuthClientConfig {
     pub scopes: Vec<String>,
     /// Client authentication policy.
     pub client_auth: OAuthClientAuth,
+    /// Grant used to obtain and renew credentials.
+    pub grant_type: OAuthGrantType,
     /// Token and revocation request encoding.
     pub request_encoding: OAuthRequestEncoding,
     /// Extra authorization-query parameters required by a provider.
@@ -829,6 +841,7 @@ impl OAuthClientConfig {
             identity_endpoint: None,
             scopes: Vec::new(),
             client_auth: OAuthClientAuth::None,
+            grant_type: OAuthGrantType::AuthorizationCode,
             request_encoding: OAuthRequestEncoding::Form,
             authorization_parameters: Vec::new(),
             device_grant: DeviceAuthorizationGrant::Rfc8628,
@@ -871,6 +884,13 @@ impl OAuthClientConfig {
         self
     }
 
+    /// Use the client-credentials grant and reacquire access tokens on renewal.
+    #[must_use]
+    pub const fn with_client_credentials_grant(mut self) -> Self {
+        self.grant_type = OAuthGrantType::ClientCredentials;
+        self
+    }
+
     /// Use JSON for token and revocation requests when required by a native
     /// provider.
     #[must_use]
@@ -906,6 +926,8 @@ impl OAuthClientConfig {
             || !valid_endpoint(&self.token_endpoint)
             || !valid_redirect(&self.redirect_uri)
             || self.scopes.iter().any(|scope| scope.is_empty())
+            || (self.grant_type == OAuthGrantType::ClientCredentials
+                && self.client_auth == OAuthClientAuth::None)
         {
             return Err(OAuthError::InvalidConfiguration);
         }
@@ -1061,6 +1083,30 @@ pub trait OAuthRefresher: Send + Sync {
         refresh_token: &'a SecretValue,
         cancellation: CancellationToken,
     ) -> OAuthFuture<'a, OAuthTokens>;
+
+    /// Renew a token set using its refresh token.
+    ///
+    /// Client-credentials providers override this operation to reacquire a
+    /// token because that grant normally does not issue refresh tokens.
+    fn renew<'a>(
+        &'a self,
+        tokens: &'a OAuthTokens,
+        cancellation: CancellationToken,
+    ) -> OAuthFuture<'a, OAuthTokens> {
+        let Some(refresh_token) = tokens.refresh_token() else {
+            return Box::pin(async { Err(OAuthError::NoRefreshToken) });
+        };
+        self.refresh(refresh_token, cancellation)
+    }
+}
+
+/// Narrow boundary for the OAuth client-credentials grant.
+pub trait OAuthClientCredentials: Send + Sync {
+    /// Acquire a service-account access token.
+    fn acquire_client_credentials(
+        &self,
+        cancellation: CancellationToken,
+    ) -> OAuthFuture<'_, OAuthTokens>;
 }
 
 /// Narrow boundary for revoking a credential.
@@ -1251,6 +1297,9 @@ impl StandardOAuthProvider {
         state: OAuthState,
         pkce: PkcePair,
     ) -> Result<AuthorizationAttempt, OAuthError> {
+        if self.config.grant_type != OAuthGrantType::AuthorizationCode {
+            return Err(OAuthError::Unsupported);
+        }
         let mut url = self.config.authorization_endpoint.clone();
         {
             let mut query = url.query_pairs_mut();
@@ -1662,6 +1711,9 @@ impl OAuthCodeExchange for StandardOAuthProvider {
         redirect_uri: &'a Url,
         cancellation: CancellationToken,
     ) -> OAuthFuture<'a, OAuthTokens> {
+        if self.config.grant_type != OAuthGrantType::AuthorizationCode {
+            return Box::pin(async { Err(OAuthError::Unsupported) });
+        }
         if redirect_uri != &self.config.redirect_uri {
             return Box::pin(async { Err(OAuthError::RedirectMismatch) });
         }
@@ -1690,6 +1742,9 @@ impl OAuthRefresher for StandardOAuthProvider {
         refresh_token: &'a SecretValue,
         cancellation: CancellationToken,
     ) -> OAuthFuture<'a, OAuthTokens> {
+        if self.config.grant_type != OAuthGrantType::AuthorizationCode {
+            return Box::pin(async { Err(OAuthError::Unsupported) });
+        }
         let fields = vec![
             ("grant_type".to_owned(), SecretValue::new("refresh_token")),
             ("refresh_token".to_owned(), refresh_token.clone()),
@@ -1721,6 +1776,48 @@ impl OAuthRefresher for StandardOAuthProvider {
                 tokens.token_type().to_owned(),
             )
             .with_id_token(tokens.id_token().cloned()))
+        })
+    }
+
+    fn renew<'a>(
+        &'a self,
+        tokens: &'a OAuthTokens,
+        cancellation: CancellationToken,
+    ) -> OAuthFuture<'a, OAuthTokens> {
+        match self.config.grant_type {
+            OAuthGrantType::ClientCredentials => self.acquire_client_credentials(cancellation),
+            OAuthGrantType::AuthorizationCode => {
+                let Some(refresh_token) = tokens.refresh_token() else {
+                    return Box::pin(async { Err(OAuthError::NoRefreshToken) });
+                };
+                self.refresh(refresh_token, cancellation)
+            }
+        }
+    }
+}
+
+impl OAuthClientCredentials for StandardOAuthProvider {
+    fn acquire_client_credentials(
+        &self,
+        cancellation: CancellationToken,
+    ) -> OAuthFuture<'_, OAuthTokens> {
+        if self.config.grant_type != OAuthGrantType::ClientCredentials {
+            return Box::pin(async { Err(OAuthError::Unsupported) });
+        }
+        let mut fields = vec![(
+            "grant_type".to_owned(),
+            SecretValue::new("client_credentials"),
+        )];
+        if !self.config.scopes.is_empty() {
+            fields.push((
+                "scope".to_owned(),
+                SecretValue::new(self.config.scopes.join(" ")),
+            ));
+        }
+        let request = self.token_request(fields);
+        Box::pin(async move {
+            let response = self.send(request, cancellation).await?;
+            Self::parse_token_response(&response).map_err(TokenEndpointError::into_oauth)
         })
     }
 }
@@ -1814,6 +1911,9 @@ impl OAuthDeviceFlow for StandardOAuthProvider {
         &self,
         cancellation: CancellationToken,
     ) -> OAuthFuture<'_, DeviceAuthorization> {
+        if self.config.grant_type != OAuthGrantType::AuthorizationCode {
+            return Box::pin(async { Err(OAuthError::Unsupported) });
+        }
         match self.config.device_grant {
             DeviceAuthorizationGrant::Rfc8628 => {
                 self.start_rfc8628_device_authorization(cancellation)
@@ -1829,6 +1929,9 @@ impl OAuthDeviceFlow for StandardOAuthProvider {
         authorization: &'a DeviceAuthorization,
         cancellation: CancellationToken,
     ) -> OAuthFuture<'a, OAuthTokens> {
+        if self.config.grant_type != OAuthGrantType::AuthorizationCode {
+            return Box::pin(async { Err(OAuthError::Unsupported) });
+        }
         match self.config.device_grant {
             DeviceAuthorizationGrant::Rfc8628 => {
                 self.poll_rfc8628_device(authorization, cancellation)
@@ -2166,6 +2269,55 @@ pub async fn refresh_with_store_if_generation(
     expected_generation: Option<u64>,
     cancellation: CancellationToken,
 ) -> Result<TokenSnapshot, OAuthError> {
+    renew_store_generation(
+        coordinator,
+        provider,
+        store,
+        credential,
+        expected_generation,
+        cancellation,
+        RenewalStrategy::RefreshToken,
+    )
+    .await
+}
+
+/// Renew one persisted credential, reacquiring client-credentials tokens when
+/// no refresh token exists, and atomically commit the next generation.
+pub async fn renew_with_store_if_generation(
+    coordinator: &RefreshCoordinator,
+    provider: &dyn OAuthRefresher,
+    store: &dyn OAuthTokenStore,
+    credential: CredentialId,
+    expected_generation: Option<u64>,
+    cancellation: CancellationToken,
+) -> Result<TokenSnapshot, OAuthError> {
+    renew_store_generation(
+        coordinator,
+        provider,
+        store,
+        credential,
+        expected_generation,
+        cancellation,
+        RenewalStrategy::GrantAware,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum RenewalStrategy {
+    RefreshToken,
+    GrantAware,
+}
+
+async fn renew_store_generation(
+    coordinator: &RefreshCoordinator,
+    provider: &dyn OAuthRefresher,
+    store: &dyn OAuthTokenStore,
+    credential: CredentialId,
+    expected_generation: Option<u64>,
+    cancellation: CancellationToken,
+    strategy: RenewalStrategy,
+) -> Result<TokenSnapshot, OAuthError> {
     let operation_credential = credential.clone();
     let operation_cancellation = cancellation.clone();
     coordinator
@@ -2178,15 +2330,24 @@ pub async fn refresh_with_store_if_generation(
             if expected_generation.is_some_and(|expected| snapshot.generation() != expected) {
                 return Ok(snapshot.tokens().clone());
             }
-            let refresh_token = snapshot
-                .tokens()
-                .refresh_token()
-                .ok_or(RefreshError::OAuth(OAuthError::NoRefreshToken))?
-                .clone();
-            let tokens = provider
-                .refresh(&refresh_token, operation_cancellation.clone())
-                .await
-                .map_err(refresh_error)?;
+            let tokens = match strategy {
+                RenewalStrategy::RefreshToken => {
+                    let refresh_token = snapshot
+                        .tokens()
+                        .refresh_token()
+                        .ok_or(RefreshError::OAuth(OAuthError::NoRefreshToken))?
+                        .clone();
+                    provider
+                        .refresh(&refresh_token, operation_cancellation.clone())
+                        .await
+                }
+                RenewalStrategy::GrantAware => {
+                    provider
+                        .renew(snapshot.tokens(), operation_cancellation.clone())
+                        .await
+                }
+            }
+            .map_err(refresh_error)?;
             store
                 .compare_and_swap(&operation_credential, snapshot.generation(), tokens.clone())
                 .await
@@ -2394,6 +2555,98 @@ mod tests {
             .await;
         assert_eq!(result, Err(OAuthError::RedirectMismatch));
         assert!(lock_unpoisoned(&transport.requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_credentials_uses_request_body_secret_and_redacts_it() {
+        let transport = Arc::new(MockTransport::new([OAuthHttpResponse::new(
+            200,
+            br#"{"access_token":"service-access","token_type":"Bearer","expires_in":3600}"#,
+        )]));
+        let provider_transport: Arc<dyn OAuthTransport> = transport.clone();
+        let config = config()
+            .with_client_auth(OAuthClientAuth::RequestBody(SecretValue::new(
+                "service-client-secret",
+            )))
+            .with_client_credentials_grant();
+        let provider = StandardOAuthProvider::new("provider", config, provider_transport).unwrap();
+
+        let tokens = provider
+            .acquire_client_credentials(CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(tokens.access_token().expose_secret(), "service-access");
+        assert!(tokens.refresh_token().is_none());
+        assert_eq!(provider.begin_authorization(), Err(OAuthError::Unsupported));
+
+        let request = transport.request(0);
+        assert_eq!(
+            request.form_field("grant_type").unwrap().expose_secret(),
+            "client_credentials"
+        );
+        assert_eq!(
+            request.form_field("client_id").unwrap().expose_secret(),
+            "client-id"
+        );
+        assert_eq!(
+            request.form_field("client_secret").unwrap().expose_secret(),
+            "service-client-secret"
+        );
+        assert_eq!(
+            request.form_field("scope").unwrap().expose_secret(),
+            "openid profile"
+        );
+        let rendered = format!("{provider:?}{request:?}{tokens:?}");
+        assert!(!rendered.contains("service-client-secret"));
+        assert!(!rendered.contains("service-access"));
+    }
+
+    #[tokio::test]
+    async fn client_credentials_renewal_reacquires_and_commits_one_generation() {
+        let transport = Arc::new(MockTransport::new([OAuthHttpResponse::new(
+            200,
+            br#"{"access_token":"renewed-service-access","expires_in":3600}"#,
+        )]));
+        let provider_transport: Arc<dyn OAuthTransport> = transport.clone();
+        let provider = StandardOAuthProvider::new(
+            "provider",
+            config()
+                .with_client_auth(OAuthClientAuth::RequestBody(SecretValue::new(
+                    "service-client-secret",
+                )))
+                .with_client_credentials_grant(),
+            provider_transport,
+        )
+        .unwrap();
+        let store = MemoryOAuthTokenStore::new();
+        let credential = CredentialId::new("service-account").unwrap();
+        store.insert(
+            credential.clone(),
+            OAuthTokens::bearer(
+                "expired-service-access",
+                None::<String>,
+                Some(SystemTime::now()),
+            ),
+        );
+
+        let renewed = renew_with_store_if_generation(
+            &RefreshCoordinator::new(),
+            &provider,
+            &store,
+            credential,
+            Some(0),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(renewed.generation(), 1);
+        assert_eq!(
+            renewed.tokens().access_token().expose_secret(),
+            "renewed-service-access"
+        );
+        assert!(renewed.tokens().refresh_token().is_none());
+        assert_eq!(lock_unpoisoned(&transport.requests).len(), 1);
     }
 
     #[tokio::test]

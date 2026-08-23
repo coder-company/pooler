@@ -22,6 +22,7 @@
     pollTimer: null,
     expanded: new Set(),
     filter: "",
+    modelsProvider: "",
     authState: "anonymous",
     authPrompted: false,
     requestGeneration: 0,
@@ -1600,14 +1601,43 @@
 
   /* ---------------- Models ---------------- */
 
+  function modelExposureSwitch(model, mutationCapable) {
+    const enabled = model.enabled !== false;
+    if (!mutationCapable) return enabledBadge(enabled);
+    const action = enabled ? "disable" : "enable";
+    const path = `/models/${modelPath(model.id)}/${action}`;
+    const pending = state.pending.has(path);
+    return `<button class="switch" type="button" role="switch" aria-checked="${enabled}" aria-label="${enabled ? "Hide" : "Expose"} model ${esc(model.id)} from clients" aria-busy="${pending}" data-model-action="${action}" data-model-id="${esc(model.id)}" title="${enabled ? "Exposed to clients" : "Hidden from clients"} — ${esc(model.id)}"${pending ? " disabled" : ""}><span class="switch-thumb"></span></button>`;
+  }
+
   function renderModels(root) {
     const payload = state.data.models || {};
     const mutationCapable =
       payload.mutation_capable === true && !state.errors.models;
     const catalog = state.data.catalog || {};
-    let models = payload.models || [];
+    const allModels = payload.models || [];
+    let models = allModels;
     const sources = payload.catalog_sources || catalog.sources || [];
     const overrides = payload.model_overrides || {};
+
+    const providerCounts = new Map();
+    for (const model of allModels) {
+      for (const target of model.targets || []) {
+        providerCounts.set(
+          target.provider,
+          (providerCounts.get(target.provider) || 0) + 1,
+        );
+      }
+    }
+    const railProviders = [...providerCounts.entries()].sort(
+      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+    );
+
+    if (state.modelsProvider) {
+      models = models.filter((m) =>
+        (m.targets || []).some((t) => t.provider === state.modelsProvider),
+      );
+    }
 
     if (state.filter) {
       const needle = state.filter.toLowerCase();
@@ -1653,15 +1683,14 @@
     const modelTable = tableWrap(
       [
         {
+          label: "Exposed",
+          render: (m) => modelExposureSwitch(m, mutationCapable),
+        },
+        {
           label: "Model",
           mono: true,
           nowrap: false,
           render: (m) => providerCell(m.id),
-        },
-        {
-          label: "Origin",
-          render: (m) =>
-            `<span class="badge ${m.selection_origin === "configured" ? "badge-accent" : "badge-neutral"}">${esc(text(m.selection_origin || "discovered"))}</span>`,
         },
         {
           label: "Targets",
@@ -1688,34 +1717,24 @@
               : "—";
           },
         },
-        { label: "Exposure", render: (m) => enabledBadge(m.enabled !== false) },
         {
-          label: "Actions",
-          render: (m) => {
-            if (!mutationCapable)
-              return `<span class="muted">Unavailable</span>`;
-            const enabled = m.enabled !== false;
-            const action = enabled ? "disable" : "enable";
-            const path = `/models/${modelPath(m.id)}/${action}`;
-            const pending = state.pending.has(path);
-            return `<div class="row-actions">
-            <button class="btn btn-subtle btn-xs" type="button" data-model-action="${action}" data-model-id="${esc(m.id)}" title="${enabled ? "Disable" : "Enable"} ${esc(m.id)}"${pending ? ` disabled aria-busy="true"` : ""}>
-              ${ic(enabled ? "pause" : "play", 13)} ${enabled ? "Disable" : "Enable"}
-            </button>
-          </div>`;
-          },
+          label: "Origin",
+          render: (m) =>
+            `<span class="badge ${m.selection_origin === "configured" ? "badge-accent" : "badge-neutral"}">${esc(text(m.selection_origin || "discovered"))}</span>`,
         },
       ],
       models,
       {
         loading: state.loading && !state.data.models,
         error: endpointError("models"),
-        emptyTitle: state.filter
-          ? "No models match the filter"
-          : "No published models",
-        emptyDescription: state.filter
-          ? ""
-          : "Configure models or catalog sources, then reload.",
+        emptyTitle:
+          state.filter || state.modelsProvider
+            ? "No models match the current filters"
+            : "No published models",
+        emptyDescription:
+          state.filter || state.modelsProvider
+            ? ""
+            : "Configure models or catalog sources, then reload.",
       },
     );
 
@@ -1798,6 +1817,28 @@
       </div>`
         : "";
 
+    const exposedCount = allModels.filter((m) => m.enabled !== false).length;
+    const railItem = (provider, label, count, logo) => {
+      const active = state.modelsProvider === provider;
+      return `<button class="rail-item${active ? " active" : ""}" type="button" data-models-provider="${esc(provider)}"${active ? ' aria-current="true"' : ""}>${logo}<span class="rail-label">${esc(label)}</span><span class="rail-count num">${fmtInt(count)}</span></button>`;
+    };
+    const rail = `
+      <nav class="model-rail" aria-label="Filter models by provider">
+        ${railItem("", "All models", allModels.length, ic("list", 15))}
+        ${railProviders
+          .map(([provider, count]) =>
+            railItem(provider, provider, count, brand(provider, 15)),
+          )
+          .join("")}
+      </nav>`;
+
+    const modelsHeading = state.modelsProvider
+      ? `Models · ${state.modelsProvider}`
+      : "Published models";
+    const modelsHint = mutationCapable
+      ? `${fmtInt(exposedCount)} of ${fmtInt(allModels.length)} exposed to clients. Toggling a model off hides it from every listener immediately; durable policy belongs in catalog overrides.`
+      : "Enablement is a runtime control; durable policy belongs in catalog overrides.";
+
     root.innerHTML = `
       ${viewHeader(
         "Models",
@@ -1807,7 +1848,10 @@
         ${mutationCapable ? `<button class="btn btn-outline btn-sm" type="button" data-action="reload-models" title="Refresh configured catalog sources"${state.pending.has("/models/reload") ? ` disabled aria-busy="true"` : ""}>${ic("refresh-double", 15)} Reload catalog</button>` : `<span class="section-hint">Authenticated mutations are unavailable.</span>`}`,
       )}
       <section class="grid-stats grid-stats-4">${stats}</section>
-      ${section("Published models", modelTable, "Enablement is a runtime control; durable policy belongs in catalog overrides.")}
+      <div class="models-layout">
+        ${rail}
+        ${section(modelsHeading, modelTable, modelsHint)}
+      </div>
       ${section("Catalog sources", sourceTable)}
       ${aliasTable ? section("Aliases", aliasTable) : ""}
       ${overrideBlock}`;
@@ -2193,12 +2237,37 @@
           nowrap: false,
           render: (a) => {
             const enableAction = a.enabled ? "disable" : "enable";
+            const menuItem = (action, label, icon, title, danger) => {
+              const supported = accountSupports(a, action);
+              if (!supported) return "";
+              const path = `/accounts/${encodeURIComponent(a.id)}/${action}`;
+              const pending = state.pending.has(path);
+              return `<button class="menu-item${danger ? " menu-danger" : ""}" type="button" data-account-action="${action}" data-account-id="${esc(a.id)}" data-account-provider="${esc(a.provider)}" title="${esc(title || label)}"${pending ? ` disabled aria-busy="true"` : ""}>${ic(icon, 14)} ${esc(label)}</button>`;
+            };
+            const menuItems = [
+              menuItem(
+                enableAction,
+                a.enabled ? "Disable" : "Enable",
+                a.enabled ? "pause" : "play",
+              ),
+              menuItem(
+                "refresh",
+                "Refresh",
+                "refresh-double",
+                "Queue an OAuth token refresh",
+              ),
+              menuItem(
+                "revoke",
+                "Revoke",
+                "trash",
+                "Remove Pooler's local credential and disable the account",
+                true,
+              ),
+            ].join("");
             return `<div class="row-actions">
             <button class="btn btn-subtle btn-xs" type="button" data-account-connect="${esc(a.id)}">${ic("key-alt", 13)} Connect</button>
             ${accountActionButton(a, "switch", "Switch", "switch-on", "Select this account and disable its same-provider siblings")}
-            ${accountActionButton(a, enableAction, a.enabled ? "Disable" : "Enable", a.enabled ? "pause" : "play")}
-            ${accountActionButton(a, "refresh", "Refresh", "refresh-double", "Queue an OAuth token refresh")}
-            ${accountActionButton(a, "revoke", "Revoke", "trash", "Remove Pooler's local credential and disable the account")}
+            ${menuItems ? `<details class="menu"><summary class="btn btn-subtle btn-xs btn-icon-xs" aria-label="More actions for ${esc(a.id)}" title="More actions">${ic("more-vert", 14)}</summary><div class="menu-list">${menuItems}</div></details>` : ""}
           </div>`;
           },
         },
@@ -3342,6 +3411,9 @@
       if (active) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
     });
+    document
+      .querySelector('.nav-link[aria-current="page"]')
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
     const view = views[state.route];
     $("#view").className = `view view-${state.route}`;
     $("#view").innerHTML = `
@@ -3364,6 +3436,23 @@
     $("#confirm-dialog [data-close]").innerHTML = ic("cancel", 16);
     $("#token-visibility").innerHTML = ic("eye-empty", 16);
     $("#token-visibility").title = "Show management secret";
+
+    document.addEventListener("click", (event) => {
+      document
+        .querySelectorAll("details.menu[open]")
+        .forEach((menu) => {
+          if (!menu.contains(event.target)) menu.removeAttribute("open");
+        });
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      const menu = document.querySelector("details.menu[open]");
+      if (!menu) return;
+      event.preventDefault();
+      menu.removeAttribute("open");
+      menu.querySelector("summary")?.focus();
+    });
 
     $(".skip-link").addEventListener("click", (event) => {
       event.preventDefault();
@@ -3478,6 +3567,13 @@
         return;
       }
 
+      const railButton = event.target.closest("[data-models-provider]");
+      if (railButton) {
+        state.modelsProvider = railButton.dataset.modelsProvider;
+        renderModels($("#view"));
+        return;
+      }
+
       const configButton = event.target.closest("[data-config-action]");
       if (configButton) {
         configurationAction(configButton.dataset.configAction);
@@ -3522,6 +3618,7 @@
 
       const accountButton = event.target.closest("[data-account-action]");
       if (accountButton) {
+        accountButton.closest("details.menu")?.removeAttribute("open");
         accountAction(
           accountButton.dataset.accountId,
           accountButton.dataset.accountAction,

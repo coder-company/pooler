@@ -772,6 +772,11 @@ fn oauth_schema() -> Value {
             ("revoke_endpoint", optional_string()),
             ("identity_endpoint", optional_string()),
             ("client_id", optional_string()),
+            ("client_secret", optional(reference("secret_ref"))),
+            (
+                "grant_type",
+                optional(string_enum(["authorization_code", "client_credentials"])),
+            ),
             ("scopes", array_schema(string_schema(), Some(0), None)),
             ("callback", optional_string()),
         ]),

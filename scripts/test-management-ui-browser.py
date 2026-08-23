@@ -682,6 +682,28 @@ def run_browser(playwright) -> None:
             page.locator("th:not([scope=col])").count() == 0,
             "column headers are missing scope",
         )
+        expect(
+            page.locator(".brand-mark").first.get_attribute("width") == "64"
+            and page.locator(".brand-mark").first.get_attribute("height") == "56",
+            "brand mark intrinsic dimensions are missing",
+        )
+        page.evaluate(
+            """() => {
+                const host = document.createElement('div');
+                host.id = 'provider-logo-test';
+                host.innerHTML = providerLogoSvg('poolside') + providerLogoSvg('poolside');
+                document.body.append(host);
+            }"""
+        )
+        logo_ids = page.locator("#provider-logo-test [id]").evaluate_all(
+            "nodes => nodes.map(node => node.id)"
+        )
+        expect(logo_ids and len(logo_ids) == len(set(logo_ids)), "provider SVG IDs collide")
+        expect(
+            page.locator("#provider-logo-test [style]").count() == 0,
+            "provider SVG contains an inline style",
+        )
+        page.locator("#provider-logo-test").evaluate("node => node.remove()")
 
         STATE.reject_all = True
         page.locator("#refresh-now").click()
@@ -954,6 +976,22 @@ def run_browser(playwright) -> None:
                 page.locator("[style]").count() == 0,
                 f"{route} rendered an inline style under strict CSP",
             )
+
+        page.locator('[data-route="models"]').click()
+        page.wait_for_selector(".view-models .switch")
+        model_switch = page.locator(".view-models .switch").first
+        expect(
+            model_switch.get_attribute("aria-label")
+            == "Hide model gpt-test from clients"
+            and model_switch.get_attribute("aria-busy") == "false",
+            "model exposure switch lacks model-specific accessible state",
+        )
+        expect(
+            page.locator('.nav-link[aria-current="page"]').evaluate(
+                "link => getComputedStyle(link).borderRadius === getComputedStyle(document.documentElement).getPropertyValue('--radius-md').trim()"
+            ),
+            "navigation does not use the existing radius token",
+        )
 
         page.locator('[data-route="usage"]').click()
         page.wait_for_selector("text=Historical usage ledger")
@@ -1252,6 +1290,15 @@ def run_browser(playwright) -> None:
         )
         page.locator("[data-account-connect-close]").click()
 
+        menu_summary = page.locator("details.menu summary").first
+        menu_summary.click()
+        menu_summary.press("Escape")
+        expect(
+            not page.locator("details.menu").first.evaluate("menu => menu.open")
+            and menu_summary.evaluate("summary => document.activeElement === summary"),
+            "Escape did not close the account menu and return focus",
+        )
+
         switch = page.locator('[data-account-action="switch"]')
         switch.click()
         expect(
@@ -1277,9 +1324,12 @@ def run_browser(playwright) -> None:
         )
         page.locator("#confirm-cancel").click()
 
+        page.locator("details.menu summary").first.click()
         disable = page.locator('[data-account-action="disable"]')
         disable.evaluate("el => { el.click(); el.click(); }")
-        page.locator('[data-account-action="disable"]:not([aria-busy])').wait_for()
+        page.locator('[data-account-action="disable"]:not([aria-busy])').wait_for(
+            state="attached"
+        )
         expect(
             STATE.posts.get("/management/accounts/primary/disable") == 1,
             "double-submit reached the mutation endpoint",
@@ -1388,6 +1438,12 @@ def run_browser(playwright) -> None:
         page.set_viewport_size({"width": 320, "height": 700})
         page.locator('[data-route="operations"]').click()
         page.wait_for_selector(".view-operations")
+        expect(
+            page.locator('.nav-link[aria-current="page"]').evaluate(
+                "link => link.offsetLeft >= link.parentElement.scrollLeft && link.offsetLeft + link.offsetWidth <= link.parentElement.scrollLeft + link.parentElement.clientWidth"
+            ),
+            "active mobile navigation item was not scrolled into view",
+        )
         expect(
             page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"),
             "320px operations layout overflows the viewport",

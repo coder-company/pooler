@@ -17,9 +17,10 @@ use url::{Host, Url};
 
 use super::oauth::{
     AuthorizationAttempt, AuthorizationCode, DeviceAuthorization, DeviceAuthorizationGrant,
-    OAuthClientConfig, OAuthCodeExchange, OAuthDeviceFlow, OAuthError, OAuthFuture, OAuthIdentity,
-    OAuthIdentityProvider, OAuthProvider, OAuthRefresher, OAuthRequestEncoding, OAuthRevoker,
-    OAuthState, OAuthTransport, PkcePair, StandardOAuthProvider,
+    OAuthClientAuth, OAuthClientConfig, OAuthClientCredentials, OAuthCodeExchange, OAuthDeviceFlow,
+    OAuthError, OAuthFuture, OAuthIdentity, OAuthIdentityProvider, OAuthProvider, OAuthRefresher,
+    OAuthRequestEncoding, OAuthRevoker, OAuthState, OAuthTransport, PkcePair,
+    StandardOAuthProvider,
 };
 use super::{OAuthTokens, SecretValue};
 
@@ -32,6 +33,8 @@ pub enum ProviderLoginMethod {
     AuthorizationCodePkce,
     /// OAuth device authorization grant with bounded polling.
     DeviceCode,
+    /// OAuth client-credentials grant for a confidential service account.
+    ClientCredentials,
 }
 
 impl fmt::Display for ProviderLoginMethod {
@@ -40,6 +43,7 @@ impl fmt::Display for ProviderLoginMethod {
             Self::ApiKey => "api_key",
             Self::AuthorizationCodePkce => "authorization_code_pkce",
             Self::DeviceCode => "device_code",
+            Self::ClientCredentials => "client_credentials",
         })
     }
 }
@@ -401,7 +405,8 @@ impl ProviderLoginDefinition {
     /// Browser flows always require a strict loopback redirect and are executed
     /// by [`StandardOAuthProvider`] with S256 PKCE and state validation. OAuth
     /// endpoints are HTTPS-only and may not contain userinfo, query values, or
-    /// fragments. No client secret is accepted at this installed-app boundary.
+    /// fragments. Confidential clients retain their secret only in a
+    /// redacting wrapper until the token-request boundary.
     pub fn build_oauth_config(
         &self,
         method: ProviderLoginMethod,
@@ -450,6 +455,22 @@ impl ProviderLoginDefinition {
         let dangerous_custom_endpoint_hosts = settings.dangerous_custom_endpoint_hosts;
         validate_loopback_redirect(&settings.redirect_uri)?;
         validate_scopes(&settings.scopes)?;
+        if self.id == "palantir_aip" {
+            let has_execute_scope = settings
+                .scopes
+                .iter()
+                .any(|scope| scope == PALANTIR_AIP_EXECUTE_SCOPE);
+            let has_offline_access = settings
+                .scopes
+                .iter()
+                .any(|scope| scope == PALANTIR_OFFLINE_ACCESS_SCOPE);
+            if !has_execute_scope
+                || (method == ProviderLoginMethod::AuthorizationCodePkce && !has_offline_access)
+                || (method == ProviderLoginMethod::ClientCredentials && has_offline_access)
+            {
+                return Err(ProviderLoginError::InvalidScopes);
+            }
+        }
 
         let authorization_endpoint = required_endpoint(
             settings.authorization_endpoint,
@@ -500,6 +521,10 @@ impl ProviderLoginDefinition {
             token_endpoint,
         )?
         .with_scopes(settings.scopes);
+        config = config.with_client_auth(settings.client_auth);
+        if method == ProviderLoginMethod::ClientCredentials {
+            config = config.with_client_credentials_grant();
+        }
         if let Some(endpoint) = device_authorization_endpoint {
             config = config.with_device_authorization_endpoint(endpoint);
         }
@@ -654,6 +679,26 @@ impl OAuthRefresher for ProviderOAuthClient {
     ) -> OAuthFuture<'a, OAuthTokens> {
         self.inner.refresh(refresh_token, cancellation)
     }
+
+    fn renew<'a>(
+        &'a self,
+        tokens: &'a OAuthTokens,
+        cancellation: CancellationToken,
+    ) -> OAuthFuture<'a, OAuthTokens> {
+        self.inner.renew(tokens, cancellation)
+    }
+}
+
+impl OAuthClientCredentials for ProviderOAuthClient {
+    fn acquire_client_credentials(
+        &self,
+        cancellation: CancellationToken,
+    ) -> OAuthFuture<'_, OAuthTokens> {
+        if self.method != ProviderLoginMethod::ClientCredentials {
+            return Box::pin(async { Err(OAuthError::Unsupported) });
+        }
+        self.inner.acquire_client_credentials(cancellation)
+    }
 }
 
 impl OAuthRevoker for ProviderOAuthClient {
@@ -691,6 +736,7 @@ pub struct ProviderOAuthSettings {
     device_authorization_endpoint: Option<Url>,
     revocation_endpoint: Option<Url>,
     identity_endpoint: Option<Url>,
+    client_auth: OAuthClientAuth,
     request_encoding: OAuthRequestEncoding,
     dangerous_custom_endpoint_hosts: bool,
 }
@@ -708,6 +754,7 @@ impl ProviderOAuthSettings {
             device_authorization_endpoint: None,
             revocation_endpoint: None,
             identity_endpoint: None,
+            client_auth: OAuthClientAuth::None,
             request_encoding: OAuthRequestEncoding::Form,
             dangerous_custom_endpoint_hosts: false,
         }
@@ -752,6 +799,13 @@ impl ProviderOAuthSettings {
     #[must_use]
     pub fn with_identity_endpoint(mut self, endpoint: Url) -> Self {
         self.identity_endpoint = Some(endpoint);
+        self
+    }
+
+    /// Authenticate a confidential client with a protected request-body secret.
+    #[must_use]
+    pub fn with_client_secret(mut self, client_secret: SecretValue) -> Self {
+        self.client_auth = OAuthClientAuth::RequestBody(client_secret);
         self
     }
 
@@ -803,6 +857,10 @@ impl fmt::Debug for ProviderOAuthSettings {
             .field(
                 "identity_endpoint_configured",
                 &self.identity_endpoint.is_some(),
+            )
+            .field(
+                "client_secret_configured",
+                &matches!(self.client_auth, OAuthClientAuth::RequestBody(_)),
             )
             .field("request_encoding", &self.request_encoding)
             .field(
@@ -888,6 +946,9 @@ pub enum ProviderLoginError {
     /// A browser callback was not an explicit local loopback HTTP target.
     #[error("provider OAuth redirect must use HTTP on an explicit loopback port")]
     UnsafeRedirect,
+    /// A Foundry enrollment value was not a bare HTTPS origin.
+    #[error("Palantir Foundry enrollment must be a bare HTTPS origin")]
+    InvalidEnrollmentOrigin,
     /// Scopes were empty, duplicated, or contained whitespace.
     #[error("provider OAuth scopes must be non-empty and unique")]
     InvalidScopes,
@@ -1066,6 +1127,7 @@ fn valid_scope(scope: &str) -> bool {
 }
 
 const MAX_CLIENT_ID_BYTES: usize = 512;
+const MAX_CLIENT_SECRET_BYTES: usize = 4 * 1024;
 const MAX_SCOPE_COUNT: usize = 32;
 const MAX_SCOPE_BYTES: usize = 512;
 const MAX_SCOPE_TOTAL_BYTES: usize = 4 * 1024;
@@ -1073,11 +1135,18 @@ const MAX_ENDPOINT_BYTES: usize = 2 * 1024;
 const MAX_SETTINGS_TOTAL_BYTES: usize = 16 * 1024;
 
 fn validate_oauth_settings(settings: &ProviderOAuthSettings) -> Result<(), ProviderLoginError> {
+    let client_secret_bytes = match &settings.client_auth {
+        OAuthClientAuth::None => 0,
+        OAuthClientAuth::Basic(secret) | OAuthClientAuth::RequestBody(secret) => secret.len(),
+    };
+    let client_secret_configured = settings.client_auth != OAuthClientAuth::None;
     if settings.client_id.is_empty()
         || settings.client_id.len() > MAX_CLIENT_ID_BYTES
         || settings.client_id.chars().any(char::is_whitespace)
         || settings.client_id.chars().any(char::is_control)
         || settings.scopes.len() > MAX_SCOPE_COUNT
+        || client_secret_configured
+            && (client_secret_bytes == 0 || client_secret_bytes > MAX_CLIENT_SECRET_BYTES)
     {
         return Err(ProviderLoginError::InputLimitExceeded);
     }
@@ -1115,7 +1184,8 @@ fn validate_oauth_settings(settings: &ProviderOAuthSettings) -> Result<(), Provi
     let total = settings
         .client_id
         .len()
-        .checked_add(scope_bytes)
+        .checked_add(client_secret_bytes)
+        .and_then(|total| total.checked_add(scope_bytes))
         .and_then(|total| total.checked_add(endpoint_bytes))
         .ok_or(ProviderLoginError::InputLimitExceeded)?;
     if total > MAX_SETTINGS_TOTAL_BYTES {
@@ -1353,6 +1423,65 @@ const KIMI_CAPABILITIES: &[ProviderLoginCapability] = &[
     ),
 ];
 
+const PALANTIR_AIP_CAPABILITIES: &[ProviderLoginCapability] = &[
+    ProviderLoginCapability::new(
+        ProviderLoginMethod::ApiKey,
+        ProviderLoginSupport::Unsupported,
+        "Palantir AIP uses Foundry OAuth bearer tokens rather than API keys.",
+    ),
+    ProviderLoginCapability::new(
+        ProviderLoginMethod::AuthorizationCodePkce,
+        ProviderLoginSupport::RequiresExplicitConfiguration,
+        "Foundry documents authorization-code login with PKCE using an operator-owned application registration and enrollment host.",
+    ),
+    ProviderLoginCapability::new(
+        ProviderLoginMethod::DeviceCode,
+        ProviderLoginSupport::Unsupported,
+        "Foundry does not document an OAuth device authorization grant.",
+    ),
+    ProviderLoginCapability::new(
+        ProviderLoginMethod::ClientCredentials,
+        ProviderLoginSupport::RequiresExplicitConfiguration,
+        "Foundry documents client credentials for confidential service applications.",
+    ),
+];
+
+/// Foundry scope required to execute AIP language models.
+pub const PALANTIR_AIP_EXECUTE_SCOPE: &str = "api:use-language-models-execute";
+/// Foundry scope used to read AIP language-model usage.
+pub const PALANTIR_AIP_USAGE_SCOPE: &str = "api:usage:language-models-execute";
+/// Standard OAuth scope required for refresh tokens in browser login.
+pub const PALANTIR_OFFLINE_ACCESS_SCOPE: &str = "offline_access";
+/// Foundry browser authorization endpoint relative to one enrollment origin.
+pub const PALANTIR_OAUTH_AUTHORIZATION_PATH: &str = "/multipass/api/oauth2/authorize";
+/// Foundry token endpoint relative to one enrollment origin.
+pub const PALANTIR_OAUTH_TOKEN_PATH: &str = "/multipass/api/oauth2/token";
+
+/// Build Palantir OAuth settings from an operator's Foundry enrollment origin.
+///
+/// The origin must be HTTPS without a path, query, fragment, or userinfo. Both
+/// endpoints are derived on that exact origin so credentials cannot be sent to
+/// a different host through an endpoint override.
+pub fn palantir_aip_oauth_settings(
+    client_id: impl Into<String>,
+    redirect_uri: Url,
+    enrollment_origin: Url,
+) -> Result<ProviderOAuthSettings, ProviderLoginError> {
+    if !valid_provider_endpoint(&enrollment_origin)
+        || !matches!(enrollment_origin.path(), "" | "/")
+        || enrollment_origin.query().is_some()
+    {
+        return Err(ProviderLoginError::InvalidEnrollmentOrigin);
+    }
+    let mut authorization_endpoint = enrollment_origin.clone();
+    authorization_endpoint.set_path(PALANTIR_OAUTH_AUTHORIZATION_PATH);
+    let mut token_endpoint = enrollment_origin;
+    token_endpoint.set_path(PALANTIR_OAUTH_TOKEN_PATH);
+    Ok(ProviderOAuthSettings::new(client_id, redirect_uri)
+        .with_authorization_endpoint(authorization_endpoint)
+        .with_token_endpoint(token_endpoint))
+}
+
 const GOOGLE_OAUTH_DEFAULTS: ProviderOAuthDefaults = ProviderOAuthDefaults::none()
     .with_authorization_endpoint("https://accounts.google.com/o/oauth2/v2/auth")
     .with_token_endpoint("https://oauth2.googleapis.com/token")
@@ -1369,7 +1498,7 @@ const OPENAI_OAUTH_DEFAULTS: ProviderOAuthDefaults = ProviderOAuthDefaults::none
 
 /// Verified provider login definitions. Declaration order is stable for CLI
 /// and management presentation.
-pub static BUILTIN_PROVIDER_LOGIN_DEFINITIONS: [ProviderLoginDefinition; 5] = [
+pub static BUILTIN_PROVIDER_LOGIN_DEFINITIONS: [ProviderLoginDefinition; 6] = [
     ProviderLoginDefinition::new(
         "openai",
         "OpenAI",
@@ -1423,6 +1552,19 @@ pub static BUILTIN_PROVIDER_LOGIN_DEFINITIONS: [ProviderLoginDefinition; 5] = [
     ])
     .with_oauth_host_suffixes(&["kimi.com", "moonshot.cn"])
     .with_capabilities(KIMI_CAPABILITIES),
+    ProviderLoginDefinition::new(
+        "palantir_aip",
+        "Palantir AIP",
+        "https://www.palantir.com/docs/foundry/platform-security-third-party/writing-oauth2-clients",
+    )
+    .with_aliases(&["palantir", "foundry", "foundry-aip"])
+    .with_oauth_host_suffixes(&["palantirfoundry.com", "palantirfoundry.co.uk"])
+    .with_suggested_scopes(&[
+        PALANTIR_AIP_EXECUTE_SCOPE,
+        PALANTIR_AIP_USAGE_SCOPE,
+        PALANTIR_OFFLINE_ACCESS_SCOPE,
+    ])
+    .with_capabilities(PALANTIR_AIP_CAPABILITIES),
 ];
 
 #[cfg(test)]
@@ -1471,10 +1613,13 @@ mod tests {
             ("moonshotai", "kimi"),
             ("moonshotai-cn", "kimi"),
             ("kimi-for-coding", "kimi"),
+            ("palantir", "palantir_aip"),
+            ("foundry", "palantir_aip"),
+            ("foundry-aip", "palantir_aip"),
         ] {
             assert_eq!(registry.require(alias).expect("provider").id(), expected);
         }
-        assert_eq!(registry.definitions().len(), 5);
+        assert_eq!(registry.definitions().len(), 6);
         assert!(registry.resolve("unknown").is_none());
         assert!(registry.resolve(" google ").is_none());
     }
@@ -1621,10 +1766,169 @@ mod tests {
             ProviderLoginSupport::RequiresExplicitConfiguration
         );
 
+        let palantir = registry.require("palantir").expect("Palantir AIP");
+        assert_eq!(
+            palantir.support(ProviderLoginMethod::AuthorizationCodePkce),
+            ProviderLoginSupport::RequiresExplicitConfiguration
+        );
+        assert_eq!(
+            palantir.support(ProviderLoginMethod::ClientCredentials),
+            ProviderLoginSupport::RequiresExplicitConfiguration
+        );
+        assert_eq!(
+            palantir.support(ProviderLoginMethod::DeviceCode),
+            ProviderLoginSupport::Unsupported
+        );
+
         for provider in registry.definitions() {
-            assert_eq!(
-                provider.support(ProviderLoginMethod::ApiKey),
+            let expected = if provider.id() == "palantir_aip" {
+                ProviderLoginSupport::Unsupported
+            } else {
                 ProviderLoginSupport::Supported
+            };
+            assert_eq!(provider.support(ProviderLoginMethod::ApiKey), expected);
+        }
+    }
+
+    #[test]
+    fn palantir_profile_derives_same_origin_endpoints_and_protects_client_secret() {
+        let definition = ProviderLoginRegistry::builtin()
+            .require("foundry")
+            .expect("Palantir AIP");
+        let settings = palantir_aip_oauth_settings(
+            "operator-client",
+            loopback_redirect(),
+            "https://example.euw-3.palantirfoundry.co.uk"
+                .parse()
+                .expect("enrollment origin"),
+        )
+        .expect("derived settings")
+        .with_scopes([PALANTIR_AIP_EXECUTE_SCOPE, PALANTIR_OFFLINE_ACCESS_SCOPE])
+        .with_client_secret(SecretValue::new("sentinel-client-secret"));
+        let config = definition
+            .build_oauth_config(ProviderLoginMethod::AuthorizationCodePkce, settings)
+            .expect("Palantir browser OAuth");
+
+        assert_eq!(
+            config.authorization_endpoint.as_str(),
+            "https://example.euw-3.palantirfoundry.co.uk/multipass/api/oauth2/authorize"
+        );
+        assert_eq!(
+            config.token_endpoint.as_str(),
+            "https://example.euw-3.palantirfoundry.co.uk/multipass/api/oauth2/token"
+        );
+        assert!(matches!(
+            config.client_auth,
+            OAuthClientAuth::RequestBody(_)
+        ));
+        assert!(!format!("{config:?}").contains("sentinel-client-secret"));
+    }
+
+    #[test]
+    fn palantir_client_credentials_requires_a_secret_and_never_enables_device_code() {
+        let definition = ProviderLoginRegistry::builtin()
+            .require("palantir_aip")
+            .expect("Palantir AIP");
+        for (method, scopes) in [
+            (
+                ProviderLoginMethod::AuthorizationCodePkce,
+                vec![PALANTIR_OFFLINE_ACCESS_SCOPE],
+            ),
+            (
+                ProviderLoginMethod::ClientCredentials,
+                vec![PALANTIR_AIP_USAGE_SCOPE],
+            ),
+        ] {
+            let missing_execute = palantir_aip_oauth_settings(
+                "operator-client",
+                loopback_redirect(),
+                "https://example.palantirfoundry.com".parse().unwrap(),
+            )
+            .unwrap()
+            .with_scopes(scopes);
+            assert_eq!(
+                definition
+                    .build_oauth_config(method, missing_execute)
+                    .expect_err("Palantir grants require model execution scope"),
+                ProviderLoginError::InvalidScopes
+            );
+        }
+        let settings = palantir_aip_oauth_settings(
+            "service-client",
+            loopback_redirect(),
+            "https://example.palantirfoundry.com"
+                .parse()
+                .expect("enrollment origin"),
+        )
+        .expect("derived settings")
+        .with_scopes([PALANTIR_AIP_EXECUTE_SCOPE]);
+        assert_eq!(
+            definition
+                .build_oauth_config(ProviderLoginMethod::ClientCredentials, settings.clone())
+                .expect_err("confidential client secret is required"),
+            ProviderLoginError::OAuth(OAuthError::InvalidConfiguration)
+        );
+        assert_eq!(
+            definition
+                .build_oauth_config(ProviderLoginMethod::AuthorizationCodePkce, settings.clone(),)
+                .expect_err("browser login requires refresh-token scope"),
+            ProviderLoginError::InvalidScopes
+        );
+        assert_eq!(
+            definition
+                .build_oauth_config(
+                    ProviderLoginMethod::ClientCredentials,
+                    settings
+                        .clone()
+                        .with_scopes([PALANTIR_AIP_EXECUTE_SCOPE, PALANTIR_OFFLINE_ACCESS_SCOPE,])
+                        .with_client_secret(SecretValue::new("service-secret")),
+                )
+                .expect_err("service grant must not request offline access"),
+            ProviderLoginError::InvalidScopes
+        );
+        let config = definition
+            .build_oauth_config(
+                ProviderLoginMethod::ClientCredentials,
+                settings.with_client_secret(SecretValue::new("service-secret")),
+            )
+            .expect("client credentials");
+        assert_eq!(config.grant_type, crate::OAuthGrantType::ClientCredentials);
+        assert_eq!(
+            definition
+                .build_oauth_config(
+                    ProviderLoginMethod::DeviceCode,
+                    palantir_aip_oauth_settings(
+                        "service-client",
+                        loopback_redirect(),
+                        "https://example.palantirfoundry.com".parse().unwrap(),
+                    )
+                    .unwrap()
+                    .with_scopes([PALANTIR_AIP_EXECUTE_SCOPE]),
+                )
+                .expect_err("no Palantir device grant"),
+            ProviderLoginError::Unsupported {
+                provider: "palantir_aip",
+                method: ProviderLoginMethod::DeviceCode,
+            }
+        );
+    }
+
+    #[test]
+    fn palantir_enrollment_must_be_a_bare_https_origin() {
+        for enrollment in [
+            "http://example.palantirfoundry.com",
+            "https://example.palantirfoundry.com/path",
+            "https://user@example.palantirfoundry.com",
+            "https://example.palantirfoundry.com?query=value",
+        ] {
+            assert_eq!(
+                palantir_aip_oauth_settings(
+                    "client",
+                    loopback_redirect(),
+                    enrollment.parse().expect("test URL"),
+                )
+                .expect_err("unsafe enrollment"),
+                ProviderLoginError::InvalidEnrollmentOrigin
             );
         }
     }
@@ -1791,18 +2095,21 @@ mod tests {
             "https://identity.example.test/authorize?sentinel-endpoint-material"
                 .parse()
                 .expect("endpoint"),
-        );
+        )
+        .with_client_secret(SecretValue::new("sentinel-client-secret"));
         let rendered = format!("{settings:?}");
         for sentinel in [
             "sentinel-client-material",
             "sentinel-redirect-material",
             "sentinel-scope-material",
             "sentinel-endpoint-material",
+            "sentinel-client-secret",
         ] {
             assert!(!rendered.contains(sentinel));
         }
         assert!(rendered.contains("scope_count"));
         assert!(rendered.contains("authorization_endpoint_configured"));
+        assert!(rendered.contains("client_secret_configured"));
     }
 
     #[test]

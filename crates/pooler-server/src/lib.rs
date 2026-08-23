@@ -13,6 +13,7 @@ mod http_runtime;
 mod lifecycle;
 mod listener;
 mod management;
+pub mod management_error;
 mod management_ui;
 mod model_facts_refresh;
 mod server;
@@ -30,6 +31,10 @@ pub use listener::{ListenerPreparationFuture, ListenerPreparer, PreparedListener
 pub use management::{
     ActiveCounts, ActiveGuard, ManagementApi, ManagementHttpServer, ManagementResponse,
     ManagementServerError,
+};
+pub use management_error::{
+    ManagementError, ManagementErrorBody, ManagementErrorCode, ManagementErrorEnvelope,
+    SCHEMA_VERSION as MANAGEMENT_ERROR_SCHEMA_VERSION,
 };
 pub use model_facts_refresh::{fetch_model_facts, project_model_facts, ModelFactsRefreshError};
 pub use pooler_core::ConfigGeneration;

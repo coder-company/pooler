@@ -32,10 +32,11 @@ use pooler_extension::{
     ExtensionCapabilities, ExtensionLimits, ExtensionRegistry, ExtensionSpec, WasmExtension,
 };
 use pooler_http::{
-    BoxError, DrainError, HttpProxy, MediaSemanticAdapter, NativeRuntime, PoolingCoordinator,
-    ProxyBody, ProxyError, ResponseDeadline, ResponseDeadlineCleanupGuard, RuntimeResourceGuard,
-    RuntimeResourceSnapshot, RuntimeResources, SelectionContext, SemanticAdapter,
-    SemanticRequestBody, SemanticResponseBody, SemanticResponseHint, SemanticWebSocketTransport,
+    BoxError, DrainError, HttpProxy, MediaSemanticAdapter, NativeBrowserLoginSession,
+    NativeRuntime, NativeRuntimeError, PoolingCoordinator, ProxyBody, ProxyError, ResponseDeadline,
+    ResponseDeadlineCleanupGuard, RuntimeResourceGuard, RuntimeResourceSnapshot, RuntimeResources,
+    SelectionContext, SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
+    SemanticResponseHint, SemanticWebSocketTransport,
 };
 use pooler_observe::MetricsRegistry;
 use thiserror::Error;
@@ -48,7 +49,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::management::{
-    ManagementReloadKind, ManagementRuntimeServices, NativeAccountAction, NativeAccountCommand,
+    ManagementOAuthBroker, ManagementOAuthError, ManagementOAuthFuture, ManagementReloadKind,
+    ManagementRuntimeServices, NativeAccountAction, NativeAccountCommand,
 };
 use crate::tls::{PreparedTls, TlsError};
 use crate::{
@@ -71,6 +73,7 @@ const MAX_RETIRED_GENERATIONS: usize = 2;
 /// Bound only the HTTP/1 header phase.  Streaming response bodies and keep-
 /// alive connections are intentionally not subject to this deadline.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_NATIVE_BROWSER_OAUTH_SESSIONS: usize = 8;
 
 type RuntimeProxy = HttpProxy<RuntimeSemanticAdapter>;
 
@@ -538,6 +541,187 @@ pub(crate) struct RuntimeGeneration {
     pub(crate) catalog: Option<Arc<CatalogRuntime>>,
 }
 
+struct NativeBrowserSession {
+    session: NativeBrowserLoginSession,
+    callback: url::Url,
+}
+
+struct NativeManagementOAuthBroker {
+    native: Arc<NativeRuntime>,
+    dispatch: Arc<ArcSwap<RuntimeGeneration>>,
+    reload_lock: Arc<AsyncMutex<()>>,
+    browser_sessions: Mutex<BTreeMap<u64, NativeBrowserSession>>,
+}
+
+impl NativeManagementOAuthBroker {
+    fn new(
+        native: Arc<NativeRuntime>,
+        dispatch: Arc<ArcSwap<RuntimeGeneration>>,
+        reload_lock: Arc<AsyncMutex<()>>,
+    ) -> Self {
+        Self {
+            native,
+            dispatch,
+            reload_lock,
+            browser_sessions: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn callback_for(config: &CompiledConfig, account_id: &str) -> Option<url::Url> {
+        let account = config.accounts().get(account_id)?;
+        let callback = config
+            .upstreams()
+            .get(account.provider())?
+            .oauth()?
+            .callback()
+            .clone();
+        let management_port = config
+            .management()?
+            .bind()
+            .parse::<std::net::SocketAddr>()
+            .ok()?
+            .port();
+        (callback.path() == "/management/oauth/browser/callback"
+            && callback.query().is_none()
+            && callback.fragment().is_none()
+            && callback.port_or_known_default() == Some(management_port))
+        .then_some(callback)
+    }
+}
+
+fn map_management_oauth_error(error: NativeRuntimeError) -> ManagementOAuthError {
+    match error {
+        NativeRuntimeError::Unsupported | NativeRuntimeError::Configuration => {
+            ManagementOAuthError::Unsupported
+        }
+        NativeRuntimeError::Authorization | NativeRuntimeError::NeedsReauth => {
+            ManagementOAuthError::Authorization
+        }
+        NativeRuntimeError::CredentialUnavailable | NativeRuntimeError::Refresh => {
+            ManagementOAuthError::Unavailable
+        }
+    }
+}
+
+impl ManagementOAuthBroker for NativeManagementOAuthBroker {
+    fn start_browser(
+        &self,
+        config: &CompiledConfig,
+        account: &str,
+        request_id: u64,
+    ) -> Result<url::Url, ManagementOAuthError> {
+        let callback =
+            Self::callback_for(config, account).ok_or(ManagementOAuthError::Unsupported)?;
+        let (authorization, session) = self
+            .native
+            .start_browser_login(config, account)
+            .map_err(map_management_oauth_error)?;
+        let mut sessions = self
+            .browser_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sessions.len() >= MAX_NATIVE_BROWSER_OAUTH_SESSIONS || sessions.contains_key(&request_id)
+        {
+            return Err(ManagementOAuthError::Unavailable);
+        }
+        sessions.insert(request_id, NativeBrowserSession { session, callback });
+        Ok(authorization.authorization_url().clone())
+    }
+
+    fn state_matches(&self, request_id: u64, candidate: &str) -> bool {
+        self.browser_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&request_id)
+            .is_some_and(|session| session.session.matches_state(candidate))
+    }
+
+    fn callback_host_matches(&self, request_id: u64, candidate: &str) -> bool {
+        let Ok(candidate) = url::Url::parse(&format!("http://{candidate}/")) else {
+            return false;
+        };
+        self.browser_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&request_id)
+            .is_some_and(|session| {
+                candidate.host_str() == session.callback.host_str()
+                    && candidate.port_or_known_default() == session.callback.port_or_known_default()
+            })
+    }
+
+    fn finish_browser<'a>(
+        &'a self,
+        request_id: u64,
+        callback_query: String,
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> ManagementOAuthFuture<'a> {
+        Box::pin(async move {
+            let NativeBrowserSession {
+                session,
+                mut callback,
+            } = self
+                .browser_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&request_id)
+                .ok_or(ManagementOAuthError::NotFound)?;
+            if self.dispatch.load().config.generation() != generation {
+                return Err(ManagementOAuthError::StaleGeneration);
+            }
+            callback.set_query(Some(&callback_query));
+            let result = self
+                .native
+                .exchange_browser_login(session, callback, cancellation)
+                .await
+                .map_err(map_management_oauth_error)?;
+            let _reload_guard = self.reload_lock.lock().await;
+            if self.dispatch.load().config.generation() != generation {
+                return Err(ManagementOAuthError::StaleGeneration);
+            }
+            self.native
+                .persist_oauth_login(result)
+                .map(|_| ())
+                .map_err(map_management_oauth_error)
+        })
+    }
+
+    fn acquire_client_credentials<'a>(
+        &'a self,
+        account: &'a str,
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> ManagementOAuthFuture<'a> {
+        Box::pin(async move {
+            let runtime = self.dispatch.load_full();
+            if runtime.config.generation() != generation {
+                return Err(ManagementOAuthError::StaleGeneration);
+            }
+            let result = self
+                .native
+                .acquire_client_credentials(runtime.config.as_ref(), account, cancellation)
+                .await
+                .map_err(map_management_oauth_error)?;
+            let _reload_guard = self.reload_lock.lock().await;
+            if self.dispatch.load().config.generation() != generation {
+                return Err(ManagementOAuthError::StaleGeneration);
+            }
+            self.native
+                .persist_oauth_login(result)
+                .map(|_| ())
+                .map_err(map_management_oauth_error)
+        })
+    }
+
+    fn discard_browser(&self, request_id: u64) {
+        self.browser_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&request_id);
+    }
+}
+
 /// A concrete HTTP/1 listener set serving every compiled listener.
 #[derive(Clone)]
 pub struct HttpProxyServer {
@@ -631,6 +815,12 @@ impl HttpProxyServer {
         let cancellation = CancellationToken::new();
         let (native_commands, native_command_receiver) = mpsc::channel(16);
         let reload_lock = Arc::new(AsyncMutex::new(()));
+        let browser_oauth: Arc<dyn ManagementOAuthBroker> =
+            Arc::new(NativeManagementOAuthBroker::new(
+                Arc::clone(&native),
+                Arc::clone(&dispatch),
+                Arc::clone(&reload_lock),
+            ));
         let management_api = config.management().map(|plan| {
             Arc::new(ManagementApi::with_runtime_dispatch(
                 plan.clone(),
@@ -642,6 +832,7 @@ impl HttpProxyServer {
                     metrics: metrics.clone(),
                     traces: traces.clone(),
                     native_commands,
+                    browser_oauth: Some(Arc::clone(&browser_oauth)),
                 },
             ))
         });
@@ -5529,6 +5720,135 @@ mod tests {
             }));
         server.begin_drain();
         std::env::remove_var("POOLER_MANAGEMENT_NATIVE_TEST_KEY");
+    }
+
+    #[tokio::test]
+    async fn browser_oauth_generation_change_is_public_and_never_persists_tokens() {
+        const MANAGEMENT_ENV: &str = "POOLER_BROWSER_GENERATION_TEST_KEY";
+        std::env::set_var(MANAGEMENT_ENV, "browser-generation-secret");
+        let reservation = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("management port reserves");
+        let address = reservation.local_addr().expect("management address");
+        drop(reservation);
+        let config = Arc::new(
+            pooler_config::compile_yaml(
+                "browser-generation-management.yaml",
+                &format!(
+                    "version: 1\nmanagement: {{bind: {address}, auth: {{secret: env:{MANAGEMENT_ENV}}}}}\nupstreams:\n  foundry:\n    url: https://example.euw-3.palantirfoundry.co.uk\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: operator-client\n      scopes: [api:use-language-models-execute, offline_access]\n      callback: http://{address}/management/oauth/browser/callback\naccounts:\n  foundry: {{provider: foundry, auth_kind: oauth}}\n"
+                ),
+            )
+            .expect("browser OAuth management config"),
+        );
+        let store = Arc::new(SqliteOAuthTokenStore::new(
+            SqliteStore::open_in_memory_encrypted(
+                MasterKey::from_bytes(b"browser-generation-test-key").expect("master key"),
+            )
+            .expect("encrypted credential store"),
+        ));
+        let native = Arc::new(
+            NativeRuntime::new_with_sqlite(config.as_ref(), Arc::clone(&store))
+                .expect("native runtime"),
+        );
+        let pooling = Arc::new(PoolingCoordinator::new(config.as_ref()).expect("pooling"));
+        let dispatch = Arc::new(ArcSwap::from_pointee(RuntimeGeneration {
+            config: Arc::clone(&config),
+            proxies: BTreeMap::new(),
+            tls: BTreeMap::new(),
+            pooling: Arc::clone(&pooling),
+            catalog: None,
+        }));
+        let reload_lock = Arc::new(AsyncMutex::new(()));
+        let browser_oauth: Arc<dyn ManagementOAuthBroker> =
+            Arc::new(NativeManagementOAuthBroker::new(
+                Arc::clone(&native),
+                Arc::clone(&dispatch),
+                Arc::clone(&reload_lock),
+            ));
+        let (native_commands, _native_receiver) = mpsc::channel(1);
+        let api = Arc::new(ManagementApi::with_runtime_dispatch(
+            config.management().cloned().expect("management plan"),
+            Arc::clone(&config),
+            Arc::clone(&pooling),
+            Arc::clone(&dispatch),
+            ActiveCounts::new(),
+            ManagementRuntimeServices {
+                metrics: MetricsRegistry::default(),
+                traces: pooler_observe::TraceRecorder::default(),
+                native_commands,
+                browser_oauth: Some(browser_oauth),
+            },
+        ));
+        let server = ManagementHttpServer::bind(Arc::clone(&api))
+            .await
+            .expect("management listener binds");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let start = format!(
+            "POST /management/accounts/foundry/oauth-browser HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nAuthorization: Bearer browser-generation-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let response = send_request(address, start.as_bytes()).await;
+        assert_eq!(status(&response), 200);
+        let start: serde_json::Value =
+            serde_json::from_slice(response_body(&response)).expect("browser start JSON");
+        let authorization: url::Url = start["authorization_url"]
+            .as_str()
+            .expect("authorization URL")
+            .parse()
+            .expect("authorization URL parses");
+        let state = authorization
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .map(|(_, value)| value.into_owned())
+            .expect("authorization state");
+
+        let replacement = Arc::new(config.with_generation(config.generation() + 1));
+        dispatch.store(Arc::new(RuntimeGeneration {
+            config: replacement,
+            proxies: BTreeMap::new(),
+            tls: BTreeMap::new(),
+            pooling,
+            catalog: None,
+        }));
+        let wrong_port = if address.port() == u16::MAX {
+            address.port() - 1
+        } else {
+            address.port() + 1
+        };
+        let wrong_host = format!(
+            "GET /management/oauth/browser/callback?state={state}&code=unused-code HTTP/1.1\r\nHost: 127.0.0.1:{wrong_port}\r\nConnection: close\r\n\r\n"
+        );
+        let response = send_request(address, wrong_host.as_bytes()).await;
+        assert_eq!(status(&response), 403);
+        let callback = format!(
+            "GET /management/oauth/browser/callback?state={state}&code=unused-code HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        );
+        let response = send_request(address, callback.as_bytes()).await;
+        assert_eq!(status(&response), 409);
+        let poll = format!(
+            "GET /management/oauth/browser/1 HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer browser-generation-secret\r\nConnection: close\r\n\r\n"
+        );
+        let response = send_request(address, poll.as_bytes()).await;
+        let status_record: serde_json::Value =
+            serde_json::from_slice(response_body(&response)).expect("browser status JSON");
+        assert_eq!(status_record["account"], "foundry");
+        assert_eq!(status_record["generation"], config.generation());
+        assert_eq!(status_record["status"], "stale_generation");
+        let credential = pooler_auth::CredentialId::new("foundry").expect("credential ID");
+        assert!(store
+            .load(&credential)
+            .await
+            .expect("credential lookup")
+            .is_none());
+
+        server.begin_shutdown();
+        runner
+            .await
+            .expect("management task does not panic")
+            .expect("management task shuts down");
+        std::env::remove_var(MANAGEMENT_ENV);
     }
 
     #[tokio::test]

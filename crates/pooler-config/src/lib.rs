@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use http::{uri::PathAndQuery, HeaderName, HeaderValue, Method};
 pub use pooler_core::{
-    BodyMode, Capability, CapabilitySet, ConfigGeneration, LossPolicy, RouteLimits,
+    BodyMode, Capability, CapabilitySet, ConfigGeneration, LossPolicy, RouteLimits, TargetId,
 };
 use pooler_protocol::{
     DEFAULT_JSON_PATCH_MAX_POINTER_BYTES, DEFAULT_JSON_PATCH_MAX_POINTER_DEPTH,
@@ -47,7 +47,7 @@ pub use watch::{
 };
 
 /// Current configuration schema version.
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
 /// Maximum number of transforms accepted for one route.
 pub const MAX_REQUEST_STEPS: usize = 32;
 /// Maximum aggregate serialized replacement bytes accepted for one route.
@@ -169,6 +169,8 @@ pub enum SecretRef {
         service: Arc<str>,
         account: Arc<str>,
     },
+    /// Opaque reference into Pooler's encrypted managed-secret store.
+    Managed(Arc<str>),
 }
 
 impl SecretRef {
@@ -195,6 +197,8 @@ impl SecretRef {
                     account: Arc::from(account),
                 })
             }
+            "managed" if valid_managed_id(payload) => Ok(Self::Managed(Arc::from(payload))),
+            "managed" => Err(SecretRefError::InvalidManagedId),
             "external" => Err(SecretRefError::UnknownScheme),
             "literal" | "raw" | "value" => Err(SecretRefError::LiteralNotAllowed),
             _ => Err(SecretRefError::UnknownScheme),
@@ -208,6 +212,7 @@ impl SecretRef {
             Self::Env(name) => format!("env:{name}"),
             Self::File(path) => format!("file:{path}"),
             Self::Keyring { service, account } => format!("keyring:{service}/{account}"),
+            Self::Managed(id) => format!("managed:{id}"),
         }
     }
 
@@ -218,6 +223,7 @@ impl SecretRef {
             Self::Env(_) => "env",
             Self::File(_) => "file",
             Self::Keyring { .. } => "keyring",
+            Self::Managed(_) => "managed",
         }
     }
 }
@@ -273,6 +279,9 @@ pub enum SecretRefError {
     /// Unsupported scheme.
     #[error("unknown secret reference scheme")]
     UnknownScheme,
+    /// Managed secret references must contain a bounded opaque ID.
+    #[error("invalid managed secret reference")]
+    InvalidManagedId,
 }
 
 /// YAML configuration declarations.
@@ -283,8 +292,7 @@ pub struct Config {
     pub version: u32,
     /// Listener declarations keyed by ID.
     pub listeners: BTreeMap<String, ListenerConfig>,
-    /// Upstream declarations keyed by ID. `providers` is accepted as an alias.
-    #[serde(alias = "providers")]
+    /// Provider/upstream declarations keyed by stable ID.
     pub upstreams: BTreeMap<String, UpstreamConfig>,
     /// Public model declarations and their static upstream targets.
     pub models: Vec<ModelConfig>,
@@ -294,11 +302,7 @@ pub struct Config {
     pub usage_price_book: Option<UsagePriceBookConfig>,
     /// Credential-bearing account declarations keyed by stable ID.
     pub accounts: BTreeMap<String, AccountConfig>,
-    /// Compatibility alias for account declarations.
-    #[serde(alias = "credentials")]
-    pub credentials: BTreeMap<String, AccountConfig>,
-    /// Named account pools used by selection policies.
-    #[serde(alias = "pools")]
+    /// Homogeneous account pools keyed by stable ID.
     pub account_pools: BTreeMap<String, AccountPoolConfig>,
     /// Named target-selection and retry policies.
     pub policies: BTreeMap<String, PolicyConfig>,
@@ -375,13 +379,11 @@ pub struct ListenerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ListenerTlsConfig {
     /// PEM certificate chain. The file must be owner-readable and owner-only.
-    #[serde(alias = "certificate", alias = "certificate_file", alias = "cert_file")]
     pub cert: String,
     /// PEM private key. The file must be owner-readable and owner-only.
-    #[serde(alias = "private_key", alias = "private_key_file", alias = "key_file")]
     pub key: String,
     /// ALPN protocol identifiers offered by this listener.
-    #[serde(default = "default_tls_alpn", alias = "alpn_protocols")]
+    #[serde(default = "default_tls_alpn")]
     pub alpn: Vec<String>,
     /// Maximum time allowed for one TLS handshake.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
@@ -395,7 +397,6 @@ pub struct ListenerTlsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ListenerClientAuthConfig {
     /// PEM certificate-authority bundle used to verify client certificates.
-    #[serde(alias = "ca_file", alias = "certificate_authority")]
     pub ca: String,
     /// Require a client certificate when true; otherwise allow anonymous TLS.
     #[serde(default)]
@@ -479,15 +480,24 @@ pub struct ModelConfig {
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelTargetConfig {
-    /// Upstream/provider ID.
-    #[serde(alias = "upstream")]
+    /// Stable target-binding ID. IDs are unique across the complete config.
+    pub id: Option<TargetId>,
+    /// Provider/upstream instance ID.
     pub provider: Option<String>,
+    /// Exactly one homogeneous account pool used by this target.
+    pub account_pool: Option<String>,
+    /// Lower positive values are higher priority tiers.
+    pub priority: Option<u32>,
     /// Model name sent to the upstream.
     pub upstream_model: Option<String>,
     /// Capabilities advertised by this target.
     pub capabilities: Vec<String>,
     /// Semantic codecs advertised by this target.
     pub codecs: Vec<String>,
+    /// Provider wire family used by this target.
+    pub wire_family: Option<String>,
+    /// Optional positive same-tier weight.
+    pub weight: Option<u32>,
 }
 
 /// Optional remote model-catalog declaration.
@@ -514,7 +524,7 @@ pub struct ModelCatalogConfig {
 #[serde(rename_all = "snake_case")]
 pub enum CatalogParserKind {
     /// OpenAI-compatible `data[]` model list.
-    #[serde(rename = "openai", alias = "open_ai")]
+    #[serde(rename = "openai")]
     OpenAi,
     /// Kimi Open Platform model list with documented baseline capabilities.
     Kimi,
@@ -590,7 +600,6 @@ pub struct ModelCatalogSourceConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AccountConfig {
     /// Provider/upstream ID that owns this account.
-    #[serde(alias = "upstream")]
     pub provider: Option<String>,
     /// Reference to the account's credential material.
     pub secret: Option<SecretRef>,
@@ -615,7 +624,7 @@ pub enum AccountAuthKind {
     /// Usage-based API key resolved from `secret`.
     ApiKey,
     /// Encrypted OAuth credential, including subscription accounts.
-    #[serde(rename = "oauth", alias = "o_auth", alias = "subscription")]
+    #[serde(rename = "oauth")]
     OAuth,
 }
 
@@ -634,8 +643,11 @@ impl AccountAuthKind {
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccountPoolConfig {
+    /// Provider/upstream ID shared by every member.
+    pub provider: Option<String>,
+    /// Strategy used within this homogeneous pool.
+    pub strategy: Option<String>,
     /// Account IDs in selection order.
-    #[serde(alias = "members")]
     pub accounts: Vec<String>,
 }
 
@@ -651,10 +663,56 @@ pub struct PolicyConfig {
     pub stream: Option<StreamConfig>,
     /// Optional health cooldown applied by policy consumers.
     pub cooldown: Option<CooldownConfig>,
-    /// Optional named account pool. A policy without this field may still be
-    /// used for static provider targets.
-    #[serde(alias = "pool")]
-    pub account_pool: Option<String>,
+    /// Dashboard-managed deterministic/adaptive routing constraints.
+    pub routing: Option<RoutingPolicyConfig>,
+}
+
+/// Canonical dashboard-managed routing constraints.
+///
+/// These fields describe candidate eligibility and ranking at the policy
+/// boundary. They are deliberately configuration-only; request bodies cannot
+/// override them.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutingPolicyConfig {
+    /// Explicit provider order used as the deterministic tie-breaker.
+    pub order: Vec<String>,
+    /// Provider allow-list.
+    pub allow: Vec<String>,
+    /// Provider deny-list.
+    pub deny: Vec<String>,
+    /// Whether lower-priority targets may be attempted.
+    pub allow_fallbacks: Option<bool>,
+    /// Hard parameter requirements.
+    pub required_parameters: Vec<String>,
+    /// Hard capability requirements.
+    pub required_capabilities: Vec<String>,
+    /// Minimum verified context window.
+    pub minimum_context: Option<u64>,
+    /// Hard quantization requirements.
+    pub quantization: Vec<String>,
+    /// Privacy/data-collection requirement.
+    pub privacy: Option<String>,
+    /// Require a verified zero-data-retention provider.
+    pub require_zdr: Option<bool>,
+    /// Provider data-policy requirement.
+    pub data_policy: Option<String>,
+    /// Optional maximum verified price in micro-USD per million tokens.
+    pub max_price: Option<u64>,
+    /// Optional soft ranking preferences.
+    pub preference: Option<RoutingPreferenceConfig>,
+}
+
+/// Optional soft ranking preferences for eligible targets.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutingPreferenceConfig {
+    /// Prefer lower verified price.
+    pub price: Option<bool>,
+    /// Prefer lower verified latency.
+    pub latency: Option<bool>,
+    /// Prefer higher verified throughput.
+    pub throughput: Option<bool>,
 }
 
 /// Target-selection declaration.
@@ -663,11 +721,6 @@ pub struct PolicyConfig {
 pub struct SelectionConfig {
     /// One of the documented deterministic strategies.
     pub strategy: Option<String>,
-    /// Named account pool to use for this selection policy.
-    #[serde(alias = "pool")]
-    pub account_pool: Option<String>,
-    /// Inline account IDs. Prefer a named account pool for reusable policy.
-    pub accounts: Vec<String>,
     /// Compatibility shorthand for an affinity lifetime.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub session_affinity: Option<Duration>,
@@ -693,50 +746,30 @@ pub struct AffinityConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RetryConfig {
     /// Total attempts, including the initial attempt.
-    #[serde(alias = "max_attempts")]
     pub maximum_attempts: Option<u32>,
     /// Maximum distinct accounts used by one request.
-    #[serde(alias = "max_credentials")]
     pub maximum_credentials: Option<u32>,
     /// Maximum distinct providers used by one request.
-    #[serde(alias = "max_providers")]
     pub maximum_providers: Option<u32>,
     /// Maximum wall time spent waiting between attempts.
-    #[serde(
-        default,
-        alias = "max_elapsed",
-        deserialize_with = "deserialize_optional_duration"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub maximum_elapsed: Option<Duration>,
     /// Maximum provider recovery delay honored by one request.
-    #[serde(
-        default,
-        alias = "max_recovery_wait",
-        deserialize_with = "deserialize_optional_duration"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub maximum_recovery_wait: Option<Duration>,
     /// Lower bound for exponential retry delay.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub base_delay: Option<Duration>,
     /// Upper bound for one retry delay.
-    #[serde(
-        default,
-        alias = "max_delay",
-        deserialize_with = "deserialize_optional_duration"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub maximum_delay: Option<Duration>,
     /// Upper bound for the sum of retry delays.
-    #[serde(
-        default,
-        alias = "max_total_delay",
-        deserialize_with = "deserialize_optional_duration"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub maximum_total_delay: Option<Duration>,
     /// Retries are legal only before downstream commitment. Must be true when
     /// more than one attempt is configured.
     pub before_commit_only: Option<bool>,
     /// Explicit upstream statuses eligible for a retry classification.
-    #[serde(alias = "retryable_statuses")]
     pub statuses: Vec<u16>,
 }
 
@@ -814,16 +847,42 @@ pub struct OAuthConfig {
     /// Token endpoint used to exchange an authorization code.
     pub token_endpoint: Option<String>,
     /// Optional endpoint used to revoke a provider token.
-    #[serde(alias = "revoke_endpoint")]
     pub revocation_endpoint: Option<String>,
     /// Optional identity endpoint used to discover the native account ID.
     pub identity_endpoint: Option<String>,
     /// Public OAuth client identifier.
     pub client_id: Option<String>,
+    /// Protected confidential-client secret reference. The value is resolved
+    /// only at the OAuth token-request boundary.
+    pub client_secret: Option<SecretRef>,
+    /// OAuth grant used to obtain and renew this account.
+    pub grant_type: Option<OAuthGrantType>,
     /// Requested OAuth scopes.
     pub scopes: Vec<String>,
     /// Loopback callback URI used by the local login flow.
     pub callback: Option<String>,
+}
+
+/// OAuth grant used by a configured native provider.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthGrantType {
+    /// Interactive authorization-code login with PKCE and refresh tokens.
+    #[default]
+    AuthorizationCode,
+    /// Confidential service-account login with token reacquisition.
+    ClientCredentials,
+}
+
+impl OAuthGrantType {
+    /// Stable configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthorizationCode => "authorization_code",
+            Self::ClientCredentials => "client_credentials",
+        }
+    }
 }
 
 /// Native provider declaration.
@@ -1332,6 +1391,8 @@ pub struct OAuthPlan {
     revocation_endpoint: Option<Url>,
     identity_endpoint: Option<Url>,
     client_id: Arc<str>,
+    client_secret: Option<SecretRef>,
+    grant_type: OAuthGrantType,
     scopes: Vec<Arc<str>>,
     callback: Url,
 }
@@ -1365,6 +1426,18 @@ impl OAuthPlan {
     #[must_use]
     pub fn client_id(&self) -> &str {
         &self.client_id
+    }
+
+    /// Protected confidential-client secret reference.
+    #[must_use]
+    pub const fn client_secret(&self) -> Option<&SecretRef> {
+        self.client_secret.as_ref()
+    }
+
+    /// Grant used to obtain and renew provider tokens.
+    #[must_use]
+    pub const fn grant_type(&self) -> OAuthGrantType {
+        self.grant_type
     }
 
     /// Requested OAuth scopes.
@@ -2947,7 +3020,7 @@ fn compile_config(
         let known_entry = known.map(|(_, provider)| provider);
         let (url, transport, http2, connect_timeout, request_timeout) =
             compile_upstream(declaration, known_entry, &label)?;
-        let (oauth, native) = compile_provider_auth(declaration, known_entry, &label)?;
+        let (oauth, native) = compile_provider_auth(declaration, known_entry, &url, &label)?;
         let auth = compile_upstream_auth(declaration, known_entry, &label)?;
         let required_headers = known_entry.map_or_else(
             || Ok(BTreeMap::new()),
@@ -3985,6 +4058,7 @@ fn compile_upstream_auth(
 fn compile_provider_auth(
     declaration: &UpstreamConfig,
     known: Option<&KnownProvider>,
+    upstream_url: &Url,
     label: &SourceLabel,
 ) -> Result<(Option<OAuthPlan>, Option<NativeProviderPlan>), ConfigError> {
     if declaration.oauth.is_some() && declaration.auth.is_some() {
@@ -3994,10 +4068,15 @@ fn compile_provider_auth(
         ));
     }
 
+    let is_palantir_aip = declaration
+        .native
+        .as_ref()
+        .and_then(|native| native.kind.as_deref())
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("palantir_aip"));
     let oauth = declaration
         .oauth
         .as_ref()
-        .map(|value| compile_oauth(value, label))
+        .map(|value| compile_oauth(value, is_palantir_aip.then_some(upstream_url), label))
         .transpose()?;
     let native = if let Some(native) = declaration.native.as_ref() {
         let kind = required_nonempty(native.kind.as_deref(), label, "native.kind")?;
@@ -4054,22 +4133,23 @@ fn compile_provider_auth(
     Ok((oauth, native))
 }
 
-fn compile_oauth(declaration: &OAuthConfig, label: &SourceLabel) -> Result<OAuthPlan, ConfigError> {
-    let authorization_endpoint = compile_secure_endpoint(
-        required_nonempty(
-            declaration.authorization_endpoint.as_deref(),
-            label,
-            "oauth.authorization_endpoint",
-        )?,
+fn compile_oauth(
+    declaration: &OAuthConfig,
+    palantir_enrollment: Option<&Url>,
+    label: &SourceLabel,
+) -> Result<OAuthPlan, ConfigError> {
+    let palantir_endpoints = palantir_enrollment
+        .map(|enrollment| compile_palantir_oauth_endpoints(enrollment, label))
+        .transpose()?;
+    let authorization_endpoint = compile_oauth_endpoint(
+        declaration.authorization_endpoint.as_deref(),
+        palantir_endpoints.as_ref().map(|(endpoint, _)| endpoint),
         label,
         "oauth.authorization_endpoint",
     )?;
-    let token_endpoint = compile_secure_endpoint(
-        required_nonempty(
-            declaration.token_endpoint.as_deref(),
-            label,
-            "oauth.token_endpoint",
-        )?,
+    let token_endpoint = compile_oauth_endpoint(
+        declaration.token_endpoint.as_deref(),
+        palantir_endpoints.as_ref().map(|(_, endpoint)| endpoint),
         label,
         "oauth.token_endpoint",
     )?;
@@ -4084,6 +4164,15 @@ fn compile_oauth(declaration: &OAuthConfig, label: &SourceLabel) -> Result<OAuth
         .map(|value| compile_secure_endpoint(value, label, "oauth.identity_endpoint"))
         .transpose()?;
     let client_id = required_nonempty(declaration.client_id.as_deref(), label, "oauth.client_id")?;
+    // Grant selection belongs to the upstream OAuth client registration. All
+    // accounts that select this upstream intentionally share that grant.
+    let grant_type = declaration.grant_type.unwrap_or_default();
+    if grant_type == OAuthGrantType::ClientCredentials && declaration.client_secret.is_none() {
+        return Err(invalid(
+            label,
+            "oauth.client_secret is required for client_credentials",
+        ));
+    }
     let callback = compile_loopback_callback(
         declaration
             .callback
@@ -4098,7 +4187,7 @@ fn compile_oauth(declaration: &OAuthConfig, label: &SourceLabel) -> Result<OAuth
             "oauth.scopes must contain at least one scope",
         ));
     }
-    let mut scopes = Vec::with_capacity(declaration.scopes.len());
+    let mut scopes: Vec<Arc<str>> = Vec::with_capacity(declaration.scopes.len());
     let mut seen = BTreeSet::new();
     for scope in &declaration.scopes {
         let scope = scope.trim();
@@ -4107,6 +4196,35 @@ fn compile_oauth(declaration: &OAuthConfig, label: &SourceLabel) -> Result<OAuth
         }
         scopes.push(Arc::from(scope));
     }
+    if palantir_enrollment.is_some() {
+        let has_execute_scope = scopes
+            .iter()
+            .any(|scope| scope.as_ref() == "api:use-language-models-execute");
+        if !has_execute_scope {
+            return Err(invalid(
+                label,
+                "Palantir OAuth requires the api:use-language-models-execute scope",
+            ));
+        }
+        let has_offline_access = scopes
+            .iter()
+            .any(|scope| scope.as_ref() == "offline_access");
+        match grant_type {
+            OAuthGrantType::AuthorizationCode if !has_offline_access => {
+                return Err(invalid(
+                    label,
+                    "Palantir authorization_code OAuth requires the offline_access scope",
+                ));
+            }
+            OAuthGrantType::ClientCredentials if has_offline_access => {
+                return Err(invalid(
+                    label,
+                    "Palantir client_credentials OAuth must not request offline_access",
+                ));
+            }
+            OAuthGrantType::AuthorizationCode | OAuthGrantType::ClientCredentials => {}
+        }
+    }
 
     Ok(OAuthPlan {
         authorization_endpoint,
@@ -4114,9 +4232,56 @@ fn compile_oauth(declaration: &OAuthConfig, label: &SourceLabel) -> Result<OAuth
         revocation_endpoint,
         identity_endpoint,
         client_id: Arc::from(client_id),
+        client_secret: declaration.client_secret.clone(),
+        grant_type,
         scopes,
         callback,
     })
+}
+
+fn compile_oauth_endpoint(
+    explicit: Option<&str>,
+    derived: Option<&Url>,
+    label: &SourceLabel,
+    field: &str,
+) -> Result<Url, ConfigError> {
+    let endpoint = match explicit {
+        Some(value) => compile_secure_endpoint(value, label, field)?,
+        None => derived
+            .cloned()
+            .ok_or_else(|| invalid(label, &format!("{field} is required")))?,
+    };
+    if derived.is_some_and(|expected| expected != &endpoint) {
+        return Err(invalid(
+            label,
+            &format!("{field} must use the configured Palantir enrollment origin and path"),
+        ));
+    }
+    Ok(endpoint)
+}
+
+fn compile_palantir_oauth_endpoints(
+    enrollment: &Url,
+    label: &SourceLabel,
+) -> Result<(Url, Url), ConfigError> {
+    if enrollment.scheme() != "https"
+        || enrollment.host_str().is_none()
+        || !enrollment.username().is_empty()
+        || enrollment.password().is_some()
+        || enrollment.query().is_some()
+        || enrollment.fragment().is_some()
+        || !matches!(enrollment.path(), "" | "/")
+    {
+        return Err(invalid(
+            label,
+            "Palantir AIP upstream URL must be a bare HTTPS enrollment origin without path, userinfo, query, or fragment",
+        ));
+    }
+    let mut authorization_endpoint = enrollment.clone();
+    authorization_endpoint.set_path("/multipass/api/oauth2/authorize");
+    let mut token_endpoint = enrollment.clone();
+    token_endpoint.set_path("/multipass/api/oauth2/token");
+    Ok((authorization_endpoint, token_endpoint))
 }
 
 fn required_nonempty<'a>(
@@ -5819,6 +5984,14 @@ fn valid_env_name(value: &str) -> bool {
         && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
+fn valid_managed_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+}
+
 fn nonempty(value: Option<String>) -> Option<Arc<str>> {
     value
         .map(|value| value.trim().to_owned())
@@ -7310,16 +7483,212 @@ upstreams:
       token_endpoint: https://auth.example.test/token
       revocation_endpoint: https://auth.example.test/revoke
       client_id: pooler-cli
+      client_secret: env:POOLER_OAUTH_CLIENT_SECRET
       scopes: [openid, profile]
       callback: http://127.0.0.1:8765/oauth/callback
 "#;
         let config = compile_yaml("oauth.yaml", text).expect("oauth config");
         let oauth = config.upstreams()["codex"].oauth().expect("oauth plan");
         assert_eq!(oauth.client_id(), "pooler-cli");
+        assert_eq!(
+            oauth.client_secret(),
+            Some(&SecretRef::Env(Arc::from("POOLER_OAUTH_CLIENT_SECRET")))
+        );
+        assert_eq!(oauth.grant_type(), OAuthGrantType::AuthorizationCode);
         assert_eq!(oauth.scopes().len(), 2);
         assert_eq!(oauth.callback().host_str(), Some("127.0.0.1"));
         assert!(format!("{oauth:?}").contains("pooler-cli"));
         assert!(!format!("{oauth:?}").contains("access_token"));
+    }
+
+    #[test]
+    fn palantir_oauth_endpoints_are_derived_from_the_enrollment_origin() {
+        let text = r#"
+version: 1
+upstreams:
+  foundry:
+    url: https://example.euw-3.palantirfoundry.co.uk
+    native: {kind: palantir_aip}
+    oauth:
+      client_id: operator-client
+      client_secret: keyring:pooler/palantir-client
+      scopes: [api:use-language-models-execute, offline_access]
+      callback: http://127.0.0.1:8765/oauth/callback
+accounts:
+  foundry-user: {provider: foundry, auth_kind: oauth}
+"#;
+        let config = compile_yaml("palantir-oauth.yaml", text).expect("Palantir OAuth config");
+        let upstream = &config.upstreams()["foundry"];
+        assert_eq!(
+            upstream.native().expect("native plan").kind(),
+            "palantir_aip"
+        );
+        let oauth = upstream.oauth().expect("OAuth plan");
+        assert_eq!(
+            oauth.authorization_endpoint().as_str(),
+            "https://example.euw-3.palantirfoundry.co.uk/multipass/api/oauth2/authorize"
+        );
+        assert_eq!(
+            oauth.token_endpoint().as_str(),
+            "https://example.euw-3.palantirfoundry.co.uk/multipass/api/oauth2/token"
+        );
+        assert_eq!(oauth.grant_type(), OAuthGrantType::AuthorizationCode);
+        assert_eq!(
+            oauth.client_secret(),
+            Some(&SecretRef::Keyring {
+                service: Arc::from("pooler"),
+                account: Arc::from("palantir-client"),
+            })
+        );
+        assert_eq!(
+            config.accounts()["foundry-user"].auth_kind(),
+            AccountAuthKind::OAuth
+        );
+    }
+
+    #[test]
+    fn palantir_client_credentials_requires_a_protected_secret_reference() {
+        let without_secret = r#"
+version: 1
+upstreams:
+  foundry:
+    url: https://example.palantirfoundry.com
+    native: {kind: palantir_aip}
+    oauth:
+      client_id: service-client
+      grant_type: client_credentials
+      scopes: [api:use-language-models-execute]
+"#;
+        let error = compile_yaml("palantir-client-credentials.yaml", without_secret)
+            .expect_err("client credentials needs a secret reference");
+        assert!(error
+            .to_string()
+            .contains("oauth.client_secret is required for client_credentials"));
+
+        let config = compile_yaml(
+            "palantir-client-credentials.yaml",
+            &without_secret.replace(
+                "grant_type: client_credentials",
+                "grant_type: client_credentials\n      client_secret: env:PALANTIR_CLIENT_SECRET",
+            ),
+        )
+        .expect("service OAuth config");
+        assert_eq!(
+            config.upstreams()["foundry"]
+                .oauth()
+                .expect("OAuth")
+                .grant_type(),
+            OAuthGrantType::ClientCredentials
+        );
+    }
+
+    #[test]
+    fn palantir_rejects_off_origin_oauth_endpoints_and_unsafe_enrollment_urls() {
+        let off_origin = r#"
+version: 1
+upstreams:
+  foundry:
+    url: https://example.palantirfoundry.com
+    native: {kind: palantir_aip}
+    oauth:
+      authorization_endpoint: https://attacker.example/authorize
+      token_endpoint: https://example.palantirfoundry.com/multipass/api/oauth2/token
+      client_id: operator-client
+      scopes: [api:use-language-models-execute]
+"#;
+        let error = compile_yaml("palantir-off-origin.yaml", off_origin)
+            .expect_err("off-origin endpoint must fail");
+        assert!(error
+            .to_string()
+            .contains("must use the configured Palantir enrollment origin and path"));
+
+        let insecure = off_origin
+            .replace(
+                "https://example.palantirfoundry.com",
+                "http://example.palantirfoundry.com",
+            )
+            .replace(
+                "authorization_endpoint: https://attacker.example/authorize\n      token_endpoint: http://example.palantirfoundry.com/multipass/api/oauth2/token\n      ",
+                "",
+            );
+        let error = compile_yaml("palantir-insecure.yaml", &insecure)
+            .expect_err("insecure enrollment must fail");
+        assert!(error
+            .to_string()
+            .contains("must be a bare HTTPS enrollment origin"));
+
+        let path_origin = insecure.replace(
+            "http://example.palantirfoundry.com",
+            "https://example.palantirfoundry.com/api/v2",
+        );
+        let error = compile_yaml("palantir-path-origin.yaml", &path_origin)
+            .expect_err("enrollment path must fail");
+        assert!(error
+            .to_string()
+            .contains("must be a bare HTTPS enrollment origin"));
+    }
+
+    #[test]
+    fn palantir_grants_enforce_refresh_scope_semantics() {
+        let browser_without_offline = r#"
+version: 1
+upstreams:
+  foundry:
+    url: https://example.palantirfoundry.com
+    native: {kind: palantir_aip}
+    oauth:
+      client_id: operator-client
+      scopes: [api:use-language-models-execute]
+"#;
+        let browser_missing_execute = browser_without_offline.replace(
+            "scopes: [api:use-language-models-execute]",
+            "scopes: [offline_access]",
+        );
+        let service_missing_execute = browser_without_offline
+            .replace(
+                "client_id: operator-client",
+                "client_id: service-client\n      client_secret: env:PALANTIR_CLIENT_SECRET\n      grant_type: client_credentials",
+            )
+            .replace(
+                "scopes: [api:use-language-models-execute]",
+                "scopes: [api:usage:language-models-execute]",
+            );
+        for (name, yaml) in [
+            (
+                "palantir-browser-execute-scope.yaml",
+                browser_missing_execute,
+            ),
+            (
+                "palantir-service-execute-scope.yaml",
+                service_missing_execute,
+            ),
+        ] {
+            let error = compile_yaml(name, &yaml).expect_err("execute scope is mandatory");
+            assert!(error
+                .to_string()
+                .contains("requires the api:use-language-models-execute scope"));
+        }
+
+        let error = compile_yaml("palantir-browser-scope.yaml", browser_without_offline)
+            .expect_err("browser login needs refresh-token scope");
+        assert!(error
+            .to_string()
+            .contains("requires the offline_access scope"));
+
+        let service_with_offline = browser_without_offline
+            .replace(
+                "client_id: operator-client",
+                "client_id: service-client\n      client_secret: env:PALANTIR_CLIENT_SECRET\n      grant_type: client_credentials",
+            )
+            .replace(
+                "scopes: [api:use-language-models-execute]",
+                "scopes: [api:use-language-models-execute, offline_access]",
+            );
+        let error = compile_yaml("palantir-service-scope.yaml", &service_with_offline)
+            .expect_err("service grant must not request refresh tokens");
+        assert!(error
+            .to_string()
+            .contains("must not request offline_access"));
     }
 
     #[test]
