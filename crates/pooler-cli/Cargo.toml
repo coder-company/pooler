@@ -29,12 +29,12 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 rustix.workspace = true
+tempfile.workspace = true
 url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 http.workspace = true
-tempfile.workspace = true
 
 [lib]
 name = "pooler_cli"

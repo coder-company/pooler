@@ -34,6 +34,7 @@ CSP = (
 class MockState:
     def __init__(self) -> None:
         self.fail_providers = False
+        self.fail_usage_export = False
         self.fail_all_reads = False
         self.slow_models = False
         self.reject_all = False
@@ -490,6 +491,13 @@ class Handler(BaseHTTPRequestHandler):
                 503, b'{"error":"provider state unavailable"}', "application/json"
             )
             return
+        if route == "/management/usage/export" and STATE.fail_usage_export:
+            self.send_bytes(
+                503,
+                b'{"error":"usage export <unsafe>"}',
+                "application/json",
+            )
+            return
         if STATE.slow_models and route in {"/management/models", "/management/catalog"}:
             STATE.models_started.set()
             time.sleep(0.45)
@@ -939,6 +947,25 @@ def run_browser(playwright) -> None:
             ),
             "usage time-range selection did not issue a bounded query",
         )
+        STATE.fail_usage_export = True
+        page.locator("#usage-export").click()
+        page.locator(".banner-error").last.wait_for()
+        usage_export_error = page.locator(".banner-error").last
+        expect(
+            usage_export_error.inner_text()
+            == "Usage export failed: usage export <unsafe>",
+            "usage export failure was not rendered as plain text",
+        )
+        expect(
+            usage_export_error.locator("img").count() == 0,
+            "server-provided usage export error was interpreted as HTML",
+        )
+        expect(not errors, f"usage export failure caused a browser error: {errors}")
+        expect(
+            page.locator("#usage-export").is_enabled(),
+            "usage export remained disabled after a failed request",
+        )
+        STATE.fail_usage_export = False
 
         page.locator('[data-route="requests"]').click()
         page.wait_for_selector('[data-request-id="pool-request-browser-1"]')
@@ -1280,6 +1307,18 @@ def run_browser(playwright) -> None:
             page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"),
             "320px setup layout overflows the viewport",
         )
+
+        page.locator('[data-route="usage"]').click()
+        page.wait_for_selector("#usage-export")
+        STATE.reject_all = True
+        page.locator("#usage-export").click()
+        authorization_required = page.get_by_text("Authorization required", exact=True)
+        authorization_required.wait_for()
+        expect(
+            authorization_required.count() == 1,
+            "usage export authentication failure did not enter the authorization-required state",
+        )
+        STATE.reject_all = False
         expect(not errors, f"browser page errors: {errors}")
         print("PASS: management dashboard browser QA")
     finally:

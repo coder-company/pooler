@@ -113,7 +113,11 @@ pub(crate) fn cliproxy(input: &Path, dry_run: bool, output: Option<&Path>) -> Re
     }
 
     let mut wrote_files = false;
-    if !dry_run {
+    if dry_run {
+        if let Some(config) = proposed_config.as_deref() {
+            validate_generated_config(input, output, config.as_bytes())?;
+        }
+    } else {
         let destination = output.ok_or_else(|| anyhow!("non-dry migration requires --output"))?;
         let config = proposed_config.as_deref().ok_or_else(|| {
             anyhow!("no safely translatable OpenAI-compatible providers were found")
@@ -178,6 +182,7 @@ fn translate(config: &LegacyConfig) -> Result<(Option<String>, Vec<String>, usiz
     let mut imports = Vec::new();
     let mut secret_refs = Vec::new();
     let mut aliases = 0;
+    let env_names = migrated_env_names(config)?;
     for (index, provider) in config.openai_compatibility.iter().enumerate() {
         aliases += provider.models.len();
         if provider.disabled {
@@ -190,7 +195,9 @@ fn translate(config: &LegacyConfig) -> Result<(Option<String>, Vec<String>, usiz
                 "compatible provider name cannot form a Pooler identifier"
             ));
         }
-        let env_name = format!("POOLER_MIGRATED_{}_KEY", id.to_ascii_uppercase());
+        let env_name = env_names[index]
+            .as_deref()
+            .expect("active providers always have a generated environment name");
         let secret_ref = format!("env:{env_name}");
         secret_refs.push(secret_ref.clone());
         imports.push(format!(
@@ -211,6 +218,53 @@ fn translate(config: &LegacyConfig) -> Result<(Option<String>, Vec<String>, usiz
         translated,
         aliases,
     ))
+}
+
+/// Generate valid, deterministic environment names for active providers and
+/// reject names whose normalization would alias one another.
+fn migrated_env_names(config: &LegacyConfig) -> Result<Vec<Option<String>>> {
+    let mut seen = BTreeMap::<String, (usize, String)>::new();
+    let mut names = Vec::with_capacity(config.openai_compatibility.len());
+    for (index, provider) in config.openai_compatibility.iter().enumerate() {
+        if provider.disabled {
+            names.push(None);
+            continue;
+        }
+        let id = normalize_env_id(&provider.name)?;
+        let env_name = format!("POOLER_MIGRATED_{id}_KEY");
+        if let Some((other_index, other_name)) =
+            seen.insert(env_name.clone(), (index, provider.name.clone()))
+        {
+            return Err(anyhow!(
+                "compatible provider names {:?} (index {}) and {:?} (index {}) normalize to the same environment variable {:?}",
+                other_name,
+                other_index,
+                provider.name,
+                index,
+                env_name,
+            ));
+        }
+        names.push(Some(env_name));
+    }
+    Ok(names)
+}
+
+fn normalize_env_id(value: &str) -> Result<String> {
+    let mut normalized = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_uppercase());
+        } else if !normalized.ends_with('_') {
+            normalized.push('_');
+        }
+    }
+    let normalized = normalized.trim_matches('_');
+    if normalized.is_empty() {
+        return Err(anyhow!(
+            "compatible provider name cannot form an environment variable identifier"
+        ));
+    }
+    Ok(normalized.to_owned())
 }
 
 fn validate_base_url(value: &str) -> Result<Url> {
@@ -308,6 +362,24 @@ fn write_validated_new(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+fn validate_generated_config(input: &Path, output: Option<&Path>, bytes: &[u8]) -> Result<()> {
+    let anchor = output.unwrap_or(input);
+    let parent = anchor.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create dry-run validation file beside {}", anchor.display()))?;
+    temporary
+        .write_all(bytes)
+        .context("write dry-run validation file")?;
+    temporary
+        .as_file()
+        .sync_all()
+        .context("sync dry-run validation file")?;
+    pooler_config::load_path(temporary.path())
+        .and_then(|config| config.compile())
+        .map(|_| ())
+        .context("translated Pooler configuration failed validation")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +421,100 @@ openai-compatibility:
         std::fs::write(&input, LEGACY).expect("legacy config");
         cliproxy(&input, true, Some(&output)).expect("dry run");
         assert!(!output.exists());
+        assert!(!directory
+            .path()
+            .join(format!(
+                ".pooler-migrate-dry-run-{}.tmp",
+                std::process::id()
+            ))
+            .exists());
+    }
+
+    #[test]
+    fn migration_normalizes_provider_names_for_environment_references() {
+        let legacy: LegacyConfig =
+            serde_yml::from_str(&LEGACY.replace("openrouter", "foo-bar")).expect("legacy config");
+        let (_, references, _, _) = translate(&legacy).expect("translation");
+        assert_eq!(references, ["env:POOLER_MIGRATED_FOO_BAR_KEY"]);
+    }
+
+    #[test]
+    fn migration_rejects_colliding_normalized_environment_references() {
+        let legacy: LegacyConfig = serde_yml::from_str(
+            r#"
+openai-compatibility:
+  - name: foo-bar
+    base-url: https://example.com/v1
+  - name: foo bar
+    base-url: https://example.org/v1
+"#,
+        )
+        .expect("legacy config");
+        let error = translate(&legacy).expect_err("colliding names rejected");
+        assert!(error.to_string().contains(
+            "normalize to the same environment variable \"POOLER_MIGRATED_FOO_BAR_KEY\""
+        ));
+    }
+
+    #[test]
+    fn migration_rejects_names_without_identifier_characters() {
+        let legacy: LegacyConfig = serde_yml::from_str(
+            r#"
+openai-compatibility:
+  - name: "---"
+    base-url: https://example.com/v1
+"#,
+        )
+        .expect("legacy config");
+        let error = translate(&legacy).expect_err("invalid name rejected");
+        assert!(error
+            .to_string()
+            .contains("cannot form an environment variable identifier"));
+    }
+
+    #[test]
+    fn dry_run_validation_rejects_invalid_expanded_configuration() {
+        let directory = tempfile::tempdir().expect("directory");
+        let input = directory.path().join("cliproxy.yaml");
+        let error = validate_generated_config(
+            &input,
+            None,
+            b"imports:\n  - preset: unsupported\nversion: 1\n",
+        )
+        .expect_err("invalid preset rejected");
+        assert!(error
+            .to_string()
+            .contains("translated Pooler configuration"));
+        assert!(!directory
+            .path()
+            .join(format!(
+                ".pooler-migrate-dry-run-{}.tmp",
+                std::process::id()
+            ))
+            .exists());
+    }
+
+    #[test]
+    fn dry_run_validation_never_removes_a_preexisting_predictable_path() {
+        let directory = tempfile::tempdir().expect("directory");
+        let input = directory.path().join("cliproxy.yaml");
+        let sentinel = directory.path().join(format!(
+            ".pooler-migrate-dry-run-{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&sentinel, b"operator-owned").expect("sentinel");
+
+        validate_generated_config(
+            &input,
+            None,
+            b"version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\n",
+        )
+        .expect("validation succeeds beside sentinel");
+
+        assert_eq!(
+            std::fs::read(&sentinel).expect("sentinel remains"),
+            b"operator-owned"
+        );
     }
 
     #[test]

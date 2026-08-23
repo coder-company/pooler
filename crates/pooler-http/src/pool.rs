@@ -753,6 +753,7 @@ impl PoolingCoordinator {
     pub fn published_models(
         &self,
         config: &CompiledConfig,
+        provider: &str,
         required: CapabilitySet,
     ) -> Result<PublishedModels, PoolError> {
         let snapshot = self.catalog.as_ref().map(|catalog| catalog.snapshot());
@@ -760,21 +761,27 @@ impl PoolingCoordinator {
         let cooling: BTreeSet<String> = self
             .cooldowns()?
             .into_iter()
-            .filter(|cooldown| cooldown.until > now)
+            .filter(|cooldown| cooldown.scope == "provider" && cooldown.until > now)
             .map(|cooldown| cooldown.key)
             .collect();
-        let unusable_providers: BTreeSet<String> = self
-            .credential_states()?
-            .into_iter()
-            .filter(|state| !state.enabled)
-            .map(|state| state.provider_id)
-            .collect();
+        let mut provider_credentials = BTreeMap::<String, bool>::new();
+        for state in self.credential_states()? {
+            if !self.accounts.contains_key(&state.credential_id) {
+                continue;
+            }
+            provider_credentials
+                .entry(state.provider_id)
+                .and_modify(|enabled| *enabled |= state.enabled)
+                .or_insert(state.enabled);
+        }
 
         // A provider is usable when it is not cooling down and at least one of
         // its credentials is still enabled. A deployment with no credential
         // state at all has nothing to contradict, so configuration stands.
-        let provider_is_usable =
-            |provider: &str| !cooling.contains(provider) && !unusable_providers.contains(provider);
+        let provider_is_usable = |provider: &str| {
+            !cooling.contains(provider)
+                && provider_credentials.get(provider).copied().unwrap_or(true)
+        };
 
         let mut published = BTreeSet::new();
         for (id, model) in config.models() {
@@ -782,7 +789,8 @@ impl PoolingCoordinator {
                 continue;
             }
             if model.targets().iter().any(|target| {
-                target.capabilities().contains_all(required)
+                target.provider() == provider
+                    && target.capabilities().contains_all(required)
                     && provider_is_usable(target.provider())
             }) {
                 published.insert(id.to_string());
@@ -795,7 +803,8 @@ impl PoolingCoordinator {
                     continue;
                 }
                 if model.targets().iter().any(|target| {
-                    target.capabilities().contains_all(required)
+                    target.provider().as_str() == provider
+                        && target.capabilities().contains_all(required)
                         && provider_is_usable(target.provider().as_str())
                 }) {
                     published.insert(id.to_owned());
@@ -2347,11 +2356,12 @@ fn unix_millis_from_instant(now: Instant, instant: Instant) -> Timestamp {
     timestamp_now().saturating_add(instant.saturating_duration_since(now).as_millis() as u64)
 }
 
-/// Apply one configured account secret using the upstream provider's auth kind.
+/// Apply one configured account secret using the upstream provider's complete
+/// authentication placement.
 pub fn apply_configured_account_auth(
     headers: &mut HeaderMap,
     secret: Option<&SecretRef>,
-    configured_kind: Option<&str>,
+    configured_auth: Option<&pooler_config::AuthPlan>,
 ) -> Result<bool, PoolError> {
     let Some(secret) = secret else {
         return Ok(false);
@@ -2368,8 +2378,12 @@ pub fn apply_configured_account_auth(
     if value.expose_secret().chars().any(char::is_whitespace) {
         return Err(PoolError::Store);
     }
-    let placement = AuthPlacement::from_configured_kind(configured_kind.unwrap_or("bearer_secret"))
-        .map_err(|_| PoolError::Store)?;
+    let placement = if let Some(auth) = configured_auth {
+        AuthPlacement::from_configured_parts(auth.kind(), auth.header(), auth.value_prefix())
+    } else {
+        AuthPlacement::from_configured_parts("bearer_secret", None, None)
+    }
+    .map_err(|_| PoolError::Store)?;
     let authorization = placement
         .materialize(&value)
         .map_err(|_| PoolError::Store)?;
@@ -2387,6 +2401,45 @@ mod tests {
     use super::*;
     use http::HeaderValue;
     use pooler_config::compile_yaml;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn account_secret_preserves_custom_header_placement() {
+        let mut secret = NamedTempFile::new().expect("temporary account secret");
+        secret
+            .write_all(b"account-secret")
+            .expect("account secret contents");
+        let secret_ref = SecretRef::File(Arc::from(secret.path().to_string_lossy().into_owned()));
+        let config = compile_yaml(
+            "custom-account-auth.yaml",
+            r#"
+version: 1
+upstreams:
+  custom:
+    url: https://provider.example
+    auth:
+      kind: header
+      header: api-key
+      value_prefix: 'Token '
+      secret: env:UPSTREAM_UNUSED
+"#,
+        )
+        .expect("custom auth config");
+        let mut headers = HeaderMap::new();
+
+        assert!(apply_configured_account_auth(
+            &mut headers,
+            Some(&secret_ref),
+            config.upstreams()["custom"].auth(),
+        )
+        .expect("account auth applies"));
+        assert_eq!(
+            headers.get("api-key"),
+            Some(&HeaderValue::from_static("Token account-secret"))
+        );
+        assert!(!headers.contains_key(http::header::AUTHORIZATION));
+    }
 
     fn pooled_config(affinity: bool) -> CompiledConfig {
         let affinity = if affinity {
@@ -2409,6 +2462,58 @@ mod tests {
             headers.insert("x-session", HeaderValue::from_str(session).expect("header"));
         }
         headers
+    }
+
+    #[test]
+    fn published_models_stay_provider_scoped_with_a_disabled_sibling_account() {
+        let config = compile_yaml(
+            "published-model-scope.yaml",
+            r#"
+version: 1
+upstreams:
+  first: {url: http://127.0.0.1:1}
+  second: {url: http://127.0.0.1:2}
+accounts:
+  first-selected: {provider: first, secret: env:FIRST_SELECTED}
+  first-disabled: {provider: first, secret: env:FIRST_DISABLED}
+models:
+  - id: first-model
+    targets: [{provider: first, upstream_model: first-private}]
+  - id: second-model
+    targets: [{provider: second, upstream_model: second-private}]
+"#,
+        )
+        .expect("published model config");
+        let store = Arc::new(MemoryStore::new());
+        store
+            .upsert_credential_state(CredentialState::new(
+                "removed-account",
+                "first",
+                true,
+                timestamp_now(),
+            ))
+            .expect("stale credential state");
+        let coordinator = PoolingCoordinator::with_store(&config, store).expect("coordinator");
+        coordinator
+            .set_account_enabled("first-disabled", false)
+            .expect("disable sibling");
+
+        let published = coordinator
+            .published_models(&config, "first", CapabilitySet::new())
+            .expect("published models");
+
+        assert_eq!(published.models(), &["first-model".to_owned()]);
+
+        coordinator
+            .set_account_enabled("first-selected", false)
+            .expect("disable selected account");
+        let published = coordinator
+            .published_models(&config, "first", CapabilitySet::new())
+            .expect("published models without an eligible current account");
+        assert!(
+            published.models().is_empty(),
+            "a removed enabled account must not keep the provider visible"
+        );
     }
 
     fn project_quota_config() -> CompiledConfig {

@@ -918,10 +918,11 @@ where
     /// account IDs, secret references, and upstream endpoints are absent by
     /// construction: only public model IDs reach this response.
     fn serve_model_catalog(&self, route: &RoutePlan) -> Response<ProxyBody> {
-        let published = match self
-            .pooling
-            .published_models(&self.config, route.target().capabilities())
-        {
+        let published = match self.pooling.published_models(
+            &self.config,
+            route.target().upstream(),
+            route.target().capabilities(),
+        ) {
             Ok(published) => published,
             Err(_) => {
                 return plain_response(
@@ -1269,7 +1270,7 @@ where
             crate::pool::apply_configured_account_auth(
                 &mut headers,
                 selection.account_secret(),
-                upstream.auth().map(pooler_config::AuthPlan::kind),
+                upstream.auth(),
             )
             .map_err(pool_error)?;
         } else {
@@ -2204,7 +2205,7 @@ where
             let _ = crate::pool::apply_configured_account_auth(
                 &mut headers,
                 selection.account_secret(),
-                upstream.auth().map(pooler_config::AuthPlan::kind),
+                upstream.auth(),
             )
             .map_err(pool_error)?;
         } else {
@@ -2313,7 +2314,7 @@ where
             crate::pool::apply_configured_account_auth(
                 &mut headers,
                 selection.account_secret(),
-                upstream.auth().map(pooler_config::AuthPlan::kind),
+                upstream.auth(),
             )
             .map_err(pool_error)?;
         } else {

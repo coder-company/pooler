@@ -618,8 +618,7 @@ impl HttpProviderCatalogFetcher {
                 .apply_to(&mut headers)
                 .map_err(|_| authentication_failure())?;
         } else if let Some(account) = &self.account {
-            let configured_kind = self.upstream.auth().map(|auth| auth.kind());
-            apply_configured_account_auth(&mut headers, account.secret(), configured_kind)
+            apply_configured_account_auth(&mut headers, account.secret(), self.upstream.auth())
                 .map_err(|_| authentication_failure())?;
         } else if self.upstream.oauth().is_some() {
             return Err(authentication_failure());

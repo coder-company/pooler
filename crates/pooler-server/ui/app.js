@@ -278,11 +278,27 @@
         warning: "warning-triangle",
         info: "info-empty",
       }[kind] || "info-empty";
-    banner.innerHTML = `
-      <span class="banner-icon">${ic(iconName, 16)}</span>
-      <div class="banner-body">${message}</div>
-      <button class="banner-dismiss" type="button" aria-label="Dismiss">${ic("cancel", 14)}</button>`;
-    $(".banner-dismiss", banner).addEventListener("click", () =>
+    const icon = document.createElement("span");
+    icon.className = "banner-icon";
+    icon.innerHTML = ic(iconName, 16);
+    const body = document.createElement("div");
+    body.className = "banner-body";
+    body.append(document.createTextNode(String(message ?? "")));
+    if (options.action) {
+      const action = document.createElement("button");
+      action.className = "btn btn-outline btn-xs";
+      action.type = "button";
+      action.dataset.openSession = "";
+      action.textContent = options.action.label;
+      body.append(" ", action);
+    }
+    const dismiss = document.createElement("button");
+    dismiss.className = "banner-dismiss";
+    dismiss.type = "button";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.innerHTML = ic("cancel", 14);
+    banner.append(icon, body, dismiss);
+    dismiss.addEventListener("click", () =>
       banner.remove(),
     );
     area.append(banner);
@@ -354,8 +370,12 @@
     if (!firstPrompt) return;
     notify(
       "warning",
-      `Authorization is required or the current token was rejected. <button class="btn btn-outline btn-xs" type="button" data-open-session>Open session</button>`,
-      { sticky: true, id: "auth" },
+      "Authorization is required or the current token was rejected.",
+      {
+        sticky: true,
+        id: "auth",
+        action: { label: "Open session" },
+      },
     );
     openSessionDialog();
   }
@@ -940,7 +960,7 @@
         editor.confirmationToken = "";
         notify(
           "success",
-          `Configuration reload request ${esc(result.request_id)} accepted.`,
+          `Configuration reload request ${result.request_id} accepted.`,
         );
         await refreshCurrentView();
       } else if (action === "rollback") {
@@ -959,7 +979,7 @@
         );
         notify(
           "success",
-          `Rollback reload request ${esc(result.request_id)} accepted.`,
+          `Rollback reload request ${result.request_id} accepted.`,
         );
         await refreshCurrentView();
       }
@@ -975,11 +995,9 @@
       else
         notify(
           "error",
-          esc(
-            error instanceof SyntaxError
-              ? "Typed JSON value is invalid."
-              : error.message,
-          ),
+          error instanceof SyntaxError
+            ? "Typed JSON value is invalid."
+            : error.message,
         );
     } finally {
       editor.busy = false;
@@ -1241,7 +1259,7 @@
       )
         return;
       if (error.status === 401) authRequired();
-      else notify("error", esc(error.message));
+      else notify("error", error.message);
     } finally {
       if (
         sessionGeneration === state.sessionGeneration &&
@@ -1322,7 +1340,7 @@
       )
         return;
       if (error.status === 401) authRequired();
-      else notify("error", esc(error.message));
+      else notify("error", error.message);
     } finally {
       if (
         sessionGeneration === state.sessionGeneration &&
@@ -2501,7 +2519,8 @@
           `pooler-usage-${state.usageRange}`,
         );
       } catch (error) {
-        showBanner("error", `Usage export failed: ${error.message}`);
+        if (error.status === 401) authRequired();
+        else notify("error", `Usage export failed: ${error.message}`);
       } finally {
         button.disabled = false;
       }
@@ -2568,7 +2587,7 @@
       explorer.timeline = { [requestId]: result.timeline || [] };
     } catch (error) {
       if (error.status === 401) authRequired();
-      else notify("error", esc(error.message));
+      else notify("error", error.message);
     } finally {
       explorer.busy = false;
       if (state.route === "requests") renderRequests($("#view"));
@@ -2593,7 +2612,7 @@
       notify("success", "Redacted request history exported.");
     } catch (error) {
       if (error.status === 401) authRequired();
-      else notify("error", esc(error.message));
+      else notify("error", error.message);
     } finally {
       explorer.busy = false;
       if (state.route === "requests") renderRequests($("#view"));
@@ -3137,7 +3156,7 @@
       if (error.status === 401) {
         authRequired();
       } else {
-        notify("error", esc(error.message));
+        notify("error", error.message);
       }
     } finally {
       if (sessionGeneration === state.sessionGeneration) {
@@ -3166,8 +3185,8 @@
             destructive: true,
           },
           queuedMessage: () =>
-            `Revocation queued for ${esc(accountId)}. The result lands in the audit log under Operations.`,
-          successMessage: () => `Revoked ${esc(accountId)}.`,
+            `Revocation queued for ${accountId}. The result lands in the audit log under Operations.`,
+          successMessage: () => `Revoked ${accountId}.`,
         },
         trigger,
       );
@@ -3177,8 +3196,8 @@
         path,
         {
           queuedMessage: () =>
-            `Refresh queued for ${esc(accountId)}. The result lands in the audit log under Operations.`,
-          successMessage: () => `Refresh requested for ${esc(accountId)}.`,
+            `Refresh queued for ${accountId}. The result lands in the audit log under Operations.`,
+          successMessage: () => `Refresh requested for ${accountId}.`,
         },
         trigger,
       );
@@ -3193,14 +3212,14 @@
             acceptLabel: "Switch account",
           },
           successMessage: () =>
-            `Switched to ${esc(accountId)}; same-provider siblings were disabled.`,
+            `Switched to ${accountId}; same-provider siblings were disabled.`,
         },
         trigger,
       );
     }
     return runMutation(
       path,
-      { successMessage: () => `${label}d ${esc(accountId)}.` },
+      { successMessage: () => `${label}d ${accountId}.` },
       trigger,
     );
   }
@@ -3581,7 +3600,7 @@
             acceptLabel: "Reload",
           },
           queuedMessage: (result) =>
-            `Reload request ${esc(result.request_id)} accepted. Follow its final outcome in Reload history.`,
+            `Reload request ${result.request_id} accepted. Follow its final outcome in Reload history.`,
           successMessage: () => "Reload requested.",
         },
         trigger,
@@ -3591,7 +3610,7 @@
         "/models/reload",
         {
           queuedMessage: (result) =>
-            `Catalog refresh request ${esc(result.request_id)} accepted. Follow its final outcome in Reload history.`,
+            `Catalog refresh request ${result.request_id} accepted. Follow its final outcome in Reload history.`,
         },
         trigger,
       );
@@ -3610,7 +3629,7 @@
         .catch((error) => {
           if (sessionGeneration !== state.sessionGeneration) return;
           if (error.status === 401) authRequired();
-          else notify("error", esc(error.message));
+          else notify("error", error.message);
         })
         .finally(() => {
           if (sessionGeneration !== state.sessionGeneration) return;
