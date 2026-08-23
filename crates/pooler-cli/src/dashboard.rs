@@ -98,7 +98,7 @@ mod tests {
         let path = directory.path().join("pooler.yaml");
         std::fs::write(
             &path,
-            "version: 1\nmanagement:\n  bind: 127.0.0.1:18477\n  auth:\n    secret: env:POOLER_MANAGEMENT_TOKEN\n",
+            "version: 2\nmanagement:\n  bind: 127.0.0.1:18477\n  auth:\n    secret: env:POOLER_MANAGEMENT_TOKEN\n",
         )
         .expect("config");
         assert_eq!(

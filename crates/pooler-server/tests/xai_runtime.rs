@@ -329,7 +329,7 @@ fn xai_rest_config(upstream_address: SocketAddr, wire: RestWire) -> pooler_confi
     compile_yaml(
         "xai-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{xai: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: xai-rest\n    listen: local\n    match: {{method: POST, path: {path}, content_types: [application/json], websocket: false}}\n    ingress: {{mode: semantic, decoder: {request_decoder}}}\n    target: {{provider: xai, path: {path}}}\n    response: {{mode: semantic, decoder: {response_decoder}, encoder: {response_encoder}}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{xai: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: xai-rest\n    listen: local\n    match: {{method: POST, path: {path}, content_types: [application/json], websocket: false}}\n    ingress: {{mode: semantic, decoder: {request_decoder}}}\n    target: {{provider: xai, path: {path}}}\n    response: {{mode: semantic, decoder: {response_decoder}, encoder: {response_encoder}}}\n    loss_policy: reject\n"
         ),
     )
     .expect("xAI REST runtime config")
@@ -339,7 +339,7 @@ fn xai_semantic_websocket_config(upstream_address: SocketAddr) -> pooler_config:
     compile_yaml(
         "xai-semantic-websocket.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{xai: {{url: ws://{upstream_address}}}}}\nroutes:\n  - id: xai-responses-realtime\n    listen: local\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: decode.xai.responses, encoder: encode.xai.responses}}\n    target: {{provider: xai, path: /v1/responses}}\n    response: {{mode: semantic, decoder: decode.xai.responses.events, encoder: encode.xai.responses.events}}\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{xai: {{url: ws://{upstream_address}}}}}\nroutes:\n  - id: xai-responses-realtime\n    listen: local\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: decode.xai.responses, encoder: encode.xai.responses}}\n    target: {{provider: xai, path: /v1/responses}}\n    response: {{mode: semantic, decoder: decode.xai.responses.events, encoder: encode.xai.responses.events}}\n"
         ),
     )
     .expect("xAI semantic WebSocket runtime config")
@@ -349,7 +349,7 @@ fn xai_websocket_config(upstream_address: SocketAddr) -> pooler_config::Compiled
     compile_yaml(
         "xai-websocket.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{xai: {{url: ws://{upstream_address}}}}}\nroutes:\n  - id: xai-responses-websocket\n    listen: local\n    match: {{method: GET, path: /v1/responses, websocket: true}}\n    limits: {{max_frame_bytes: 8388608, max_queue_bytes: 8388608, max_queue_items: 64, request_timeout: null}}\n    ingress: {{mode: opaque}}\n    target: {{provider: xai, path: /v1/responses}}\n    response: {{mode: opaque}}\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{xai: {{url: ws://{upstream_address}}}}}\nroutes:\n  - id: xai-responses-websocket\n    listen: local\n    match: {{method: GET, path: /v1/responses, websocket: true}}\n    limits: {{max_frame_bytes: 8388608, max_queue_bytes: 8388608, max_queue_items: 64, request_timeout: null}}\n    ingress: {{mode: opaque}}\n    target: {{provider: xai, path: /v1/responses}}\n    response: {{mode: opaque}}\n"
         ),
     )
     .expect("xAI WebSocket runtime config")

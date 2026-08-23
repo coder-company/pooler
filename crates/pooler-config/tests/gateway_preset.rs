@@ -350,7 +350,7 @@ fn two_gateway_aliases_stay_isolated() {
     let mut file = std::fs::File::create(&path).expect("config file");
     write!(
         file,
-        "imports:\n  - preset: gateway\n    as: first\n    with: {{bind: 127.0.0.1:18601, secret: 'env:FIRST_KEY'}}\n  - preset: gateway\n    as: second\n    with: {{bind: 127.0.0.1:18602, provider: anthropic, secret: 'env:SECOND_KEY'}}\n\nversion: 1\n"
+        "imports:\n  - preset: gateway\n    as: first\n    with: {{bind: 127.0.0.1:18601, secret: 'env:FIRST_KEY'}}\n  - preset: gateway\n    as: second\n    with: {{bind: 127.0.0.1:18602, provider: anthropic, secret: 'env:SECOND_KEY'}}\n\nversion: 2\n"
     )
     .expect("config contents");
     drop(file);
@@ -470,7 +470,7 @@ fn each_provider_mounts_only_its_documented_endpoint_families() {
         std::fs::write(
             &path,
             format!(
-                "imports:\n  - preset: gateway\n    as: gw\n    with: {{bind: 127.0.0.1:0, provider: {provider}, secret: 'env:K'}}\n\nversion: 1\n"
+                "imports:\n  - preset: gateway\n    as: gw\n    with: {{bind: 127.0.0.1:0, provider: {provider}, secret: 'env:K'}}\n\nversion: 2\n"
             ),
         )
         .expect("config contents");
@@ -493,7 +493,7 @@ fn xai_gateway_uses_xai_semantics_for_the_responses_websocket_transport() {
     let path = directory.path().join("gateway.yaml");
     std::fs::write(
         &path,
-        "imports:\n  - preset: gateway\n    as: gw\n    with: {bind: 127.0.0.1:0, provider: xai, websocket_url: 'wss://api.x.ai', secret: 'env:K'}\n\nversion: 1\n",
+        "imports:\n  - preset: gateway\n    as: gw\n    with: {bind: 127.0.0.1:0, provider: xai, websocket_url: 'wss://api.x.ai', secret: 'env:K'}\n\nversion: 2\n",
     )
     .expect("config contents");
     let config = load_path(&path)
@@ -519,7 +519,7 @@ fn route_transport_upstream_accepts_an_arbitrary_ws_upstream_name() {
     let config = pooler_config::compile_yaml(
         "explicit-transport-upstream.yaml",
         r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams:
   model-provider: {url: http://127.0.0.1:1}
@@ -548,7 +548,7 @@ fn route_transport_upstream_rejects_a_missing_upstream() {
     let error = pooler_config::compile_yaml(
         "missing-transport-upstream.yaml",
         r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {model-provider: {url: http://127.0.0.1:1}}
 routes:
@@ -569,7 +569,7 @@ fn route_transport_upstream_rejects_a_non_websocket_upstream() {
     let error = pooler_config::compile_yaml(
         "incompatible-transport-upstream.yaml",
         r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams:
   model-provider: {url: http://127.0.0.1:1}
@@ -600,7 +600,7 @@ fn an_undocumented_endpoint_family_is_rejected_at_compile_time() {
     let path = directory.path().join("bad.yaml");
     std::fs::write(
         &path,
-        "version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  openai:\n    known_provider: openai\n    auth: {secret: env:K}\nroutes:\n  - id: anthropic-on-openai\n    listen: local\n    match: {methods: [POST], path: /v1/messages}\n    ingress: {mode: opaque}\n    target: {provider: openai, endpoint_family: messages}\n    response: {mode: opaque}\n",
+        "version: 2\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  openai:\n    known_provider: openai\n    auth: {secret: env:K}\nroutes:\n  - id: anthropic-on-openai\n    listen: local\n    match: {methods: [POST], path: /v1/messages}\n    ingress: {mode: opaque}\n    target: {provider: openai, endpoint_family: messages}\n    response: {mode: opaque}\n",
     )
     .expect("config contents");
 
@@ -624,7 +624,7 @@ fn an_operator_configured_upstream_keeps_its_declared_family() {
     let path = directory.path().join("private.yaml");
     std::fs::write(
         &path,
-        "version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams: {private: {url: 'http://127.0.0.1:9', auth: {secret: env:K}}}\nroutes:\n  - id: anything\n    listen: local\n    match: {methods: [POST], path: /v1/messages}\n    ingress: {mode: opaque}\n    target: {provider: private, endpoint_family: messages}\n    response: {mode: opaque}\n",
+        "version: 2\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams: {private: {url: 'http://127.0.0.1:9', auth: {secret: env:K}}}\nroutes:\n  - id: anything\n    listen: local\n    match: {methods: [POST], path: /v1/messages}\n    ingress: {mode: opaque}\n    target: {provider: private, endpoint_family: messages}\n    response: {mode: opaque}\n",
     )
     .expect("config contents");
 
@@ -640,7 +640,7 @@ fn the_gateway_preset_rejects_an_unknown_parameter() {
     let path = directory.path().join("bad.yaml");
     std::fs::write(
         &path,
-        "imports:\n  - preset: gateway\n    with: {bogus: 1}\n\nversion: 1\n",
+        "imports:\n  - preset: gateway\n    with: {bogus: 1}\n\nversion: 2\n",
     )
     .expect("config contents");
 
@@ -686,7 +686,7 @@ fn the_schema_preset_enum_matches_every_preset_the_loader_accepts() {
         let path = directory.path().join("preset.yaml");
         std::fs::write(
             &path,
-            format!("imports:\n  - preset: {preset}\n\nversion: 1\n"),
+            format!("imports:\n  - preset: {preset}\n\nversion: 2\n"),
         )
         .expect("config contents");
         let error = load_path(&path).err().map(|error| error.to_string());
@@ -743,7 +743,7 @@ fn a_gateway_alias_keeps_each_providers_documented_credential_placement() {
         std::fs::write(
             &path,
             format!(
-                "imports:\n  - preset: gateway\n    as: gw\n    with: {{bind: 127.0.0.1:0, provider: {provider}, secret: 'env:OPERATOR_KEY'}}\n\nversion: 1\n"
+                "imports:\n  - preset: gateway\n    as: gw\n    with: {{bind: 127.0.0.1:0, provider: {provider}, secret: 'env:OPERATOR_KEY'}}\n\nversion: 2\n"
             ),
         )
         .expect("config contents");
@@ -778,7 +778,7 @@ fn an_explicit_placement_still_outranks_the_provider_default() {
     let path = directory.path().join("explicit.yaml");
     std::fs::write(
         &path,
-        "version: 1\nupstreams:\n  private:\n    known_provider: anthropic\n    auth:\n      kind: header\n      header: x-private-key\n      value_prefix: 'Token '\n      secret: env:PRIVATE_KEY\n",
+        "version: 2\nupstreams:\n  private:\n    known_provider: anthropic\n    auth:\n      kind: header\n      header: x-private-key\n      value_prefix: 'Token '\n      secret: env:PRIVATE_KEY\n",
     )
     .expect("config contents");
 
@@ -801,7 +801,7 @@ fn a_known_provider_without_an_auth_block_keeps_its_documented_reference() {
     let path = directory.path().join("documented.yaml");
     std::fs::write(
         &path,
-        "version: 1\nupstreams:\n  anthropic:\n    known_provider: anthropic\n",
+        "version: 2\nupstreams:\n  anthropic:\n    known_provider: anthropic\n",
     )
     .expect("config contents");
 

@@ -16,7 +16,7 @@ use pooler_core::Capability;
 use crate::loader::SUPPORTED_PRESETS;
 
 /// Version of the generated JSON Schema document.
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 /// Returns the source-configuration JSON Schema.
 #[must_use]
@@ -58,6 +58,8 @@ pub fn config_schema() -> Value {
     definitions.insert("native".to_owned(), native_schema());
     definitions.insert("oauth".to_owned(), oauth_schema());
     definitions.insert("policy".to_owned(), policy_schema());
+    definitions.insert("routing_preference".to_owned(), routing_preference_schema());
+    definitions.insert("routing".to_owned(), routing_schema());
     definitions.insert("request".to_owned(), request_schema());
     definitions.insert("request_step".to_owned(), request_step_schema());
     definitions.insert("retry".to_owned(), retry_schema());
@@ -75,17 +77,14 @@ pub fn config_schema() -> Value {
     definitions.insert("upstream".to_owned(), upstream_schema());
 
     let mut properties = BTreeMap::new();
-    properties.insert("version", integer_schema(Some(1), Some(1)));
+    properties.insert("version", integer_schema(Some(2), Some(2)));
     properties.insert("listeners", named_map_schema(reference("listener")));
     properties.insert("upstreams", named_map_schema(reference("upstream")));
-    properties.insert("providers", named_map_schema(reference("upstream")));
     properties.insert("models", array_schema(reference("model"), Some(0), None));
     properties.insert("catalog", optional(reference("catalog")));
     properties.insert("usage_price_book", optional(reference("usage_price_book")));
     properties.insert("accounts", named_map_schema(reference("account")));
-    properties.insert("credentials", named_map_schema(reference("account")));
     properties.insert("account_pools", named_map_schema(reference("account_pool")));
-    properties.insert("pools", named_map_schema(reference("account_pool")));
     properties.insert("policies", named_map_schema(reference("policy")));
     properties.insert("routes", array_schema(reference("route"), Some(0), None));
     properties.insert("extensions", named_map_schema(reference("extension")));
@@ -102,7 +101,7 @@ pub fn config_schema() -> Value {
     );
     object.insert(
         "$id".to_owned(),
-        Value::String("https://coder-company.github.io/pooler/schemas/config-v1.json".to_owned()),
+        Value::String("https://coder-company.github.io/pooler/schemas/config-v2.json".to_owned()),
     );
     object.insert(
         "title".to_owned(),
@@ -130,19 +129,18 @@ pub fn render_config_schema() -> String {
 fn account_schema() -> Value {
     object_schema(
         properties([
-            ("provider", optional_string()),
-            ("upstream", optional_string()),
+            ("provider", id_schema()),
             ("secret", optional(reference("secret_ref"))),
-            (
-                "auth_kind",
-                optional(string_enum(["api_key", "oauth", "subscription"])),
-            ),
+            ("auth_kind", optional(string_enum(["api_key", "oauth"]))),
             ("enabled", optional(boolean_schema())),
-            ("weight", optional(u32_schema())),
+            (
+                "weight",
+                optional(integer_schema(Some(1), Some(u64::from(u32::MAX)))),
+            ),
             ("max_concurrency", optional(u32_schema())),
             ("quota_project", optional(id_schema())),
         ]),
-        &[],
+        &["provider"],
         true,
     )
 }
@@ -398,14 +396,7 @@ fn catalog_source_schema() -> Value {
             ("account", optional(id_schema())),
             (
                 "parser",
-                string_enum([
-                    "openai",
-                    "open_ai",
-                    "kimi",
-                    "gemini",
-                    "vertex",
-                    "antigravity",
-                ]),
+                string_enum(["openai", "kimi", "gemini", "vertex", "antigravity"]),
             ),
             ("path", optional(string_schema())),
             (
@@ -454,10 +445,21 @@ fn catalog_source_schema() -> Value {
 fn account_pool_schema() -> Value {
     object_schema(
         properties([
-            ("accounts", array_schema(string_schema(), Some(0), None)),
-            ("members", array_schema(string_schema(), Some(0), None)),
+            ("provider", id_schema()),
+            (
+                "strategy",
+                optional(string_enum([
+                    "round_robin",
+                    "smooth_weighted_round_robin",
+                    "fill_first",
+                    "least_in_flight",
+                    "health_weighted",
+                    "ordered_fallback",
+                ])),
+            ),
+            ("accounts", array_schema(string_schema(), Some(1), None)),
         ]),
-        &[],
+        &["provider", "accounts"],
         true,
     )
 }
@@ -720,7 +722,7 @@ fn model_schema() -> Value {
             ("id", string_pattern(r"^[A-Za-z0-9._-]{1,128}$")),
             (
                 "targets",
-                array_schema(reference("model_target"), Some(0), None),
+                array_schema(reference("model_target"), Some(1), None),
             ),
         ]),
         &["id"],
@@ -729,11 +731,17 @@ fn model_schema() -> Value {
 }
 
 fn model_target_schema() -> Value {
-    object_schema(
+    let mut schema = object_schema(
         properties([
-            ("provider", optional_string()),
-            ("upstream", optional_string()),
-            ("upstream_model", optional_string()),
+            ("id", id_schema()),
+            ("provider", id_schema()),
+            ("account", optional(id_schema())),
+            ("account_pool", optional(id_schema())),
+            (
+                "priority",
+                integer_schema(Some(1), Some(u64::from(u32::MAX))),
+            ),
+            ("upstream_model", nonempty_string()),
             (
                 "capabilities",
                 array_schema(
@@ -743,10 +751,28 @@ fn model_target_schema() -> Value {
                 ),
             ),
             ("codecs", array_schema(string_schema(), Some(0), None)),
+            ("wire_family", optional_string()),
+            ("weight", integer_schema(Some(1), Some(u64::from(u32::MAX)))),
         ]),
-        &[],
+        &[
+            "id",
+            "provider",
+            "priority",
+            "upstream_model",
+            "capabilities",
+            "codecs",
+            "wire_family",
+        ],
         false,
-    )
+    );
+    schema.as_object_mut().expect("object schema").insert(
+        "oneOf".to_owned(),
+        serde_json::json!([
+            {"required": ["account"], "not": {"required": ["account_pool"]}},
+            {"required": ["account_pool"], "not": {"required": ["account"]}}
+        ]),
+    );
+    schema
 }
 
 fn native_schema() -> Value {
@@ -769,7 +795,6 @@ fn oauth_schema() -> Value {
             ("authorization_endpoint", optional_string()),
             ("token_endpoint", optional_string()),
             ("revocation_endpoint", optional_string()),
-            ("revoke_endpoint", optional_string()),
             ("identity_endpoint", optional_string()),
             ("client_id", optional_string()),
             ("client_secret", optional(reference("secret_ref"))),
@@ -792,11 +817,57 @@ fn policy_schema() -> Value {
             ("retry", optional(reference("retry"))),
             ("stream", optional(reference("stream"))),
             ("cooldown", optional(reference("cooldown"))),
-            ("account_pool", optional_string()),
-            ("pool", optional_string()),
+            ("routing", optional(reference("routing"))),
         ]),
         &[],
         true,
+    )
+}
+
+fn routing_preference_schema() -> Value {
+    object_schema(
+        properties([
+            ("price", optional(boolean_schema())),
+            ("latency", optional(boolean_schema())),
+            ("throughput", optional(boolean_schema())),
+        ]),
+        &[],
+        false,
+    )
+}
+
+fn routing_schema() -> Value {
+    object_schema(
+        properties([
+            ("order", array_schema(id_schema(), Some(0), None)),
+            ("allow", array_schema(id_schema(), Some(0), None)),
+            ("deny", array_schema(id_schema(), Some(0), None)),
+            ("allow_fallbacks", optional(boolean_schema())),
+            (
+                "required_parameters",
+                array_schema(nonempty_string(), Some(0), None),
+            ),
+            (
+                "required_capabilities",
+                array_schema(
+                    string_enum(Capability::ALL.map(Capability::as_str)),
+                    Some(0),
+                    None,
+                ),
+            ),
+            ("minimum_context", optional(integer_schema(Some(1), None))),
+            (
+                "quantization",
+                array_schema(nonempty_string(), Some(0), None),
+            ),
+            ("privacy", optional(nonempty_string())),
+            ("require_zdr", optional(boolean_schema())),
+            ("data_policy", optional(nonempty_string())),
+            ("max_price", optional(u64_schema())),
+            ("preference", optional(reference("routing_preference"))),
+        ]),
+        &[],
+        false,
     )
 }
 
@@ -855,27 +926,16 @@ fn retry_schema() -> Value {
     object_schema(
         properties([
             ("maximum_attempts", optional(u32_schema())),
-            ("max_attempts", optional(u32_schema())),
             ("maximum_credentials", optional(u32_schema())),
-            ("max_credentials", optional(u32_schema())),
-            ("maximum_providers", optional(u32_schema())),
-            ("max_providers", optional(u32_schema())),
+            ("maximum_upstreams", optional(u32_schema())),
             ("maximum_elapsed", optional(reference("duration"))),
-            ("max_elapsed", optional(reference("duration"))),
             ("maximum_recovery_wait", optional(reference("duration"))),
-            ("max_recovery_wait", optional(reference("duration"))),
             ("base_delay", optional(reference("duration"))),
             ("maximum_delay", optional(reference("duration"))),
-            ("max_delay", optional(reference("duration"))),
             ("maximum_total_delay", optional(reference("duration"))),
-            ("max_total_delay", optional(reference("duration"))),
             ("before_commit_only", optional(boolean_schema())),
             (
                 "statuses",
-                array_schema(integer_schema(Some(0), Some(599)), Some(0), None),
-            ),
-            (
-                "retryable_statuses",
                 array_schema(integer_schema(Some(0), Some(599)), Some(0), None),
             ),
         ]),
@@ -963,9 +1023,6 @@ fn selection_schema() -> Value {
                     "ordered_fallback",
                 ])),
             ),
-            ("account_pool", optional_string()),
-            ("pool", optional_string()),
-            ("accounts", array_schema(string_schema(), Some(0), None)),
             ("session_affinity", optional(reference("duration"))),
             ("affinity", optional(reference("affinity"))),
         ]),
@@ -1064,7 +1121,7 @@ fn upstream_schema() -> Value {
 
 fn secret_ref_schema() -> Value {
     string_pattern(
-        r"^(env:[A-Za-z_][A-Za-z0-9_]*|file:(/.*|[A-Za-z]:[/\\].*|\\\\[^\\/]+[/\\].*)|keyring:[^/]+/.+)$",
+        r"^(env:[A-Za-z_][A-Za-z0-9_]*|file:(/.*|[A-Za-z]:[/\\].*|\\\\[^\\/]+[/\\].*)|keyring:[^/]+/.+|managed:[A-Za-z0-9._-]{1,128})$",
     )
 }
 
@@ -1309,7 +1366,9 @@ mod tests {
         assert_eq!(first, render_config_schema());
         assert!(first.contains("\"additionalProperties\": false"));
         assert!(first.contains("\"imports\""));
-        assert!(first.contains("\"providers\""));
+        assert!(first.contains("\"upstreams\""));
+        assert!(first.contains("routing_preference"));
+        assert!(first.contains("managed:[A-Za-z0-9._-]{1,128}"));
         assert!(first.contains("keyring:[^/]+/.+"));
         assert!(first.contains("file:(/.*|[A-Za-z]:"));
     }

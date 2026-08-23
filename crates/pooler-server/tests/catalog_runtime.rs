@@ -43,14 +43,15 @@ fn config() -> pooler_config::CompiledConfig {
     pooler_config::compile_yaml(
         "catalog-runtime.yaml",
         r#"
-version: 1
+version: 2
 management: {bind: 127.0.0.1:0}
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {provider-a: {url: http://127.0.0.1:1}}
 accounts: {catalog-account: {provider: provider-a, secret: env:POOLER_TEST_CATALOG_KEY}}
 models:
   - id: configured-only
-    targets: [{provider: provider-a, upstream_model: configured-upstream, capabilities: [text]}]
+    targets:
+      - {id: configured-only-target, provider: provider-a, account: catalog-account, priority: 1, upstream_model: configured-upstream, capabilities: [text], codecs: [], wire_family: openai}
 catalog:
   # The timeout is deliberately generous: these tests assert catalog shaping,
   # not refresh deadlines, and a tight budget only measures machine load.
@@ -101,7 +102,7 @@ async fn catalog_configured_native_uses_account_key_and_static_auth_without_acco
     let account_config = pooler_config::compile_yaml(
         "catalog-native-account.yaml",
         &format!(
-            "version: 1\nupstreams:\n  xai:\n    url: http://{account_address}\n    native: {{kind: xai}}\n    auth: {{kind: header, header: x-provider-key, value_prefix: 'Token ', secret: 'file:{}'}}\naccounts:\n  account:\n    provider: xai\n    auth_kind: api_key\n    secret: 'file:{}'\ncatalog:\n  sources: [{{id: xai.primary, provider: xai, parser: open_ai, account: account}}]\n",
+            "version: 2\nupstreams:\n  xai:\n    url: http://{account_address}\n    native: {{kind: xai}}\n    auth: {{kind: header, header: x-provider-key, value_prefix: 'Token ', secret: 'file:{}'}}\naccounts:\n  account:\n    provider: xai\n    auth_kind: api_key\n    secret: 'file:{}'\ncatalog:\n  sources: [{{id: xai.primary, provider: xai, parser: openai, account: account}}]\n",
             static_file.path().display(),
             account_file.path().display()
         ),
@@ -137,7 +138,7 @@ async fn catalog_configured_native_uses_account_key_and_static_auth_without_acco
     let static_config = pooler_config::compile_yaml(
         "catalog-native-static.yaml",
         &format!(
-            "version: 1\nupstreams:\n  xai:\n    url: http://{static_address}\n    native: {{kind: xai}}\n    auth: {{kind: header, header: x-provider-key, value_prefix: 'Token ', secret: 'file:{}'}}\ncatalog:\n  sources: [{{id: xai.primary, provider: xai, parser: open_ai}}]\n",
+            "version: 2\nupstreams:\n  xai:\n    url: http://{static_address}\n    native: {{kind: xai}}\n    auth: {{kind: header, header: x-provider-key, value_prefix: 'Token ', secret: 'file:{}'}}\ncatalog:\n  sources: [{{id: xai.primary, provider: xai, parser: openai}}]\n",
             static_file.path().display()
         ),
     )
@@ -173,7 +174,7 @@ async fn catalog_unknown_native_and_non_native_oauth_fail_before_transport() {
     let unknown_config = pooler_config::compile_yaml(
         "catalog-unknown-native.yaml",
         &format!(
-            "version: 1\nupstreams:\n  future:\n    url: http://{unknown_address}\n    native: {{kind: future_provider}}\n    auth: {{kind: bearer, secret: 'file:{}'}}\ncatalog:\n  sources: [{{id: future.primary, provider: future, parser: open_ai}}]\n",
+            "version: 2\nupstreams:\n  future:\n    url: http://{unknown_address}\n    native: {{kind: future_provider}}\n    auth: {{kind: bearer, secret: 'file:{}'}}\ncatalog:\n  sources: [{{id: future.primary, provider: future, parser: openai}}]\n",
             unknown_file.path().display()
         ),
     )
@@ -206,7 +207,7 @@ async fn catalog_unknown_native_and_non_native_oauth_fail_before_transport() {
     let oauth_config = pooler_config::compile_yaml(
         "catalog-non-native-oauth.yaml",
         &format!(
-            "version: 1\nupstreams:\n  plain:\n    url: http://{oauth_address}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  subscription:\n    provider: plain\n    auth_kind: oauth\ncatalog:\n  sources: [{{id: plain.primary, provider: plain, parser: open_ai, account: subscription}}]\n"
+            "version: 2\nupstreams:\n  plain:\n    url: http://{oauth_address}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  subscription:\n    provider: plain\n    auth_kind: oauth\ncatalog:\n  sources: [{{id: plain.primary, provider: plain, parser: openai, account: subscription}}]\n"
         ),
     )
     .expect("non-native OAuth catalog config");
@@ -339,7 +340,7 @@ async fn vendored_request_facts_reach_discovered_targets_and_the_model_view() {
     let config = pooler_config::compile_yaml(
         "catalog-model-facts.yaml",
         r#"
-version: 1
+version: 2
 management: {bind: 127.0.0.1:0}
 upstreams:
   openai: {url: http://127.0.0.1:1}
@@ -347,9 +348,9 @@ upstreams:
   private: {url: http://127.0.0.1:3}
 catalog:
   sources:
-    - {id: openai.primary, provider: openai, parser: open_ai, prefix: direct}
-    - {id: gateway.primary, provider: gateway, parser: open_ai, prefix: gateway, model_facts_provider: openai}
-    - {id: private.primary, provider: private, parser: open_ai, prefix: private}
+    - {id: openai.primary, provider: openai, parser: openai, prefix: direct}
+    - {id: gateway.primary, provider: gateway, parser: openai, prefix: gateway, model_facts_provider: openai}
+    - {id: private.primary, provider: private, parser: openai, prefix: private}
 "#,
     )
     .expect("model facts config");
@@ -425,7 +426,7 @@ catalog:
     assert_eq!(profiled["targets"][0]["profile"]["tools"], "supported");
     assert_eq!(
         profiled["targets"][0]["profile"]["request_transform"],
-        "open_ai_chat"
+        "openai_chat"
     );
     assert!(profiled["targets"][0]["profile"]["context_limit"]
         .as_u64()
@@ -440,13 +441,13 @@ async fn operator_overrides_withhold_and_reshape_published_models() {
     let config = pooler_config::compile_yaml(
         "catalog-overrides.yaml",
         r#"
-version: 1
+version: 2
 management: {bind: 127.0.0.1:0}
 upstreams:
   openai: {url: http://127.0.0.1:1}
 catalog:
   sources:
-    - {id: openai.primary, provider: openai, parser: open_ai}
+    - {id: openai.primary, provider: openai, parser: openai}
   overrides:
     - {model: gpt-4o, disabled: true}
     - model: gpt-image-1.5
@@ -533,11 +534,11 @@ async fn injected_fetcher_output_is_rechecked_against_the_source_body_bound() {
     let config = pooler_config::compile_yaml(
         "catalog-bound.yaml",
         r#"
-version: 1
+version: 2
 upstreams: {provider-a: {url: http://127.0.0.1:1}}
 catalog:
   sources:
-    - {id: provider-a.primary, provider: provider-a, parser: open_ai, max_response_bytes: 8}
+    - {id: provider-a.primary, provider: provider-a, parser: openai, max_response_bytes: 8}
 "#,
     )
     .expect("bounded config");
@@ -614,7 +615,7 @@ async fn startup_catalog_alias_selects_and_rewrites_a_real_proxy_request() {
         "catalog-selection.yaml",
         &format!(
             r#"
-version: 1
+version: 2
 listeners: {{local: {{bind: 127.0.0.1:0}}}}
 upstreams: {{provider-a: {{url: http://{upstream_address}}}}}
 catalog:
@@ -795,11 +796,11 @@ async fn proxy_a_request_after_client_delay(
         "catalog-dialect.yaml",
         &format!(
             r#"
-version: 1
+version: 2
 listeners: {{local: {{bind: 127.0.0.1:0}}}}
 upstreams: {{openai: {{url: http://{upstream_address}}}}}
 catalog:
-  sources: [{{id: openai.primary, provider: openai, parser: open_ai}}]
+  sources: [{{id: openai.primary, provider: openai, parser: openai}}]
 {overrides}routes:
   - id: chat
     listen: local

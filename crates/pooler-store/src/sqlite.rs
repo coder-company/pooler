@@ -14,14 +14,16 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 
 use crate::{
     encrypted::{CredentialCipher, CredentialPayload},
-    non_empty, CooldownState, CredentialHealthState, CredentialHealthStatus, CredentialState,
-    DecisionRecord, MasterKey, MemoryStore, PruneReport, RequestEvent, RetentionPolicy,
+    hex_digest, non_empty, validate_fingerprint, AffinityBindingIdentity, AuditRecord,
+    CooldownState, CredentialHealthState, CredentialHealthStatus, CredentialState, DecisionRecord,
+    DraftRecord, ManagedSecretRecord, ManagementSessionRecord, MasterKey, MemoryStore,
+    OAuthFlowRecord, OAuthFlowStatus, PruneReport, ReloadRecord, RequestEvent, RetentionPolicy,
     SecretPayload, SessionAffinity, Store, StoreError, StoreLengths, StoreResult, Timestamp,
     UsageRecord, MAX_REQUEST_EVENTS_PER_REQUEST,
 };
 
 const MAX_COOLDOWNS: usize = 4_096;
-const LATEST_SCHEMA_VERSION: i64 = 7;
+const LATEST_SCHEMA_VERSION: i64 = 8;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/001_initial.sql")),
     (2, include_str!("migrations/002_health_and_cooldowns.sql")),
@@ -30,6 +32,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, include_str!("migrations/005_usage_ledger.sql")),
     (6, include_str!("migrations/006_request_event_indexes.sql")),
     (7, include_str!("migrations/007_encryption_fence.sql")),
+    (8, include_str!("migrations/008_control_plane_identity.sql")),
 ];
 
 /// A transactional, WAL-backed SQLite [`Store`].
@@ -124,7 +127,8 @@ impl SqliteStore {
     pub fn len(&self) -> StoreResult<StoreLengths> {
         let connection = self.connection()?;
         let credentials = count_rows(&connection, "credentials")?;
-        let affinities = count_rows(&connection, "affinities")?;
+        let affinities = count_rows(&connection, "affinities")?
+            .saturating_add(count_rows(&connection, "scoped_affinities")?);
         let decisions = count_rows(&connection, "decisions")?;
         let request_events = count_rows(&connection, "request_events")?;
         let usage_records = count_rows(&connection, "usage_records")?;
@@ -189,25 +193,73 @@ impl SqliteStore {
         payload: &CredentialPayload,
         updated_at: Timestamp,
     ) -> StoreResult<()> {
+        self.upsert_credential_payload_with_fingerprint(credential_id, None, payload, updated_at)
+    }
+
+    /// Persist a payload only when the caller's immutable identity fingerprint
+    /// still matches the credential metadata.
+    pub fn upsert_credential_payload_for_fingerprint(
+        &self,
+        credential_id: &str,
+        configuration_fingerprint: &str,
+        payload: &CredentialPayload,
+        updated_at: Timestamp,
+    ) -> StoreResult<()> {
+        self.upsert_credential_payload_with_fingerprint(
+            credential_id,
+            Some(configuration_fingerprint),
+            payload,
+            updated_at,
+        )
+    }
+
+    fn upsert_credential_payload_with_fingerprint(
+        &self,
+        credential_id: &str,
+        expected_fingerprint: Option<&str>,
+        payload: &CredentialPayload,
+        updated_at: Timestamp,
+    ) -> StoreResult<()> {
         non_empty("credential_id", credential_id)?;
+        if let Some(fingerprint) = expected_fingerprint {
+            validate_fingerprint(fingerprint)?;
+        }
         let cipher = self
             .encryption_read()?
             .clone()
             .ok_or(StoreError::EncryptionRequired)?;
-        let envelope = cipher.seal_for(payload, credential_id.as_bytes())?;
         self.with_transaction(|transaction| {
             assert_cipher_current_transaction(transaction, &cipher)?;
-            let exists = transaction
+            let current: CredentialState = transaction
                 .query_row(
-                    "SELECT 1 FROM credentials WHERE credential_id = ?1",
+                    "SELECT credential_id, provider_id, configuration_fingerprint,
+                            enabled, updated_at, revision
+                     FROM credentials WHERE credential_id = ?1",
                     [credential_id],
-                    |row| row.get::<_, i64>(0),
+                    credential_from_row,
                 )
                 .optional()
-                .map_err(sqlite_error)?;
-            if exists.is_none() {
-                return Err(StoreError::CredentialNotFound(credential_id.to_owned()));
+                .map_err(sqlite_error)?
+                .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
+            if let Some(expected) = expected_fingerprint {
+                if current.configuration_fingerprint != expected {
+                    return Err(StoreError::CredentialFingerprintConflict);
+                }
             }
+            if let Some(existing_envelope) = transaction
+                .query_row(
+                    "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
+                    [credential_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?
+            {
+                let aad = credential_payload_aad(credential_id, &current.configuration_fingerprint);
+                cipher.open_for(&existing_envelope, &aad)?;
+            }
+            let aad = credential_payload_aad(credential_id, &current.configuration_fingerprint);
+            let envelope = cipher.seal_for(payload, &aad)?;
             transaction
                 .execute(
                     "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
@@ -236,7 +288,46 @@ impl SqliteStore {
         payload: &CredentialPayload,
         updated_at: Timestamp,
     ) -> StoreResult<CredentialState> {
+        self.compare_and_swap_credential_payload_with_fingerprint(
+            credential_id,
+            expected_revision,
+            None,
+            payload,
+            updated_at,
+        )
+    }
+
+    /// Compare-and-swap a payload while fencing the immutable credential
+    /// configuration identity before any existing ciphertext is opened.
+    pub fn compare_and_swap_credential_payload_for_fingerprint(
+        &self,
+        credential_id: &str,
+        expected_revision: u64,
+        configuration_fingerprint: &str,
+        payload: &CredentialPayload,
+        updated_at: Timestamp,
+    ) -> StoreResult<CredentialState> {
+        self.compare_and_swap_credential_payload_with_fingerprint(
+            credential_id,
+            expected_revision,
+            Some(configuration_fingerprint),
+            payload,
+            updated_at,
+        )
+    }
+
+    fn compare_and_swap_credential_payload_with_fingerprint(
+        &self,
+        credential_id: &str,
+        expected_revision: u64,
+        expected_fingerprint: Option<&str>,
+        payload: &CredentialPayload,
+        updated_at: Timestamp,
+    ) -> StoreResult<CredentialState> {
         non_empty("credential_id", credential_id)?;
+        if let Some(fingerprint) = expected_fingerprint {
+            validate_fingerprint(fingerprint)?;
+        }
         let cipher = self
             .encryption_read()?
             .clone()
@@ -245,7 +336,8 @@ impl SqliteStore {
             assert_cipher_current_transaction(transaction, &cipher)?;
             let current: CredentialState = transaction
                 .query_row(
-                    "SELECT credential_id, provider_id, enabled, updated_at, revision
+                    "SELECT credential_id, provider_id, configuration_fingerprint,
+                            enabled, updated_at, revision
                      FROM credentials WHERE credential_id = ?1",
                     [credential_id],
                     credential_from_row,
@@ -255,6 +347,11 @@ impl SqliteStore {
                 .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
             if current.revision != expected_revision {
                 return Err(StoreError::CredentialRevisionConflict);
+            }
+            if let Some(expected) = expected_fingerprint {
+                if current.configuration_fingerprint != expected {
+                    return Err(StoreError::CredentialFingerprintConflict);
+                }
             }
             if let Some(existing_envelope) = transaction
                 .query_row(
@@ -268,9 +365,11 @@ impl SqliteStore {
                 // Authenticate the old value before changing either the
                 // metadata revision or the encrypted payload. A wrong key
                 // must fail closed rather than overwrite an unreadable token.
-                cipher.open_for(&existing_envelope, credential_id.as_bytes())?;
+                let aad = credential_payload_aad(credential_id, &current.configuration_fingerprint);
+                cipher.open_for(&existing_envelope, &aad)?;
             }
-            let envelope = cipher.seal_for(payload, credential_id.as_bytes())?;
+            let aad = credential_payload_aad(credential_id, &current.configuration_fingerprint);
+            let envelope = cipher.seal_for(payload, &aad)?;
             let revision = current.revision.saturating_add(1);
             let changed = transaction
                 .execute(
@@ -325,6 +424,15 @@ impl SqliteStore {
         let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
         let connection = self.connection()?;
         assert_cipher_current_connection(&connection, cipher)?;
+        let fingerprint: String = connection
+            .query_row(
+                "SELECT configuration_fingerprint FROM credentials WHERE credential_id = ?1",
+                [credential_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
         let envelope = connection
             .query_row(
                 "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
@@ -333,9 +441,42 @@ impl SqliteStore {
             )
             .optional()
             .map_err(sqlite_error)?;
+        let aad = credential_payload_aad(credential_id, &fingerprint);
         envelope
-            .map(|value| cipher.open_for(&value, credential_id.as_bytes()))
+            .map(|value| cipher.open_for(&value, &aad))
             .transpose()
+    }
+
+    /// Load a payload only when an expected immutable identity fingerprint
+    /// matches the persisted credential metadata.
+    pub fn credential_payload_for_fingerprint(
+        &self,
+        credential_id: &str,
+        configuration_fingerprint: &str,
+    ) -> StoreResult<Option<CredentialPayload>> {
+        non_empty("credential_id", credential_id)?;
+        validate_fingerprint(configuration_fingerprint)?;
+        let encryption = self.encryption_read()?;
+        let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
+        let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, cipher)?;
+        let row = connection
+            .query_row(
+                "SELECT c.configuration_fingerprint, p.envelope
+                 FROM credentials AS c
+                 LEFT JOIN credential_payloads AS p ON p.credential_id = c.credential_id
+                 WHERE c.credential_id = ?1",
+                [credential_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
+        if row.0 != configuration_fingerprint {
+            return Err(StoreError::CredentialFingerprintConflict);
+        }
+        let aad = credential_payload_aad(credential_id, &row.0);
+        row.1.map(|value| cipher.open_for(&value, &aad)).transpose()
     }
 
     /// Load credential metadata and its encrypted payload under one SQLite
@@ -352,8 +493,8 @@ impl SqliteStore {
         assert_cipher_current_connection(&connection, cipher)?;
         let row = connection
             .query_row(
-                "SELECT c.credential_id, c.provider_id, c.enabled, c.updated_at,
-                        c.revision, p.envelope
+                "SELECT c.credential_id, c.provider_id, c.configuration_fingerprint,
+                        c.enabled, c.updated_at, c.revision, p.envelope
                  FROM credentials AS c
                  LEFT JOIN credential_payloads AS p
                    ON p.credential_id = c.credential_id
@@ -363,23 +504,131 @@ impl SqliteStore {
                     let state = CredentialState {
                         credential_id: row.get(0)?,
                         provider_id: row.get(1)?,
-                        enabled: row.get::<_, i64>(2)? != 0,
-                        updated_at: row.get(3)?,
-                        revision: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(u64::MAX),
+                        configuration_fingerprint: row.get(2)?,
+                        enabled: row.get::<_, i64>(3)? != 0,
+                        updated_at: row.get(4)?,
+                        revision: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(u64::MAX),
                     };
-                    let envelope = row.get::<_, Option<Vec<u8>>>(5)?;
+                    let envelope = row.get::<_, Option<Vec<u8>>>(6)?;
                     Ok((state, envelope))
                 },
             )
             .optional()
             .map_err(sqlite_error)?;
         row.map(|(state, envelope)| {
+            let aad = credential_payload_aad(credential_id, &state.configuration_fingerprint);
             envelope
-                .map(|value| cipher.open_for(&value, credential_id.as_bytes()))
+                .map(|value| cipher.open_for(&value, &aad))
                 .transpose()
                 .map(|payload| (state, payload))
         })
         .transpose()
+    }
+
+    /// Explicitly adopt a new immutable credential identity. Legacy rows use
+    /// an empty fingerprint and version-1 AAD; adoption authenticates that
+    /// payload and re-encrypts it under the version-2 fingerprint AAD in one
+    /// transaction. No implicit account-ID reuse is permitted.
+    pub fn adopt_credential_fingerprint(
+        &self,
+        credential_id: &str,
+        expected_old_fingerprint: &str,
+        new_fingerprint: &str,
+        updated_at: Timestamp,
+    ) -> StoreResult<CredentialState> {
+        non_empty("credential_id", credential_id)?;
+        validate_fingerprint(expected_old_fingerprint)?;
+        validate_fingerprint(new_fingerprint)?;
+        if new_fingerprint.is_empty() {
+            return Err(StoreError::InvalidCredentialFingerprint);
+        }
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        self.with_immediate_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
+            let current: CredentialState = transaction
+                .query_row(
+                    "SELECT credential_id, provider_id, configuration_fingerprint,
+                            enabled, updated_at, revision
+                     FROM credentials WHERE credential_id = ?1",
+                    [credential_id],
+                    credential_from_row,
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
+            if current.configuration_fingerprint != expected_old_fingerprint {
+                return Err(StoreError::CredentialFingerprintConflict);
+            }
+            let old_aad = credential_payload_aad(credential_id, expected_old_fingerprint);
+            let new_aad = credential_payload_aad(credential_id, new_fingerprint);
+            let replacement = transaction
+                .query_row(
+                    "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
+                    [credential_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .map(|envelope| {
+                    cipher
+                        .open_for(&envelope, &old_aad)
+                        .and_then(|payload| cipher.seal_for(&payload, &new_aad))
+                })
+                .transpose()?;
+            let revision = current.revision.saturating_add(1);
+            let changed = transaction
+                .execute(
+                    "UPDATE credentials
+                     SET configuration_fingerprint = ?1, updated_at = ?2, revision = ?3
+                     WHERE credential_id = ?4 AND revision = ?5",
+                    params![
+                        new_fingerprint,
+                        updated_at,
+                        i64::try_from(revision).unwrap_or(i64::MAX),
+                        credential_id,
+                        i64::try_from(current.revision).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            if changed != 1 {
+                return Err(StoreError::CredentialRevisionConflict);
+            }
+            if let Some(envelope) = replacement {
+                transaction
+                    .execute(
+                        "UPDATE credential_payloads SET envelope = ?1, updated_at = ?2
+                         WHERE credential_id = ?3",
+                        params![envelope, updated_at, credential_id],
+                    )
+                    .map_err(sqlite_error)?;
+            }
+            Ok(CredentialState {
+                configuration_fingerprint: new_fingerprint.to_owned(),
+                updated_at,
+                revision,
+                ..current
+            })
+        })
+    }
+
+    /// Compatibility spelling for callers that use the full configuration
+    /// terminology.
+    pub fn adopt_credential_configuration_fingerprint(
+        &self,
+        credential_id: &str,
+        expected_old_fingerprint: &str,
+        new_fingerprint: &str,
+        updated_at: Timestamp,
+    ) -> StoreResult<CredentialState> {
+        self.adopt_credential_fingerprint(
+            credential_id,
+            expected_old_fingerprint,
+            new_fingerprint,
+            updated_at,
+        )
     }
 
     /// Alias for [`Self::credential_payload`].
@@ -452,21 +701,28 @@ impl SqliteStore {
         let credential_rows = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT credential_id, envelope
-                     FROM credential_payloads ORDER BY credential_id ASC",
+                    "SELECT p.credential_id, c.configuration_fingerprint, p.envelope
+                     FROM credential_payloads AS p
+                     JOIN credentials AS c ON c.credential_id = p.credential_id
+                     ORDER BY p.credential_id ASC",
                 )
                 .map_err(sqlite_error)?;
             let rows = statement
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
                 })
                 .map_err(sqlite_error)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
         };
         let mut rotated = 0_usize;
-        for (credential_id, envelope) in credential_rows {
-            let payload = current.open_for(&envelope, credential_id.as_bytes())?;
-            let replacement = next.seal_for(&payload, credential_id.as_bytes())?;
+        for (credential_id, fingerprint, envelope) in credential_rows {
+            let aad = credential_payload_aad(&credential_id, &fingerprint);
+            let payload = current.open_for(&envelope, &aad)?;
+            let replacement = next.seal_for(&payload, &aad)?;
             transaction
                 .execute(
                     "UPDATE credential_payloads SET envelope = ?1 WHERE credential_id = ?2",
@@ -534,6 +790,78 @@ impl SqliteStore {
                 .map_err(sqlite_error)?;
             rotated += 1;
         }
+
+        let managed_secret_rows = {
+            let mut statement = transaction
+                .prepare("SELECT secret_id, envelope FROM managed_secrets ORDER BY secret_id ASC")
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(sqlite_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+        };
+        for (secret_id, envelope) in managed_secret_rows {
+            let payload = current.open_for(&envelope, &managed_secret_aad(&secret_id))?;
+            let replacement = next.seal_for(&payload, &managed_secret_aad(&secret_id))?;
+            transaction
+                .execute(
+                    "UPDATE managed_secrets SET envelope = ?1 WHERE secret_id = ?2",
+                    params![replacement, secret_id],
+                )
+                .map_err(sqlite_error)?;
+            rotated += 1;
+        }
+
+        let draft_rows = {
+            let mut statement = transaction
+                .prepare("SELECT draft_id, envelope FROM management_drafts ORDER BY draft_id ASC")
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(sqlite_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+        };
+        for (draft_id, envelope) in draft_rows {
+            let payload = current.open_for(&envelope, &draft_aad(draft_id))?;
+            let replacement = next.seal_for(&payload, &draft_aad(draft_id))?;
+            transaction
+                .execute(
+                    "UPDATE management_drafts SET envelope = ?1 WHERE draft_id = ?2",
+                    params![replacement, draft_id],
+                )
+                .map_err(sqlite_error)?;
+            rotated += 1;
+        }
+
+        let oauth_rows = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT flow_id, pkce_envelope FROM oauth_flows
+                     WHERE pkce_envelope IS NOT NULL ORDER BY flow_id ASC",
+                )
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(sqlite_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+        };
+        for (flow_id, envelope) in oauth_rows {
+            let payload = current.open_for(&envelope, &oauth_pkce_aad(&flow_id))?;
+            let replacement = next.seal_for(&payload, &oauth_pkce_aad(&flow_id))?;
+            transaction
+                .execute(
+                    "UPDATE oauth_flows SET pkce_envelope = ?1 WHERE flow_id = ?2",
+                    params![replacement, flow_id],
+                )
+                .map_err(sqlite_error)?;
+            rotated += 1;
+        }
         let current_key_id = current.key_id();
         let next_key_id = next.key_id();
         let fenced = transaction
@@ -589,6 +917,1107 @@ impl SqliteStore {
             }
             Ok(states)
         })
+    }
+
+    /// Persist an affinity in the version-2 composite binding namespace.
+    pub fn upsert_scoped_session_affinity(
+        &self,
+        affinity: SessionAffinity,
+    ) -> StoreResult<SessionAffinity> {
+        non_empty("key", &affinity.key)?;
+        non_empty("provider_id", &affinity.provider_id)?;
+        non_empty("credential_id", &affinity.credential_id)?;
+        non_empty("upstream_model", &affinity.upstream_model)?;
+        let scope = affinity.binding_identity();
+        scope.validate()?;
+        self.with_transaction(|transaction| {
+            require_credential(transaction, &affinity.credential_id)?;
+            transaction
+                .execute(
+                    "DELETE FROM scoped_affinities WHERE expires_at <= ?1",
+                    [affinity.created_at],
+                )
+                .map_err(sqlite_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO scoped_affinities
+                     (key, route_id, policy_id, logical_model, account_pool_id,
+                      target_binding_id, provider_id, credential_id, upstream_model,
+                      created_at, last_used_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)
+                     ON CONFLICT(key, route_id, policy_id, logical_model,
+                                 account_pool_id, target_binding_id) DO UPDATE SET
+                       provider_id = excluded.provider_id,
+                       credential_id = excluded.credential_id,
+                       upstream_model = excluded.upstream_model,
+                       created_at = excluded.created_at,
+                       last_used_at = excluded.last_used_at,
+                       expires_at = excluded.expires_at",
+                    params![
+                        &affinity.key,
+                        &affinity.route_id,
+                        &affinity.policy_id,
+                        &affinity.logical_model,
+                        &affinity.account_pool_id,
+                        &affinity.target_binding_id,
+                        &affinity.provider_id,
+                        &affinity.credential_id,
+                        &affinity.upstream_model,
+                        affinity.created_at,
+                        affinity.expires_at,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            evict_scoped_affinities(transaction, self.retention.max_affinities)
+        })?;
+        Ok(affinity)
+    }
+
+    /// Restore an affinity only for the exact route/policy/model/pool/binding
+    /// identity that created it.
+    pub fn scoped_session_affinity(
+        &self,
+        key: &str,
+        scope: &AffinityBindingIdentity,
+        now: Timestamp,
+    ) -> StoreResult<Option<SessionAffinity>> {
+        non_empty("key", key)?;
+        scope.validate()?;
+        self.with_transaction(|transaction| {
+            transaction
+                .execute(
+                    "DELETE FROM scoped_affinities WHERE expires_at <= ?1",
+                    [now],
+                )
+                .map_err(sqlite_error)?;
+            let value = transaction
+                .query_row(
+                    "SELECT key, route_id, policy_id, logical_model, account_pool_id,
+                            target_binding_id, provider_id, credential_id, upstream_model,
+                            created_at, last_used_at, expires_at
+                     FROM scoped_affinities
+                     WHERE key = ?1 AND route_id = ?2 AND policy_id = ?3
+                       AND logical_model = ?4 AND account_pool_id = ?5
+                       AND target_binding_id = ?6",
+                    params![
+                        key,
+                        &scope.route_id,
+                        &scope.policy_id,
+                        &scope.logical_model,
+                        &scope.account_pool_id,
+                        &scope.target_binding_id,
+                    ],
+                    affinity_from_row,
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            if value.is_some() {
+                transaction
+                    .execute(
+                        "UPDATE scoped_affinities
+                         SET last_used_at = MAX(last_used_at, ?1)
+                         WHERE key = ?2 AND route_id = ?3 AND policy_id = ?4
+                           AND logical_model = ?5 AND account_pool_id = ?6
+                           AND target_binding_id = ?7",
+                        params![
+                            now,
+                            key,
+                            &scope.route_id,
+                            &scope.policy_id,
+                            &scope.logical_model,
+                            &scope.account_pool_id,
+                            &scope.target_binding_id,
+                        ],
+                    )
+                    .map_err(sqlite_error)?;
+            }
+            Ok(value.map(|mut affinity| {
+                affinity.last_used_at = affinity.last_used_at.max(now);
+                affinity
+            }))
+        })
+    }
+
+    /// List all non-expired scoped affinities in stable composite-key order.
+    pub fn scoped_session_affinities(&self, now: Timestamp) -> StoreResult<Vec<SessionAffinity>> {
+        self.with_transaction(|transaction| {
+            transaction
+                .execute(
+                    "DELETE FROM scoped_affinities WHERE expires_at <= ?1",
+                    [now],
+                )
+                .map_err(sqlite_error)?;
+            let mut statement = transaction
+                .prepare(
+                    "SELECT key, route_id, policy_id, logical_model, account_pool_id,
+                            target_binding_id, provider_id, credential_id, upstream_model,
+                            created_at, last_used_at, expires_at
+                     FROM scoped_affinities
+                     ORDER BY key, route_id, policy_id, logical_model,
+                              account_pool_id, target_binding_id",
+                )
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], affinity_from_row)
+                .map_err(sqlite_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
+        })
+    }
+
+    /// Remove one exact scoped affinity binding.
+    pub fn remove_scoped_session_affinity(
+        &self,
+        key: &str,
+        scope: &AffinityBindingIdentity,
+    ) -> StoreResult<bool> {
+        non_empty("key", key)?;
+        scope.validate()?;
+        self.with_transaction(|transaction| {
+            let removed = transaction
+                .execute(
+                    "DELETE FROM scoped_affinities
+                     WHERE key = ?1 AND route_id = ?2 AND policy_id = ?3
+                       AND logical_model = ?4 AND account_pool_id = ?5
+                       AND target_binding_id = ?6",
+                    params![
+                        key,
+                        &scope.route_id,
+                        &scope.policy_id,
+                        &scope.logical_model,
+                        &scope.account_pool_id,
+                        &scope.target_binding_id,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            Ok(removed != 0)
+        })
+    }
+
+    /// Insert or replace one encrypted managed secret with optional revision
+    /// fencing. The returned record never contains the secret bytes.
+    pub fn put_managed_secret(
+        &self,
+        mut record: ManagedSecretRecord,
+        payload: &SecretPayload,
+        expected_revision: Option<u64>,
+    ) -> StoreResult<ManagedSecretRecord> {
+        validate_control_text("secret_id", &record.secret_id, 256)?;
+        validate_control_text("owner_id", &record.owner_id, 256)?;
+        validate_control_text("kind", &record.kind, 128)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::ManagedSecretEncryptionRequired)?;
+        self.with_immediate_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
+            let existing = transaction
+                .query_row(
+                    "SELECT owner_id, kind, revision, created_at, updated_at, expires_at, envelope
+                     FROM managed_secrets WHERE secret_id = ?1",
+                    [&record.secret_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, u64>(3)?,
+                            row.get::<_, u64>(4)?,
+                            row.get::<_, Option<u64>>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            let (revision, created_at) = if let Some((owner, kind, old_revision, created, _, _, envelope)) = existing {
+                if owner != record.owner_id || kind != record.kind {
+                    return Err(StoreError::OwnerMismatch);
+                }
+                let old_revision = u64::try_from(old_revision)
+                    .map_err(|_| StoreError::ManagedSecretRevisionConflict)?;
+                if expected_revision != Some(old_revision) {
+                    return Err(StoreError::ManagedSecretRevisionConflict);
+                }
+                let aad = managed_secret_aad(&record.secret_id);
+                cipher.open_for(&envelope, &aad)?;
+                (old_revision.saturating_add(1), created)
+            } else {
+                if expected_revision.is_some() {
+                    return Err(StoreError::ManagedSecretRevisionConflict);
+                }
+                (1, record.created_at)
+            };
+            record.revision = revision;
+            record.created_at = created_at;
+            record.updated_at = record.updated_at.max(record.created_at);
+            let envelope = cipher.seal_for(payload, &managed_secret_aad(&record.secret_id))?;
+            transaction
+                .execute(
+                    "INSERT INTO managed_secrets
+                     (secret_id, owner_id, kind, revision, created_at, updated_at, expires_at, envelope)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(secret_id) DO UPDATE SET
+                       revision = excluded.revision, updated_at = excluded.updated_at,
+                       expires_at = excluded.expires_at, envelope = excluded.envelope",
+                    params![
+                        &record.secret_id,
+                        &record.owner_id,
+                        &record.kind,
+                        i64::try_from(record.revision).unwrap_or(i64::MAX),
+                        record.created_at,
+                        record.updated_at,
+                        record.expires_at,
+                        envelope,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            prune_managed_secrets(
+                transaction,
+                self.retention.max_managed_secrets,
+                self.retention.control_history_ttl_ms,
+                record.updated_at,
+            )?;
+            Ok(record.clone())
+        })
+    }
+
+    /// Compare-and-swap spelling for callers that make revision fencing
+    /// explicit.
+    pub fn compare_and_swap_managed_secret(
+        &self,
+        record: ManagedSecretRecord,
+        expected_revision: u64,
+        payload: &SecretPayload,
+    ) -> StoreResult<ManagedSecretRecord> {
+        self.put_managed_secret(record, payload, Some(expected_revision))
+    }
+
+    pub fn managed_secret(&self, secret_id: &str) -> StoreResult<Option<ManagedSecretRecord>> {
+        validate_control_text("secret_id", secret_id, 256)?;
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT secret_id, owner_id, kind, revision, created_at, updated_at, expires_at
+                 FROM managed_secrets WHERE secret_id = ?1",
+                [secret_id],
+                managed_secret_from_row,
+            )
+            .optional()
+            .map_err(sqlite_error)
+    }
+
+    pub fn managed_secret_payload(&self, secret_id: &str) -> StoreResult<SecretPayload> {
+        validate_control_text("secret_id", secret_id, 256)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::ManagedSecretEncryptionRequired)?;
+        let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, &cipher)?;
+        let envelope = connection
+            .query_row(
+                "SELECT envelope FROM managed_secrets WHERE secret_id = ?1",
+                [secret_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .ok_or(StoreError::ManagedSecretNotFound)?;
+        cipher.open_for(&envelope, &managed_secret_aad(secret_id))
+    }
+
+    pub fn remove_managed_secret(&self, secret_id: &str) -> StoreResult<bool> {
+        validate_control_text("secret_id", secret_id, 256)?;
+        self.with_transaction(|transaction| {
+            let removed = transaction
+                .execute(
+                    "DELETE FROM managed_secrets WHERE secret_id = ?1",
+                    [secret_id],
+                )
+                .map_err(sqlite_error)?;
+            Ok(removed != 0)
+        })
+    }
+
+    /// Create a cookie-authenticated management session. Only a keyed digest
+    /// of `cookie_secret` is persisted.
+    pub fn create_management_session(
+        &self,
+        mut record: ManagementSessionRecord,
+        cookie_secret: &[u8],
+    ) -> StoreResult<ManagementSessionRecord> {
+        validate_control_text("session_id", &record.session_id, 256)?;
+        validate_control_text("actor_id", &record.actor_id, 256)?;
+        validate_secret_input(cookie_secret)?;
+        if record.expires_at <= record.created_at {
+            return Err(StoreError::RecordExpired);
+        }
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let cookie_hash = cipher.secret_index(cookie_secret);
+        self.with_immediate_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
+            transaction
+                .execute(
+                    "DELETE FROM management_sessions WHERE expires_at <= ?1 OR revoked_at IS NOT NULL",
+                    [record.created_at],
+                )
+                .map_err(sqlite_error)?;
+            let exists: Option<i64> = transaction
+                .query_row(
+                    "SELECT 1 FROM management_sessions
+                     WHERE session_id = ?1 OR cookie_hash = ?2",
+                    params![&record.session_id, cookie_hash.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            if exists.is_some() {
+                return Err(StoreError::ManagementSessionAlreadyExists);
+            }
+            record.revision = 1;
+            transaction
+                .execute(
+                    "INSERT INTO management_sessions
+                     (session_id, actor_id, cookie_hash, revision, created_at, expires_at, revoked_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                    params![
+                        &record.session_id,
+                        &record.actor_id,
+                        cookie_hash.as_slice(),
+                        record.revision,
+                        record.created_at,
+                        record.expires_at,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            prune_management_sessions(
+                transaction,
+                self.retention.max_management_sessions,
+                record.created_at,
+            )?;
+            Ok(record.clone())
+        })
+    }
+
+    pub fn management_session(
+        &self,
+        session_id: &str,
+        now: Timestamp,
+    ) -> StoreResult<Option<ManagementSessionRecord>> {
+        validate_control_text("session_id", session_id, 256)?;
+        let connection = self.connection()?;
+        let record = connection
+            .query_row(
+                "SELECT session_id, actor_id, revision, created_at, expires_at, revoked_at
+                 FROM management_sessions WHERE session_id = ?1",
+                [session_id],
+                management_session_from_row,
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        Ok(record.filter(|value| value.active_at(now)))
+    }
+
+    pub fn management_session_by_cookie(
+        &self,
+        cookie_secret: &[u8],
+        now: Timestamp,
+    ) -> StoreResult<Option<ManagementSessionRecord>> {
+        validate_secret_input(cookie_secret)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let cookie_hash = cipher.secret_index(cookie_secret);
+        let connection = self.connection()?;
+        let record = connection
+            .query_row(
+                "SELECT session_id, actor_id, revision, created_at, expires_at, revoked_at
+                 FROM management_sessions WHERE cookie_hash = ?1",
+                [cookie_hash.as_slice()],
+                management_session_from_row,
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        Ok(record.filter(|value| value.active_at(now)))
+    }
+
+    pub fn revoke_management_session(
+        &self,
+        session_id: &str,
+        expected_revision: u64,
+        revoked_at: Timestamp,
+    ) -> StoreResult<ManagementSessionRecord> {
+        validate_control_text("session_id", session_id, 256)?;
+        self.with_immediate_transaction(|transaction| {
+            let current = transaction
+                .query_row(
+                    "SELECT session_id, actor_id, revision, created_at, expires_at, revoked_at
+                     FROM management_sessions WHERE session_id = ?1",
+                    [session_id],
+                    management_session_from_row,
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .ok_or(StoreError::OwnerMismatch)?;
+            if current.revision != expected_revision {
+                return Err(StoreError::ManagementRevisionConflict);
+            }
+            let revision = current.revision.saturating_add(1);
+            let changed = transaction
+                .execute(
+                    "UPDATE management_sessions SET revision = ?1, revoked_at = ?2
+                     WHERE session_id = ?3 AND revision = ?4",
+                    params![
+                        i64::try_from(revision).unwrap_or(i64::MAX),
+                        revoked_at,
+                        session_id,
+                        i64::try_from(expected_revision).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            if changed != 1 {
+                return Err(StoreError::ManagementRevisionConflict);
+            }
+            Ok(ManagementSessionRecord {
+                revision,
+                revoked_at: Some(revoked_at),
+                ..current
+            })
+        })
+    }
+
+    /// Create an owner-scoped encrypted draft. The payload is deliberately
+    /// rejected when it resembles a secret-bearing record.
+    pub fn create_draft(&self, mut draft: DraftRecord) -> StoreResult<DraftRecord> {
+        validate_draft(&draft)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        self.with_immediate_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
+            transaction
+                .execute(
+                    "INSERT INTO management_drafts
+                     (owner_id, kind, etag, base_generation, revision, created_at,
+                      updated_at, expires_at, envelope)
+                     VALUES (?1, ?2, '', ?3, 1, ?4, ?4, ?5, X'00')",
+                    params![
+                        &draft.owner_id,
+                        &draft.kind,
+                        i64::try_from(draft.base_generation).unwrap_or(i64::MAX),
+                        draft.created_at,
+                        draft.expires_at,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            let id = transaction.last_insert_rowid();
+            if id <= 0 {
+                return Err(StoreError::ManagementCapacity);
+            }
+            draft.draft_id = u64::try_from(id).map_err(|_| StoreError::ManagementCapacity)?;
+            draft.revision = 1;
+            draft.updated_at = draft.created_at;
+            draft.etag = draft_etag(&draft);
+            let envelope = cipher.seal_for(&SecretPayload::new(&draft.payload)?, &draft_aad(id))?;
+            transaction
+                .execute(
+                    "UPDATE management_drafts SET etag = ?1, envelope = ?2 WHERE draft_id = ?3",
+                    params![&draft.etag, envelope, id],
+                )
+                .map_err(sqlite_error)?;
+            prune_drafts(
+                transaction,
+                self.retention.max_drafts,
+                self.retention.control_history_ttl_ms,
+                draft.created_at,
+            )?;
+            Ok(draft.clone())
+        })
+    }
+
+    /// Update an owned draft under both owner and revision/ETag fencing.
+    pub fn update_draft(
+        &self,
+        draft_id: u64,
+        owner_id: &str,
+        expected_revision: u64,
+        expected_etag: &str,
+        payload: Vec<u8>,
+        updated_at: Timestamp,
+    ) -> StoreResult<DraftRecord> {
+        validate_control_text("owner_id", owner_id, 256)?;
+        validate_control_text("etag", expected_etag, 256)?;
+        validate_payload(&payload)?;
+        self.with_immediate_transaction(|transaction| {
+            let cipher = self
+                .encryption_read()?
+                .clone()
+                .ok_or(StoreError::EncryptionRequired)?;
+            assert_cipher_current_transaction(transaction, &cipher)?;
+            let current = load_draft_transaction(transaction, &cipher, draft_id)?
+                .ok_or(StoreError::RecordExpired)?;
+            if !current.active_at(updated_at) {
+                return Err(StoreError::RecordExpired);
+            }
+            if current.owner_id != owner_id {
+                return Err(StoreError::OwnerMismatch);
+            }
+            if current.revision != expected_revision || current.etag != expected_etag {
+                return Err(StoreError::ManagementRevisionConflict);
+            }
+            let mut next = DraftRecord {
+                draft_id,
+                owner_id: current.owner_id,
+                kind: current.kind,
+                etag: String::new(),
+                base_generation: current.base_generation,
+                revision: current.revision.saturating_add(1),
+                payload,
+                created_at: current.created_at,
+                updated_at,
+                expires_at: current.expires_at,
+            };
+            next.etag = draft_etag(&next);
+            let envelope = cipher.seal_for(
+                &SecretPayload::new(&next.payload)?,
+                &draft_aad(i64::try_from(draft_id).unwrap_or(i64::MAX)),
+            )?;
+            let changed = transaction
+                .execute(
+                    "UPDATE management_drafts
+                     SET etag = ?1, revision = ?2, updated_at = ?3, envelope = ?4
+                     WHERE draft_id = ?5 AND owner_id = ?6 AND revision = ?7 AND etag = ?8",
+                    params![
+                        &next.etag,
+                        i64::try_from(next.revision).unwrap_or(i64::MAX),
+                        next.updated_at,
+                        envelope,
+                        i64::try_from(draft_id).unwrap_or(i64::MAX),
+                        owner_id,
+                        i64::try_from(expected_revision).unwrap_or(i64::MAX),
+                        expected_etag,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            if changed != 1 {
+                return Err(StoreError::ManagementRevisionConflict);
+            }
+            Ok(next)
+        })
+    }
+
+    pub fn draft(
+        &self,
+        draft_id: u64,
+        owner_id: &str,
+        now: Timestamp,
+    ) -> StoreResult<Option<DraftRecord>> {
+        validate_control_text("owner_id", owner_id, 256)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let connection = self.connection()?;
+        let draft = load_draft_connection(&connection, &cipher, draft_id)?;
+        match draft {
+            Some(value) if value.owner_id != owner_id => Err(StoreError::OwnerMismatch),
+            Some(value) if !value.active_at(now) => Err(StoreError::RecordExpired),
+            value => Ok(value),
+        }
+    }
+
+    pub fn drafts_for_owner(
+        &self,
+        owner_id: &str,
+        now: Timestamp,
+    ) -> StoreResult<Vec<DraftRecord>> {
+        validate_control_text("owner_id", owner_id, 256)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT draft_id FROM management_drafts
+                 WHERE owner_id = ?1 AND expires_at > ?2
+                 ORDER BY updated_at DESC, draft_id DESC",
+            )
+            .map_err(sqlite_error)?;
+        let ids = statement
+            .query_map(params![owner_id, now], |row| row.get::<_, i64>(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?;
+        ids.into_iter()
+            .map(|id| {
+                load_draft_connection(
+                    &connection,
+                    &cipher,
+                    u64::try_from(id).map_err(|_| StoreError::ManagementCapacity)?,
+                )?
+                .ok_or(StoreError::RecordExpired)
+            })
+            .collect()
+    }
+
+    pub fn remove_draft(&self, draft_id: u64, owner_id: &str) -> StoreResult<bool> {
+        validate_control_text("owner_id", owner_id, 256)?;
+        self.with_transaction(|transaction| {
+            let current_owner: Option<String> = transaction
+                .query_row(
+                    "SELECT owner_id FROM management_drafts WHERE draft_id = ?1",
+                    [i64::try_from(draft_id).unwrap_or(i64::MAX)],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            if let Some(current_owner) = current_owner {
+                if current_owner != owner_id {
+                    return Err(StoreError::OwnerMismatch);
+                }
+            }
+            let removed = transaction
+                .execute(
+                    "DELETE FROM management_drafts WHERE draft_id = ?1 AND owner_id = ?2",
+                    params![i64::try_from(draft_id).unwrap_or(i64::MAX), owner_id],
+                )
+                .map_err(sqlite_error)?;
+            Ok(removed != 0)
+        })
+    }
+
+    pub fn append_audit_record(&self, mut record: AuditRecord) -> StoreResult<AuditRecord> {
+        validate_audit_record(&record)?;
+        self.with_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO management_audit_records
+                     (owner_id, action, resource, outcome, generation, error_code, recorded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        &record.owner_id,
+                        &record.action,
+                        &record.resource,
+                        &record.outcome,
+                        i64::try_from(record.generation).unwrap_or(i64::MAX),
+                        &record.error_code,
+                        record.recorded_at,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            let id = transaction.last_insert_rowid();
+            record.id = u64::try_from(id).map_err(|_| StoreError::ManagementCapacity)?;
+            prune_audit_records(
+                transaction,
+                self.retention.max_audit_records,
+                self.retention.control_history_ttl_ms,
+                record.recorded_at,
+            )?;
+            Ok(record.clone())
+        })
+    }
+
+    pub fn audit_records(&self) -> StoreResult<Vec<AuditRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, owner_id, action, resource, outcome, generation,
+                        error_code, recorded_at
+                 FROM management_audit_records ORDER BY id ASC",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], audit_from_row)
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
+    }
+
+    pub fn append_reload_record(&self, mut record: ReloadRecord) -> StoreResult<ReloadRecord> {
+        validate_reload_record(&record)?;
+        self.with_transaction(|transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO management_reload_records
+                     (owner_id, generation, status, etag, error_code,
+                      started_at, completed_at, revision)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                    params![
+                        &record.owner_id,
+                        i64::try_from(record.generation).unwrap_or(i64::MAX),
+                        &record.status,
+                        &record.etag,
+                        &record.error_code,
+                        record.started_at,
+                        record.completed_at,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            let id = transaction.last_insert_rowid();
+            record.id = u64::try_from(id).map_err(|_| StoreError::ManagementCapacity)?;
+            record.revision = 1;
+            prune_reload_records(
+                transaction,
+                self.retention.max_reload_records,
+                self.retention.control_history_ttl_ms,
+                record.started_at,
+            )?;
+            Ok(record.clone())
+        })
+    }
+
+    pub fn update_reload_record(
+        &self,
+        record_id: u64,
+        expected_revision: u64,
+        status: &str,
+        error_code: Option<&str>,
+        completed_at: Option<Timestamp>,
+    ) -> StoreResult<ReloadRecord> {
+        validate_control_text("status", status, 128)?;
+        if let Some(error_code) = error_code {
+            validate_control_text("error_code", error_code, 128)?;
+        }
+        self.with_immediate_transaction(|transaction| {
+            let current = transaction
+                .query_row(
+                    "SELECT id, owner_id, generation, status, etag, error_code,
+                            started_at, completed_at, revision
+                     FROM management_reload_records WHERE id = ?1",
+                    [i64::try_from(record_id).unwrap_or(i64::MAX)],
+                    reload_from_row,
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .ok_or(StoreError::ManagementRevisionConflict)?;
+            if current.revision != expected_revision {
+                return Err(StoreError::ManagementRevisionConflict);
+            }
+            let revision = current.revision.saturating_add(1);
+            let changed = transaction
+                .execute(
+                    "UPDATE management_reload_records
+                     SET status = ?1, error_code = ?2, completed_at = ?3, revision = ?4
+                     WHERE id = ?5 AND revision = ?6",
+                    params![
+                        status,
+                        error_code,
+                        completed_at,
+                        i64::try_from(revision).unwrap_or(i64::MAX),
+                        i64::try_from(record_id).unwrap_or(i64::MAX),
+                        i64::try_from(expected_revision).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            if changed != 1 {
+                return Err(StoreError::ManagementRevisionConflict);
+            }
+            Ok(ReloadRecord {
+                status: status.to_owned(),
+                error_code: error_code.map(ToOwned::to_owned),
+                completed_at,
+                revision,
+                ..current
+            })
+        })
+    }
+
+    pub fn reload_records(&self) -> StoreResult<Vec<ReloadRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, owner_id, generation, status, etag, error_code,
+                        started_at, completed_at, revision
+                 FROM management_reload_records ORDER BY id ASC",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], reload_from_row)
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
+    }
+
+    /// Persist one owner-scoped OAuth flow. State is keyed and the PKCE
+    /// verifier is encrypted; neither raw value is represented in the row.
+    pub fn begin_oauth_flow(
+        &self,
+        mut record: OAuthFlowRecord,
+        state: &[u8],
+        pkce_verifier: Option<&SecretPayload>,
+    ) -> StoreResult<OAuthFlowRecord> {
+        validate_oauth_flow(&record)?;
+        validate_secret_input(state)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let state_hash = cipher.secret_index(state);
+        let pkce_envelope = pkce_verifier
+            .map(|value| cipher.seal_for(value, &oauth_pkce_aad(&record.flow_id)))
+            .transpose()?;
+        self.with_immediate_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
+            transaction
+                .execute(
+                    "DELETE FROM oauth_flows WHERE expires_at <= ?1",
+                    [record.created_at],
+                )
+                .map_err(sqlite_error)?;
+            let duplicate: Option<i64> = transaction
+                .query_row(
+                    "SELECT 1 FROM oauth_flows
+                     WHERE (provider_id = ?1 AND account_id = ?2 AND status = 'pending')
+                        OR state_hash = ?3",
+                    params![
+                        &record.provider_id,
+                        &record.account_id,
+                        state_hash.as_slice()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            if duplicate.is_some() {
+                return Err(StoreError::OAuthFlowAlreadyExists);
+            }
+            record.status = OAuthFlowStatus::Pending;
+            record.revision = 1;
+            transaction
+                .execute(
+                    "INSERT INTO oauth_flows
+                     (flow_id, owner_id, provider_id, account_id, flow_kind, status,
+                      state_hash, pkce_envelope, revision, created_at, expires_at,
+                      state_consumed_at, completed_at, error_code)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, NULL, NULL, NULL)",
+                    params![
+                        &record.flow_id,
+                        &record.owner_id,
+                        &record.provider_id,
+                        &record.account_id,
+                        &record.flow_kind,
+                        record.status.as_str(),
+                        state_hash.as_slice(),
+                        pkce_envelope,
+                        record.created_at,
+                        record.expires_at,
+                    ],
+                )
+                .map_err(map_oauth_sqlite_error)?;
+            prune_oauth_flows(
+                transaction,
+                self.retention.max_oauth_flows,
+                self.retention.control_history_ttl_ms,
+                record.created_at,
+            )?;
+            Ok(record.clone())
+        })
+    }
+
+    pub fn oauth_flow(&self, flow_id: &str) -> StoreResult<Option<OAuthFlowRecord>> {
+        validate_control_text("flow_id", flow_id, 256)?;
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT flow_id, owner_id, provider_id, account_id, flow_kind, status,
+                        revision, created_at, expires_at, state_consumed_at,
+                        completed_at, error_code
+                 FROM oauth_flows WHERE flow_id = ?1",
+                [flow_id],
+                oauth_flow_from_row,
+            )
+            .optional()
+            .map_err(sqlite_error)
+    }
+
+    /// Read a pending, unconsumed flow by the caller-held raw state without
+    /// consuming it. Callback handlers should use [`Self::consume_oauth_state`]
+    /// for the one-time transition.
+    pub fn oauth_flow_by_state(
+        &self,
+        state: &[u8],
+        now: Timestamp,
+    ) -> StoreResult<Option<OAuthFlowRecord>> {
+        validate_secret_input(state)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let state_hash = cipher.secret_index(state);
+        let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, &cipher)?;
+        connection
+            .query_row(
+                "SELECT flow_id, owner_id, provider_id, account_id, flow_kind, status,
+                        revision, created_at, expires_at, state_consumed_at,
+                        completed_at, error_code
+                 FROM oauth_flows
+                 WHERE state_hash = ?1 AND state_consumed_at IS NULL
+                   AND expires_at > ?2 AND status = 'pending'",
+                params![state_hash.as_slice(), now],
+                oauth_flow_from_row,
+            )
+            .optional()
+            .map_err(sqlite_error)
+    }
+
+    /// Correlate a callback without requiring the dashboard session cookie.
+    /// The lookup returns metadata only and consumes the one-time state.
+    pub fn consume_oauth_state(
+        &self,
+        state: &[u8],
+        now: Timestamp,
+    ) -> StoreResult<Option<OAuthFlowRecord>> {
+        validate_secret_input(state)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let state_hash = cipher.secret_index(state);
+        self.with_immediate_transaction(|transaction| {
+            let current = transaction
+                .query_row(
+                    "SELECT flow_id, owner_id, provider_id, account_id, flow_kind, status,
+                            revision, created_at, expires_at, state_consumed_at,
+                            completed_at, error_code
+                     FROM oauth_flows
+                     WHERE state_hash = ?1 AND state_consumed_at IS NULL
+                       AND expires_at > ?2 AND status = 'pending'",
+                    params![state_hash.as_slice(), now],
+                    oauth_flow_from_row,
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            let Some(current) = current else {
+                return Ok(None);
+            };
+            let changed = transaction
+                .execute(
+                    "UPDATE oauth_flows SET state_consumed_at = ?, revision = revision + 1
+                     WHERE flow_id = ? AND revision = ? AND state_consumed_at IS NULL",
+                    params![
+                        now,
+                        &current.flow_id,
+                        i64::try_from(current.revision).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            if changed != 1 {
+                return Err(StoreError::OAuthStateConflict);
+            }
+            Ok(Some(OAuthFlowRecord {
+                state_consumed_at: Some(now),
+                revision: current.revision.saturating_add(1),
+                ..current
+            }))
+        })
+    }
+
+    pub fn oauth_flow_pkce_verifier(&self, flow_id: &str) -> StoreResult<Option<SecretPayload>> {
+        validate_control_text("flow_id", flow_id, 256)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, &cipher)?;
+        let envelope = connection
+            .query_row(
+                "SELECT pkce_envelope FROM oauth_flows WHERE flow_id = ?1",
+                [flow_id],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .ok_or(StoreError::OAuthFlowNotFound)?;
+        envelope
+            .map(|value| cipher.open_for(&value, &oauth_pkce_aad(flow_id)))
+            .transpose()
+    }
+
+    pub fn update_oauth_flow(
+        &self,
+        flow_id: &str,
+        owner_id: &str,
+        expected_revision: u64,
+        status: OAuthFlowStatus,
+        error_code: Option<&str>,
+        completed_at: Option<Timestamp>,
+    ) -> StoreResult<OAuthFlowRecord> {
+        validate_control_text("flow_id", flow_id, 256)?;
+        validate_control_text("owner_id", owner_id, 256)?;
+        if let Some(error_code) = error_code {
+            validate_control_text("error_code", error_code, 128)?;
+        }
+        self.with_immediate_transaction(|transaction| {
+            let current = transaction
+                .query_row(
+                    "SELECT flow_id, owner_id, provider_id, account_id, flow_kind, status,
+                            revision, created_at, expires_at, state_consumed_at,
+                            completed_at, error_code
+                     FROM oauth_flows WHERE flow_id = ?1",
+                    [flow_id],
+                    oauth_flow_from_row,
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .ok_or(StoreError::OAuthFlowNotFound)?;
+            if current.owner_id != owner_id {
+                return Err(StoreError::OwnerMismatch);
+            }
+            if current.revision != expected_revision {
+                return Err(StoreError::ManagementRevisionConflict);
+            }
+            let revision = current.revision.saturating_add(1);
+            let changed = transaction
+                .execute(
+                    "UPDATE oauth_flows
+                     SET status = ?1, error_code = ?2, completed_at = ?3, revision = ?4
+                     WHERE flow_id = ?5 AND revision = ?6 AND owner_id = ?7",
+                    params![
+                        status.as_str(),
+                        error_code,
+                        completed_at,
+                        i64::try_from(revision).unwrap_or(i64::MAX),
+                        flow_id,
+                        i64::try_from(expected_revision).unwrap_or(i64::MAX),
+                        owner_id,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            if changed != 1 {
+                return Err(StoreError::ManagementRevisionConflict);
+            }
+            Ok(OAuthFlowRecord {
+                status,
+                error_code: error_code.map(ToOwned::to_owned),
+                completed_at,
+                revision,
+                ..current
+            })
+        })
+    }
+
+    pub fn oauth_flows_for_owner(&self, owner_id: &str) -> StoreResult<Vec<OAuthFlowRecord>> {
+        validate_control_text("owner_id", owner_id, 256)?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT flow_id, owner_id, provider_id, account_id, flow_kind, status,
+                        revision, created_at, expires_at, state_consumed_at,
+                        completed_at, error_code
+                 FROM oauth_flows WHERE owner_id = ?1
+                 ORDER BY created_at ASC, flow_id ASC",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([owner_id], oauth_flow_from_row)
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
     }
 
     fn connection(&self) -> StoreResult<MutexGuard<'_, Connection>> {
@@ -773,19 +2202,26 @@ fn validate_existing_encrypted_rows(
     let credential_rows = {
         let mut statement = transaction
             .prepare(
-                "SELECT credential_id, envelope
-                 FROM credential_payloads ORDER BY credential_id ASC",
+                "SELECT p.credential_id, c.configuration_fingerprint, p.envelope
+                 FROM credential_payloads AS p
+                 JOIN credentials AS c ON c.credential_id = p.credential_id
+                 ORDER BY p.credential_id ASC",
             )
             .map_err(sqlite_error)?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
             })
             .map_err(sqlite_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
     };
-    for (credential_id, envelope) in credential_rows {
-        cipher.open_for(&envelope, credential_id.as_bytes())?;
+    for (credential_id, fingerprint, envelope) in credential_rows {
+        let aad = credential_payload_aad(&credential_id, &fingerprint);
+        cipher.open_for(&envelope, &aad)?;
     }
 
     let request_rows = {
@@ -816,6 +2252,54 @@ fn validate_existing_encrypted_rows(
     };
     for (id, envelope) in usage_rows {
         decrypt_usage_record(cipher, id, &envelope)?;
+    }
+
+    let managed_secret_rows = {
+        let mut statement = transaction
+            .prepare("SELECT secret_id, envelope FROM managed_secrets ORDER BY secret_id ASC")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    for (secret_id, envelope) in managed_secret_rows {
+        cipher.open_for(&envelope, &managed_secret_aad(&secret_id))?;
+    }
+
+    let draft_rows = {
+        let mut statement = transaction
+            .prepare("SELECT draft_id, envelope FROM management_drafts ORDER BY draft_id ASC")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    for (draft_id, envelope) in draft_rows {
+        cipher.open_for(&envelope, &draft_aad(draft_id))?;
+    }
+
+    let oauth_rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT flow_id, pkce_envelope FROM oauth_flows
+                 WHERE pkce_envelope IS NOT NULL ORDER BY flow_id ASC",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    for (flow_id, envelope) in oauth_rows {
+        cipher.open_for(&envelope, &oauth_pkce_aad(&flow_id))?;
     }
     Ok(())
 }
@@ -1072,12 +2556,13 @@ fn count_rows(connection: &Connection, table: &str) -> StoreResult<usize> {
 }
 
 fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<CredentialState> {
-    let revision: i64 = row.get(4)?;
+    let revision: i64 = row.get(5)?;
     Ok(CredentialState {
         credential_id: row.get(0)?,
         provider_id: row.get(1)?,
-        enabled: row.get::<_, i64>(2)? != 0,
-        updated_at: row.get(3)?,
+        configuration_fingerprint: row.get(2)?,
+        enabled: row.get::<_, i64>(3)? != 0,
+        updated_at: row.get(4)?,
         revision: u64::try_from(revision).unwrap_or(u64::MAX),
     })
 }
@@ -1085,9 +2570,31 @@ fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<CredentialState> {
 fn affinity_from_row(row: &Row<'_>) -> rusqlite::Result<SessionAffinity> {
     Ok(SessionAffinity {
         key: row.get(0)?,
+        provider_id: row.get(6)?,
+        credential_id: row.get(7)?,
+        upstream_model: row.get(8)?,
+        route_id: row.get(1)?,
+        policy_id: row.get(2)?,
+        logical_model: row.get(3)?,
+        account_pool_id: row.get(4)?,
+        target_binding_id: row.get(5)?,
+        created_at: row.get(9)?,
+        last_used_at: row.get(10)?,
+        expires_at: row.get(11)?,
+    })
+}
+
+fn legacy_affinity_from_row(row: &Row<'_>) -> rusqlite::Result<SessionAffinity> {
+    Ok(SessionAffinity {
+        key: row.get(0)?,
         provider_id: row.get(1)?,
         credential_id: row.get(2)?,
         upstream_model: row.get(3)?,
+        route_id: String::new(),
+        policy_id: String::new(),
+        logical_model: String::new(),
+        account_pool_id: String::new(),
+        target_binding_id: String::new(),
         created_at: row.get(4)?,
         last_used_at: row.get(5)?,
         expires_at: row.get(6)?,
@@ -1140,21 +2647,28 @@ fn decision_from_row(row: &Row<'_>) -> StoreResult<DecisionRecord> {
         selected_provider: row.get(5).map_err(sqlite_error)?,
         selected_credential: row.get(6).map_err(sqlite_error)?,
         upstream_model: row.get(7).map_err(sqlite_error)?,
+        target_binding_id: row.get(8).map_err(sqlite_error)?,
+        priority_tier: row
+            .get::<_, Option<i64>>(9)
+            .map_err(sqlite_error)?
+            .map(|value| {
+                u32::try_from(value).map_err(|_| StoreError::Sqlite("priority overflow".to_owned()))
+            })
+            .transpose()?,
         attempt: row
-            .get::<_, i64>(8)
+            .get::<_, i64>(10)
             .map_err(sqlite_error)
             .and_then(|value| {
                 u32::try_from(value).map_err(|_| StoreError::Sqlite("attempt overflow".to_owned()))
             })?,
-        configuration_generation: row
-            .get::<_, i64>(9)
-            .map_err(sqlite_error)
-            .and_then(|value| {
+        configuration_generation: row.get::<_, i64>(11).map_err(sqlite_error).and_then(
+            |value| {
                 u64::try_from(value)
                     .map_err(|_| StoreError::Sqlite("generation overflow".to_owned()))
-            })?,
-        reason: row.get(10).map_err(sqlite_error)?,
-        recorded_at: row.get(11).map_err(sqlite_error)?,
+            },
+        )?,
+        reason: row.get(12).map_err(sqlite_error)?,
+        recorded_at: row.get(13).map_err(sqlite_error)?,
     })
 }
 
@@ -1174,6 +2688,12 @@ fn delete_credential_dependents(
     transaction
         .execute(
             "DELETE FROM affinities WHERE credential_id = ?1",
+            [credential_id],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM scoped_affinities WHERE credential_id = ?1",
             [credential_id],
         )
         .map_err(sqlite_error)?;
@@ -1318,6 +2838,514 @@ fn evict_affinities(transaction: &Transaction<'_>, limit: usize) -> StoreResult<
         .map_err(sqlite_error)
 }
 
+fn evict_scoped_affinities(transaction: &Transaction<'_>, limit: usize) -> StoreResult<usize> {
+    let limit =
+        i64::try_from(limit).map_err(|_| StoreError::Sqlite("retention overflow".to_owned()))?;
+    let removed = transaction
+        .execute(
+            "DELETE FROM scoped_affinities WHERE rowid IN (
+                 SELECT rowid FROM scoped_affinities
+                 ORDER BY last_used_at ASC, created_at ASC, key ASC,
+                          route_id ASC, policy_id ASC, logical_model ASC,
+                          account_pool_id ASC, target_binding_id ASC
+                 LIMIT MAX((SELECT COUNT(*) FROM scoped_affinities) - ?1, 0)
+             )",
+            [limit],
+        )
+        .map_err(sqlite_error)?;
+    Ok(removed)
+}
+
+const MAX_CONTROL_TEXT_BYTES: usize = 512;
+const MAX_CONTROL_PAYLOAD_BYTES: usize = 256 * 1024;
+
+fn validate_control_text(field: &'static str, value: &str, max: usize) -> StoreResult<()> {
+    non_empty(field, value)?;
+    if value.len() > max {
+        return Err(StoreError::Serialization(format!(
+            "{field} exceeds metadata bounds"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_secret_input(value: &[u8]) -> StoreResult<()> {
+    if value.is_empty() {
+        return Err(StoreError::EmptyCredentialPayload);
+    }
+    if value.len() > MAX_CONTROL_TEXT_BYTES {
+        return Err(StoreError::Serialization(
+            "control secret exceeds metadata bounds".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_payload(payload: &[u8]) -> StoreResult<()> {
+    if payload.is_empty() || payload.len() > MAX_CONTROL_PAYLOAD_BYTES {
+        return Err(StoreError::Serialization(
+            "control payload exceeds bounds".to_owned(),
+        ));
+    }
+    if let Ok(text) = std::str::from_utf8(payload) {
+        let lower = text.to_ascii_lowercase();
+        for forbidden in [
+            "access_token",
+            "refresh_token",
+            "client_secret",
+            "bearer ",
+            "password",
+            "cookie_secret",
+            "pkce_verifier",
+        ] {
+            if lower.contains(forbidden) {
+                return Err(StoreError::Serialization(
+                    "control draft must not contain secret-bearing fields".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_draft(draft: &DraftRecord) -> StoreResult<()> {
+    validate_control_text("owner_id", &draft.owner_id, 256)?;
+    validate_control_text("kind", &draft.kind, 128)?;
+    if draft.expires_at <= draft.created_at {
+        return Err(StoreError::RecordExpired);
+    }
+    validate_payload(&draft.payload)
+}
+
+fn validate_audit_record(record: &AuditRecord) -> StoreResult<()> {
+    if let Some(owner_id) = &record.owner_id {
+        validate_control_text("owner_id", owner_id, 256)?;
+    }
+    validate_control_text("action", &record.action, 128)?;
+    validate_control_text("resource", &record.resource, 256)?;
+    validate_control_text("outcome", &record.outcome, 128)?;
+    if let Some(error_code) = &record.error_code {
+        validate_control_text("error_code", error_code, 128)?;
+    }
+    Ok(())
+}
+
+fn validate_reload_record(record: &ReloadRecord) -> StoreResult<()> {
+    if let Some(owner_id) = &record.owner_id {
+        validate_control_text("owner_id", owner_id, 256)?;
+    }
+    validate_control_text("status", &record.status, 128)?;
+    if let Some(etag) = &record.etag {
+        validate_control_text("etag", etag, 256)?;
+    }
+    if let Some(error_code) = &record.error_code {
+        validate_control_text("error_code", error_code, 128)?;
+    }
+    Ok(())
+}
+
+fn validate_oauth_flow(record: &OAuthFlowRecord) -> StoreResult<()> {
+    for (field, value) in [
+        ("flow_id", record.flow_id.as_str()),
+        ("owner_id", record.owner_id.as_str()),
+        ("provider_id", record.provider_id.as_str()),
+        ("account_id", record.account_id.as_str()),
+        ("flow_kind", record.flow_kind.as_str()),
+    ] {
+        validate_control_text(field, value, 256)?;
+    }
+    if record.expires_at <= record.created_at {
+        return Err(StoreError::RecordExpired);
+    }
+    if let Some(error_code) = &record.error_code {
+        validate_control_text("error_code", error_code, 128)?;
+    }
+    Ok(())
+}
+
+fn managed_secret_aad(secret_id: &str) -> Vec<u8> {
+    format!("pooler-managed-secret:v1:{secret_id}").into_bytes()
+}
+
+fn draft_aad(draft_id: i64) -> Vec<u8> {
+    format!("pooler-management-draft:v1:{draft_id}").into_bytes()
+}
+
+fn oauth_pkce_aad(flow_id: &str) -> Vec<u8> {
+    format!("pooler-oauth-pkce:v1:{flow_id}").into_bytes()
+}
+
+fn draft_etag(draft: &DraftRecord) -> String {
+    let mut value = Vec::with_capacity(draft.payload.len() + 128);
+    value.extend_from_slice(b"pooler-draft-etag:v1|");
+    value.extend_from_slice(draft.owner_id.as_bytes());
+    value.push(b'|');
+    value.extend_from_slice(draft.kind.as_bytes());
+    value.push(b'|');
+    value.extend_from_slice(draft.base_generation.to_string().as_bytes());
+    value.push(b'|');
+    value.extend_from_slice(draft.revision.to_string().as_bytes());
+    value.push(b'|');
+    value.extend_from_slice(&draft.payload);
+    hex_digest(&value)
+}
+
+fn managed_secret_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedSecretRecord> {
+    Ok(ManagedSecretRecord {
+        secret_id: row.get(0)?,
+        owner_id: row.get(1)?,
+        kind: row.get(2)?,
+        revision: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(u64::MAX),
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        expires_at: row.get(6)?,
+    })
+}
+
+fn management_session_from_row(row: &Row<'_>) -> rusqlite::Result<ManagementSessionRecord> {
+    Ok(ManagementSessionRecord {
+        session_id: row.get(0)?,
+        actor_id: row.get(1)?,
+        revision: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(u64::MAX),
+        created_at: row.get(3)?,
+        expires_at: row.get(4)?,
+        revoked_at: row.get(5)?,
+    })
+}
+
+fn audit_from_row(row: &Row<'_>) -> rusqlite::Result<AuditRecord> {
+    Ok(AuditRecord {
+        id: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(u64::MAX),
+        owner_id: row.get(1)?,
+        action: row.get(2)?,
+        resource: row.get(3)?,
+        outcome: row.get(4)?,
+        generation: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(u64::MAX),
+        error_code: row.get(6)?,
+        recorded_at: row.get(7)?,
+    })
+}
+
+fn reload_from_row(row: &Row<'_>) -> rusqlite::Result<ReloadRecord> {
+    Ok(ReloadRecord {
+        id: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(u64::MAX),
+        owner_id: row.get(1)?,
+        generation: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(u64::MAX),
+        status: row.get(3)?,
+        etag: row.get(4)?,
+        error_code: row.get(5)?,
+        started_at: row.get(6)?,
+        completed_at: row.get(7)?,
+        revision: u64::try_from(row.get::<_, i64>(8)?).unwrap_or(u64::MAX),
+    })
+}
+
+fn oauth_flow_from_row(row: &Row<'_>) -> rusqlite::Result<OAuthFlowRecord> {
+    let status: String = row.get(5)?;
+    let status = OAuthFlowStatus::parse(&status).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid OAuth flow status",
+            )),
+        )
+    })?;
+    Ok(OAuthFlowRecord {
+        flow_id: row.get(0)?,
+        owner_id: row.get(1)?,
+        provider_id: row.get(2)?,
+        account_id: row.get(3)?,
+        flow_kind: row.get(4)?,
+        status,
+        revision: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(u64::MAX),
+        created_at: row.get(7)?,
+        expires_at: row.get(8)?,
+        state_consumed_at: row.get(9)?,
+        completed_at: row.get(10)?,
+        error_code: row.get(11)?,
+    })
+}
+
+fn load_draft_connection(
+    connection: &Connection,
+    cipher: &CredentialCipher,
+    draft_id: u64,
+) -> StoreResult<Option<DraftRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT draft_id, owner_id, kind, etag, base_generation, revision,
+                    created_at, updated_at, expires_at, envelope
+             FROM management_drafts WHERE draft_id = ?1",
+            [i64::try_from(draft_id).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, u64>(7)?,
+                    row.get::<_, u64>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((
+        id,
+        owner_id,
+        kind,
+        etag,
+        base_generation,
+        revision,
+        created_at,
+        updated_at,
+        expires_at,
+        envelope,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let payload = cipher.open_for(&envelope, &draft_aad(id))?;
+    let payload = payload.into_bytes();
+    let draft = DraftRecord {
+        draft_id: u64::try_from(id).map_err(|_| StoreError::ManagementCapacity)?,
+        owner_id,
+        kind,
+        etag,
+        base_generation: u64::try_from(base_generation).unwrap_or(u64::MAX),
+        revision: u64::try_from(revision).unwrap_or(u64::MAX),
+        payload,
+        created_at,
+        updated_at,
+        expires_at,
+    };
+    if draft.etag != draft_etag(&draft) {
+        return Err(StoreError::CredentialEnvelopeAuthenticationFailed);
+    }
+    Ok(Some(draft))
+}
+
+fn load_draft_transaction(
+    transaction: &Transaction<'_>,
+    cipher: &CredentialCipher,
+    draft_id: u64,
+) -> StoreResult<Option<DraftRecord>> {
+    let row = transaction
+        .query_row(
+            "SELECT draft_id, owner_id, kind, etag, base_generation, revision,
+                    created_at, updated_at, expires_at, envelope
+             FROM management_drafts WHERE draft_id = ?1",
+            [i64::try_from(draft_id).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, u64>(7)?,
+                    row.get::<_, u64>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((
+        id,
+        owner_id,
+        kind,
+        etag,
+        base_generation,
+        revision,
+        created_at,
+        updated_at,
+        expires_at,
+        envelope,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let payload = cipher.open_for(&envelope, &draft_aad(id))?.into_bytes();
+    let draft = DraftRecord {
+        draft_id: u64::try_from(id).map_err(|_| StoreError::ManagementCapacity)?,
+        owner_id,
+        kind,
+        etag,
+        base_generation: u64::try_from(base_generation).unwrap_or(u64::MAX),
+        revision: u64::try_from(revision).unwrap_or(u64::MAX),
+        payload,
+        created_at,
+        updated_at,
+        expires_at,
+    };
+    if draft.etag != draft_etag(&draft) {
+        return Err(StoreError::CredentialEnvelopeAuthenticationFailed);
+    }
+    Ok(Some(draft))
+}
+
+fn prune_managed_secrets(
+    transaction: &Transaction<'_>,
+    limit: usize,
+    ttl: u64,
+    now: Timestamp,
+) -> StoreResult<()> {
+    transaction
+        .execute(
+            "DELETE FROM managed_secrets WHERE expires_at IS NOT NULL AND expires_at <= ?1
+             OR updated_at < ?2",
+            params![now, now.saturating_sub(ttl)],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM managed_secrets WHERE secret_id IN (
+                 SELECT secret_id FROM managed_secrets ORDER BY updated_at ASC, secret_id ASC
+                 LIMIT MAX((SELECT COUNT(*) FROM managed_secrets) - ?1, 0)
+             )",
+            [i64::try_from(limit).map_err(|_| StoreError::ManagementCapacity)?],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn prune_management_sessions(
+    transaction: &Transaction<'_>,
+    limit: usize,
+    now: Timestamp,
+) -> StoreResult<()> {
+    transaction
+        .execute(
+            "DELETE FROM management_sessions WHERE expires_at <= ?1 OR revoked_at IS NOT NULL",
+            [now],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM management_sessions WHERE session_id IN (
+                 SELECT session_id FROM management_sessions
+                 ORDER BY created_at ASC, session_id ASC
+                 LIMIT MAX((SELECT COUNT(*) FROM management_sessions) - ?1, 0)
+             )",
+            [i64::try_from(limit).map_err(|_| StoreError::ManagementCapacity)?],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn prune_drafts(
+    transaction: &Transaction<'_>,
+    limit: usize,
+    ttl: u64,
+    now: Timestamp,
+) -> StoreResult<()> {
+    transaction
+        .execute(
+            "DELETE FROM management_drafts WHERE expires_at <= ?1 OR updated_at < ?2",
+            params![now, now.saturating_sub(ttl)],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM management_drafts WHERE draft_id IN (
+                 SELECT draft_id FROM management_drafts ORDER BY updated_at ASC, draft_id ASC
+                 LIMIT MAX((SELECT COUNT(*) FROM management_drafts) - ?1, 0)
+             )",
+            [i64::try_from(limit).map_err(|_| StoreError::ManagementCapacity)?],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn prune_audit_records(
+    transaction: &Transaction<'_>,
+    limit: usize,
+    ttl: u64,
+    now: Timestamp,
+) -> StoreResult<()> {
+    transaction
+        .execute(
+            "DELETE FROM management_audit_records WHERE recorded_at < ?1",
+            [now.saturating_sub(ttl)],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM management_audit_records WHERE id IN (
+                 SELECT id FROM management_audit_records ORDER BY id ASC
+                 LIMIT MAX((SELECT COUNT(*) FROM management_audit_records) - ?1, 0)
+             )",
+            [i64::try_from(limit).map_err(|_| StoreError::ManagementCapacity)?],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn prune_reload_records(
+    transaction: &Transaction<'_>,
+    limit: usize,
+    ttl: u64,
+    now: Timestamp,
+) -> StoreResult<()> {
+    transaction
+        .execute(
+            "DELETE FROM management_reload_records WHERE started_at < ?1",
+            [now.saturating_sub(ttl)],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM management_reload_records WHERE id IN (
+                 SELECT id FROM management_reload_records ORDER BY id ASC
+                 LIMIT MAX((SELECT COUNT(*) FROM management_reload_records) - ?1, 0)
+             )",
+            [i64::try_from(limit).map_err(|_| StoreError::ManagementCapacity)?],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn prune_oauth_flows(
+    transaction: &Transaction<'_>,
+    limit: usize,
+    ttl: u64,
+    now: Timestamp,
+) -> StoreResult<()> {
+    transaction
+        .execute(
+            "DELETE FROM oauth_flows WHERE expires_at <= ?1 OR created_at < ?2",
+            params![now, now.saturating_sub(ttl)],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM oauth_flows WHERE flow_id IN (
+                 SELECT flow_id FROM oauth_flows ORDER BY created_at ASC, flow_id ASC
+                 LIMIT MAX((SELECT COUNT(*) FROM oauth_flows) - ?1, 0)
+             )",
+            [i64::try_from(limit).map_err(|_| StoreError::ManagementCapacity)?],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn map_oauth_sqlite_error(error: rusqlite::Error) -> StoreError {
+    if error.to_string().contains("UNIQUE constraint failed") {
+        StoreError::OAuthFlowAlreadyExists
+    } else {
+        sqlite_error(error)
+    }
+}
+
 fn evict_decisions(transaction: &Transaction<'_>, limit: usize) -> StoreResult<usize> {
     let limit =
         i64::try_from(limit).map_err(|_| StoreError::Sqlite("retention overflow".to_owned()))?;
@@ -1340,7 +3368,8 @@ fn set_credential_enabled_tx(
 ) -> StoreResult<CredentialState> {
     let old = transaction
         .query_row(
-            "SELECT credential_id, provider_id, enabled, updated_at, revision
+            "SELECT credential_id, provider_id, configuration_fingerprint,
+                    enabled, updated_at, revision
              FROM credentials WHERE credential_id = ?1",
             [credential_id],
             credential_from_row,
@@ -1390,6 +3419,22 @@ fn set_credential_enabled_tx(
         revision,
         ..old
     })
+}
+
+fn credential_payload_aad(credential_id: &str, fingerprint: &str) -> Vec<u8> {
+    if fingerprint.is_empty() {
+        // Version-1 rows are intentionally kept adoptable. The migration
+        // leaves their metadata fingerprint empty and this exact legacy AAD
+        // is used only until an explicit adoption transaction re-encrypts it.
+        return credential_id.as_bytes().to_vec();
+    }
+    format!(
+        "pooler-credential-payload:v2:{}:{}:{}",
+        credential_id.len(),
+        credential_id,
+        fingerprint
+    )
+    .into_bytes()
 }
 
 fn request_event_aad(id: u64) -> Vec<u8> {
@@ -1562,31 +3607,51 @@ impl Store for SqliteStore {
     fn upsert_credential_state(&self, state: CredentialState) -> StoreResult<CredentialState> {
         non_empty("credential_id", &state.credential_id)?;
         non_empty("provider_id", &state.provider_id)?;
-        let revision = self.with_transaction(|transaction| {
-            let existing: Option<i64> = transaction
+        validate_fingerprint(&state.configuration_fingerprint)?;
+        let (revision, configuration_fingerprint) = self.with_transaction(|transaction| {
+            let existing: Option<(i64, String)> = transaction
                 .query_row(
-                    "SELECT revision FROM credentials WHERE credential_id = ?1",
+                    "SELECT revision, configuration_fingerprint
+                     FROM credentials WHERE credential_id = ?1",
                     [&state.credential_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
                 .map_err(sqlite_error)?;
+            if let Some((_, existing_fingerprint)) = &existing {
+                if !state.configuration_fingerprint.is_empty()
+                    && !existing_fingerprint.is_empty()
+                    && existing_fingerprint != &state.configuration_fingerprint
+                {
+                    return Err(StoreError::CredentialFingerprintConflict);
+                }
+            }
+            let configuration_fingerprint = if state.configuration_fingerprint.is_empty() {
+                existing
+                    .as_ref()
+                    .map_or_else(String::new, |(_, fingerprint)| fingerprint.clone())
+            } else {
+                state.configuration_fingerprint.clone()
+            };
             let revision = existing
-                .map(|value| u64::try_from(value).unwrap_or(u64::MAX).saturating_add(1))
+                .map(|(value, _)| u64::try_from(value).unwrap_or(u64::MAX).saturating_add(1))
                 .unwrap_or(1);
             let revision_i64 = i64::try_from(revision).unwrap_or(i64::MAX);
             transaction
                 .execute(
-                    "INSERT INTO credentials (credential_id, provider_id, enabled, updated_at, revision)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
+                    "INSERT INTO credentials
+                     (credential_id, provider_id, configuration_fingerprint, enabled, updated_at, revision)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(credential_id) DO UPDATE SET
                        provider_id = excluded.provider_id,
+                       configuration_fingerprint = excluded.configuration_fingerprint,
                        enabled = excluded.enabled,
                        updated_at = excluded.updated_at,
                        revision = excluded.revision",
                     params![
                         &state.credential_id,
                         &state.provider_id,
+                        &configuration_fingerprint,
                         i64::from(state.enabled),
                         state.updated_at,
                         revision_i64,
@@ -1594,9 +3659,13 @@ impl Store for SqliteStore {
                 )
                 .map_err(sqlite_error)?;
             evict_credentials(transaction, self.retention.max_credentials)?;
-            Ok(revision)
+            Ok((revision, configuration_fingerprint))
         })?;
-        Ok(CredentialState { revision, ..state })
+        Ok(CredentialState {
+            configuration_fingerprint,
+            revision,
+            ..state
+        })
     }
 
     fn credential_state(&self, credential_id: &str) -> StoreResult<Option<CredentialState>> {
@@ -1604,7 +3673,8 @@ impl Store for SqliteStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT credential_id, provider_id, enabled, updated_at, revision
+                "SELECT credential_id, provider_id, configuration_fingerprint,
+                        enabled, updated_at, revision
                  FROM credentials WHERE credential_id = ?1",
                 [credential_id],
                 credential_from_row,
@@ -1617,7 +3687,8 @@ impl Store for SqliteStore {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT credential_id, provider_id, enabled, updated_at, revision
+                "SELECT credential_id, provider_id, configuration_fingerprint,
+                        enabled, updated_at, revision
                  FROM credentials ORDER BY credential_id ASC",
             )
             .map_err(sqlite_error)?;
@@ -1862,7 +3933,7 @@ impl Store for SqliteStore {
                     "SELECT key, provider_id, credential_id, upstream_model, created_at, last_used_at, expires_at
                      FROM affinities WHERE key = ?1",
                     [key],
-                    affinity_from_row,
+                    legacy_affinity_from_row,
                 )
                 .optional()
                 .map_err(sqlite_error)?;
@@ -1893,7 +3964,7 @@ impl Store for SqliteStore {
                 )
                 .map_err(sqlite_error)?;
             let rows = statement
-                .query_map([], affinity_from_row)
+                .query_map([], legacy_affinity_from_row)
                 .map_err(sqlite_error)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
         })
@@ -1920,9 +3991,9 @@ impl Store for SqliteStore {
                 .execute(
                     "INSERT INTO decisions
                      (request_id, route_id, model, candidates_json, selected_provider,
-                      selected_credential, upstream_model, attempt, configuration_generation,
-                      reason, recorded_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      selected_credential, upstream_model, target_binding_id, priority_tier,
+                      attempt, configuration_generation, reason, recorded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         &record.request_id,
                         &record.route_id,
@@ -1931,6 +4002,8 @@ impl Store for SqliteStore {
                         &record.selected_provider,
                         &record.selected_credential,
                         &record.upstream_model,
+                        &record.target_binding_id,
+                        record.priority_tier.map(i64::from),
                         i64::from(record.attempt),
                         i64::try_from(record.configuration_generation).unwrap_or(i64::MAX),
                         &record.reason,
@@ -1956,8 +4029,9 @@ impl Store for SqliteStore {
         let mut statement = connection
             .prepare(
                 "SELECT id, request_id, route_id, model, candidates_json, selected_provider,
-                 selected_credential, upstream_model, attempt, configuration_generation,
-                 reason, recorded_at FROM decisions ORDER BY id ASC",
+                 selected_credential, upstream_model, target_binding_id, priority_tier,
+                 attempt, configuration_generation, reason, recorded_at
+                 FROM decisions ORDER BY id ASC",
             )
             .map_err(sqlite_error)?;
         let rows = statement
@@ -1976,8 +4050,9 @@ impl Store for SqliteStore {
         let mut statement = connection
             .prepare(
                 "SELECT id, request_id, route_id, model, candidates_json, selected_provider,
-                 selected_credential, upstream_model, attempt, configuration_generation,
-                 reason, recorded_at FROM decisions ORDER BY id DESC LIMIT ?1",
+                 selected_credential, upstream_model, target_binding_id, priority_tier,
+                 attempt, configuration_generation, reason, recorded_at
+                 FROM decisions ORDER BY id DESC LIMIT ?1",
             )
             .map_err(sqlite_error)?;
         let rows = statement
@@ -2216,12 +4291,21 @@ impl Store for SqliteStore {
             let expired_affinities = transaction
                 .execute("DELETE FROM affinities WHERE expires_at <= ?1", [now])
                 .map_err(sqlite_error)?;
+            let expired_scoped_affinities = transaction
+                .execute(
+                    "DELETE FROM scoped_affinities WHERE expires_at <= ?1",
+                    [now],
+                )
+                .map_err(sqlite_error)?;
             transaction
                 .execute("DELETE FROM cooldowns WHERE until_at <= ?1", [now])
                 .map_err(sqlite_error)?;
             let evicted_credentials =
                 evict_credentials(transaction, self.retention.max_credentials)?;
-            let evicted_affinities = evict_affinities(transaction, self.retention.max_affinities)?;
+            let evicted_affinities =
+                evict_affinities(transaction, self.retention.max_affinities)?.saturating_add(
+                    evict_scoped_affinities(transaction, self.retention.max_affinities)?,
+                );
             let evicted_decisions = evict_decisions(transaction, self.retention.max_decisions)?;
             let evicted_request_events = transaction
                 .execute(
@@ -2248,7 +4332,7 @@ impl Store for SqliteStore {
                     .map_err(sqlite_error)?,
             );
             Ok(PruneReport {
-                expired_affinities,
+                expired_affinities: expired_affinities.saturating_add(expired_scoped_affinities),
                 evicted_credentials,
                 evicted_affinities,
                 evicted_decisions,
@@ -2267,7 +4351,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{CredentialHealthStatus, DecisionCandidate, RequestEventKind};
+    use crate::{
+        CredentialFingerprintInput, CredentialHealthStatus, DecisionCandidate, RequestEventKind,
+    };
 
     fn policy(credentials: usize, affinities: usize, decisions: usize) -> RetentionPolicy {
         RetentionPolicy::new(credentials, affinities, decisions).expect("valid policy")
@@ -4014,5 +6100,285 @@ mod tests {
                 usage_records: 0,
             }
         );
+    }
+
+    #[test]
+    fn identity_fingerprint_fences_payload_cas_and_supports_explicit_adoption() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"fingerprint-test-key").expect("key"),
+        )
+        .expect("store");
+        let first = CredentialFingerprintInput {
+            account_id: "account-a".to_owned(),
+            provider_instance_id: "provider-a".to_owned(),
+            provider_origin: "https://example.test".to_owned(),
+            auth_kind: "oauth".to_owned(),
+            provider_profile: "example".to_owned(),
+            oauth_client_id: Some("client-a".to_owned()),
+            oauth_grant_type: Some("authorization_code".to_owned()),
+            authorization_endpoint: Some("https://example.test/authorize".to_owned()),
+            token_endpoint: Some("https://example.test/token".to_owned()),
+            auth_placement: "bearer".to_owned(),
+        }
+        .fingerprint()
+        .expect("fingerprint");
+        let second = CredentialFingerprintInput {
+            account_id: "account-a".to_owned(),
+            provider_instance_id: "provider-a".to_owned(),
+            provider_origin: "https://example.test".to_owned(),
+            auth_kind: "oauth".to_owned(),
+            provider_profile: "example".to_owned(),
+            oauth_client_id: Some("client-b".to_owned()),
+            oauth_grant_type: Some("authorization_code".to_owned()),
+            authorization_endpoint: Some("https://example.test/authorize".to_owned()),
+            token_endpoint: Some("https://example.test/token".to_owned()),
+            auth_placement: "bearer".to_owned(),
+        }
+        .fingerprint()
+        .expect("fingerprint");
+        assert_ne!(first, second);
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "account-a",
+                "provider-a",
+                &first,
+                true,
+                1,
+            ))
+            .expect("state");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "account-a",
+                &first,
+                &CredentialPayload::new(b"stable-secret").expect("payload"),
+                1,
+            )
+            .expect("payload");
+        assert_eq!(
+            store.upsert_credential_state(CredentialState::new_with_fingerprint(
+                "account-a",
+                "provider-a",
+                &second,
+                true,
+                2,
+            )),
+            Err(StoreError::CredentialFingerprintConflict)
+        );
+        assert_eq!(
+            store.credential_payload_for_fingerprint("account-a", &second),
+            Err(StoreError::CredentialFingerprintConflict)
+        );
+        assert_eq!(
+            store
+                .credential_payload_for_fingerprint("account-a", &first)
+                .expect("payload")
+                .expect("payload")
+                .as_bytes(),
+            b"stable-secret"
+        );
+
+        let legacy = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"legacy-adoption-key").expect("key"),
+        )
+        .expect("legacy store");
+        legacy
+            .upsert_credential_state(CredentialState::new(
+                "legacy-account",
+                "provider-a",
+                true,
+                1,
+            ))
+            .expect("legacy state");
+        legacy
+            .upsert_credential_payload(
+                "legacy-account",
+                &CredentialPayload::new(b"legacy-secret").expect("payload"),
+                1,
+            )
+            .expect("legacy payload");
+        let adopted = legacy
+            .adopt_credential_fingerprint("legacy-account", "", &first, 2)
+            .expect("adopt");
+        assert_eq!(adopted.configuration_fingerprint, first);
+        assert_eq!(
+            legacy
+                .credential_payload("legacy-account")
+                .expect("payload")
+                .expect("payload")
+                .as_bytes(),
+            b"legacy-secret"
+        );
+    }
+
+    #[test]
+    fn scoped_affinity_uses_composite_binding_identity() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
+        let first_scope =
+            AffinityBindingIdentity::new("route-a", "policy-a", "model-a", "pool-a", "target-a");
+        let second_scope =
+            AffinityBindingIdentity::new("route-b", "policy-a", "model-a", "pool-a", "target-a");
+        store
+            .upsert_scoped_session_affinity(SessionAffinity::new_scoped(
+                "conversation",
+                "provider",
+                "credential",
+                "upstream-a",
+                first_scope.clone(),
+                1,
+                100,
+            ))
+            .expect("first affinity");
+        store
+            .upsert_scoped_session_affinity(SessionAffinity::new_scoped(
+                "conversation",
+                "provider",
+                "credential",
+                "upstream-b",
+                second_scope.clone(),
+                1,
+                100,
+            ))
+            .expect("second affinity");
+        assert_eq!(
+            store
+                .scoped_session_affinity("conversation", &first_scope, 2)
+                .expect("lookup")
+                .expect("affinity")
+                .upstream_model,
+            "upstream-a"
+        );
+        assert_eq!(
+            store
+                .scoped_session_affinity("conversation", &second_scope, 2)
+                .expect("lookup")
+                .expect("affinity")
+                .upstream_model,
+            "upstream-b"
+        );
+        assert_eq!(store.scoped_session_affinities(2).expect("list").len(), 2);
+    }
+
+    #[test]
+    fn durable_control_records_are_owner_scoped_encrypted_and_one_time() {
+        let directory = private_tempdir();
+        let path = directory.path().join("control.sqlite");
+        let key = MasterKey::from_bytes(b"control-records-key").expect("key");
+        let store = SqliteStore::open_encrypted(&path, key.clone()).expect("store");
+        let secret = ManagedSecretRecord::new("managed-1", "session-a", "api_key", 1, None);
+        store
+            .put_managed_secret(
+                secret,
+                &SecretPayload::new(b"managed-secret-sentinel").expect("secret"),
+                None,
+            )
+            .expect("managed secret");
+        let session = store
+            .create_management_session(
+                ManagementSessionRecord::new("session-a", "actor-a", 1, 10_000),
+                b"cookie-sentinel",
+            )
+            .expect("session");
+        let draft = store
+            .create_draft(DraftRecord::new(
+                "session-a",
+                "config",
+                7,
+                br#"{"provider":"provider-a","enabled":true}"#.to_vec(),
+                1,
+                10_000,
+            ))
+            .expect("draft");
+        store
+            .append_audit_record(AuditRecord::new(
+                Some("session-a".to_owned()),
+                "draft.commit",
+                "config",
+                "accepted",
+                7,
+                2,
+            ))
+            .expect("audit");
+        let reload = store
+            .append_reload_record(ReloadRecord::new(
+                Some("session-a".to_owned()),
+                8,
+                "queued",
+                3,
+            ))
+            .expect("reload");
+        let flow = store
+            .begin_oauth_flow(
+                OAuthFlowRecord::new(
+                    "flow-a",
+                    "session-a",
+                    "provider-a",
+                    "account-a",
+                    "browser",
+                    4,
+                    10_000,
+                ),
+                b"oauth-state-sentinel",
+                Some(&SecretPayload::new(b"pkce-verifier-sentinel").expect("verifier")),
+            )
+            .expect("OAuth flow");
+        drop(store);
+
+        let raw = std::fs::read(&path).expect("database bytes");
+        assert!(!raw
+            .windows(b"managed-secret-sentinel".len())
+            .any(|window| window == b"managed-secret-sentinel"));
+        assert!(!raw
+            .windows(b"pkce-verifier-sentinel".len())
+            .any(|window| window == b"pkce-verifier-sentinel"));
+
+        let reopened = SqliteStore::open_encrypted(&path, key).expect("reopen");
+        assert_eq!(
+            reopened
+                .managed_secret_payload("managed-1")
+                .expect("secret")
+                .as_bytes(),
+            b"managed-secret-sentinel"
+        );
+        assert_eq!(
+            reopened
+                .management_session_by_cookie(b"cookie-sentinel", 5)
+                .expect("session")
+                .expect("session")
+                .session_id,
+            session.session_id
+        );
+        assert_eq!(
+            reopened
+                .draft(draft.draft_id, "session-a", 5)
+                .expect("draft")
+                .expect("draft")
+                .payload,
+            br#"{"provider":"provider-a","enabled":true}"#.to_vec()
+        );
+        assert_eq!(reopened.audit_records().expect("audit").len(), 1);
+        assert_eq!(reopened.reload_records().expect("reload")[0], reload);
+        assert_eq!(
+            reopened
+                .oauth_flow_pkce_verifier(&flow.flow_id)
+                .expect("verifier")
+                .expect("verifier")
+                .as_bytes(),
+            b"pkce-verifier-sentinel"
+        );
+        assert!(reopened
+            .consume_oauth_state(b"oauth-state-sentinel", 5)
+            .expect("consume")
+            .is_some());
+        assert!(reopened
+            .consume_oauth_state(b"oauth-state-sentinel", 6)
+            .expect("replay")
+            .is_none());
+        assert!(matches!(
+            reopened.draft(draft.draft_id, "other-session", 5),
+            Err(StoreError::OwnerMismatch)
+        ));
     }
 }

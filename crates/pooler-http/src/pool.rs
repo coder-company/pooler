@@ -184,6 +184,20 @@ fn store_error_class(error: &StoreError) -> &'static str {
         | StoreError::CredentialEnvelopeAuthenticationFailed
         | StoreError::EncryptionFailed => "encryption",
         StoreError::CredentialRevisionConflict => "concurrency",
+        StoreError::CredentialFingerprintConflict
+        | StoreError::InvalidCredentialFingerprint
+        | StoreError::InvalidAffinityBinding
+        | StoreError::OwnerMismatch
+        | StoreError::RecordExpired
+        | StoreError::ManagementRevisionConflict
+        | StoreError::ManagementCapacity
+        | StoreError::ManagementSessionAlreadyExists
+        | StoreError::OAuthFlowAlreadyExists
+        | StoreError::OAuthFlowNotFound
+        | StoreError::OAuthStateConflict
+        | StoreError::ManagedSecretNotFound
+        | StoreError::ManagedSecretRevisionConflict => "concurrency",
+        StoreError::ManagedSecretEncryptionRequired => "encryption",
         StoreError::UnsupportedSchemaVersion(_) | StoreError::Migration { .. } => "migration",
         StoreError::LockPoisoned => "lock",
     }
@@ -624,7 +638,13 @@ impl PoolingCoordinator {
 
         for model in config.models().values() {
             let registry = Arc::new(CredentialRegistry::new());
-            register_model_accounts(&registry, model.id(), model.targets(), &accounts)?;
+            register_model_accounts(
+                &registry,
+                model.id(),
+                model.targets(),
+                &accounts,
+                config.account_pools(),
+            )?;
             registries.insert(model.id().to_owned(), registry);
         }
         for route in config.routes() {
@@ -1155,7 +1175,7 @@ impl PoolingCoordinator {
                 .with_codec(codec)
                 .map_err(|_| PoolError::Selection)?;
         }
-        if let Some(allowed) = account_allow_list(config, &policy) {
+        if let Some(allowed) = model_account_allow_list(config, &logical_model) {
             let ids = allowed
                 .into_iter()
                 .filter_map(|id| CredentialId::new(id).ok())
@@ -1204,7 +1224,16 @@ impl PoolingCoordinator {
             .and_then(|plan| {
                 plan.targets()
                     .iter()
-                    .find(|target| target.provider() == provider.as_str())
+                    .find(|target| {
+                        target.provider() == provider.as_str()
+                            && target_bound_accounts(target, config.account_pools())
+                                .contains(&account_id.as_str())
+                    })
+                    .or_else(|| {
+                        plan.targets()
+                            .iter()
+                            .find(|target| target.provider() == provider.as_str())
+                    })
             })
             .map(|target| target.upstream_model().to_owned())
             .or(static_model);
@@ -1426,7 +1455,17 @@ impl PoolingCoordinator {
                 model
                     .targets()
                     .iter()
-                    .find(|target| target.provider() == provider.as_str())
+                    .find(|target| {
+                        target.provider() == provider.as_str()
+                            && target_bound_accounts(target, config.account_pools())
+                                .contains(&credential.as_str())
+                    })
+                    .or_else(|| {
+                        model
+                            .targets()
+                            .iter()
+                            .find(|target| target.provider() == provider.as_str())
+                    })
             })
             .map(|target| Arc::from(target.upstream_model()))
             .or_else(|| {
@@ -2114,37 +2153,41 @@ fn register_model_accounts(
     model: &str,
     targets: &[pooler_config::ModelTargetPlan],
     accounts: &BTreeMap<String, AccountPlan>,
+    account_pools: &BTreeMap<Arc<str>, pooler_config::AccountPoolPlan>,
 ) -> Result<(), PoolError> {
     let model = ModelId::new(model.to_owned()).map_err(|_| PoolError::InvalidModel)?;
-    for account in accounts.values() {
-        let Some(target) = targets
-            .iter()
-            .find(|target| target.provider() == account.provider())
-        else {
-            continue;
-        };
-        let registration = CredentialRegistration::from_strings(
-            account.id(),
-            account.provider(),
-            model.as_str(),
-            target.capabilities(),
-        )
-        .map_err(|_| PoolError::Selection)?
-        .with_weight(account.weight())
-        .map_err(|_| PoolError::Selection)?;
-        let registration = registration
-            .with_codecs(target.codecs().iter().map(AsRef::as_ref))
+    for target in targets {
+        let account_ids = target_bound_accounts(target, account_pools);
+        for account_id in account_ids {
+            let Some(account) = accounts.get(account_id) else {
+                continue;
+            };
+            if account.provider() != target.provider() {
+                continue;
+            }
+            let registration = CredentialRegistration::from_strings(
+                account.id(),
+                account.provider(),
+                model.as_str(),
+                target.capabilities(),
+            )
+            .map_err(|_| PoolError::Selection)?
+            .with_weight(account.weight())
             .map_err(|_| PoolError::Selection)?;
-        let registration = with_account_quota_project(registration, account)?;
-        let registration = match account.max_concurrency() {
-            Some(max) => registration
-                .with_max_in_flight(max)
-                .map_err(|_| PoolError::Selection)?,
-            None => registration,
-        };
-        registry
-            .register(registration)
-            .map_err(|_| PoolError::Selection)?;
+            let registration = registration
+                .with_codecs(target.codecs().iter().map(AsRef::as_ref))
+                .map_err(|_| PoolError::Selection)?;
+            let registration = with_account_quota_project(registration, account)?;
+            let registration = match account.max_concurrency() {
+                Some(max) => registration
+                    .with_max_in_flight(max)
+                    .map_err(|_| PoolError::Selection)?,
+                None => registration,
+            };
+            registry
+                .register(registration)
+                .map_err(|_| PoolError::Selection)?;
+        }
     }
     Ok(())
 }
@@ -2413,26 +2456,30 @@ fn config_strategy(strategy: ConfigSelectionStrategy) -> pooler_policy::Selectio
     }
 }
 
-fn account_allow_list(config: &CompiledConfig, policy: &PolicyPlan) -> Option<Vec<String>> {
-    let selection = policy.selection();
-    if let Some(pool) = selection.account_pool().or(policy.account_pool()) {
-        return config.account_pools().get(pool).map(|pool| {
-            pool.accounts()
-                .iter()
-                .map(|account| account.to_string())
-                .collect()
-        });
+fn model_account_allow_list(config: &CompiledConfig, model: &str) -> Option<Vec<String>> {
+    let targets = config.models().get(model)?.targets();
+    let mut accounts = BTreeSet::new();
+    for target in targets {
+        for account in target_bound_accounts(target, config.account_pools()) {
+            accounts.insert(account.to_owned());
+        }
     }
-    if !selection.accounts().is_empty() {
-        return Some(
-            selection
-                .accounts()
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-        );
+    Some(accounts.into_iter().collect())
+}
+
+fn target_bound_accounts<'a>(
+    target: &'a pooler_config::ModelTargetPlan,
+    account_pools: &'a BTreeMap<Arc<str>, pooler_config::AccountPoolPlan>,
+) -> Vec<&'a str> {
+    if let Some(account) = target.account() {
+        return vec![account];
     }
-    None
+    target
+        .account_pool()
+        .and_then(|pool| account_pools.get(pool))
+        .map_or_else(Vec::new, |pool| {
+            pool.accounts().iter().map(AsRef::as_ref).collect()
+        })
 }
 
 fn affinity_value(
@@ -2597,6 +2644,7 @@ pub fn apply_configured_account_auth(
             service: service.to_string(),
             account: account.to_string(),
         },
+        SecretRef::Managed(_) => return Err(PoolError::Store),
     };
     let value = reference.resolve().map_err(|_| PoolError::Store)?;
     if value.expose_secret().chars().any(char::is_whitespace) {
@@ -2639,7 +2687,7 @@ mod tests {
         let config = compile_yaml(
             "custom-account-auth.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   custom:
     url: https://provider.example
@@ -2703,7 +2751,7 @@ upstreams:
         compile_yaml(
             "pooling-test.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://127.0.0.1:1}}}}\naccounts:\n  first: {{provider: local, secret: env:POOLER_FIRST}}\n  second: {{provider: local, secret: env:POOLER_SECOND}}\naccount_pools:\n  pool: {{accounts: [first, second]}}\npolicies:\n  pooled:\n    selection:\n      strategy: ordered_fallback\n      account_pool: pool{affinity}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    target: {{provider: local, policy: pooled}}\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://127.0.0.1:1}}}}\naccounts:\n  first: {{provider: local, secret: env:POOLER_FIRST}}\n  second: {{provider: local, secret: env:POOLER_SECOND}}\naccount_pools:\n  pool: {{provider: local, strategy: ordered_fallback, accounts: [first, second]}}\npolicies:\n  pooled:\n    selection:\n      strategy: ordered_fallback{affinity}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    target: {{provider: local, policy: pooled}}\n",
             ),
         )
         .expect("pooling test config")
@@ -2722,18 +2770,21 @@ upstreams:
         let config = compile_yaml(
             "published-model-scope.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   first: {url: http://127.0.0.1:1}
   second: {url: http://127.0.0.1:2}
 accounts:
   first-selected: {provider: first, secret: env:FIRST_SELECTED}
   first-disabled: {provider: first, secret: env:FIRST_DISABLED}
+  second-selected: {provider: second, secret: env:SECOND_SELECTED}
 models:
   - id: first-model
-    targets: [{provider: first, upstream_model: first-private}]
+    targets:
+      - {id: first-target, provider: first, account: first-selected, priority: 1, upstream_model: first-private, capabilities: [text], codecs: [], wire_family: openai}
   - id: second-model
-    targets: [{provider: second, upstream_model: second-private}]
+    targets:
+      - {id: second-target, provider: second, account: second-selected, priority: 1, upstream_model: second-private, capabilities: [text], codecs: [], wire_family: openai}
 "#,
         )
         .expect("published model config");
@@ -2773,7 +2824,7 @@ models:
         compile_yaml(
             "project-quota-test.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 accounts:
@@ -2781,10 +2832,10 @@ accounts:
   second: {provider: local, secret: env:POOLER_SECOND, quota_project: shared-billing}
   third: {provider: local, secret: env:POOLER_THIRD, quota_project: alternate-billing}
 account_pools:
-  pool: {accounts: [first, second, third]}
+  pool: {provider: local, strategy: ordered_fallback, accounts: [first, second, third]}
 policies:
   pooled:
-    selection: {strategy: ordered_fallback, account_pool: pool}
+    selection: {strategy: ordered_fallback}
     retry: {maximum_attempts: 3, maximum_credentials: 3, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}
 routes:
   - id: pooled
@@ -2918,7 +2969,7 @@ routes:
         let config = pooler_config::compile_yaml(
             "selection-requirements.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams:
   capable: {url: http://127.0.0.1:1}
@@ -2926,15 +2977,17 @@ upstreams:
 accounts:
   capable: {provider: capable, secret: env:POOLER_CAPABLE}
   incomplete: {provider: incomplete, secret: env:POOLER_INCOMPLETE}
-account_pools: {pool: {accounts: [capable, incomplete]}}
+account_pools:
+  capable-pool: {provider: capable, strategy: ordered_fallback, accounts: [capable]}
+  incomplete-pool: {provider: incomplete, strategy: ordered_fallback, accounts: [incomplete]}
 models:
   - id: public-model
     targets:
-      - {provider: capable, upstream_model: capable-model, capabilities: [text, streaming], codecs: [decode.factory.language_model]}
-      - {provider: incomplete, upstream_model: incomplete-model, capabilities: [streaming], codecs: [decode.other]}
+      - {id: capable-target, provider: capable, account_pool: capable-pool, priority: 1, upstream_model: capable-model, capabilities: [text, streaming], codecs: [decode.factory.language_model], wire_family: openai}
+      - {id: incomplete-target, provider: incomplete, account_pool: incomplete-pool, priority: 2, upstream_model: incomplete-model, capabilities: [streaming], codecs: [decode.other], wire_family: openai}
 policies:
   pooled:
-    selection: {strategy: ordered_fallback, account_pool: pool}
+    selection: {strategy: ordered_fallback}
 routes:
   - id: model-route
     listen: local
@@ -2987,7 +3040,7 @@ routes:
         let config = pooler_config::compile_yaml(
             "optional-semantic-model.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams:
   local: {url: http://127.0.0.1:1}
@@ -2995,10 +3048,13 @@ upstreams:
 models:
   - id: public-model
     targets:
-      - {provider: local, upstream_model: private-model, capabilities: [text], codecs: [decode.gemini.generate_content]}
+      - {id: public-local-target, provider: local, account: local-account, priority: 1, upstream_model: private-model, capabilities: [text], codecs: [decode.gemini.generate_content], wire_family: gemini}
   - id: foreign-only
     targets:
-      - {provider: other, upstream_model: foreign-model, capabilities: [text]}
+      - {id: foreign-target, provider: other, account: other-account, priority: 1, upstream_model: foreign-model, capabilities: [text], codecs: [], wire_family: openai}
+accounts:
+  local-account: {provider: local, secret: env:POOLER_LOCAL}
+  other-account: {provider: other, secret: env:POOLER_OTHER}
 routes:
   - id: semantic
     listen: local
@@ -3066,7 +3122,7 @@ routes:
         let config = pooler_config::compile_yaml(
             "gemini-affinity.yaml",
             r#"
-version: 1
+version: 2
 policies:
   interactions:
     selection:
@@ -3090,7 +3146,7 @@ policies:
         let config = pooler_config::compile_yaml(
             "gemini-returned-affinity.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 accounts:
@@ -3099,12 +3155,13 @@ accounts:
 models:
   - id: public-gemini
     targets:
-      - {provider: local, upstream_model: private-gemini, capabilities: [text]}
+      - {id: public-gemini-target, provider: local, account_pool: interaction-pool, priority: 1, upstream_model: private-gemini, capabilities: [text], codecs: [decode.gemini.generate_content], wire_family: gemini}
+account_pools:
+  interaction-pool: {provider: local, strategy: round_robin, accounts: [first, second]}
 policies:
   interactions:
     selection:
       strategy: round_robin
-      accounts: [first, second]
       affinity: {key: gemini.interaction_id, ttl: 30m}
 routes:
   - id: create
@@ -3223,7 +3280,7 @@ routes:
         let config = pooler_config::compile_yaml(
             "static-selection-contract.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 routes:
@@ -3786,15 +3843,15 @@ routes:
         let config = pooler_config::compile_yaml(
             "no-eligible.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 accounts:
   first: {provider: local, secret: env:POOLER_FIRST, enabled: false}
-account_pools: {pool: {accounts: [first]}}
+account_pools: {pool: {provider: local, strategy: ordered_fallback, accounts: [first]}}
 policies:
   pooled:
-    selection: {strategy: ordered_fallback, account_pool: pool}
+    selection: {strategy: ordered_fallback}
 routes:
   - id: pooled
     listen: local

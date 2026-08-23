@@ -188,7 +188,7 @@ fn opaque_config(
 ) -> CompiledConfig {
     let pooling = account_secrets.map_or_else(String::new, |(first, second)| {
         format!(
-            "accounts:\n  first: {{provider: local, secret: '{first}'}}\n  second: {{provider: local, secret: '{second}'}}\npolicies:\n  uploads:\n    selection: {{strategy: ordered_fallback, accounts: [first, second]}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, maximum_providers: 1, statuses: [503], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1ms}}\n"
+            "accounts:\n  first: {{provider: local, secret: '{first}'}}\n  second: {{provider: local, secret: '{second}'}}\naccount_pools:\n  uploads-pool: {{provider: local, accounts: [first, second]}}\npolicies:\n  uploads:\n    selection: {{strategy: ordered_fallback}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, maximum_upstreams: 1, statuses: [503], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1ms}}\n"
         )
     });
     let target = account_secrets.map_or_else(
@@ -198,7 +198,7 @@ fn opaque_config(
     compile_yaml(
         "raw-media-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream}}}}}\n{pooling}routes:\n  - id: raw-media\n    listen: local\n    match: {{method: POST, path: /v1/images/raw, content_types: [image/*]}}\n    limits: {{max_request_body_bytes: {body_limit}, max_frame_bytes: 1024}}\n    ingress: {{mode: opaque}}\n    target: {target}\n    response: {{mode: opaque}}\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream}}}}}\n{pooling}routes:\n  - id: raw-media\n    listen: local\n    match: {{method: POST, path: /v1/images/raw, content_types: [image/*]}}\n    limits: {{max_request_body_bytes: {body_limit}, max_frame_bytes: 1024}}\n    ingress: {{mode: opaque}}\n    target: {target}\n    response: {{mode: opaque}}\n"
         ),
     )
     .expect("raw media config")
@@ -208,7 +208,7 @@ fn media_surface_config(upstream: SocketAddr) -> CompiledConfig {
     compile_yaml(
         "media-surface-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream}}}}}\nroutes:\n  - {{id: images, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/images}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [images]}}, response: {{mode: opaque}}}}\n  - {{id: audio, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/audio}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [audio]}}, response: {{mode: opaque}}}}\n  - {{id: files, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/files}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [files]}}, response: {{mode: opaque}}}}\n  - {{id: batches, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/batches}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [batch]}}, response: {{mode: opaque}}}}\n  - {{id: embeddings, listen: local, match: {{method: POST, path: /v1/embeddings}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [text, embeddings]}}, response: {{mode: opaque}}}}\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream}}}}}\nroutes:\n  - {{id: images, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/images}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [images]}}, response: {{mode: opaque}}}}\n  - {{id: audio, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/audio}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [audio]}}, response: {{mode: opaque}}}}\n  - {{id: files, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/files}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [files]}}, response: {{mode: opaque}}}}\n  - {{id: batches, listen: local, match: {{methods: [GET, POST, DELETE], path_prefix: /v1/batches}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [batch]}}, response: {{mode: opaque}}}}\n  - {{id: embeddings, listen: local, match: {{method: POST, path: /v1/embeddings}}, ingress: {{mode: opaque}}, target: {{provider: local, capabilities: [text, embeddings]}}, response: {{mode: opaque}}}}\n"
         ),
     )
     .expect("media surface config")
@@ -218,7 +218,7 @@ fn multipart_config(upstream: SocketAddr, body_limit: usize) -> CompiledConfig {
     compile_yaml(
         "multipart-media-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream}}}}}\nroutes:\n  - id: multipart-media\n    listen: local\n    match: {{method: POST, path: /v1/images/edits, content_types: [multipart/form-data]}}\n    limits: {{max_request_body_bytes: {body_limit}, max_frame_bytes: {body_limit}}}\n    ingress: {{mode: semantic, decoder: decode.media.multipart}}\n    target: {{provider: local, capabilities: [text, files], codecs: [decode.media.multipart]}}\n    response: {{mode: opaque}}\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream}}}}}\nroutes:\n  - id: multipart-media\n    listen: local\n    match: {{method: POST, path: /v1/images/edits, content_types: [multipart/form-data]}}\n    limits: {{max_request_body_bytes: {body_limit}, max_frame_bytes: {body_limit}}}\n    ingress: {{mode: semantic, decoder: decode.media.multipart}}\n    target: {{provider: local, capabilities: [text, files], codecs: [decode.media.multipart]}}\n    response: {{mode: opaque}}\n"
         ),
     )
     .expect("multipart media config")

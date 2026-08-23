@@ -144,7 +144,7 @@ async fn factory_current_fixture_replays_through_http_proxy_server() {
     let config = compile_yaml(
         "factory-current-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nmodels:\n  - id: gpt-5.6-sol\n    targets:\n      - {{provider: local, upstream_model: gpt-5.6-sol, capabilities: [text, tools, function_calling, tool_choice, streaming], codecs: [decode.factory.language_model]}}\nroutes:\n  - id: factory-current\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: local, path: /v1/chat/completions, model_from: request.model}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: degrade\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts: {{model-account: {{provider: local, secret: env:POOLER_TEST_MODEL_KEY}}}}\nmodels:\n  - id: gpt-5.6-sol\n    targets:\n      - {{id: gpt-current-target, provider: local, account: model-account, priority: 1, upstream_model: gpt-5.6-sol, capabilities: [text, tools, function_calling, tool_choice, streaming], codecs: [decode.factory.language_model], wire_family: openai}}\nroutes:\n  - id: factory-current\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: local, path: /v1/chat/completions, model_from: request.model}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: degrade\n"
         ),
     )
     .expect("Factory runtime config");
@@ -203,7 +203,7 @@ async fn fx_body_model_hint_survives_http_runtime_without_upstream_echo() {
     let config = compile_yaml(
         "fx-body-model-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: fx-body-model\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.fx.language_model}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.fx.events}}\n    loss_policy: degrade\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: fx-body-model\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.fx.language_model}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.fx.events}}\n    loss_policy: degrade\n"
         ),
     )
     .expect("fx body-model runtime config");
@@ -280,7 +280,7 @@ async fn devin_current_tool_follow_up_replays_through_http_proxy_server() {
     let config = compile_yaml(
         "devin-current-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: devin-current\n    listen: local\n    match: {{method: POST, path: /exa.api_server_pb.ApiServerService/GetChatMessage, content_types: [application/connect+proto]}}\n    ingress: {{mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: devin-current\n    listen: local\n    match: {{method: POST, path: /exa.api_server_pb.ApiServerService/GetChatMessage, content_types: [application/connect+proto]}}\n    ingress: {{mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}}\n    loss_policy: reject\n"
         ),
     )
     .expect("Devin runtime config");

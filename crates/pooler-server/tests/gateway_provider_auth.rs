@@ -46,7 +46,7 @@ fn gateway_config(
     std::fs::write(
         &path,
         format!(
-            "imports:\n  - preset: gateway\n    as: gw\n    with:\n      bind: 127.0.0.1:0\n      provider: {provider}\n      upstream_url: http://{upstream}\n      websocket_url: ws://{upstream}\n      secret: 'file:{secret}'\n\nversion: 1\n"
+            "imports:\n  - preset: gateway\n    as: gw\n    with:\n      bind: 127.0.0.1:0\n      provider: {provider}\n      upstream_url: http://{upstream}\n      websocket_url: ws://{upstream}\n      secret: 'file:{secret}'\n\nversion: 2\n"
         ),
     )
     .expect("gateway config");
@@ -149,7 +149,7 @@ fn vertex_config(directory: &TempDir, upstream: SocketAddr) -> pooler_config::Co
         "vertex-mounted-test.yaml",
         &format!(
             r#"
-version: 1
+version: 2
 listeners:
   vertex: {{bind: 127.0.0.1:0}}
 upstreams:
@@ -162,13 +162,21 @@ upstreams:
       publisher: google
     auth:
       secret: 'file:{}'
+accounts:
+  vertex-account:
+    provider: vertex
+    secret: 'file:{}'
 models:
   - id: gemini-2.5-pro
     targets:
-      - provider: vertex
+      - id: vertex-gemini-target
+        provider: vertex
+        account: vertex-account
+        priority: 1
         upstream_model: gemini-2.5-pro
         capabilities: [text, streaming, tools]
         codecs: [decode.gemini.generate_content]
+        wire_family: gemini
 routes:
   - id: vertex-model-actions
     listen: vertex
@@ -189,6 +197,7 @@ routes:
     response:
       mode: opaque
 "#,
+            secret.display(),
             secret.display()
         ),
     )
@@ -225,7 +234,7 @@ fn antigravity_config(directory: &TempDir, upstream: SocketAddr) -> pooler_confi
         "antigravity-mounted-test.yaml",
         &format!(
             r#"
-version: 1
+version: 2
 listeners:
   antigravity: {{bind: 127.0.0.1:0}}
 upstreams:
@@ -276,7 +285,7 @@ fn compatible_provider_config(
         "compatible-mounted-test.yaml",
         &format!(
             r#"
-version: 1
+version: 2
 listeners:
   compatible: {{bind: 127.0.0.1:0}}
 upstreams:
@@ -288,12 +297,21 @@ upstreams:
       header: x-provider-token
       value_prefix: 'Token '
       secret: 'file:{}'
+accounts:
+  compatible-account:
+    provider: compatible
+    secret: 'file:{}'
 models:
   - id: public-model
     targets:
-      - provider: compatible
+      - id: compatible-model-target
+        provider: compatible
+        account: compatible-account
+        priority: 1
         upstream_model: vendor-model
         capabilities: [text]
+        codecs: []
+        wire_family: openai
 routes:
   - id: compatible-models
     listen: compatible
@@ -323,6 +341,7 @@ routes:
       model_from: request.model
     response: {{mode: opaque}}
 "#,
+            secret.display(),
             secret.display()
         ),
     )
@@ -1218,7 +1237,7 @@ fn the_credential_value_is_never_rendered() {
     let path = directory.path().join("gateway.yaml");
     std::fs::write(
         &path,
-        "imports:\n  - preset: gateway\n    as: gw\n    with: {bind: 127.0.0.1:0, provider: anthropic, secret: 'env:OPERATOR_KEY'}\n\nversion: 1\n",
+        "imports:\n  - preset: gateway\n    as: gw\n    with: {bind: 127.0.0.1:0, provider: anthropic, secret: 'env:OPERATOR_KEY'}\n\nversion: 2\n",
     )
     .expect("gateway config");
 
@@ -1248,7 +1267,7 @@ async fn the_upstream_credential_never_reaches_a_management_surface() {
     std::fs::write(
         &path,
         format!(
-            "imports:\n  - preset: gateway\n    as: gw\n    with:\n      bind: 127.0.0.1:0\n      upstream_url: http://{}\n      secret: '{secret_reference}'\n\nversion: 1\nmanagement: {{bind: 127.0.0.1:0}}\n",
+            "imports:\n  - preset: gateway\n    as: gw\n    with:\n      bind: 127.0.0.1:0\n      upstream_url: http://{}\n      secret: '{secret_reference}'\n\nversion: 2\nmanagement: {{bind: 127.0.0.1:0}}\n",
             upstream.address()
         ),
     )

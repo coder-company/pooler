@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{PoisonError, RwLock};
 
+use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -36,6 +37,13 @@ pub struct RetentionPolicy {
     pub request_history_ttl_ms: u64,
     pub max_usage_records: usize,
     pub usage_history_ttl_ms: u64,
+    pub max_managed_secrets: usize,
+    pub max_management_sessions: usize,
+    pub max_drafts: usize,
+    pub max_audit_records: usize,
+    pub max_reload_records: usize,
+    pub max_oauth_flows: usize,
+    pub control_history_ttl_ms: u64,
 }
 
 impl RetentionPolicy {
@@ -57,6 +65,13 @@ impl RetentionPolicy {
             request_history_ttl_ms: 7 * 24 * 60 * 60 * 1_000,
             max_usage_records: 16_384,
             usage_history_ttl_ms: 90 * 24 * 60 * 60 * 1_000,
+            max_managed_secrets: 1_024,
+            max_management_sessions: 1_024,
+            max_drafts: 1_024,
+            max_audit_records: 16_384,
+            max_reload_records: 4_096,
+            max_oauth_flows: 1_024,
+            control_history_ttl_ms: 30 * 24 * 60 * 60 * 1_000,
         })
     }
 
@@ -87,6 +102,38 @@ impl RetentionPolicy {
         self.usage_history_ttl_ms = usage_history_ttl_ms;
         Ok(self)
     }
+
+    /// Override bounded durable control-plane retention.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn with_control_plane_history(
+        mut self,
+        max_managed_secrets: usize,
+        max_management_sessions: usize,
+        max_drafts: usize,
+        max_audit_records: usize,
+        max_reload_records: usize,
+        max_oauth_flows: usize,
+        control_history_ttl_ms: u64,
+    ) -> Result<Self, StoreError> {
+        if max_managed_secrets == 0
+            || max_management_sessions == 0
+            || max_drafts == 0
+            || max_audit_records == 0
+            || max_reload_records == 0
+            || max_oauth_flows == 0
+            || control_history_ttl_ms == 0
+        {
+            return Err(StoreError::InvalidRetention);
+        }
+        self.max_managed_secrets = max_managed_secrets;
+        self.max_management_sessions = max_management_sessions;
+        self.max_drafts = max_drafts;
+        self.max_audit_records = max_audit_records;
+        self.max_reload_records = max_reload_records;
+        self.max_oauth_flows = max_oauth_flows;
+        self.control_history_ttl_ms = control_history_ttl_ms;
+        Ok(self)
+    }
 }
 
 impl Default for RetentionPolicy {
@@ -99,8 +146,114 @@ impl Default for RetentionPolicy {
             request_history_ttl_ms: 7 * 24 * 60 * 60 * 1_000,
             max_usage_records: 16_384,
             usage_history_ttl_ms: 90 * 24 * 60 * 60 * 1_000,
+            max_managed_secrets: 1_024,
+            max_management_sessions: 1_024,
+            max_drafts: 1_024,
+            max_audit_records: 16_384,
+            max_reload_records: 4_096,
+            max_oauth_flows: 1_024,
+            control_history_ttl_ms: 30 * 24 * 60 * 60 * 1_000,
         }
     }
+}
+
+/// Non-secret immutable inputs used to derive a credential configuration
+/// fingerprint. Values are configuration identity only; bearer and client
+/// secret values must never be supplied here.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CredentialFingerprintInput {
+    pub account_id: String,
+    pub provider_instance_id: String,
+    pub provider_origin: String,
+    pub auth_kind: String,
+    pub provider_profile: String,
+    pub oauth_client_id: Option<String>,
+    pub oauth_grant_type: Option<String>,
+    pub authorization_endpoint: Option<String>,
+    pub token_endpoint: Option<String>,
+    pub auth_placement: String,
+}
+
+impl CredentialFingerprintInput {
+    /// Return a stable SHA-256 hex fingerprint over canonical, length-prefixed
+    /// identity fields. Secret values are not accepted by this type.
+    pub fn fingerprint(&self) -> StoreResult<String> {
+        for (field, value) in [
+            ("account_id", self.account_id.as_str()),
+            ("provider_instance_id", self.provider_instance_id.as_str()),
+            ("provider_origin", self.provider_origin.as_str()),
+            ("auth_kind", self.auth_kind.as_str()),
+            ("provider_profile", self.provider_profile.as_str()),
+            ("auth_placement", self.auth_placement.as_str()),
+        ] {
+            non_empty(field, value)?;
+            if value.len() > 512 {
+                return Err(StoreError::Serialization(
+                    "credential fingerprint field exceeds metadata bounds".to_owned(),
+                ));
+            }
+        }
+        for value in [
+            self.oauth_client_id.as_deref(),
+            self.oauth_grant_type.as_deref(),
+            self.authorization_endpoint.as_deref(),
+            self.token_endpoint.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if value.is_empty() || value.len() > 1_024 {
+                return Err(StoreError::Serialization(
+                    "credential fingerprint field exceeds metadata bounds".to_owned(),
+                ));
+            }
+        }
+        let mut canonical = String::from("pooler-credential-fingerprint:v1\n");
+        for value in [
+            Some(self.account_id.as_str()),
+            Some(self.provider_instance_id.as_str()),
+            Some(self.provider_origin.as_str()),
+            Some(self.auth_kind.as_str()),
+            Some(self.provider_profile.as_str()),
+            self.oauth_client_id.as_deref(),
+            self.oauth_grant_type.as_deref(),
+            self.authorization_endpoint.as_deref(),
+            self.token_endpoint.as_deref(),
+            Some(self.auth_placement.as_str()),
+        ] {
+            let value = value.unwrap_or("");
+            canonical.push_str(&value.len().to_string());
+            canonical.push(':');
+            canonical.push_str(value);
+            canonical.push('|');
+        }
+        Ok(hex_digest(canonical.as_bytes()))
+    }
+}
+
+/// Compute a stable non-secret credential configuration fingerprint.
+pub fn credential_configuration_fingerprint(
+    input: &CredentialFingerprintInput,
+) -> StoreResult<String> {
+    input.fingerprint()
+}
+
+pub(crate) fn hex_digest(value: &[u8]) -> String {
+    digest(&SHA256, value)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn validate_fingerprint(value: &str) -> StoreResult<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(StoreError::InvalidCredentialFingerprint);
+    }
+    Ok(())
 }
 
 /// Mutable state for one credential.  This is metadata only; it never carries a
@@ -109,6 +262,10 @@ impl Default for RetentionPolicy {
 pub struct CredentialState {
     pub credential_id: String,
     pub provider_id: String,
+    /// Immutable, non-secret account/provider/auth configuration identity.
+    /// Empty is retained only for version-1 rows awaiting explicit adoption.
+    #[serde(default)]
+    pub configuration_fingerprint: String,
     pub enabled: bool,
     pub updated_at: Timestamp,
     /// Store-assigned revision, starting at one.
@@ -125,10 +282,75 @@ impl CredentialState {
         Self {
             credential_id: credential_id.into(),
             provider_id: provider_id.into(),
+            configuration_fingerprint: String::new(),
             enabled,
             updated_at,
             revision: 0,
         }
+    }
+
+    /// Construct metadata with an immutable configuration fingerprint.
+    pub fn new_with_fingerprint(
+        credential_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        configuration_fingerprint: impl Into<String>,
+        enabled: bool,
+        updated_at: Timestamp,
+    ) -> Self {
+        Self {
+            credential_id: credential_id.into(),
+            provider_id: provider_id.into(),
+            configuration_fingerprint: configuration_fingerprint.into(),
+            enabled,
+            updated_at,
+            revision: 0,
+        }
+    }
+}
+
+/// Stable identity that scopes an affinity to one compiled target binding.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AffinityBindingIdentity {
+    pub route_id: String,
+    pub policy_id: String,
+    pub logical_model: String,
+    pub account_pool_id: String,
+    pub target_binding_id: String,
+}
+
+impl AffinityBindingIdentity {
+    pub fn new(
+        route_id: impl Into<String>,
+        policy_id: impl Into<String>,
+        logical_model: impl Into<String>,
+        account_pool_id: impl Into<String>,
+        target_binding_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            route_id: route_id.into(),
+            policy_id: policy_id.into(),
+            logical_model: logical_model.into(),
+            account_pool_id: account_pool_id.into(),
+            target_binding_id: target_binding_id.into(),
+        }
+    }
+
+    fn validate(&self) -> StoreResult<()> {
+        for (field, value) in [
+            ("route_id", self.route_id.as_str()),
+            ("policy_id", self.policy_id.as_str()),
+            ("logical_model", self.logical_model.as_str()),
+            ("account_pool_id", self.account_pool_id.as_str()),
+            ("target_binding_id", self.target_binding_id.as_str()),
+        ] {
+            non_empty(field, value)?;
+            if value.len() > 256 {
+                return Err(StoreError::Serialization(
+                    "affinity binding identity exceeds metadata bounds".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -141,6 +363,18 @@ pub struct SessionAffinity {
     pub provider_id: String,
     pub credential_id: String,
     pub upstream_model: String,
+    /// Full scope prevents a conversation key from leaking across routes,
+    /// policies, logical models, pools, or compiled target bindings.
+    #[serde(default)]
+    pub route_id: String,
+    #[serde(default)]
+    pub policy_id: String,
+    #[serde(default)]
+    pub logical_model: String,
+    #[serde(default)]
+    pub account_pool_id: String,
+    #[serde(default)]
+    pub target_binding_id: String,
     pub created_at: Timestamp,
     pub last_used_at: Timestamp,
     /// Expiry is exclusive: `now >= expires_at` means expired.
@@ -161,6 +395,11 @@ impl SessionAffinity {
             provider_id: provider_id.into(),
             credential_id: credential_id.into(),
             upstream_model: upstream_model.into(),
+            route_id: String::new(),
+            policy_id: String::new(),
+            logical_model: String::new(),
+            account_pool_id: String::new(),
+            target_binding_id: String::new(),
             created_at,
             last_used_at: created_at,
             expires_at,
@@ -170,6 +409,44 @@ impl SessionAffinity {
     #[must_use]
     pub const fn expired_at(&self, now: Timestamp) -> bool {
         now >= self.expires_at
+    }
+
+    /// Construct an affinity with an explicit composite target-binding scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_scoped(
+        key: impl Into<String>,
+        provider_id: impl Into<String>,
+        credential_id: impl Into<String>,
+        upstream_model: impl Into<String>,
+        scope: AffinityBindingIdentity,
+        created_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            provider_id: provider_id.into(),
+            credential_id: credential_id.into(),
+            upstream_model: upstream_model.into(),
+            route_id: scope.route_id,
+            policy_id: scope.policy_id,
+            logical_model: scope.logical_model,
+            account_pool_id: scope.account_pool_id,
+            target_binding_id: scope.target_binding_id,
+            created_at,
+            last_used_at: created_at,
+            expires_at,
+        }
+    }
+
+    #[must_use]
+    pub fn binding_identity(&self) -> AffinityBindingIdentity {
+        AffinityBindingIdentity::new(
+            self.route_id.clone(),
+            self.policy_id.clone(),
+            self.logical_model.clone(),
+            self.account_pool_id.clone(),
+            self.target_binding_id.clone(),
+        )
     }
 }
 
@@ -196,6 +473,10 @@ pub struct DecisionRecord {
     pub selected_provider: Option<String>,
     pub selected_credential: Option<String>,
     pub upstream_model: Option<String>,
+    #[serde(default)]
+    pub target_binding_id: Option<String>,
+    #[serde(default)]
+    pub priority_tier: Option<u32>,
     pub attempt: u32,
     pub configuration_generation: u64,
     pub reason: Option<String>,
@@ -218,6 +499,8 @@ impl DecisionRecord {
             selected_provider: None,
             selected_credential: None,
             upstream_model: None,
+            target_binding_id: None,
+            priority_tier: None,
             attempt: 1,
             configuration_generation: 0,
             reason: None,
@@ -285,6 +568,10 @@ pub struct RequestEvent {
     pub route_id: String,
     pub public_model: Option<String>,
     pub upstream_model: Option<String>,
+    #[serde(default)]
+    pub target_binding_id: Option<String>,
+    #[serde(default)]
+    pub priority_tier: Option<u32>,
     pub provider: Option<String>,
     pub account_pseudonym: Option<String>,
     pub attempt: Option<u32>,
@@ -323,6 +610,8 @@ impl RequestEvent {
             route_id: route_id.into(),
             public_model: None,
             upstream_model: None,
+            target_binding_id: None,
+            priority_tier: None,
             provider: None,
             account_pseudonym: None,
             attempt: None,
@@ -341,6 +630,287 @@ impl RequestEvent {
             request_body_sha256: None,
             response_body_sha256: None,
         }
+    }
+}
+
+/// Metadata for one encrypted managed secret. The secret bytes are available
+/// only through the explicit store payload methods and never through this
+/// record or its debug representation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagedSecretRecord {
+    pub secret_id: String,
+    pub owner_id: String,
+    pub kind: String,
+    pub revision: u64,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
+}
+
+impl ManagedSecretRecord {
+    #[must_use]
+    pub fn new(
+        secret_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        kind: impl Into<String>,
+        created_at: Timestamp,
+        expires_at: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            secret_id: secret_id.into(),
+            owner_id: owner_id.into(),
+            kind: kind.into(),
+            revision: 0,
+            created_at,
+            updated_at: created_at,
+            expires_at,
+        }
+    }
+}
+
+/// A same-origin management session. Only a keyed cookie digest is persisted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagementSessionRecord {
+    pub session_id: String,
+    pub actor_id: String,
+    pub revision: u64,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub revoked_at: Option<Timestamp>,
+}
+
+impl ManagementSessionRecord {
+    #[must_use]
+    pub fn new(
+        session_id: impl Into<String>,
+        actor_id: impl Into<String>,
+        created_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            actor_id: actor_id.into(),
+            revision: 0,
+            created_at,
+            expires_at,
+            revoked_at: None,
+        }
+    }
+}
+
+impl ManagementSessionRecord {
+    #[must_use]
+    pub fn active_at(&self, now: Timestamp) -> bool {
+        self.revoked_at.is_none() && now < self.expires_at
+    }
+}
+
+/// An owner-scoped, encrypted, non-secret configuration draft.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DraftRecord {
+    pub draft_id: u64,
+    pub owner_id: String,
+    pub kind: String,
+    pub etag: String,
+    pub base_generation: u64,
+    pub revision: u64,
+    pub payload: Vec<u8>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub expires_at: Timestamp,
+}
+
+impl DraftRecord {
+    #[must_use]
+    pub fn new(
+        owner_id: impl Into<String>,
+        kind: impl Into<String>,
+        base_generation: u64,
+        payload: Vec<u8>,
+        created_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> Self {
+        Self {
+            draft_id: 0,
+            owner_id: owner_id.into(),
+            kind: kind.into(),
+            etag: String::new(),
+            base_generation,
+            revision: 0,
+            payload,
+            created_at,
+            updated_at: created_at,
+            expires_at,
+        }
+    }
+}
+
+impl DraftRecord {
+    #[must_use]
+    pub fn active_at(&self, now: Timestamp) -> bool {
+        now < self.expires_at
+    }
+}
+
+/// Bounded, metadata-only management audit entry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub id: u64,
+    pub owner_id: Option<String>,
+    pub action: String,
+    pub resource: String,
+    pub outcome: String,
+    pub generation: u64,
+    pub error_code: Option<String>,
+    pub recorded_at: Timestamp,
+}
+
+impl AuditRecord {
+    #[must_use]
+    pub fn new(
+        owner_id: Option<String>,
+        action: impl Into<String>,
+        resource: impl Into<String>,
+        outcome: impl Into<String>,
+        generation: u64,
+        recorded_at: Timestamp,
+    ) -> Self {
+        Self {
+            id: 0,
+            owner_id,
+            action: action.into(),
+            resource: resource.into(),
+            outcome: outcome.into(),
+            generation,
+            error_code: None,
+            recorded_at,
+        }
+    }
+}
+
+/// Durable native reload status and its generation correlation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReloadRecord {
+    pub id: u64,
+    pub owner_id: Option<String>,
+    pub generation: u64,
+    pub status: String,
+    pub etag: Option<String>,
+    pub error_code: Option<String>,
+    pub started_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
+    pub revision: u64,
+}
+
+impl ReloadRecord {
+    #[must_use]
+    pub fn new(
+        owner_id: Option<String>,
+        generation: u64,
+        status: impl Into<String>,
+        started_at: Timestamp,
+    ) -> Self {
+        Self {
+            id: 0,
+            owner_id,
+            generation,
+            status: status.into(),
+            etag: None,
+            error_code: None,
+            started_at,
+            completed_at: None,
+            revision: 0,
+        }
+    }
+}
+
+/// Lifecycle state for one persisted OAuth flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthFlowStatus {
+    Pending,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl OAuthFlowStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, ()> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(()),
+        }
+    }
+
+    #[must_use]
+    pub const fn active(self) -> bool {
+        matches!(self, Self::Pending)
+    }
+}
+
+/// Owner-scoped OAuth correlation metadata. Raw state and PKCE verifier bytes
+/// are intentionally absent; the store accepts them only at write/consume
+/// boundaries and keeps their encrypted or keyed forms.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OAuthFlowRecord {
+    pub flow_id: String,
+    pub owner_id: String,
+    pub provider_id: String,
+    pub account_id: String,
+    pub flow_kind: String,
+    pub status: OAuthFlowStatus,
+    pub revision: u64,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub state_consumed_at: Option<Timestamp>,
+    pub completed_at: Option<Timestamp>,
+    pub error_code: Option<String>,
+}
+
+impl OAuthFlowRecord {
+    #[must_use]
+    pub fn new(
+        flow_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        account_id: impl Into<String>,
+        flow_kind: impl Into<String>,
+        created_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> Self {
+        Self {
+            flow_id: flow_id.into(),
+            owner_id: owner_id.into(),
+            provider_id: provider_id.into(),
+            account_id: account_id.into(),
+            flow_kind: flow_kind.into(),
+            status: OAuthFlowStatus::Pending,
+            revision: 0,
+            created_at,
+            expires_at,
+            state_consumed_at: None,
+            completed_at: None,
+            error_code: None,
+        }
+    }
+}
+
+impl OAuthFlowRecord {
+    #[must_use]
+    pub fn active_at(&self, now: Timestamp) -> bool {
+        self.status.active() && now < self.expires_at
     }
 }
 
@@ -575,6 +1145,34 @@ pub enum StoreError {
     EncryptionFailed,
     #[error("credential revision changed during update")]
     CredentialRevisionConflict,
+    #[error("credential configuration fingerprint changed")]
+    CredentialFingerprintConflict,
+    #[error("credential fingerprint is invalid")]
+    InvalidCredentialFingerprint,
+    #[error("affinity binding identity is invalid")]
+    InvalidAffinityBinding,
+    #[error("management owner does not match the record owner")]
+    OwnerMismatch,
+    #[error("management record has expired")]
+    RecordExpired,
+    #[error("management record revision changed during update")]
+    ManagementRevisionConflict,
+    #[error("management record capacity is exhausted")]
+    ManagementCapacity,
+    #[error("management session already exists")]
+    ManagementSessionAlreadyExists,
+    #[error("OAuth flow already exists for this provider account")]
+    OAuthFlowAlreadyExists,
+    #[error("OAuth flow was not found")]
+    OAuthFlowNotFound,
+    #[error("OAuth flow state is invalid or already consumed")]
+    OAuthStateConflict,
+    #[error("managed secret was not found")]
+    ManagedSecretNotFound,
+    #[error("managed secret revision changed during update")]
+    ManagedSecretRevisionConflict,
+    #[error("managed secret payload is required to be encrypted")]
+    ManagedSecretEncryptionRequired,
     #[error("database schema version {0} is newer than this Pooler binary")]
     UnsupportedSchemaVersion(i64),
     #[error("migration {version} failed: {message}")]
@@ -692,7 +1290,8 @@ impl MemoryStore {
 
     fn validate_credential(state: &CredentialState) -> StoreResult<()> {
         non_empty("credential_id", &state.credential_id)?;
-        non_empty("provider_id", &state.provider_id)
+        non_empty("provider_id", &state.provider_id)?;
+        validate_fingerprint(&state.configuration_fingerprint)
     }
 
     fn validate_affinity(affinity: &SessionAffinity) -> StoreResult<()> {
@@ -939,6 +1538,17 @@ impl Store for MemoryStore {
     fn upsert_credential_state(&self, mut state: CredentialState) -> StoreResult<CredentialState> {
         Self::validate_credential(&state)?;
         let mut inner = self.inner.write().map_err(lock_error)?;
+        if let Some(previous) = inner.credentials.get(&state.credential_id) {
+            if !state.configuration_fingerprint.is_empty()
+                && !previous.configuration_fingerprint.is_empty()
+                && previous.configuration_fingerprint != state.configuration_fingerprint
+            {
+                return Err(StoreError::CredentialFingerprintConflict);
+            }
+            if state.configuration_fingerprint.is_empty() {
+                state.configuration_fingerprint = previous.configuration_fingerprint.clone();
+            }
+        }
         state.revision = inner
             .credentials
             .get(&state.credential_id)

@@ -12,7 +12,7 @@ fn committed_overlay_seeds_replay_named_merge_and_remove() {
     let root = directory.path().join("root.yaml");
     fs::write(
         &base,
-        "version: 1\nupstreams:\n  local:\n    url: http://127.0.0.1:9000\nroutes:\n  - id: obsolete\n    listen: local\n    match:\n      path: /obsolete\n    target:\n      provider: local\n",
+        "version: 2\nupstreams:\n  local:\n    url: http://127.0.0.1:9000\nroutes:\n  - id: obsolete\n    listen: local\n    match:\n      path: /obsolete\n    target:\n      provider: local\n",
     )
     .expect("base fixture");
     fs::write(
@@ -27,7 +27,7 @@ fn committed_overlay_seeds_replay_named_merge_and_remove() {
     .expect("remove seed");
     fs::write(
         &root,
-        "version: 1\nimports:\n  - file: base.yaml\n  - overlay: named-map-merge.yaml\n  - overlay: named-list-remove.yaml\n",
+        "version: 2\nimports:\n  - file: base.yaml\n  - overlay: named-map-merge.yaml\n  - overlay: named-list-remove.yaml\n",
     )
     .expect("root fixture");
 
@@ -61,7 +61,7 @@ fn semantic_overlay_seed_replays_merge_render_and_compile() {
     let root = directory.path().join("root.yaml");
     fs::write(
         &base,
-        "version: 1\nlisteners:\n  local:\n    bind: 127.0.0.1:0\nupstreams:\n  local:\n    url: http://127.0.0.1:1\nroutes:\n  - id: obsolete\n    listen: local\n    match:\n      path: /obsolete\n    target: local\n",
+        "version: 2\nlisteners:\n  local:\n    bind: 127.0.0.1:0\nupstreams:\n  local:\n    url: http://127.0.0.1:1\nroutes:\n  - id: obsolete\n    listen: local\n    match:\n      path: /obsolete\n    target: local\n",
     )
     .expect("base fixture");
     fs::write(
@@ -71,7 +71,7 @@ fn semantic_overlay_seed_replays_merge_render_and_compile() {
     .expect("semantic overlay seed");
     fs::write(
         &root,
-        "version: 1\nimports:\n  - file: base.yaml\n  - overlay: semantic-route-merge.yaml\n",
+        "version: 2\nimports:\n  - file: base.yaml\n  - overlay: semantic-route-merge.yaml\n",
     )
     .expect("root fixture");
 

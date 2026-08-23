@@ -129,7 +129,7 @@ async fn fixture_drop_aborts_owned_task_handles() {
     let counters = LeakCounters::new();
     let config = compile_yaml(
         "fault-drop.yaml",
-        "version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\nroutes: []\n",
+        "version: 2\nlisteners: {local: {bind: 127.0.0.1:0}}\nroutes: []\n",
     )
     .expect("drop-cleanup config compiles");
     let server = HttpProxyServer::bind(config)
@@ -180,7 +180,7 @@ async fn unix_listener_tracks_its_runtime_socket_until_shutdown() {
     let socket_path = directory.path().join("pooler.sock");
     let downstream_secret = TestSecret::new("unix-token", &counters);
     let yaml = format!(
-        "version: 1\nlisteners:\n  local:\n    bind: unix:{}\nupstreams:\n  local:\n    url: http://{}\n    transport: {{connect_timeout: 500ms, request_timeout: 3s}}\nroutes:\n  - id: fault\n    listen: local\n    match: {{method: POST, path: /fault, content_types: [application/json]}}\n    downstream_auth: {{secret: {}}}\n    ingress: {{mode: patch}}\n    target: {{provider: local}}\n    response: {{mode: opaque}}\n",
+        "version: 2\nlisteners:\n  local:\n    bind: unix:{}\nupstreams:\n  local:\n    url: http://{}\n    transport: {{connect_timeout: 500ms, request_timeout: 3s}}\nroutes:\n  - id: fault\n    listen: local\n    match: {{method: POST, path: /fault, content_types: [application/json]}}\n    downstream_auth: {{secret: {}}}\n    ingress: {{mode: patch}}\n    target: {{provider: local}}\n    response: {{mode: opaque}}\n",
         socket_path.display(),
         upstream.address,
         downstream_secret.reference(),
@@ -592,7 +592,7 @@ fn pooled_config(
     let first = TestSecret::new("first-token", counters);
     let second = TestSecret::new("second-token", counters);
     let yaml = format!(
-        "version: 1\nlisteners:\n  local:\n    bind: 127.0.0.1:0\nupstreams:\n  local:\n    url: {upstream_url}\n    transport: {{connect_timeout: 500ms, request_timeout: 3s}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\npolicies:\n  faults:\n    selection: {{strategy: ordered_fallback, accounts: [first, second]}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, maximum_providers: 2, statuses: [429, 500, 502, 503, 504], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s, maximum_elapsed: 3s, maximum_recovery_wait: 2s}}\nroutes:\n{route}\n",
+        "version: 2\nlisteners:\n  local:\n    bind: 127.0.0.1:0\nupstreams:\n  local:\n    url: {upstream_url}\n    transport: {{connect_timeout: 500ms, request_timeout: 3s}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  faults-pool: {{provider: local, accounts: [first, second]}}\npolicies:\n  faults:\n    selection: {{strategy: ordered_fallback}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, maximum_upstreams: 2, statuses: [429, 500, 502, 503, 504], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s, maximum_elapsed: 3s, maximum_recovery_wait: 2s}}\nroutes:\n{route}\n",
         first.reference(),
         second.reference(),
     );
@@ -842,7 +842,7 @@ async fn execute_native_refresh(case: &Case, counters: LeakCounters) {
     let upstream = spawn_http_upstream(HttpFault::RefreshThenSuccess, counters.clone(), None).await;
     let account_secret = TestSecret::new("unused-native-secret", &counters);
     let yaml = format!(
-        "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  account-a: {{provider: codex, secret: {}}}\npolicies:\n  faults:\n    selection: {{strategy: fill_first, accounts: [account-a]}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 1, statuses: [429], before_commit_only: true}}\nroutes:\n  - id: fault\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: codex, policy: faults}}\n    response: {{mode: opaque}}\n",
+        "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  account-a: {{provider: codex, secret: {}}}\naccount_pools:\n  faults-pool: {{provider: codex, accounts: [account-a]}}\npolicies:\n  faults:\n    selection: {{strategy: fill_first}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 1, statuses: [429], before_commit_only: true}}\nroutes:\n  - id: fault\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: codex, policy: faults}}\n    response: {{mode: opaque}}\n",
         upstream.address,
         account_secret.reference(),
     );

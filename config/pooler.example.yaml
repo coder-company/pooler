@@ -1,10 +1,10 @@
-version: 1
+version: 2
 
 listeners:
   local:
     bind: 127.0.0.1:8400
 
-providers:
+upstreams:
   local-upstream:
     transport:
       kind: http
@@ -27,4 +27,3 @@ routes:
       upstream_path: /v1/responses
     response:
       mode: opaque
-

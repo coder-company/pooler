@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-const VALID_CONFIG: &str = "version: 1\n";
+const VALID_CONFIG: &str = "version: 2\n";
 const INVALID_VERSION: &str = "version: 999\n";
 
 fn invoke(cwd: &Path, args: &[&str], xdg: &Path, home: &Path) -> Output {

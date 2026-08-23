@@ -5442,6 +5442,7 @@ fn resolve_secret(secret: &SecretRef) -> Result<SecretValue, ProxyError> {
             service: service.to_string(),
             account: account.to_string(),
         },
+        SecretRef::Managed(_) => return Err(ProxyError::SecretUnavailable),
     };
     let secret = reference
         .resolve()
@@ -5845,7 +5846,7 @@ mod tests {
         let config = compile_yaml(
             "test.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6081,7 +6082,7 @@ routes:
         let config = compile_yaml(
             "usage-price-book.yaml",
             r#"
-version: 1
+version: 2
 upstreams: {provider: {url: http://127.0.0.1:8319}}
 usage_price_book:
   version: operator-2026-08-22
@@ -6135,7 +6136,7 @@ usage_price_book:
         let config = compile_yaml(
             "provider-quota-dispatch.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {provider: {url: http://127.0.0.1:8319}}
 routes: [{id: route, listen: local, target: provider}]
@@ -6171,7 +6172,7 @@ routes: [{id: route, listen: local, target: provider}]
         let config = compile_yaml(
             "test.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:8319/base?tenant=pooler}}
 routes:
@@ -6199,7 +6200,7 @@ routes:
         let config = compile_yaml(
             "websocket-query.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: ws://127.0.0.1:8319/base?tenant=pooler}}
 routes:
@@ -6229,7 +6230,7 @@ routes:
         let config = compile_yaml(
             "vertex-query.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams:
   vertex:
@@ -6264,7 +6265,7 @@ routes:
         let config = compile_yaml(
             "opaque-auth.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams:
   tunnel: {url: http://127.0.0.1:8319}
@@ -6529,7 +6530,7 @@ routes:
         let config = compile_yaml(
             "timeout.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6557,7 +6558,7 @@ routes:
         let config = compile_yaml(
             "managed-websocket-timeout.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: ws://127.0.0.1:8319}}
 routes:
@@ -6593,7 +6594,7 @@ routes:
         let config = compile_yaml(
             "selection-timeout.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams:
   fallback:
@@ -6602,7 +6603,9 @@ upstreams:
     transport: {kind: http, base_url: http://127.0.0.1:8320, request_timeout: 1s}
 models:
   - id: public
-    targets: [{provider: selected, upstream_model: private}]
+    targets: [{id: public-selected-target, provider: selected, account: selected-account, priority: 1, upstream_model: private, capabilities: [text], codecs: [], wire_family: openai}]
+accounts:
+  selected-account: {provider: selected, secret: env:POOLER_SELECTED}
 routes:
   - id: route
     listen: local

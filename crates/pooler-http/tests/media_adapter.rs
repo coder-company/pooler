@@ -14,7 +14,7 @@ fn route(decoder: &str, body_limit: usize) -> (pooler_config::CompiledConfig, St
         "media-adapter.yaml",
         &format!(
             r#"
-version: 1
+version: 2
 listeners: {{local: {{bind: 127.0.0.1:1}}}}
 upstreams: {{local: {{url: http://127.0.0.1:2}}}}
 routes:
@@ -178,7 +178,7 @@ fn content_type_and_route_contracts_are_explicit() {
     let unsupported = compile_yaml(
         "media-response.yaml",
         r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:2}}
 routes:

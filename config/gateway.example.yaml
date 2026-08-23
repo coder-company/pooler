@@ -7,4 +7,4 @@ imports:
       websocket_url: wss://api.openai.com
       secret: env:POOLER_GATEWAY_KEY
 
-version: 1
+version: 2

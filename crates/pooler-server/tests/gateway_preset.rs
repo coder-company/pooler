@@ -366,7 +366,7 @@ fn gateway_config_with_models(
     std::fs::write(
         &path,
         format!(
-            "imports:\n  - preset: gateway\n    as: gateway\n    with:\n      bind: 127.0.0.1:0\n      upstream_url: http://{upstream}\n      websocket_url: ws://{websocket}\n      secret: 'file:{secret}'\n\nversion: 1\n{models}"
+            "imports:\n  - preset: gateway\n    as: gateway\n    with:\n      bind: 127.0.0.1:0\n      upstream_url: http://{upstream}\n      websocket_url: ws://{websocket}\n      secret: 'file:{secret}'\n\nversion: 2\naccounts:\n  gateway-model-account:\n    provider: gateway\n    secret: 'file:{secret}'\n{models}"
         ),
     )
     .expect("gateway config");
@@ -703,10 +703,14 @@ async fn the_gateway_preset_uses_semantic_responses_websocket_with_continuation(
 models:
   - id: semantic-responses
     targets:
-      - provider: gateway
+      - id: semantic-responses-target
+        provider: gateway
+        account: gateway-model-account
+        priority: 1
         upstream_model: gpt-4o
         capabilities: [text, streaming, tools, reasoning, function_calling, continuation]
         codecs: [decode.openai.responses]
+        wire_family: openai
 "#,
     );
     let server = bind_gateway(config).await;
@@ -815,10 +819,14 @@ async fn semantic_responses_rewrites_public_alias_before_websocket_transport() {
 models:
   - id: public-responses
     targets:
-      - provider: gateway
+      - id: public-responses-target
+        provider: gateway
+        account: gateway-model-account
+        priority: 1
         upstream_model: private-responses
         capabilities: [text, streaming, tools, reasoning, function_calling, continuation]
         codecs: [decode.openai.responses]
+        wire_family: openai
 "#,
     );
     let server = bind_gateway(config).await;

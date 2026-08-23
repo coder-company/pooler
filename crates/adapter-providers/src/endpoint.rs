@@ -20,6 +20,15 @@ use crate::{
     ProviderResponseClassifier,
 };
 
+/// Maximum URL length accepted for a custom provider endpoint.
+pub const MAX_CUSTOM_PROVIDER_URL_BYTES: usize = 2_048;
+/// Maximum configured authentication-kind length.
+pub const MAX_CUSTOM_AUTH_KIND_BYTES: usize = 64;
+/// Maximum custom provider authentication header name length.
+pub const MAX_CUSTOM_AUTH_HEADER_BYTES: usize = 128;
+/// Maximum custom provider authentication value prefix length.
+pub const MAX_CUSTOM_AUTH_PREFIX_BYTES: usize = 128;
+
 /// Errors raised before a provider request is sent.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum AdapterError {
@@ -50,6 +59,12 @@ pub enum AdapterError {
     /// A configured custom authentication header name is invalid.
     #[error("provider authentication header name is invalid")]
     InvalidHeaderName,
+    /// A redirect would move an outbound request to another origin.
+    #[error("provider redirect is outside the configured origin")]
+    OffOriginRedirect,
+    /// A configured provider value exceeds a non-disableable input bound.
+    #[error("provider configuration field {field} exceeds its input bound")]
+    InputLimitExceeded { field: &'static str },
 }
 
 /// Explicit acknowledgement required before a built-in adapter targets an unrelated public host.
@@ -106,6 +121,9 @@ impl AuthPlacement {
         header: Option<&str>,
         value_prefix: Option<&str>,
     ) -> Result<Self, AdapterError> {
+        if kind.len() > MAX_CUSTOM_AUTH_KIND_BYTES {
+            return Err(AdapterError::InputLimitExceeded { field: "auth_kind" });
+        }
         match kind.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "bearer" | "bearer_secret" => Ok(Self::Bearer),
             "x_api_key" => Self::custom("x-api-key", ""),
@@ -120,10 +138,23 @@ impl AuthPlacement {
 
     /// Construct a custom header placement after validating its name and prefix.
     pub fn custom(name: &str, value_prefix: impl Into<String>) -> Result<Self, AdapterError> {
+        if name.len() > MAX_CUSTOM_AUTH_HEADER_BYTES {
+            return Err(AdapterError::InputLimitExceeded {
+                field: "auth_header",
+            });
+        }
         let name =
             HeaderName::from_bytes(name.as_bytes()).map_err(|_| AdapterError::InvalidHeaderName)?;
         let value_prefix = value_prefix.into();
-        if value_prefix.contains(['\r', '\n']) {
+        if value_prefix.len() > MAX_CUSTOM_AUTH_PREFIX_BYTES
+            || !value_prefix.is_ascii()
+            || value_prefix.contains(['\r', '\n'])
+        {
+            if value_prefix.len() > MAX_CUSTOM_AUTH_PREFIX_BYTES {
+                return Err(AdapterError::InputLimitExceeded {
+                    field: "auth_value_prefix",
+                });
+            }
             return Err(AdapterError::InvalidAuthorization);
         }
         Ok(Self::Header { name, value_prefix })
@@ -775,11 +806,7 @@ impl OpenAiCompatibleAdapter {
     where
         I: IntoIterator<Item = ProviderOperation>,
     {
-        if matches!(auth, AuthPlacement::None) {
-            validate_base_url(&base_url)?;
-        } else {
-            validate_public_credential_base_url(&base_url)?;
-        }
+        validate_custom_provider_base_url(&base_url)?;
         let provider = ProviderId::new(provider.into())?;
         let operations = operations.into_iter().collect::<BTreeSet<_>>();
         if operations.is_empty() {
@@ -806,6 +833,21 @@ impl OpenAiCompatibleAdapter {
     pub fn operations(&self) -> &BTreeSet<ProviderOperation> {
         &self.operations
     }
+
+    /// Configured custom-provider origin.
+    #[must_use]
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+
+    /// Validate a provider redirect before following it or forwarding it.
+    ///
+    /// Redirects may change paths and query values, but never their scheme,
+    /// host, port, userinfo, or fragment. This keeps credentials on the
+    /// explicitly configured origin.
+    pub fn validate_redirect(&self, redirect: &Url) -> Result<(), AdapterError> {
+        validate_provider_redirect(&self.base_url, redirect)
+    }
 }
 
 impl ProviderAdapter for OpenAiCompatibleAdapter {
@@ -820,6 +862,25 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             AuthPlacement::Bearer => vec![crate::AuthMode::ApiKeyBearer],
             AuthPlacement::Header { .. } => vec![crate::AuthMode::CustomHeader],
             AuthPlacement::None => Vec::new(),
+        };
+        profile.metadata.auth_placement = match &self.auth {
+            AuthPlacement::Bearer => {
+                crate::ProviderFact::operator_declared(crate::AuthPlacementKind::Bearer)
+            }
+            AuthPlacement::Header { name, .. }
+                if name.as_str().eq_ignore_ascii_case("x-api-key") =>
+            {
+                crate::ProviderFact::operator_declared(crate::AuthPlacementKind::XApiKey)
+            }
+            AuthPlacement::Header { name, .. }
+                if name.as_str().eq_ignore_ascii_case("x-goog-api-key") =>
+            {
+                crate::ProviderFact::operator_declared(crate::AuthPlacementKind::XGoogApiKey)
+            }
+            AuthPlacement::Header { .. } => crate::ProviderFact::unknown(),
+            AuthPlacement::None => {
+                crate::ProviderFact::operator_declared(crate::AuthPlacementKind::None)
+            }
         };
         profile
     }
@@ -866,7 +927,8 @@ fn parse_base_url(value: &str) -> Result<Url, AdapterError> {
 }
 
 fn validate_base_url(url: &Url) -> Result<(), AdapterError> {
-    if !matches!(url.scheme(), "http" | "https")
+    if url.as_str().len() > MAX_CUSTOM_PROVIDER_URL_BYTES
+        || !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -874,6 +936,36 @@ fn validate_base_url(url: &Url) -> Result<(), AdapterError> {
         || url.fragment().is_some()
     {
         return Err(AdapterError::InvalidBaseUrl);
+    }
+    if url.scheme() == "http" && !is_loopback_host(url.host()) {
+        return Err(AdapterError::InvalidBaseUrl);
+    }
+    if is_forbidden_network_target(url) && !is_loopback_host(url.host()) {
+        return Err(AdapterError::ForbiddenNetworkTarget);
+    }
+    Ok(())
+}
+
+fn validate_custom_provider_base_url(url: &Url) -> Result<(), AdapterError> {
+    validate_base_url(url)
+}
+
+/// Validate that a provider redirect stays on its configured origin.
+pub fn validate_provider_redirect(base: &Url, redirect: &Url) -> Result<(), AdapterError> {
+    validate_base_url(base)?;
+    if redirect.as_str().len() > MAX_CUSTOM_PROVIDER_URL_BYTES
+        || redirect.host().is_none()
+        || !redirect.username().is_empty()
+        || redirect.password().is_some()
+        || redirect.fragment().is_some()
+    {
+        return Err(AdapterError::OffOriginRedirect);
+    }
+    if base.scheme() != redirect.scheme()
+        || base.host() != redirect.host()
+        || base.port_or_known_default() != redirect.port_or_known_default()
+    {
+        return Err(AdapterError::OffOriginRedirect);
     }
     Ok(())
 }
@@ -895,6 +987,28 @@ fn validate_public_credential_base_url(url: &Url) -> Result<(), AdapterError> {
         }
         Some(_) => Ok(()),
         None => Err(AdapterError::InvalidBaseUrl),
+    }
+}
+
+fn is_loopback_host(host: Option<Host<&str>>) -> bool {
+    match host {
+        Some(Host::Domain(host)) => {
+            let host = host.trim_end_matches('.');
+            host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+        }
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn is_forbidden_network_target(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(host)) => is_forbidden_domain(host),
+        Some(Host::Ipv4(address)) => is_forbidden_ipv4(address),
+        Some(Host::Ipv6(address)) => is_forbidden_ipv6(address),
+        None => true,
     }
 }
 
@@ -956,7 +1070,7 @@ fn validate_antigravity_base_url(
 }
 
 fn is_forbidden_domain(host: &str) -> bool {
-    let host = host.to_ascii_lowercase();
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
     !host.contains('.')
         || host == "localhost"
         || host.ends_with(".localhost")
@@ -966,6 +1080,8 @@ fn is_forbidden_domain(host: &str) -> bool {
         || host.ends_with(".test")
         || host.ends_with(".example")
         || host.ends_with(".invalid")
+        || host.ends_with(".nip.io")
+        || host.ends_with(".xip.io")
         || host == "metadata.google.internal"
 }
 

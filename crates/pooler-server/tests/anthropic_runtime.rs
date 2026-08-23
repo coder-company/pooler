@@ -119,7 +119,7 @@ fn anthropic_config(upstream_address: SocketAddr) -> pooler_config::CompiledConf
     compile_yaml(
         "anthropic-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: droid-anthropic\n    listen: local\n    match: {{method: POST, path: /v1/messages, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.anthropic.messages, encoder: encode.anthropic.messages}}\n    target: {{provider: local, path: /v1/messages}}\n    response: {{mode: semantic, decoder: decode.anthropic.messages.events, encoder: encode.anthropic.messages.events}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: droid-anthropic\n    listen: local\n    match: {{method: POST, path: /v1/messages, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.anthropic.messages, encoder: encode.anthropic.messages}}\n    target: {{provider: local, path: /v1/messages}}\n    response: {{mode: semantic, decoder: decode.anthropic.messages.events, encoder: encode.anthropic.messages.events}}\n    loss_policy: reject\n"
         ),
     )
     .expect("Anthropic runtime config")

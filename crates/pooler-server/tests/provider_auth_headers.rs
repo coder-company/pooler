@@ -27,7 +27,7 @@ async fn non_native_oauth_account_fails_before_proxy_transport() {
     let config = compile_yaml(
         "non-native-oauth-proxy.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  plain:\n    url: http://{upstream_address}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  subscription:\n    provider: plain\n    auth_kind: oauth\npolicies:\n  oauth:\n    selection: {{strategy: fill_first, accounts: [subscription]}}\nroutes:\n  - id: oauth\n    listen: local\n    match: {{method: POST, path: /v1/chat/completions, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: plain, policy: oauth}}\n    response: {{mode: opaque}}\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  plain:\n    url: http://{upstream_address}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  subscription:\n    provider: plain\n    auth_kind: oauth\naccount_pools:\n  oauth-pool: {{provider: plain, accounts: [subscription]}}\npolicies:\n  oauth:\n    selection: {{strategy: fill_first}}\nroutes:\n  - id: oauth\n    listen: local\n    match: {{method: POST, path: /v1/chat/completions, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: plain, policy: oauth}}\n    response: {{mode: opaque}}\n"
         ),
     )
     .expect("non-native OAuth proxy config");
@@ -271,7 +271,7 @@ fn anthropic_config(
     compile_yaml(
         "anthropic-provider-auth.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  anthropic:\n    url: http://{upstream_address}\n    auth: {{kind: x-api-key, secret: 'file:{}'}}\nroutes:\n  - id: anthropic-auth\n    listen: local\n    match: {{method: POST, path: /v1/messages, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.anthropic.messages, encoder: encode.anthropic.messages}}\n    target: {{provider: anthropic, path: /v1/messages}}\n    response: {{mode: semantic, decoder: decode.anthropic.messages.events, encoder: encode.anthropic.messages.events}}\n    loss_policy: reject\n",
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  anthropic:\n    url: http://{upstream_address}\n    auth: {{kind: x-api-key, secret: 'file:{}'}}\nroutes:\n  - id: anthropic-auth\n    listen: local\n    match: {{method: POST, path: /v1/messages, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.anthropic.messages, encoder: encode.anthropic.messages}}\n    target: {{provider: anthropic, path: /v1/messages}}\n    response: {{mode: semantic, decoder: decode.anthropic.messages.events, encoder: encode.anthropic.messages.events}}\n    loss_policy: reject\n",
             secret_path.display()
         ),
     )
@@ -285,7 +285,7 @@ fn gemini_config(
     compile_yaml(
         "gemini-provider-auth.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  gemini:\n    url: http://{upstream_address}\n    auth: {{kind: x-goog-api-key, secret: 'file:{}'}}\nroutes:\n  - id: gemini-auth\n    listen: local\n    match: {{method: POST, path: /v1beta/models/gemini-test:generateContent, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: gemini}}\n    response: {{mode: semantic, decoder: decode.gemini.generate_content.response, encoder: encode.gemini.generate_content.response}}\n    loss_policy: reject\n",
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  gemini:\n    url: http://{upstream_address}\n    auth: {{kind: x-goog-api-key, secret: 'file:{}'}}\nroutes:\n  - id: gemini-auth\n    listen: local\n    match: {{method: POST, path: /v1beta/models/gemini-test:generateContent, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: gemini}}\n    response: {{mode: semantic, decoder: decode.gemini.generate_content.response, encoder: encode.gemini.generate_content.response}}\n    loss_policy: reject\n",
             secret_path.display()
         ),
     )
@@ -299,7 +299,7 @@ fn azure_config(
     compile_yaml(
         "azure-provider-auth.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  azure:\n    url: http://{upstream_address}\n    auth: {{kind: header, header: api-key, secret: 'file:{}'}}\n    query: {{api-version: '2024-10-21'}}\nroutes:\n  - id: azure-chat\n    listen: local\n    match: {{method: POST, path: /v1/chat/completions, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: azure, path: /openai/deployments/gpt-4o/chat/completions}}\n    response: {{mode: opaque}}\n",
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  azure:\n    url: http://{upstream_address}\n    auth: {{kind: header, header: api-key, secret: 'file:{}'}}\n    query: {{api-version: '2024-10-21'}}\nroutes:\n  - id: azure-chat\n    listen: local\n    match: {{method: POST, path: /v1/chat/completions, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: azure, path: /openai/deployments/gpt-4o/chat/completions}}\n    response: {{mode: opaque}}\n",
             secret_path.display()
         ),
     )

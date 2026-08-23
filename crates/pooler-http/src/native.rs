@@ -1425,6 +1425,7 @@ fn resolve_protected_secret(secret: &SecretRef) -> Result<SecretValue, NativeRun
             service: service.to_string(),
             account: account.to_string(),
         },
+        SecretRef::Managed(_) => return Err(NativeRuntimeError::CredentialUnavailable),
     };
     let secret = reference
         .resolve()
@@ -1670,7 +1671,7 @@ mod tests {
         pooler_config::compile_yaml(
             "native-configured-test.yaml",
             &format!(
-                "version: 1\nupstreams:\n  xai:\n    url: http://127.0.0.1:8322\n    native:\n      kind: xai\n    auth:\n      kind: header\n      header: x-provider-key\n      value_prefix: 'Token '\n      secret: 'file:{}'\naccounts:\n  api-account:\n    provider: xai\n    auth_kind: api_key\n    secret: file:/definitely/not/a/native/key\n",
+                "version: 2\nupstreams:\n  xai:\n    url: http://127.0.0.1:8322\n    native:\n      kind: xai\n    auth:\n      kind: header\n      header: x-provider-key\n      value_prefix: 'Token '\n      secret: 'file:{}'\naccounts:\n  api-account:\n    provider: xai\n    auth_kind: api_key\n    secret: file:/definitely/not/a/native/key\n",
                 static_path.display()
             ),
         )
@@ -1681,7 +1682,7 @@ mod tests {
         pooler_config::compile_yaml(
             "native-compatible-test.yaml",
             &format!(
-                "version: 1\nupstreams:\n  compatible:\n    url: http://127.0.0.1:8336\n    native: {{kind: compatible}}\n    auth:\n      kind: header\n      header: x-provider-token\n      value_prefix: 'Token '\n      secret: 'file:{}'\n",
+                "version: 2\nupstreams:\n  compatible:\n    url: http://127.0.0.1:8336\n    native: {{kind: compatible}}\n    auth:\n      kind: header\n      header: x-provider-token\n      value_prefix: 'Token '\n      secret: 'file:{}'\n",
                 static_path.display()
             ),
         )
@@ -1692,7 +1693,7 @@ mod tests {
         pooler_config::compile_yaml(
             "native-kimi-oauth-test.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   kimi-coding:
     url: http://127.0.0.1:8334
@@ -1713,7 +1714,7 @@ accounts:
         pooler_config::compile_yaml(
             "native-vertex-oauth-test.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   vertex:
     url: http://127.0.0.1:8335
@@ -1746,7 +1747,7 @@ accounts:
         pooler_config::compile_yaml(
             "native-palantir-oauth-test.yaml",
             &format!(
-                "version: 1\nupstreams:\n  foundry:\n    url: https://example.euw-3.palantirfoundry.co.uk\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: operator-client\n      client_secret: 'file:{}'\n      grant_type: {grant}\n      scopes: [{scopes}]\n      callback: http://127.0.0.1:8765/oauth/callback\naccounts:\n  foundry-account: {{provider: foundry, auth_kind: oauth}}\n",
+                "version: 2\nupstreams:\n  foundry:\n    url: https://example.euw-3.palantirfoundry.co.uk\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: operator-client\n      client_secret: 'file:{}'\n      grant_type: {grant}\n      scopes: [{scopes}]\n      callback: http://127.0.0.1:8765/oauth/callback\naccounts:\n  foundry-account: {{provider: foundry, auth_kind: oauth}}\n",
                 client_secret.display(),
             ),
         )
@@ -1770,7 +1771,7 @@ accounts:
     fn configured_without_auth_config() -> CompiledConfig {
         pooler_config::compile_yaml(
             "native-configured-without-auth-test.yaml",
-            "version: 1\nupstreams:\n  xai:\n    url: http://127.0.0.1:8333\n    native: {kind: xai}\n",
+            "version: 2\nupstreams:\n  xai:\n    url: http://127.0.0.1:8333\n    native: {kind: xai}\n",
         )
         .expect("configured native config without auth")
     }
@@ -1779,7 +1780,7 @@ accounts:
         pooler_config::compile_yaml(
             "native-kinds-test.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   anthropic:
     url: http://127.0.0.1:8323
@@ -1819,7 +1820,7 @@ upstreams:
         pooler_config::compile_yaml(
             "native-test.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   codex:
     url: http://127.0.0.1:8319
@@ -1843,7 +1844,7 @@ accounts:
         pooler_config::compile_yaml(
             "native-unregistered-test.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   other:
     url: http://127.0.0.1:8320
@@ -1857,7 +1858,7 @@ upstreams:
         pooler_config::compile_yaml(
             "native-mismatched-kind-test.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   codex:
     url: http://127.0.0.1:8321
@@ -1871,7 +1872,7 @@ upstreams:
         pooler_config::compile_yaml(
             "native-hydration-filter-test.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   codex:
     url: http://127.0.0.1:8319
@@ -2281,7 +2282,7 @@ accounts:
         let config = pooler_config::compile_yaml(
             "native-kimi-open-platform-test.yaml",
             &format!(
-                "version: 1\nupstreams:\n  moonshot:\n    known_provider: moonshotai\naccounts:\n  moonshot-key:\n    provider: moonshot\n    auth_kind: api_key\n    secret: file:{}\n",
+                "version: 2\nupstreams:\n  moonshot:\n    known_provider: moonshotai\naccounts:\n  moonshot-key:\n    provider: moonshot\n    auth_kind: api_key\n    secret: file:{}\n",
                 api_secret.path().display()
             ),
         )

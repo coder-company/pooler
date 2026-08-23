@@ -33,7 +33,7 @@ fn gateway_config(
         .map(|capability| format!("      capabilities: [{capability}]\n"))
         .unwrap_or_default();
     let text = format!(
-        "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  gateway:\n    known_provider: openai\n    url: http://{upstream}\n    auth: {{secret: 'file:{}'}}\nroutes:\n  - id: models\n    listen: local\n    match: {{methods: [GET], path: /v1/models}}\n    serve: model_catalog\n    ingress: {{mode: opaque}}\n    target:\n      provider: gateway\n      endpoint_family: models\n{capabilities}    response: {{mode: opaque}}\n",
+        "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  gateway:\n    known_provider: openai\n    url: http://{upstream}\n    auth: {{secret: 'file:{}'}}\nroutes:\n  - id: models\n    listen: local\n    match: {{methods: [GET], path: /v1/models}}\n    serve: model_catalog\n    ingress: {{mode: opaque}}\n    target:\n      provider: gateway\n      endpoint_family: models\n{capabilities}    response: {{mode: opaque}}\n",
         secret.display()
     );
     pooler_config::compile_yaml("gateway-models.yaml", &text).expect("config compiles")

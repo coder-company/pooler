@@ -8,4 +8,4 @@ imports:
       upstream_url: http://127.0.0.1:8319
       secret: env:POOLER_UPSTREAM_KEY
 
-version: 1
+version: 2

@@ -90,7 +90,7 @@ async fn start_server(
         ""
     };
     let config_text = format!(
-        "version: 1\nlisteners:\n  local:\n    bind: 127.0.0.1:0\nupstreams:\n  local:\n    url: http://{upstream}\nroutes:\n  - id: cached\n    listen: local\n    match: {{method: POST, path: /cache}}\n    ingress: {{mode: patch}}\n    response: {{mode: opaque}}\n{cache}    target: local\n"
+        "version: 2\nlisteners:\n  local:\n    bind: 127.0.0.1:0\nupstreams:\n  local:\n    url: http://{upstream}\nroutes:\n  - id: cached\n    listen: local\n    match: {{method: POST, path: /cache}}\n    ingress: {{mode: patch}}\n    response: {{mode: opaque}}\n{cache}    target: local\n"
     );
     let config = compile_yaml("cache-runtime.yaml", &config_text).expect("cache config");
     let server = HttpProxyServer::bind(config).await.expect("server binds");

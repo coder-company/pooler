@@ -168,7 +168,7 @@ async fn start_server(
     JoinHandle<Result<(), pooler_server::HttpProxyServerError>>,
 ) {
     let config_text = format!(
-        "version: 1\nlisteners:\n  local:\n    bind: 127.0.0.1:0\nupstreams:\n  socket:\n    url: ws://{upstream_address}/fixed-origin\nroutes:\n  - id: socket\n    listen: local\n    match:\n      method: GET\n      path: /socket\n      websocket: true\n    limits:\n      max_frame_bytes: {max_frame_bytes}\n      request_timeout: 10s\n    target:\n      provider: socket\n      upstream_path: /echo\n"
+        "version: 2\nlisteners:\n  local:\n    bind: 127.0.0.1:0\nupstreams:\n  socket:\n    url: ws://{upstream_address}/fixed-origin\nroutes:\n  - id: socket\n    listen: local\n    match:\n      method: GET\n      path: /socket\n      websocket: true\n    limits:\n      max_frame_bytes: {max_frame_bytes}\n      request_timeout: 10s\n    target:\n      provider: socket\n      upstream_path: /echo\n"
     );
     let config =
         compile_yaml("websocket-test.yaml", &config_text).expect("WebSocket config compiles");

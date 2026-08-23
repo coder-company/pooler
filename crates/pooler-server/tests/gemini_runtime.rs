@@ -267,7 +267,7 @@ async fn unary_responses_to_chat_reject_before_upstream() {
     let config = compile_yaml(
         "droid-unary-chat-unsupported.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: droid-unary-chat\n    listen: local\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.openai.responses}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.openai.responses.events}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: droid-unary-chat\n    listen: local\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.openai.responses}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.openai.responses.events}}\n    loss_policy: reject\n"
         ),
     )
     .expect("unsupported unary Chat bridge config");
@@ -941,7 +941,7 @@ async fn gemini_returned_interaction_id_keeps_follow_ups_on_the_creating_account
     let config = compile_yaml(
         "gemini-interaction-affinity-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: 'file:{}'}}\n  second: {{provider: local, secret: 'file:{}'}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{provider: local, upstream_model: private-gemini, capabilities: [text]}}\npolicies:\n  interactions:\n    selection:\n      strategy: round_robin\n      accounts: [first, second]\n      affinity: {{key: gemini.interaction_id, ttl: 30m}}\nroutes:\n  - id: create\n    listen: local\n    match: {{method: POST, path: /v1beta/interactions, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model, policy: interactions}}\n    response: {{mode: opaque}}\n  - id: resource\n    listen: local\n    match: {{methods: [GET, DELETE], path_template: '/v1beta/interactions/{{interaction}}'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, policy: interactions}}\n    response: {{mode: opaque}}\n  - id: cancel\n    listen: local\n    match: {{method: POST, path_template: '/v1beta/interactions/{{interaction}}/cancel'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, policy: interactions}}\n    response: {{mode: opaque}}\n",
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: 'file:{}'}}\n  second: {{provider: local, secret: 'file:{}'}}\naccount_pools: {{pool: {{provider: local, accounts: [first, second]}}}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{id: public-gemini-target, provider: local, account_pool: pool, priority: 1, upstream_model: private-gemini, capabilities: [text], codecs: [], wire_family: gemini}}\npolicies:\n  interactions:\n    selection:\n      strategy: round_robin\n      affinity: {{key: gemini.interaction_id, ttl: 30m}}\nroutes:\n  - id: create\n    listen: local\n    match: {{method: POST, path: /v1beta/interactions, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model, policy: interactions}}\n    response: {{mode: opaque}}\n  - id: resource\n    listen: local\n    match: {{methods: [GET, DELETE], path_template: '/v1beta/interactions/{{interaction}}'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, policy: interactions}}\n    response: {{mode: opaque}}\n  - id: cancel\n    listen: local\n    match: {{method: POST, path_template: '/v1beta/interactions/{{interaction}}/cancel'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, policy: interactions}}\n    response: {{mode: opaque}}\n",
             first_secret.display(),
             second_secret.display(),
         ),
@@ -1040,7 +1040,7 @@ async fn gemini_interaction_create_rejects_compressed_responses_before_commitmen
     let config = compile_yaml(
         "gemini-compressed-interaction.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nmodels: [{{id: public-gemini, targets: [{{provider: local, upstream_model: private-gemini, capabilities: [text]}}]}}]\nroutes:\n  - id: create\n    listen: local\n    match: {{method: POST, path: /v1beta/interactions, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model}}\n    response: {{mode: opaque}}\n",
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts: {{model-account: {{provider: local, secret: env:POOLER_TEST_MODEL_KEY}}}}\nmodels: [{{id: public-gemini, targets: [{{id: public-gemini-target, provider: local, account: model-account, priority: 1, upstream_model: private-gemini, capabilities: [text], codecs: [], wire_family: gemini}}]}}]\nroutes:\n  - id: create\n    listen: local\n    match: {{method: POST, path: /v1beta/interactions, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model}}\n    response: {{mode: opaque}}\n",
         ),
     )
     .expect("compressed interaction config");
@@ -1122,7 +1122,7 @@ fn gemini_config(
     compile_yaml(
         "gemini-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: gemini\n    listen: local\n    match: {{method: POST, path: '{downstream_path}', content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local}}\n    response: {{mode: semantic, decoder: decode.gemini.generate_content.response, encoder: encode.gemini.generate_content.response}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: gemini\n    listen: local\n    match: {{method: POST, path: '{downstream_path}', content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local}}\n    response: {{mode: semantic, decoder: decode.gemini.generate_content.response, encoder: encode.gemini.generate_content.response}}\n    loss_policy: reject\n"
         ),
     )
     .expect("Gemini runtime config")
@@ -1136,7 +1136,7 @@ fn gemini_same_wire_alias_config(
     compile_yaml(
         "gemini-same-wire-alias-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}, query: {{key: server-key}}}}}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{provider: local, upstream_model: private-gemini, capabilities: [text, streaming, tools, function_calling], codecs: [decode.gemini.generate_content]}}\nroutes:\n  - id: gemini-same-wire-alias\n    listen: local\n    match: {{method: {method}, path: '{downstream_path}'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local}}\n    response: {{mode: opaque}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}, query: {{key: server-key}}}}}}\naccounts: {{model-account: {{provider: local, secret: env:POOLER_TEST_MODEL_KEY}}}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{id: public-gemini-target, provider: local, account: model-account, priority: 1, upstream_model: private-gemini, capabilities: [text, streaming, tools, function_calling], codecs: [decode.gemini.generate_content], wire_family: gemini}}\nroutes:\n  - id: gemini-same-wire-alias\n    listen: local\n    match: {{method: {method}, path: '{downstream_path}'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local}}\n    response: {{mode: opaque}}\n    loss_policy: reject\n"
         ),
     )
     .expect("Gemini same-wire alias config")
@@ -1146,7 +1146,7 @@ fn gemini_alias_config(upstream_address: SocketAddr) -> pooler_config::CompiledC
     compile_yaml(
         "gemini-alias-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}, query: {{key: server-key}}}}}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{provider: local, upstream_model: private-gemini, capabilities: [text, streaming], codecs: [decode.gemini.generate_content]}}\nroutes:\n  - id: gemini-alias\n    listen: local\n    match: {{method: POST, path_template: '/v1beta/models/{{model_action}}', content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model}}\n    response: {{mode: semantic, decoder: decode.gemini.generate_content.response, encoder: encode.gemini.generate_content.response}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}, query: {{key: server-key}}}}}}\naccounts: {{model-account: {{provider: local, secret: env:POOLER_TEST_MODEL_KEY}}}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{id: public-gemini-target, provider: local, account: model-account, priority: 1, upstream_model: private-gemini, capabilities: [text, streaming], codecs: [decode.gemini.generate_content], wire_family: gemini}}\nroutes:\n  - id: gemini-alias\n    listen: local\n    match: {{method: POST, path_template: '/v1beta/models/{{model_action}}', content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model}}\n    response: {{mode: semantic, decoder: decode.gemini.generate_content.response, encoder: encode.gemini.generate_content.response}}\n    loss_policy: reject\n"
         ),
     )
     .expect("Gemini alias runtime config")
@@ -1156,7 +1156,7 @@ fn droid_config(upstream_address: SocketAddr) -> pooler_config::CompiledConfig {
     compile_yaml(
         "droid-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: droid-responses\n    listen: local\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.openai.responses}}\n    target: {{provider: local, path: /v1/responses}}\n    response: {{mode: semantic, decoder: decode.openai.responses.events, encoder: encode.openai.responses.events}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: droid-responses\n    listen: local\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.openai.responses}}\n    target: {{provider: local, path: /v1/responses}}\n    response: {{mode: semantic, decoder: decode.openai.responses.events, encoder: encode.openai.responses.events}}\n    loss_policy: reject\n"
         ),
     )
     .expect("Droid runtime config")
@@ -1166,7 +1166,7 @@ fn codex_unary_config(upstream_address: SocketAddr) -> pooler_config::CompiledCo
     compile_yaml(
         "codex-unary-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{upstream_address}\n    native: {{kind: codex}}\naccounts:\n  codex-account: {{provider: codex, auth_kind: oauth}}\nmodels:\n  - id: public-luna\n    targets:\n      - {{provider: codex, upstream_model: private-luna, capabilities: [text, streaming, tools, reasoning, function_calling], codecs: [decode.openai.responses]}}\npolicies:\n  codex-responses:\n    selection: {{strategy: fill_first, accounts: [codex-account]}}\nroutes:\n  - id: codex-responses\n    listen: local\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    limits: {{max_request_body_bytes: 1048576, max_response_body_bytes: 1048576, max_frame_bytes: 1048576, max_event_bytes: 1048576}}\n    ingress: {{mode: semantic, decoder: decode.openai.responses, encoder: encode.openai.responses}}\n    target: {{provider: codex, model_from: request.model, policy: codex-responses}}\n    response: {{mode: semantic, decoder: decode.openai.responses.events, encoder: encode.openai.responses.events}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{upstream_address}\n    native: {{kind: codex}}\naccounts:\n  codex-account: {{provider: codex, auth_kind: oauth}}\naccount_pools:\n  codex-pool: {{provider: codex, accounts: [codex-account]}}\nmodels:\n  - id: public-luna\n    targets:\n      - {{id: public-luna-target, provider: codex, account: codex-account, priority: 1, upstream_model: private-luna, capabilities: [text, streaming, tools, reasoning, function_calling], codecs: [decode.openai.responses], wire_family: openai}}\npolicies:\n  codex-responses:\n    selection: {{strategy: fill_first}}\nroutes:\n  - id: codex-responses\n    listen: local\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    limits: {{max_request_body_bytes: 1048576, max_response_body_bytes: 1048576, max_frame_bytes: 1048576, max_event_bytes: 1048576}}\n    ingress: {{mode: semantic, decoder: decode.openai.responses, encoder: encode.openai.responses}}\n    target: {{provider: codex, model_from: request.model, policy: codex-responses}}\n    response: {{mode: semantic, decoder: decode.openai.responses.events, encoder: encode.openai.responses.events}}\n    loss_policy: reject\n"
         ),
     )
     .expect("Codex unary runtime config")
@@ -1185,7 +1185,7 @@ fn timeout_route_config(
     compile_yaml(
         "separated-timeout-runtime.yaml",
         &format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  delayed:\n    transport: {{kind: {transport}, base_url: '{upstream_url}', connect_timeout: {connect_timeout}, request_timeout: {request_timeout}}}\nroutes:\n  - id: delayed\n    listen: local\n    match: {{method: POST, path: /delayed}}\n    ingress: {{mode: opaque}}\n    target: {{provider: delayed}}\n    response: {{mode: opaque}}\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  delayed:\n    transport: {{kind: {transport}, base_url: '{upstream_url}', connect_timeout: {connect_timeout}, request_timeout: {request_timeout}}}\nroutes:\n  - id: delayed\n    listen: local\n    match: {{method: POST, path: /delayed}}\n    ingress: {{mode: opaque}}\n    target: {{provider: delayed}}\n    response: {{mode: opaque}}\n"
         ),
     )
     .expect("separated timeout runtime config")

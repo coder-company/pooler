@@ -155,7 +155,7 @@ pub(crate) fn cliproxy(input: &Path, dry_run: bool, output: Option<&Path>) -> Re
     unsupported_settings.dedup();
 
     let report = MigrationReport {
-        schema_version: 1,
+        schema_version: 2,
         source_revision: SOURCE_REVISION,
         dry_run,
         wrote_files,
@@ -213,7 +213,7 @@ fn translate(config: &LegacyConfig) -> Result<(Option<String>, Vec<String>, usiz
     }
     let translated = imports.len();
     Ok((
-        Some(format!("imports:\n{}\nversion: 1\n", imports.concat())),
+        Some(format!("imports:\n{}\nversion: 2\n", imports.concat())),
         secret_refs,
         translated,
         aliases,
@@ -479,7 +479,7 @@ openai-compatibility:
         let error = validate_generated_config(
             &input,
             None,
-            b"imports:\n  - preset: unsupported\nversion: 1\n",
+            b"imports:\n  - preset: unsupported\nversion: 2\n",
         )
         .expect_err("invalid preset rejected");
         assert!(error
@@ -507,7 +507,7 @@ openai-compatibility:
         validate_generated_config(
             &input,
             None,
-            b"version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\n",
+            b"version: 2\nlisteners: {local: {bind: 127.0.0.1:0}}\n",
         )
         .expect("validation succeeds beside sentinel");
 

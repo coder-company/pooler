@@ -2449,7 +2449,7 @@ mod tests {
         pooler_config::compile_yaml(
             "response-deadline-backpressure.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: {protocol}}}}}\nupstreams: {{local: {{url: http://{upstream}}}}}\naccounts:\n  only: {{provider: local, secret: {}, max_concurrency: 1}}\npolicies:\n  only:\n    selection: {{strategy: fill_first, accounts: [only]}}\nroutes:\n  - id: deadline\n    listen: local\n    match: {{method: GET, path: /deadline}}\n    limits: {{request_timeout: 1s, max_response_body_bytes: 134217728}}\n    target: {{provider: local, policy: only}}\n    ingress: {{mode: opaque}}\n    response: {{mode: opaque}}\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: {protocol}}}}}\nupstreams: {{local: {{url: http://{upstream}}}}}\naccounts:\n  only: {{provider: local, secret: {}, max_concurrency: 1}}\naccount_pools:\n  only-pool: {{provider: local, accounts: [only]}}\npolicies:\n  only:\n    selection: {{strategy: fill_first}}\nroutes:\n  - id: deadline\n    listen: local\n    match: {{method: GET, path: /deadline}}\n    limits: {{request_timeout: 1s, max_response_body_bytes: 134217728}}\n    target: {{provider: local, policy: only}}\n    ingress: {{mode: opaque}}\n    response: {{mode: opaque}}\n",
                 secret.reference()
             ),
         )
@@ -2700,7 +2700,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "h2c.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: h2c}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: h2c\n    listen: local\n    match: {{method: GET, path: /h2c}}\n    target: local\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: h2c}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: h2c\n    listen: local\n    match: {{method: GET, path: /h2c}}\n    target: local\n"
             ),
         )
         .expect("h2c config compiles");
@@ -2777,7 +2777,7 @@ mod tests {
     async fn h2_route_header_limit_is_enforced_per_stream() {
         let config = pooler_config::compile_yaml(
             "h2-header-limit.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:0, protocol: h2c}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes:\n  - id: h2-header-limit\n    listen: local\n    match: {method: GET, path: /h2-header-limit}\n    limits: {max_header_bytes: 16}\n    target: local\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:0, protocol: h2c}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes:\n  - id: h2-header-limit\n    listen: local\n    match: {method: GET, path: /h2-header-limit}\n    limits: {max_header_bytes: 16}\n    target: local\n",
         )
         .expect("h2 header-limit config compiles");
         let server = HttpProxyServer::bind(config).await.expect("proxy binds");
@@ -2830,7 +2830,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "h2-goaway.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: h2c}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: h2-goaway\n    listen: local\n    match: {{method: GET, path: /h2-goaway}}\n    target: local\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: h2c}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: h2-goaway\n    listen: local\n    match: {{method: GET, path: /h2-goaway}}\n    target: local\n"
             ),
         )
         .expect("h2 GOAWAY config compiles");
@@ -2924,7 +2924,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "auto.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: auto}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: auto-h2\n    listen: local\n    match: {{method: GET, path: /auto-h2}}\n    target: local\n  - id: auto-h1\n    listen: local\n    match: {{method: GET, path: /auto-h1}}\n    target: local\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: auto}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: auto-h2\n    listen: local\n    match: {{method: GET, path: /auto-h2}}\n    target: local\n  - id: auto-h1\n    listen: local\n    match: {{method: GET, path: /auto-h1}}\n    target: local\n"
             ),
         )
         .expect("auto config compiles");
@@ -3011,7 +3011,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "h2-reset.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: h2c}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: h2-reset\n    listen: local\n    match: {{method: GET, path: /h2-reset}}\n    target: local\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: h2c}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: h2-reset\n    listen: local\n    match: {{method: GET, path: /h2-reset}}\n    target: local\n"
             ),
         )
         .expect("h2 reset config compiles");
@@ -3105,7 +3105,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "upstream-h2c.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  local:\n    transport: {{kind: http, base_url: http://{upstream_address}, http2: true}}\nroutes:\n  - id: upstream-h2c\n    listen: local\n    match: {{method: GET, path: /upstream-h2c}}\n    target: local\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  local:\n    transport: {{kind: http, base_url: http://{upstream_address}, http2: true}}\nroutes:\n  - id: upstream-h2c\n    listen: local\n    match: {{method: GET, path: /upstream-h2c}}\n    target: local\n"
             ),
         )
         .expect("upstream h2c config compiles");
@@ -3160,7 +3160,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "e2e.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: opaque\n    listen: local\n    match: {{method: GET, path: /proxy}}\n    target: local\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: opaque\n    listen: local\n    match: {{method: GET, path: /proxy}}\n    target: local\n"
             ),
         )
         .expect("proxy config compiles");
@@ -3232,7 +3232,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "mixed.yaml",
             &format!(
-                "version: 1\nlisteners: {{shared: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: first\n    listen: shared\n    match: {{path: /first}}\n    target: first\n  - id: second\n    listen: shared\n    match: {{path: /second}}\n    target: second\n"
+                "version: 2\nlisteners: {{shared: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: first\n    listen: shared\n    match: {{path: /first}}\n    target: first\n  - id: second\n    listen: shared\n    match: {{path: /second}}\n    target: second\n"
             ),
         )
         .expect("mixed config compiles");
@@ -3273,7 +3273,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "listeners.yaml",
             &format!(
-                "version: 1\nlisteners:\n  a: {{bind: 127.0.0.1:0}}\n  b: {{bind: 127.0.0.1:0}}\nupstreams:\n  a: {{url: http://{first_address}}}\n  b: {{url: http://{second_address}}}\nroutes:\n  - {{id: a, listen: a, match: {{path: /same}}, target: a}}\n  - {{id: b, listen: b, match: {{path: /same}}, target: b}}\n"
+                "version: 2\nlisteners:\n  a: {{bind: 127.0.0.1:0}}\n  b: {{bind: 127.0.0.1:0}}\nupstreams:\n  a: {{url: http://{first_address}}}\n  b: {{url: http://{second_address}}}\nroutes:\n  - {{id: a, listen: a, match: {{path: /same}}, target: a}}\n  - {{id: b, listen: b, match: {{path: /same}}, target: b}}\n"
             ),
         )
         .expect("multi-listener config");
@@ -3308,7 +3308,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "auth.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: protected\n    listen: local\n    match: {{path: /protected}}\n    downstream_auth: {{secret: {}}}\n    target: local\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: protected\n    listen: local\n    match: {{path: /protected}}\n    downstream_auth: {{secret: {}}}\n    target: local\n",
                 secret.reference()
             ),
         )
@@ -3346,7 +3346,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "limit.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: limited\n    listen: local\n    match: {{method: POST, path: /limited}}\n    limits: {{max_request_body_bytes: 3}}\n    target: local\n  - id: expanded\n    listen: local\n    match: {{method: POST, path: /expanded}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /x, value: \"1234567890123456789012345678901234567890\"}}\n    limits: {{max_request_body_bytes: 16}}\n    target: local\n    response: {{mode: opaque}}\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: limited\n    listen: local\n    match: {{method: POST, path: /limited}}\n    limits: {{max_request_body_bytes: 3}}\n    target: local\n  - id: expanded\n    listen: local\n    match: {{method: POST, path: /expanded}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /x, value: \"1234567890123456789012345678901234567890\"}}\n    limits: {{max_request_body_bytes: 16}}\n    target: local\n    response: {{mode: opaque}}\n"
             ),
         )
         .expect("limit config compiles");
@@ -3417,7 +3417,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "extension-crash.yaml",
             &format!(
-                "version: 1\nextensions:\n  broken:\n    wasm: {}\n    capabilities: [transform]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: external\n    listen: local\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.external.broken\n          with: {{pointer: /unused, value: null}}\n    response: {{mode: opaque}}\n    target: local\n",
+                "version: 2\nextensions:\n  broken:\n    wasm: {}\n    capabilities: [transform]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: external\n    listen: local\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.external.broken\n          with: {{pointer: /unused, value: null}}\n    response: {{mode: opaque}}\n    target: local\n",
                 module_path.display(),
             ),
         )
@@ -3450,7 +3450,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "extension-inspect.yaml",
             &format!(
-                "version: 1\nextensions:\n  selector:\n    command: /bin/sh\n    args: [-c, 'read line; printf \\\"%s\\\\n\\\" \\\"{{\\\\\"metadata\\\\\":{{\\\\\"model\\\\\":\\\\\"provider\\\\\"}}}}\\\"']\n    capabilities: [inspect]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nmodels:\n  - id: provider\n    targets: [{{provider: local, upstream_model: upstream-provider}}]\nroutes:\n  - id: external-inspect\n    listen: local\n    ingress: {{mode: patch, inspectors: [inspect.external.selector]}}\n    response: {{mode: opaque}}\n    target: {{provider: local, model_from: inspected.model}}\n"
+                "version: 2\nextensions:\n  selector:\n    command: /bin/sh\n    args: [-c, 'read line; printf \\\"%s\\\\n\\\" \\\"{{\\\\\"metadata\\\\\":{{\\\\\"model\\\\\":\\\\\"provider\\\\\"}}}}\\\"']\n    capabilities: [inspect]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts: {{model-account: {{provider: local, secret: env:POOLER_TEST_MODEL_KEY}}}}\nmodels:\n  - id: provider\n    targets: [{{id: provider-target, provider: local, account: model-account, priority: 1, upstream_model: upstream-provider, capabilities: [text], codecs: [], wire_family: openai}}]\nroutes:\n  - id: external-inspect\n    listen: local\n    ingress: {{mode: patch, inspectors: [inspect.external.selector]}}\n    response: {{mode: opaque}}\n    target: {{provider: local, model_from: inspected.model}}\n"
             ),
         )
         .expect("external inspector config compiles");
@@ -3511,7 +3511,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "wasm-extension.yaml",
             &format!(
-                "version: 1\nextensions:\n  selector:\n    wasm: {}\n    capabilities: [inspect]\n  transformer:\n    wasm: {}\n    capabilities: [transform]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nmodels:\n  - id: provider\n    targets: [{{provider: local, upstream_model: upstream-provider}}]\nroutes:\n  - id: wasm\n    listen: local\n    ingress: {{mode: patch, inspectors: [inspect.external.selector]}}\n    request:\n      steps:\n        - use: transform.external.transformer\n          with: {{pointer: /unused, value: null}}\n    response: {{mode: opaque}}\n    target: {{provider: local, model_from: inspected.model}}\n",
+                "version: 2\nextensions:\n  selector:\n    wasm: {}\n    capabilities: [inspect]\n  transformer:\n    wasm: {}\n    capabilities: [transform]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts: {{model-account: {{provider: local, secret: env:POOLER_TEST_MODEL_KEY}}}}\nmodels:\n  - id: provider\n    targets: [{{id: provider-target, provider: local, account: model-account, priority: 1, upstream_model: upstream-provider, capabilities: [text], codecs: [], wire_family: openai}}]\nroutes:\n  - id: wasm\n    listen: local\n    ingress: {{mode: patch, inspectors: [inspect.external.selector]}}\n    request:\n      steps:\n        - use: transform.external.transformer\n          with: {{pointer: /unused, value: null}}\n    response: {{mode: opaque}}\n    target: {{provider: local, model_from: inspected.model}}\n",
                 selector_path.display(),
                 transformer_path.display(),
             ),
@@ -3545,7 +3545,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "response-limit.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: limited\n    listen: local\n    limits: {{max_response_body_bytes: 3}}\n    target: local\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: limited\n    listen: local\n    limits: {{max_response_body_bytes: 3}}\n    target: local\n"
             ),
         )
         .expect("response limit config");
@@ -3583,7 +3583,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "cancel.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes: [{{id: cancel, listen: local, target: local}}]\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes: [{{id: cancel, listen: local, target: local}}]\n"
             ),
         )
         .expect("cancel config compiles");
@@ -3645,7 +3645,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "management-active.yaml",
             &format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes: [{{id: active, listen: local, target: local}}]\n"
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes: [{{id: active, listen: local, target: local}}]\n"
             ),
         )
         .expect("management active config compiles");
@@ -3722,7 +3722,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "lifecycle.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes: [{{id: pending, listen: local, target: local}}]\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes: [{{id: pending, listen: local, target: local}}]\n"
             ),
         )
         .expect("lifecycle config");
@@ -3758,7 +3758,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "patch.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: patch\n    listen: local\n    match: {{method: POST, path: /patch}}\n    ingress: {{mode: patch, inspectors: [inspect.openai.model]}}\n    request:\n      steps:\n        - use: transform.json.set_when_model_prefix\n          with: {{prefix: gpt-, pointer: /reasoning/effort, value: high}}\n    target: local\n    response: {{mode: opaque}}\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: patch\n    listen: local\n    match: {{method: POST, path: /patch}}\n    ingress: {{mode: patch, inspectors: [inspect.openai.model]}}\n    request:\n      steps:\n        - use: transform.json.set_when_model_prefix\n          with: {{prefix: gpt-, pointer: /reasoning/effort, value: high}}\n    target: local\n    response: {{mode: opaque}}\n"
             ),
         )
         .expect("patch route compiles");
@@ -3796,7 +3796,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "model-route.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  fallback: {{url: http://{fallback_address}}}\n  selected:\n    url: http://{selected_address}\n    auth: {{secret: {}}}\nmodels:\n  - id: public-model\n    targets:\n      - {{provider: selected, upstream_model: provider-model, capabilities: [text]}}\nroutes:\n  - id: model-route\n    listen: local\n    match: {{method: POST, path: /model}}\n    ingress: {{mode: patch, inspectors: [inspect.openai.model]}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /model, value: mutated-model}}\n    target: {{provider: fallback, model_from: inspected.model}}\n    response: {{mode: opaque}}\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  fallback: {{url: http://{fallback_address}}}\n  selected:\n    url: http://{selected_address}\n    auth: {{secret: {}}}\naccounts:\n  selected-account: {{provider: selected, secret: env:POOLER_SELECTED_MODEL_KEY}}\nmodels:\n  - id: public-model\n    targets:\n      - {{id: public-model-target, provider: selected, account: selected-account, priority: 1, upstream_model: provider-model, capabilities: [text], codecs: [], wire_family: openai}}\nroutes:\n  - id: model-route\n    listen: local\n    match: {{method: POST, path: /model}}\n    ingress: {{mode: patch, inspectors: [inspect.openai.model]}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /model, value: mutated-model}}\n    target: {{provider: fallback, model_from: inspected.model}}\n    response: {{mode: opaque}}\n",
                 selected_secret.reference()
             ),
         )
@@ -3898,7 +3898,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "semantic-model-selection.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{upstream_address}}}\n  blocked: {{url: http://{upstream_address}}}\n  rebound: {{url: http://{upstream_address}}}\naccounts:\n  first: {{provider: first, secret: {}}}\n  blocked: {{provider: blocked, secret: {}}}\n  rebound: {{provider: rebound, secret: {}}}\naccount_pools: {{pool: {{accounts: [first, blocked, rebound]}}}}\nmodels:\n  - id: public-model\n    targets:\n      - {{provider: first, upstream_model: first-model, capabilities: [text, streaming], codecs: [decode.factory.language_model]}}\n      - {{provider: blocked, upstream_model: blocked-model, capabilities: [streaming], codecs: [decode.other]}}\n      - {{provider: rebound, upstream_model: rebound-model, capabilities: [text, streaming], codecs: [decode.factory.language_model]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, account_pool: pool, affinity: {{key: request.session_id, ttl: 10m, rebind: true}}}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}}\nroutes:\n  - id: factory-pooled\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: first, model_from: request.model, policy: pooled}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{upstream_address}}}\n  blocked: {{url: http://{upstream_address}}}\n  rebound: {{url: http://{upstream_address}}}\naccounts:\n  first: {{provider: first, secret: {}}}\n  blocked: {{provider: blocked, secret: {}}}\n  rebound: {{provider: rebound, secret: {}}}\nmodels:\n  - id: public-model\n    targets:\n      - {{id: first-target, provider: first, account: first, priority: 1, upstream_model: first-model, capabilities: [text, streaming], codecs: [decode.factory.language_model], wire_family: openai}}\n      - {{id: blocked-target, provider: blocked, account: blocked, priority: 2, upstream_model: blocked-model, capabilities: [streaming], codecs: [decode.other], wire_family: openai}}\n      - {{id: rebound-target, provider: rebound, account: rebound, priority: 2, upstream_model: rebound-model, capabilities: [text, streaming], codecs: [decode.factory.language_model], wire_family: openai}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, affinity: {{key: request.session_id, ttl: 10m, rebind: true}}}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}}\nroutes:\n  - id: factory-pooled\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: first, model_from: request.model, policy: pooled}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n",
                 first_secret.reference(),
                 blocked_secret.reference(),
                 rebound_secret.reference(),
@@ -4008,7 +4008,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "pooling.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  a-backup: {{provider: local, secret: {}}}\n  z-primary: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{accounts: [z-primary, a-backup]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, account_pool: pool}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  a-backup: {{provider: local, secret: {}}}\n  z-primary: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{provider: local, accounts: [z-primary, a-backup]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
                 second_secret.reference(),
                 first_secret.reference()
             ),
@@ -4099,7 +4099,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "pooling-restart.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{accounts: [first, second]}}\npolicies:\n  pooled:\n    selection:\n      strategy: ordered_fallback\n      account_pool: pool\n      affinity: {{key: header:x-session, ttl: 10m, rebind: true}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{provider: local, accounts: [first, second]}}\npolicies:\n  pooled:\n    selection:\n      strategy: ordered_fallback\n      affinity: {{key: header:x-session, ttl: 10m, rebind: true}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
                 first_secret.reference(),
                 second_secret.reference()
             ),
@@ -4181,7 +4181,7 @@ mod tests {
             request
         });
         let restart_yaml = format!(
-            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{restart_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{accounts: [first, second]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, account_pool: pool, affinity: {{key: header:x-session, ttl: 10m, rebind: true}}}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{restart_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{provider: local, accounts: [first, second]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, affinity: {{key: header:x-session, ttl: 10m, rebind: true}}}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
             first_secret.reference(),
             second_secret.reference()
         );
@@ -4234,7 +4234,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "model-source.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  plain: {{url: http://{plain_address}}}\n  selected: {{url: http://{selected_address}}}\nmodels:\n  - id: public\n    targets: [{{provider: selected, upstream_model: private}}]\nroutes:\n  - id: plain\n    listen: local\n    match: {{method: POST, path: /plain}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /value, value: true}}\n    target: plain\n    response: {{mode: opaque}}\n  - id: request-model\n    listen: local\n    match: {{method: POST, path: /request-model}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /model, value: public}}\n    target: {{provider: plain, model_from: request.model}}\n    response: {{mode: opaque}}\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  plain: {{url: http://{plain_address}}}\n  selected: {{url: http://{selected_address}}}\naccounts: {{model-account: {{provider: selected, secret: env:POOLER_TEST_MODEL_KEY}}}}\nmodels:\n  - id: public\n    targets: [{{id: public-target, provider: selected, account: model-account, priority: 1, upstream_model: private, capabilities: [text], codecs: [], wire_family: openai}}]\nroutes:\n  - id: plain\n    listen: local\n    match: {{method: POST, path: /plain}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /value, value: true}}\n    target: plain\n    response: {{mode: opaque}}\n  - id: request-model\n    listen: local\n    match: {{method: POST, path: /request-model}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /model, value: public}}\n    target: {{provider: plain, model_from: request.model}}\n    response: {{mode: opaque}}\n"
             ),
         )
         .expect("model source config");
@@ -4272,7 +4272,7 @@ mod tests {
         let (upstream_address, upstream) = spawn_one_shot_upstream(b"cursor").await;
         let upstream_secret = TestSecret::new("cursor-token\n");
         let config_file = TestSecret::new(&format!(
-            "imports:\n  - preset: cursor\n    as: cursor-test\n    with:\n      bind: 127.0.0.1:0\n      reasoning_effort: high\n      model_prefix: gpt-\n      upstream_url: http://{upstream_address}\n      secret: {}\nversion: 1\n",
+            "imports:\n  - preset: cursor\n    as: cursor-test\n    with:\n      bind: 127.0.0.1:0\n      reasoning_effort: high\n      model_prefix: gpt-\n      upstream_url: http://{upstream_address}\n      secret: {}\nversion: 2\n",
             upstream_secret.reference()
         ));
         let config = pooler_config::Config::from_path(&config_file.path)
@@ -4389,7 +4389,7 @@ mod tests {
 
         let upstream_secret = TestSecret::new("cursor-fixture-token");
         let config_file = TestSecret::new(&format!(
-            "imports:\n  - preset: cursor\n    as: cursor-fixture\n    with:\n      bind: 127.0.0.1:0\n      reasoning_effort: high\n      model_prefix: gpt-\n      upstream_url: http://{upstream_address}\n      secret: {}\nversion: 1\n",
+            "imports:\n  - preset: cursor\n    as: cursor-fixture\n    with:\n      bind: 127.0.0.1:0\n      reasoning_effort: high\n      model_prefix: gpt-\n      upstream_url: http://{upstream_address}\n      secret: {}\nversion: 2\n",
             upstream_secret.reference()
         ));
         let config = pooler_config::Config::from_path(&config_file.path)
@@ -4521,7 +4521,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "factory-runtime.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
             ),
         )
         .expect("Factory semantic route compiles");
@@ -4637,7 +4637,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "semantic-factory.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
             ),
         )
         .expect("semantic route config");
@@ -4714,7 +4714,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "semantic-devin.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: devin\n    listen: local\n    match: {{method: POST, path: /exa.api_server_pb.ApiServerService/GetChatMessage, content_types: [application/connect+proto]}}\n    ingress: {{mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}}\n    target: {{provider: local, upstream_path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}}\n    loss_policy: reject\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: devin\n    listen: local\n    match: {{method: POST, path: /exa.api_server_pb.ApiServerService/GetChatMessage, content_types: [application/connect+proto]}}\n    ingress: {{mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}}\n    target: {{provider: local, upstream_path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}}\n    loss_policy: reject\n"
             ),
         )
         .expect("semantic route config");
@@ -4817,7 +4817,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "semantic-devin-cancel.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: devin\n    listen: local\n    match: {{method: POST, path: /exa.api_server_pb.ApiServerService/GetChatMessage, content_types: [application/connect+proto]}}\n    ingress: {{mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}}\n    target: {{provider: local, upstream_path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}}\n    loss_policy: reject\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: devin\n    listen: local\n    match: {{method: POST, path: /exa.api_server_pb.ApiServerService/GetChatMessage, content_types: [application/connect+proto]}}\n    ingress: {{mode: semantic, framing: decode.connect.envelope, decoder: decode.devin.chat}}\n    target: {{provider: local, upstream_path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.devin.connect}}\n    loss_policy: reject\n"
             ),
         )
         .expect("semantic route config");
@@ -4881,7 +4881,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "semantic-reject.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
             ),
         )
         .expect("semantic route config");
@@ -4919,7 +4919,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "semantic-request-limit.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    limits: {{max_request_body_bytes: 100}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    limits: {{max_request_body_bytes: 100}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
             ),
         )
         .expect("semantic route config");
@@ -4957,7 +4957,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "semantic-frame-limit.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    limits: {{max_frame_bytes: 8, max_request_body_bytes: 4096}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: factory\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model}}\n    limits: {{max_frame_bytes: 8, max_request_body_bytes: 4096}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: local\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: reject\n"
             ),
         )
         .expect("semantic route config");
@@ -5045,7 +5045,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "native-codex-e2e.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{upstream_address}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  account-a:\n    provider: codex\n    secret: env:CODEX_TEST_SECRET\npolicies:\n  codex:\n    selection: {{strategy: fill_first, accounts: [account-a]}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 1, statuses: [429], before_commit_only: true}}\nroutes:\n  - id: codex\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: codex, policy: codex}}\n    response: {{mode: opaque}}\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{upstream_address}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  account-a:\n    provider: codex\n    secret: env:CODEX_TEST_SECRET\naccount_pools:\n  codex-pool: {{provider: codex, accounts: [account-a]}}\npolicies:\n  codex:\n    selection: {{strategy: fill_first}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 1, statuses: [429], before_commit_only: true}}\nroutes:\n  - id: codex\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: codex, policy: codex}}\n    response: {{mode: opaque}}\n"
             ),
         )
         .expect("native route config");
@@ -5156,7 +5156,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "mixed-openai-auth-e2e.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  subscription:\n    url: http://{subscription_address}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\n  api:\n    url: http://{api_address}\naccounts:\n  a-subscription-account:\n    provider: subscription\n    auth_kind: oauth\n  b-api-account:\n    provider: api\n    auth_kind: api_key\n    secret: {}\naccount_pools:\n  mixed: {{accounts: [a-subscription-account, b-api-account]}}\nmodels:\n  - id: gpt-test\n    targets:\n      - {{provider: subscription, upstream_model: gpt-test}}\n      - {{provider: api, upstream_model: gpt-test}}\npolicies:\n  mixed:\n    selection: {{strategy: ordered_fallback, account_pool: mixed}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, maximum_providers: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}}\nroutes:\n  - id: mixed\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: subscription, model_from: request.model, policy: mixed}}\n    response: {{mode: opaque}}\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  subscription:\n    url: http://{subscription_address}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\n  api:\n    url: http://{api_address}\naccounts:\n  a-subscription-account:\n    provider: subscription\n    auth_kind: oauth\n  b-api-account:\n    provider: api\n    auth_kind: api_key\n    secret: {}\nmodels:\n  - id: gpt-test\n    targets:\n      - {{id: subscription-target, provider: subscription, account: a-subscription-account, priority: 1, upstream_model: gpt-test, capabilities: [text], codecs: [], wire_family: openai}}\n      - {{id: api-target, provider: api, account: b-api-account, priority: 2, upstream_model: gpt-test, capabilities: [text], codecs: [], wire_family: openai}}\npolicies:\n  mixed:\n    selection: {{strategy: ordered_fallback}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, maximum_upstreams: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}}\nroutes:\n  - id: mixed\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: subscription, model_from: request.model, policy: mixed}}\n    response: {{mode: opaque}}\n",
                 api_secret.reference()
             ),
         )
@@ -5293,7 +5293,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "reload.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: first\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: first\n"
             ),
         )
         .expect("initial config");
@@ -5316,7 +5316,7 @@ mod tests {
         let replacement = pooler_config::compile_yaml(
             "reload.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: second\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: second\n"
             ),
         )
         .expect("replacement config");
@@ -5336,7 +5336,7 @@ mod tests {
             pooler_config::compile_yaml(
                 "reload-retired-cap.yaml",
                 &format!(
-                    "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  local: {{url: http://127.0.0.1:1}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: {path}}}\n    target: local\n"
+                    "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  local: {{url: http://127.0.0.1:1}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: {path}}}\n    target: local\n"
                 ),
             )
             .expect("reload cap config")
@@ -5373,13 +5373,13 @@ mod tests {
     async fn reload_rejects_native_provider_binding_changes() {
         let config = pooler_config::compile_yaml(
             "native-reload.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  provider: {url: https://example.com}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  provider: {url: https://example.com}\n",
         )
         .expect("initial config");
         let server = HttpProxyServer::bind(config).await.expect("proxy binds");
         let candidate = pooler_config::compile_yaml(
             "native-reload.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  provider:\n    url: https://example.com\n    native: {kind: antigravity}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  provider:\n    url: https://example.com\n    native: {kind: antigravity}\n",
         )
         .expect("native candidate");
 
@@ -5397,7 +5397,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "management-runtime.yaml",
             &format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /management-runtime}}\n    target: first\n"
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /management-runtime}}\n    target: first\n"
             ),
         )
         .expect("management runtime config");
@@ -5488,7 +5488,7 @@ mod tests {
         let replacement = pooler_config::compile_yaml(
             "management-runtime.yaml",
             &format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /management-runtime}}\n    target: second\n"
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /management-runtime}}\n    target: second\n"
             ),
         )
         .expect("replacement management runtime config");
@@ -5560,7 +5560,7 @@ mod tests {
         std::env::set_var(SECRET_ENV, "stale-reload-secret");
         let config = pooler_config::compile_yaml(
             "management-stale-reload.yaml",
-            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:1}}\n",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:1}}\n",
         )
         .expect("initial management config");
         let server = HttpProxyServer::bind(config).await.expect("bind server");
@@ -5578,7 +5578,7 @@ mod tests {
 
         let replacement = pooler_config::compile_yaml(
             "management-stale-reload.yaml",
-            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:2}}\n",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:2}}\n",
         )
         .expect("replacement management config");
         assert_eq!(
@@ -5617,7 +5617,7 @@ mod tests {
         assert_eq!(accepted_generation, 2);
         let third = pooler_config::compile_yaml(
             "management-stale-reload.yaml",
-            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:3}}\n",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:3}}\n",
         )
         .expect("third management config");
         assert_eq!(
@@ -5629,7 +5629,7 @@ mod tests {
         );
         let obsolete = pooler_config::compile_yaml(
             "management-stale-reload.yaml",
-            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:4}}\n",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_STALE_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:4}}\n",
         )
         .expect("obsolete management candidate");
         assert!(matches!(
@@ -5651,7 +5651,7 @@ mod tests {
         std::env::set_var("POOLER_MANAGEMENT_NATIVE_TEST_KEY", "native-command-secret");
         let config = pooler_config::compile_yaml(
             "management-native-command.yaml",
-            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_NATIVE_TEST_KEY}}\nupstreams:\n  codex:\n    url: http://127.0.0.1:1\n    native: {kind: codex}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      client_id: test\n      scopes: [openid]\naccounts:\n  account-a: {provider: codex, auth_kind: oauth}\n",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_NATIVE_TEST_KEY}}\nupstreams:\n  codex:\n    url: http://127.0.0.1:1\n    native: {kind: codex}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      client_id: test\n      scopes: [openid]\naccounts:\n  account-a: {provider: codex, auth_kind: oauth}\n",
         )
         .expect("management native command config");
         let server = HttpProxyServer::bind(config).await.expect("bind server");
@@ -5735,7 +5735,7 @@ mod tests {
             pooler_config::compile_yaml(
                 "browser-generation-management.yaml",
                 &format!(
-                    "version: 1\nmanagement: {{bind: {address}, auth: {{secret: env:{MANAGEMENT_ENV}}}}}\nupstreams:\n  foundry:\n    url: https://example.euw-3.palantirfoundry.co.uk\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: operator-client\n      scopes: [api:use-language-models-execute, offline_access]\n      callback: http://{address}/management/oauth/browser/callback\naccounts:\n  foundry: {{provider: foundry, auth_kind: oauth}}\n"
+                    "version: 2\nmanagement: {{bind: {address}, auth: {{secret: env:{MANAGEMENT_ENV}}}}}\nupstreams:\n  foundry:\n    url: https://example.euw-3.palantirfoundry.co.uk\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: operator-client\n      scopes: [api:use-language-models-execute, offline_access]\n      callback: http://{address}/management/oauth/browser/callback\naccounts:\n  foundry: {{provider: foundry, auth_kind: oauth}}\n"
                 ),
             )
             .expect("browser OAuth management config"),
@@ -5872,7 +5872,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "reload-inflight.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: first\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: first\n"
             ),
         )
         .expect("initial config");
@@ -5892,7 +5892,7 @@ mod tests {
         let replacement = pooler_config::compile_yaml(
             "reload-inflight.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: second\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  first: {{url: http://{first_address}}}\n  second: {{url: http://{second_address}}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /reload}}\n    target: second\n"
             ),
         )
         .expect("replacement config");

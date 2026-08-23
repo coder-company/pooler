@@ -199,12 +199,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory");
         let explicit = directory.path().join("operator.yaml");
         let local = directory.path().join(CONFIG_FILENAME);
-        std::fs::write(&local, "version: 1\n").expect("local config");
+        std::fs::write(&local, "version: 2\n").expect("local config");
         let platform_root = directory.path().join("xdg");
         std::fs::create_dir_all(platform_root.join(CONFIG_DIRECTORY)).expect("platform root");
         std::fs::write(
             platform_root.join(CONFIG_DIRECTORY).join(CONFIG_FILENAME),
-            "version: 1\n",
+            "version: 2\n",
         )
         .expect("platform config");
 
@@ -221,11 +221,11 @@ mod tests {
     fn existing_working_directory_config_precedes_platform_config() {
         let directory = tempfile::tempdir().expect("directory");
         let local = directory.path().join(CONFIG_FILENAME);
-        std::fs::write(&local, "version: 1\n").expect("local config");
+        std::fs::write(&local, "version: 2\n").expect("local config");
         let platform_root = directory.path().join("xdg");
         std::fs::create_dir_all(platform_root.join(CONFIG_DIRECTORY)).expect("platform root");
         let platform = platform_root.join(CONFIG_DIRECTORY).join(CONFIG_FILENAME);
-        std::fs::write(&platform, "version: 1\n").expect("platform config");
+        std::fs::write(&platform, "version: 2\n").expect("platform config");
 
         assert_eq!(
             resolve_from(
@@ -244,7 +244,7 @@ mod tests {
         let xdg = directory.path().join("xdg");
         let platform = xdg.join(CONFIG_DIRECTORY).join(CONFIG_FILENAME);
         std::fs::create_dir_all(platform.parent().expect("platform parent")).expect("directory");
-        std::fs::write(&platform, "version: 1\n").expect("platform config");
+        std::fs::write(&platform, "version: 2\n").expect("platform config");
 
         assert_eq!(
             resolve_from(None, directory.path(), &environment(Some(&xdg), None))
@@ -263,7 +263,7 @@ mod tests {
             .join(CONFIG_DIRECTORY)
             .join(CONFIG_FILENAME);
         std::fs::create_dir_all(platform.parent().expect("platform parent")).expect("directory");
-        std::fs::write(&platform, "version: 1\n").expect("platform config");
+        std::fs::write(&platform, "version: 2\n").expect("platform config");
 
         assert_eq!(
             resolve_from(None, directory.path(), &environment(None, Some(&home)))
@@ -289,11 +289,11 @@ mod tests {
         let target = directory.path().join("target.yaml");
         let local = directory.path().join(CONFIG_FILENAME);
         let platform_root = directory.path().join("xdg");
-        std::fs::write(&target, "version: 1\n").expect("target");
+        std::fs::write(&target, "version: 2\n").expect("target");
         std::os::unix::fs::symlink(&target, &local).expect("symlink");
         std::fs::create_dir_all(platform_root.join(CONFIG_DIRECTORY)).expect("platform root");
         let platform = platform_root.join(CONFIG_DIRECTORY).join(CONFIG_FILENAME);
-        std::fs::write(&platform, "version: 1\n").expect("platform config");
+        std::fs::write(&platform, "version: 2\n").expect("platform config");
 
         let discovered = resolve_from(
             None,

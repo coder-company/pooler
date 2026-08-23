@@ -229,6 +229,16 @@ impl CredentialCipher {
         index
     }
 
+    /// Return a keyed, non-reversible digest for a short-lived control-plane
+    /// secret such as a browser cookie or OAuth state value.
+    pub(crate) fn secret_index(&self, value: &[u8]) -> [u8; 32] {
+        let key = hmac::Key::new(HMAC_SHA256, self.key.key.as_ref().as_ref());
+        let digest = hmac::sign(&key, value);
+        let mut index = [0_u8; 32];
+        index.copy_from_slice(digest.as_ref());
+        index
+    }
+
     pub(crate) fn seal_for(
         &self,
         payload: &CredentialPayload,

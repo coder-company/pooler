@@ -381,7 +381,7 @@ mod tests {
         compile_yaml(
             "routes.yaml",
             r#"
-version: 1
+version: 2
 listeners:
   shared: {bind: 127.0.0.1:8400}
   other: {bind: 127.0.0.1:8401}
@@ -547,7 +547,7 @@ routes:
         let compiled = compile_yaml(
             "wildcard.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:

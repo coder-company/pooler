@@ -5,7 +5,7 @@ use std::process::{Command, Output};
 use pooler_store::{MasterKey, SqliteStore, Store};
 
 const CONFIG: &str = r#"
-version: 1
+version: 2
 upstreams:
   xai:
     url: https://api.x.ai

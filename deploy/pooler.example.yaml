@@ -17,7 +17,7 @@ imports:
       websocket_url: wss://api.openai.com
       secret: file:/run/secrets/upstream.key
 
-version: 1
+version: 2
 
 management:
   bind: 127.0.0.1:18477

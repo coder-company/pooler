@@ -4,4 +4,4 @@ imports:
     with:
       bind: 127.0.0.1:18474
       upstream_url: http://127.0.0.1:8319
-version: 1
+version: 2

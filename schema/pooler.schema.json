@@ -13,8 +13,7 @@
         "auth_kind": {
           "enum": [
             "api_key",
-            "oauth",
-            "subscription"
+            "oauth"
           ],
           "type": "string"
         },
@@ -28,6 +27,7 @@
         },
         "merge": true,
         "provider": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
           "type": "string"
         },
         "quota_project": {
@@ -38,15 +38,15 @@
         "secret": {
           "$ref": "#/$defs/secret_ref"
         },
-        "upstream": {
-          "type": "string"
-        },
         "weight": {
           "maximum": 4294967295,
-          "minimum": 0,
+          "minimum": 1,
           "type": "integer"
         }
       },
+      "required": [
+        "provider"
+      ],
       "type": "object"
     },
     "account_pool": {
@@ -62,19 +62,31 @@
           "items": {
             "type": "string"
           },
-          "minItems": 0,
-          "type": "array"
-        },
-        "members": {
-          "items": {
-            "type": "string"
-          },
-          "minItems": 0,
+          "minItems": 1,
           "type": "array"
         },
         "merge": true,
-        "remove": true
+        "provider": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        },
+        "remove": true,
+        "strategy": {
+          "enum": [
+            "round_robin",
+            "smooth_weighted_round_robin",
+            "fill_first",
+            "least_in_flight",
+            "health_weighted",
+            "ordered_fallback"
+          ],
+          "type": "string"
+        }
       },
+      "required": [
+        "provider",
+        "accounts"
+      ],
       "type": "object"
     },
     "affinity": {
@@ -391,7 +403,6 @@
         "parser": {
           "enum": [
             "openai",
-            "open_ai",
             "kimi",
             "gemini",
             "vertex",
@@ -821,7 +832,7 @@
           "items": {
             "$ref": "#/$defs/model_target"
           },
-          "minItems": 0,
+          "minItems": 1,
           "type": "array"
         }
       },
@@ -1056,6 +1067,14 @@
     "model_target": {
       "additionalProperties": false,
       "properties": {
+        "account": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        },
+        "account_pool": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        },
         "capabilities": {
           "items": {
             "enum": [
@@ -1100,16 +1119,37 @@
           "minItems": 0,
           "type": "array"
         },
-        "provider": {
+        "id": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
           "type": "string"
         },
-        "upstream": {
+        "priority": {
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "provider": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
           "type": "string"
         },
         "upstream_model": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "weight": {
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "wire_family": {
           "type": "string"
         }
       },
+      "required": [
+        "id",
+        "provider",
+        "upstream_model"
+      ],
       "type": "object"
     },
     "native": {
@@ -1161,9 +1201,6 @@
         "revocation_endpoint": {
           "type": "string"
         },
-        "revoke_endpoint": {
-          "type": "string"
-        },
         "scopes": {
           "items": {
             "type": "string"
@@ -1186,19 +1223,16 @@
         ]
       },
       "properties": {
-        "account_pool": {
-          "type": "string"
-        },
         "cooldown": {
           "$ref": "#/$defs/cooldown"
         },
         "merge": true,
-        "pool": {
-          "type": "string"
-        },
         "remove": true,
         "retry": {
           "$ref": "#/$defs/retry"
+        },
+        "routing": {
+          "$ref": "#/$defs/routing"
         },
         "selection": {
           "$ref": "#/$defs/selection"
@@ -1249,33 +1283,6 @@
         "before_commit_only": {
           "type": "boolean"
         },
-        "max_attempts": {
-          "maximum": 4294967295,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "max_credentials": {
-          "maximum": 4294967295,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "max_delay": {
-          "$ref": "#/$defs/duration"
-        },
-        "max_elapsed": {
-          "$ref": "#/$defs/duration"
-        },
-        "max_providers": {
-          "maximum": 4294967295,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "max_recovery_wait": {
-          "$ref": "#/$defs/duration"
-        },
-        "max_total_delay": {
-          "$ref": "#/$defs/duration"
-        },
         "maximum_attempts": {
           "maximum": 4294967295,
           "minimum": 0,
@@ -1292,25 +1299,16 @@
         "maximum_elapsed": {
           "$ref": "#/$defs/duration"
         },
-        "maximum_providers": {
-          "maximum": 4294967295,
-          "minimum": 0,
-          "type": "integer"
-        },
         "maximum_recovery_wait": {
           "$ref": "#/$defs/duration"
         },
         "maximum_total_delay": {
           "$ref": "#/$defs/duration"
         },
-        "retryable_statuses": {
-          "items": {
-            "maximum": 599,
-            "minimum": 0,
-            "type": "integer"
-          },
-          "minItems": 0,
-          "type": "array"
+        "maximum_upstreams": {
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
         },
         "statuses": {
           "items": {
@@ -1465,28 +1463,138 @@
       },
       "type": "object"
     },
-    "secret_ref": {
-      "pattern": "^(env:[A-Za-z_][A-Za-z0-9_]*|file:(/.*|[A-Za-z]:[/\\\\].*|\\\\\\\\[^\\\\/]+[/\\\\].*)|keyring:[^/]+/.+)$",
-      "type": "string"
-    },
-    "selection": {
+    "routing": {
       "additionalProperties": false,
       "properties": {
-        "account_pool": {
-          "type": "string"
-        },
-        "accounts": {
+        "allow": {
           "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
             "type": "string"
           },
           "minItems": 0,
           "type": "array"
         },
+        "allow_fallbacks": {
+          "type": "boolean"
+        },
+        "data_policy": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "deny": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "max_price": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_context": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "order": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "preference": {
+          "$ref": "#/$defs/routing_preference"
+        },
+        "privacy": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "quantization": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "require_zdr": {
+          "type": "boolean"
+        },
+        "required_capabilities": {
+          "items": {
+            "enum": [
+              "text",
+              "images",
+              "audio",
+              "files",
+              "tools",
+              "reasoning",
+              "streaming",
+              "usage",
+              "structured_output",
+              "json_schema",
+              "function_calling",
+              "tool_choice",
+              "cache_hints",
+              "continuation",
+              "response_metadata",
+              "encrypted_reasoning",
+              "refusal",
+              "error_events",
+              "input_audio",
+              "output_audio",
+              "code_execution",
+              "computer_use",
+              "batch",
+              "embeddings",
+              "sse",
+              "web_socket",
+              "connect_rpc",
+              "protobuf"
+            ],
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "required_parameters": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "routing_preference": {
+      "additionalProperties": false,
+      "properties": {
+        "latency": {
+          "type": "boolean"
+        },
+        "price": {
+          "type": "boolean"
+        },
+        "throughput": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "secret_ref": {
+      "pattern": "^(env:[A-Za-z_][A-Za-z0-9_]*|file:(/.*|[A-Za-z]:[/\\\\].*|\\\\\\\\[^\\\\/]+[/\\\\].*)|keyring:[^/]+/.+|managed:[A-Za-z0-9._-]{1,128})$",
+      "type": "string"
+    },
+    "selection": {
+      "additionalProperties": false,
+      "properties": {
         "affinity": {
           "$ref": "#/$defs/affinity"
-        },
-        "pool": {
-          "type": "string"
         },
         "session_affinity": {
           "$ref": "#/$defs/duration"
@@ -1758,7 +1866,7 @@
       "type": "object"
     }
   },
-  "$id": "https://coder-company.github.io/pooler/schemas/config-v1.json",
+  "$id": "https://coder-company.github.io/pooler/schemas/config-v2.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -1784,16 +1892,6 @@
     },
     "catalog": {
       "$ref": "#/$defs/catalog"
-    },
-    "credentials": {
-      "additionalProperties": {
-        "$ref": "#/$defs/account"
-      },
-      "propertyNames": {
-        "pattern": "^[A-Za-z0-9._-]{1,128}$",
-        "type": "string"
-      },
-      "type": "object"
     },
     "extensions": {
       "additionalProperties": {
@@ -1842,26 +1940,6 @@
       },
       "type": "object"
     },
-    "pools": {
-      "additionalProperties": {
-        "$ref": "#/$defs/account_pool"
-      },
-      "propertyNames": {
-        "pattern": "^[A-Za-z0-9._-]{1,128}$",
-        "type": "string"
-      },
-      "type": "object"
-    },
-    "providers": {
-      "additionalProperties": {
-        "$ref": "#/$defs/upstream"
-      },
-      "propertyNames": {
-        "pattern": "^[A-Za-z0-9._-]{1,128}$",
-        "type": "string"
-      },
-      "type": "object"
-    },
     "routes": {
       "items": {
         "$ref": "#/$defs/route"
@@ -1883,8 +1961,8 @@
       "$ref": "#/$defs/usage_price_book"
     },
     "version": {
-      "maximum": 1,
-      "minimum": 1,
+      "maximum": 2,
+      "minimum": 2,
       "type": "integer"
     }
   },

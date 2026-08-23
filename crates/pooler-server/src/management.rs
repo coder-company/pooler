@@ -309,6 +309,15 @@ pub struct ManagementResponse {
 
 impl ManagementResponse {
     fn json(status: StatusCode, value: Value, head: bool) -> Self {
+        let value = if status.is_client_error() || status.is_server_error() {
+            if let Some(message) = value.get("error").and_then(Value::as_str) {
+                ManagementError::from_status(status, message).value()
+            } else {
+                value
+            }
+        } else {
+            value
+        };
         let encoded = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
         Self::body(status, "application/json", encoded, head)
     }
@@ -322,6 +331,23 @@ impl ManagementResponse {
             response.headers.insert(header::RETRY_AFTER, seconds);
         }
         response
+    }
+
+    fn error_code(
+        code: ManagementErrorCode,
+        message: impl Into<String>,
+        head: bool,
+    ) -> Self {
+        Self::error(ManagementError::new(code, message), head)
+    }
+
+    fn error_status(status: StatusCode, message: impl Into<String>, head: bool) -> Self {
+        let error = ManagementError::from_status(status, message);
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            Self::error(error.with_retry_after_seconds(1), head)
+        } else {
+            Self::error(error, head)
+        }
     }
 
     fn body(status: StatusCode, content_type: &'static str, encoded: Vec<u8>, head: bool) -> Self {
@@ -571,7 +597,7 @@ fn generate_palantir_setup_config(body: &[u8]) -> Result<String, &'static str> {
         OAuthGrantType::ClientCredentials => format!("[{PALANTIR_AIP_EXECUTE_SCOPE}]"),
     };
     let config = format!(
-        "version: 1\n\nlisteners:\n  gateway:\n    bind: 127.0.0.1:8319\n\nupstreams:\n  palantir-aip:\n    url: {enrollment}\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: {client_id}\n{client_secret}      grant_type: {}\n      scopes: {scopes}\n      callback: http://127.0.0.1:18477/management/oauth/browser/callback\n\naccounts:\n  {account}:\n    provider: palantir-aip\n    auth_kind: oauth\n\naccount_pools:\n  palantir-aip:\n    accounts: [{account}]\n\npolicies:\n  palantir-aip:\n    selection:\n      strategy: ordered_fallback\n      account_pool: palantir-aip\n\nmodels:\n  - id: {model}\n    targets:\n      - provider: palantir-aip\n        upstream_model: {model}\n\nroutes:\n  - id: palantir-aip-chat\n    listen: gateway\n    match: {{method: POST, path: /v1/chat/completions, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: palantir-aip, path: /api/v2/llm/proxy/openai/v1/chat/completions, policy: palantir-aip}}\n    response: {{mode: opaque}}\n  - id: palantir-aip-responses\n    listen: gateway\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: palantir-aip, path: /api/v2/llm/proxy/openai/v1/responses, policy: palantir-aip}}\n    response: {{mode: opaque}}\n  - id: palantir-aip-messages\n    listen: gateway\n    match: {{method: POST, path: /v1/messages, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: palantir-aip, path: /api/v2/llm/proxy/anthropic/v1/messages, policy: palantir-aip}}\n    response: {{mode: opaque}}\n\nmanagement:\n  bind: 127.0.0.1:18477\n  auth:\n    secret: env:POOLER_MANAGEMENT_TOKEN\n",
+        "version: 2\n\nlisteners:\n  gateway:\n    bind: 127.0.0.1:8319\n\nupstreams:\n  palantir-aip:\n    url: {enrollment}\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: {client_id}\n{client_secret}      grant_type: {}\n      scopes: {scopes}\n      callback: http://127.0.0.1:18477/management/oauth/browser/callback\n\naccounts:\n  {account}:\n    provider: palantir-aip\n    auth_kind: oauth\n\naccount_pools:\n  palantir-aip:\n    provider: palantir-aip\n    strategy: ordered_fallback\n    accounts: [{account}]\n\npolicies:\n  palantir-aip:\n    selection:\n      strategy: ordered_fallback\n\nmodels:\n  - id: {model}\n    targets:\n      - id: palantir-aip-target\n        provider: palantir-aip\n        account_pool: palantir-aip\n        priority: 1\n        upstream_model: {model}\n        capabilities: [text, streaming]\n        codecs: [openai]\n        wire_family: openai\n\nroutes:\n  - id: palantir-aip-chat\n    listen: gateway\n    match: {{method: POST, path: /v1/chat/completions, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: palantir-aip, path: /api/v2/llm/proxy/openai/v1/chat/completions, policy: palantir-aip}}\n    response: {{mode: opaque}}\n  - id: palantir-aip-responses\n    listen: gateway\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: palantir-aip, path: /api/v2/llm/proxy/openai/v1/responses, policy: palantir-aip}}\n    response: {{mode: opaque}}\n  - id: palantir-aip-messages\n    listen: gateway\n    match: {{method: POST, path: /v1/messages, content_types: [application/json]}}\n    ingress: {{mode: opaque}}\n    target: {{provider: palantir-aip, path: /api/v2/llm/proxy/anthropic/v1/messages, policy: palantir-aip}}\n    response: {{mode: opaque}}\n\nmanagement:\n  bind: 127.0.0.1:18477\n  auth:\n    secret: env:POOLER_MANAGEMENT_TOKEN\n",
         grant_type.as_str(),
     );
     compile_yaml("management-palantir-setup-generated.yaml", &config)
@@ -728,9 +754,10 @@ fn generate_setup_config(
     };
     let quoted_model =
         serde_json::to_string(model_id).map_err(|_| "model identifier is invalid")?;
+    let wire_family = provider.integration.request_dialect.as_str();
     let model_mapping = if discovery.is_empty() {
         format!(
-            "models:\n  - id: {quoted_model}\n    targets:\n      - provider: {provider_id}\n        upstream_model: {quoted_model}\n\n"
+            "models:\n  - id: {quoted_model}\n    targets:\n      - id: setup-target\n        provider: {provider_id}\n        account_pool: setup\n        priority: 1\n        upstream_model: {quoted_model}\n        capabilities: [text, streaming]\n        codecs: [{wire_family}]\n        wire_family: {wire_family}\n\n"
         )
     } else {
         String::new()
@@ -746,7 +773,7 @@ fn generate_setup_config(
         ""
     };
     let config = format!(
-        "version: 1\n\nlisteners:\n  gateway:\n    bind: {bind}\n\nupstreams:\n  {provider_id}:\n    known_provider: {provider_id}\n{upstream_native}\naccounts:\n{account}\naccount_pools:\n  setup:\n    accounts: [{account_id}]\n\npolicies:\n  setup-account:\n    selection:\n      strategy: ordered_fallback\n      account_pool: setup\n\n{model_mapping}{discovery}routes:\n{route}\nmanagement:\n  bind: 127.0.0.1:18477\n  auth:\n    secret: env:POOLER_MANAGEMENT_TOKEN\n"
+        "version: 2\n\nlisteners:\n  gateway:\n    bind: {bind}\n\nupstreams:\n  {provider_id}:\n    known_provider: {provider_id}\n{upstream_native}\naccounts:\n{account}\naccount_pools:\n  setup:\n    provider: {provider_id}\n    strategy: ordered_fallback\n    accounts: [{account_id}]\n\npolicies:\n  setup-account:\n    selection:\n      strategy: ordered_fallback\n\n{model_mapping}{discovery}routes:\n{route}\nmanagement:\n  bind: 127.0.0.1:18477\n  auth:\n    secret: env:POOLER_MANAGEMENT_TOKEN\n"
     );
     compile_yaml("management-setup-generated.yaml", &config)
         .map_err(|_| "generated configuration did not pass Pooler validation")?;
@@ -1091,11 +1118,12 @@ struct BrowserOAuthRecord {
     expires_at_ms: u64,
     expires_at: Instant,
     completed_at_ms: Option<u64>,
+    error: Option<crate::management_error::ManagementErrorBody>,
 }
 
 impl BrowserOAuthRecord {
     fn json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "schema_version": 1,
             "request_id": self.request_id,
             "account": self.account,
@@ -1104,8 +1132,36 @@ impl BrowserOAuthRecord {
             "created_at_ms": self.created_at_ms,
             "expires_at_ms": self.expires_at_ms,
             "completed_at_ms": self.completed_at_ms,
-        })
+        });
+        if let Some(error) = &self.error {
+            value["error"] = serde_json::to_value(error).expect("OAuth error is serializable");
+        }
+        value
     }
+}
+
+fn browser_oauth_status_error(
+    status: BrowserOAuthStatus,
+) -> Option<crate::management_error::ManagementErrorBody> {
+    let error = match status {
+        BrowserOAuthStatus::Failed => ManagementError::new(
+            ManagementErrorCode::OAuthAuthorizationFailed,
+            "OAuth authorization failed",
+        ),
+        BrowserOAuthStatus::Expired => ManagementError::new(
+            ManagementErrorCode::OAuthCallbackInvalid,
+            "OAuth authorization expired",
+        ),
+        BrowserOAuthStatus::StaleGeneration => ManagementError::new(
+            ManagementErrorCode::ConfigGenerationConflict,
+            "configuration changed during OAuth authorization",
+        ),
+        BrowserOAuthStatus::Starting
+        | BrowserOAuthStatus::AuthorizationRequired
+        | BrowserOAuthStatus::Exchanging
+        | BrowserOAuthStatus::Succeeded => return None,
+    };
+    Some(error.body())
 }
 
 #[derive(Debug, Default)]
@@ -1132,6 +1188,7 @@ impl BrowserOAuthControl {
             .find(|record| record.request_id == request_id)
         {
             record.status = status;
+            record.error = browser_oauth_status_error(status);
             if !status.active() {
                 record.completed_at_ms = Some(unix_timestamp_ms());
             }
@@ -1187,14 +1244,14 @@ fn oauth_status_response(
         .strip_prefix(prefix)
         .and_then(|value| value.parse::<u64>().ok())
     else {
-        return ManagementResponse::json(StatusCode::NOT_FOUND, json!({"error": not_found}), false);
+        return ManagementResponse::error_code(ManagementErrorCode::NotFound, not_found, false);
     };
     records
         .iter()
         .find(|record| record["request_id"].as_u64() == Some(request_id))
         .cloned()
         .map_or_else(
-            || ManagementResponse::json(StatusCode::NOT_FOUND, json!({"error": not_found}), false),
+            || ManagementResponse::error_code(ManagementErrorCode::NotFound, not_found, false),
             |record| ManagementResponse::json(StatusCode::OK, record, false),
         )
 }
@@ -1429,6 +1486,10 @@ impl ManagementApi {
             .find(|record| record["request_id"].as_u64() == Some(request_id))
         {
             record["status"] = json!("authorization_required");
+            record
+                .as_object_mut()
+                .expect("device record object")
+                .remove("error");
             record["verification_uri"] = json!(verification_uri);
             record["verification_uri_complete"] =
                 verification_uri_complete.map_or(Value::Null, |value| json!(value));
@@ -1449,6 +1510,15 @@ impl ManagementApi {
         {
             record["status"] = json!(outcome);
             record["completed_at_ms"] = json!(unix_timestamp_ms());
+            if outcome == "failed" {
+                record["error"] = ManagementError::new(
+                    ManagementErrorCode::OAuthAuthorizationFailed,
+                    "OAuth device authorization failed",
+                )
+                .body_value();
+            } else if let Some(object) = record.as_object_mut() {
+                object.remove("error");
+            }
             if outcome == "succeeded" {
                 record
                     .as_object_mut()
@@ -1530,9 +1600,9 @@ impl ManagementApi {
             .strip_prefix("/oauth/browser/")
             .and_then(|value| value.parse::<u64>().ok())
         else {
-            return ManagementResponse::json(
-                StatusCode::NOT_FOUND,
-                json!({"error": "browser OAuth request not found"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::RequestNotFound,
+                "browser OAuth request not found",
                 false,
             );
         };
@@ -1548,9 +1618,9 @@ impl ManagementApi {
             .map(BrowserOAuthRecord::json)
             .map_or_else(
                 || {
-                    ManagementResponse::json(
-                        StatusCode::NOT_FOUND,
-                        json!({"error": "browser OAuth request not found"}),
+                    ManagementResponse::error_code(
+                        ManagementErrorCode::RequestNotFound,
+                        "browser OAuth request not found",
                         false,
                     )
                 },
@@ -1615,32 +1685,35 @@ impl ManagementApi {
             expires_at_ms: created_at_ms.saturating_add(ttl_ms),
             expires_at: Instant::now() + BROWSER_OAUTH_SESSION_TTL,
             completed_at_ms: None,
+            error: None,
         });
         Ok(request_id)
     }
 
     fn oauth_runtime_error(error: ManagementOAuthError) -> ManagementResponse {
-        let (status, message) = match error {
+        let (code, message) = match error {
             ManagementOAuthError::Unsupported => (
-                StatusCode::CONFLICT,
+                ManagementErrorCode::OAuthUnsupported,
                 "configured account does not support this OAuth flow",
             ),
-            ManagementOAuthError::NotFound => {
-                (StatusCode::NOT_FOUND, "browser OAuth request not found")
-            }
-            ManagementOAuthError::Authorization => {
-                (StatusCode::BAD_REQUEST, "OAuth authorization was rejected")
-            }
+            ManagementOAuthError::NotFound => (
+                ManagementErrorCode::RequestNotFound,
+                "browser OAuth request not found",
+            ),
+            ManagementOAuthError::Authorization => (
+                ManagementErrorCode::OAuthAuthorizationFailed,
+                "OAuth authorization was rejected",
+            ),
             ManagementOAuthError::StaleGeneration => (
-                StatusCode::CONFLICT,
+                ManagementErrorCode::ConfigGenerationConflict,
                 "configuration changed during OAuth authorization",
             ),
             ManagementOAuthError::Unavailable => (
-                StatusCode::SERVICE_UNAVAILABLE,
+                ManagementErrorCode::OAuthUnavailable,
                 "OAuth service is unavailable",
             ),
         };
-        ManagementResponse::json(status, json!({"error": message}), false)
+        ManagementResponse::error_code(code, message, false)
     }
 
     async fn start_browser_oauth_login(&self, account: &str) -> ManagementResponse {
@@ -1651,7 +1724,20 @@ impl ManagementApi {
         let request_id = match self.reserve_browser_oauth_login(account, generation) {
             Ok(request_id) => request_id,
             Err((status, error)) => {
-                return ManagementResponse::json(status, json!({"error": error}), false);
+                let code = match status {
+                    StatusCode::CONFLICT => ManagementErrorCode::OperationInProgress,
+                    StatusCode::TOO_MANY_REQUESTS => ManagementErrorCode::CapacityExceeded,
+                    _ => ManagementErrorCode::for_status(status),
+                };
+                let management_error = ManagementError::new(code, error);
+                return if code == ManagementErrorCode::CapacityExceeded {
+                    ManagementResponse::error(
+                        management_error.with_retry_after_seconds(1),
+                        false,
+                    )
+                } else {
+                    ManagementResponse::error(management_error, false)
+                };
             }
         };
         let authorization_url = match broker.start_browser(&config, account, request_id) {
@@ -1737,16 +1823,19 @@ impl ManagementApi {
                     .iter()
                     .any(|record| record.account == account && record.status.active())
             {
-                return ManagementResponse::json(
-                    StatusCode::CONFLICT,
-                    json!({"error": "an OAuth request is already active for this account"}),
+                return ManagementResponse::error_code(
+                    ManagementErrorCode::OperationInProgress,
+                    "an OAuth request is already active for this account",
                     false,
                 );
             }
             if state.client_credentials_inflight.len() >= MAX_ACTIVE_CLIENT_CREDENTIALS {
-                return ManagementResponse::json(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    json!({"error": "too many client-credentials requests are active"}),
+                return ManagementResponse::error(
+                    ManagementError::new(
+                        ManagementErrorCode::CapacityExceeded,
+                        "too many client-credentials requests are active",
+                    )
+                    .with_retry_after_seconds(1),
                     false,
                 );
             }
@@ -1799,24 +1888,24 @@ impl ManagementApi {
         cancellation: CancellationToken,
     ) -> ManagementResponse {
         let Some(callback_host) = oauth_browser_callback_host(self, headers) else {
-            return ManagementResponse::json(
-                StatusCode::FORBIDDEN,
-                json!({"error": LOOPBACK_HOST_ERROR}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::ForbiddenHost,
+                LOOPBACK_HOST_ERROR,
                 false,
             );
         };
         let Some(query) = query.filter(|query| query.len() <= MAX_OAUTH_CALLBACK_QUERY_BYTES)
         else {
-            return ManagementResponse::json(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "OAuth callback is invalid"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::OAuthCallbackInvalid,
+                "OAuth callback is invalid",
                 false,
             );
         };
         let Some(state_value) = unique_bounded_query_value(query, "state", 256) else {
-            return ManagementResponse::json(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "OAuth callback is invalid"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::OAuthCallbackInvalid,
+                "OAuth callback is invalid",
                 false,
             );
         };
@@ -1839,17 +1928,17 @@ impl ManagementApi {
             .filter(|request_id| broker.state_matches(*request_id, &state_value))
             .collect::<Vec<_>>();
         if matching_ids.len() != 1 {
-            return ManagementResponse::json(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "OAuth callback is invalid or expired"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::OAuthCallbackInvalid,
+                "OAuth callback is invalid or expired",
                 false,
             );
         }
         let request_id = matching_ids[0];
         if !broker.callback_host_matches(request_id, callback_host) {
-            return ManagementResponse::json(
-                StatusCode::FORBIDDEN,
-                json!({"error": "OAuth callback Host does not match its registered target"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::ForbiddenHost,
+                "OAuth callback Host does not match its registered target",
                 false,
             );
         }
@@ -1863,9 +1952,9 @@ impl ManagementApi {
                 record.request_id == request_id
                     && record.status == BrowserOAuthStatus::AuthorizationRequired
             }) else {
-                return ManagementResponse::json(
-                    StatusCode::CONFLICT,
-                    json!({"error": "OAuth callback was already consumed"}),
+                return ManagementResponse::error_code(
+                    ManagementErrorCode::OAuthCallbackConsumed,
+                    "OAuth callback was already consumed",
                     false,
                 );
             };
@@ -1936,9 +2025,9 @@ impl ManagementApi {
         }
         let (account, action) = management_oauth_account_action(path)?;
         if !management_request_host_allowed(self, false, headers) {
-            return Some(ManagementResponse::json(
-                StatusCode::FORBIDDEN,
-                json!({"error": LOOPBACK_HOST_ERROR}),
+            return Some(ManagementResponse::error_code(
+                ManagementErrorCode::ForbiddenHost,
+                LOOPBACK_HOST_ERROR,
                 false,
             ));
         }
@@ -2010,6 +2099,17 @@ impl ManagementApi {
         } else {
             outcome
         };
+        let failure = match outcome {
+            "restoration_failed" => Some(ManagementError::new(
+                ManagementErrorCode::StateUnavailable,
+                "configuration persistence requires operator recovery",
+            )),
+            "failed" => Some(ManagementError::new(
+                ManagementErrorCode::DependencyUnavailable,
+                "management reload failed",
+            )),
+            _ => None,
+        };
         let kind = {
             let mut state = self
                 .reload
@@ -2028,6 +2128,22 @@ impl ManagementApi {
             record["configuration_generation"] = json!(configuration_generation);
             if let Some(generation) = catalog_generation {
                 record["catalog_generation"] = json!(generation);
+            }
+            let error = if outcome == "failed"
+                && record["accepted_configuration_generation"].as_u64()
+                    != Some(configuration_generation)
+            {
+                Some(ManagementError::new(
+                    ManagementErrorCode::ConfigGenerationConflict,
+                    "configuration generation changed before reload completed",
+                ))
+            } else {
+                failure.clone()
+            };
+            if let Some(error) = error {
+                record["error"] = error.body_value();
+            } else if let Some(object) = record.as_object_mut() {
+                object.remove("error");
             }
             record["kind"]
                 .as_str()
@@ -2171,26 +2287,26 @@ impl ManagementApi {
         pooling: &PoolingCoordinator,
     ) -> ManagementResponse {
         let Some((account, action)) = management_account_action(path) else {
-            return ManagementResponse::json(
-                StatusCode::NOT_FOUND,
-                json!({"error": "management endpoint not found"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::NotFound,
+                "management endpoint not found",
                 false,
             );
         };
         let Some(account_plan) = snapshot.config().accounts().get(account.as_str()) else {
             self.record_audit(action, Some(&account), "not_found");
-            return ManagementResponse::json(
-                StatusCode::NOT_FOUND,
-                json!({"error": "configured account not found"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::AccountNotFound,
+                "configured account not found",
                 false,
             );
         };
         if matches!(action, "refresh" | "revoke" | "oauth-device") {
             if account_plan.auth_kind() != pooler_config::AccountAuthKind::OAuth {
                 self.record_audit(action, Some(&account), "unsupported_auth_kind");
-                return ManagementResponse::json(
-                    StatusCode::CONFLICT,
-                    json!({"error": "account does not use OAuth credentials"}),
+                return ManagementResponse::error_code(
+                    ManagementErrorCode::OAuthUnsupported,
+                    "account does not use OAuth credentials",
                     false,
                 );
             }
@@ -2206,9 +2322,9 @@ impl ManagementApi {
                     });
                 if !supports_device_login {
                     self.record_audit(action, Some(&account), "unsupported_provider");
-                    return ManagementResponse::json(
-                        StatusCode::CONFLICT,
-                        json!({"error": "account provider has no documented brokered device flow"}),
+                    return ManagementResponse::error_code(
+                        ManagementErrorCode::OAuthUnsupported,
+                        "account provider has no documented brokered device flow",
                         false,
                     );
                 }
@@ -2230,9 +2346,9 @@ impl ManagementApi {
                     )
                 }) {
                     self.record_audit(action, Some(&account), "already_active");
-                    return ManagementResponse::json(
-                        StatusCode::CONFLICT,
-                        json!({"error": "a brokered OAuth device authorization is already active"}),
+                    return ManagementResponse::error_code(
+                        ManagementErrorCode::OperationInProgress,
+                        "a brokered OAuth device authorization is already active",
                         false,
                     );
                 }
@@ -2314,9 +2430,9 @@ impl ManagementApi {
             }
             Err(PoolError::InvalidCredential) => {
                 self.record_audit(action, Some(&account), "not_found");
-                ManagementResponse::json(
-                    StatusCode::NOT_FOUND,
-                    json!({"error": "configured account not found"}),
+                ManagementResponse::error_code(
+                    ManagementErrorCode::AccountNotFound,
+                    "configured account not found",
                     false,
                 )
             }
@@ -2335,9 +2451,9 @@ impl ManagementApi {
         catalog: Option<&CatalogRuntime>,
     ) -> ManagementResponse {
         let Some((model, action)) = management_model_action(path) else {
-            return ManagementResponse::json(
-                StatusCode::NOT_FOUND,
-                json!({"error": "management endpoint not found"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::NotFound,
+                "management endpoint not found",
                 false,
             );
         };
@@ -2351,9 +2467,9 @@ impl ManagementApi {
             });
         if !known {
             self.record_audit(action, Some(&model), "not_found");
-            return ManagementResponse::json(
-                StatusCode::NOT_FOUND,
-                json!({"error": "published model not found"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::ModelNotFound,
+                "published model not found",
                 false,
             );
         }
@@ -2372,9 +2488,9 @@ impl ManagementApi {
                     false,
                 )
             }
-            Err(PoolError::InvalidModel) => ManagementResponse::json(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "invalid model identifier"}),
+            Err(PoolError::InvalidModel) => ManagementResponse::error_code(
+                ManagementErrorCode::InvalidModelIdentifier,
+                "invalid model identifier",
                 false,
             ),
             Err(_) => state_unavailable(),
@@ -2462,46 +2578,80 @@ impl ManagementApi {
             .clone()
     }
 
-    fn config_error(error: ConfigManagementError) -> ManagementResponse {
-        let (status, message) = match error {
-            ConfigManagementError::NotFound => {
-                (StatusCode::NOT_FOUND, "configuration draft was not found")
-            }
-            ConfigManagementError::Expired => (StatusCode::GONE, "configuration draft has expired"),
+    fn config_error(
+        error: ConfigManagementError,
+        current_generation: Option<u64>,
+        expected_etag: Option<&str>,
+        current_etag: Option<&str>,
+    ) -> ManagementResponse {
+        let (code, message, retry_after) = match error {
+            ConfigManagementError::NotFound => (
+                ManagementErrorCode::NotFound,
+                "configuration draft was not found",
+                None,
+            ),
+            ConfigManagementError::Expired => (
+                ManagementErrorCode::DraftExpired,
+                "configuration draft has expired",
+                None,
+            ),
             ConfigManagementError::Precondition => (
-                StatusCode::PRECONDITION_FAILED,
+                ManagementErrorCode::ConfigDraftEtagMismatch,
                 "configuration precondition failed",
+                None,
             ),
             ConfigManagementError::UnsupportedPatch => (
-                StatusCode::BAD_REQUEST,
+                ManagementErrorCode::UnsupportedOperation,
                 "configuration patch is not supported",
+                None,
             ),
             ConfigManagementError::PatchLimit => (
-                StatusCode::TOO_MANY_REQUESTS,
+                ManagementErrorCode::CapacityExceeded,
                 "configuration patch limit reached",
+                Some(1),
             ),
             ConfigManagementError::TooLarge => (
-                StatusCode::PAYLOAD_TOO_LARGE,
+                ManagementErrorCode::PayloadTooLarge,
                 "configuration document is too large",
+                None,
             ),
             ConfigManagementError::Invalid(_) => (
-                StatusCode::UNPROCESSABLE_ENTITY,
+                ManagementErrorCode::ValidationFailed,
                 "configuration candidate is invalid",
+                None,
             ),
             ConfigManagementError::Confirmation => (
-                StatusCode::CONFLICT,
+                ManagementErrorCode::ConfirmationInvalid,
                 "configuration confirmation is invalid",
+                None,
             ),
             ConfigManagementError::Persistence => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                ManagementErrorCode::InternalFailure,
                 "configuration persistence failed",
+                None,
             ),
             ConfigManagementError::RecoveryRequired => (
-                StatusCode::SERVICE_UNAVAILABLE,
+                ManagementErrorCode::StateUnavailable,
                 "configuration persistence requires operator recovery",
+                None,
             ),
         };
-        ManagementResponse::json(status, json!({"error": message}), false)
+        let mut management_error = ManagementError::new(code, message);
+        if let Some(generation) = current_generation {
+            management_error = management_error.with_current_generation(Some(generation));
+        }
+        if code == ManagementErrorCode::ConfigDraftEtagMismatch {
+            if let Some(etag) = expected_etag {
+                management_error = management_error.with_detail("expected_etag", etag);
+            }
+            if let Some(etag) = current_etag {
+                management_error = management_error.with_detail("current_etag", etag);
+            }
+        }
+        if let Some(seconds) = retry_after {
+            management_error = management_error.with_retry_after_seconds(seconds);
+        }
+        ManagementResponse::error(management_error, false)
     }
 
     fn queue_config_commit(
@@ -2525,7 +2675,11 @@ impl ManagementApi {
                 "restoration_failed"
             };
             self.record_audit(action, None, outcome);
-            return state_unavailable();
+            return if outcome == "queue_unavailable" {
+                capacity_exceeded()
+            } else {
+                state_unavailable()
+            };
         }
         self.record_audit_with_fields(
             action,
@@ -2557,20 +2711,29 @@ impl ManagementApi {
         active_generation: u64,
     ) -> ManagementResponse {
         let Some(manager) = self.config_manager() else {
-            return ManagementResponse::json(
-                StatusCode::CONFLICT,
-                json!({"error": "managed configuration is not enabled"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::ManagementNotConfigured,
+                "managed configuration is not enabled",
                 false,
             );
         };
+        let expected_etag = headers
+            .get(header::IF_MATCH)
+            .and_then(|value| value.to_str().ok());
+        let current_etag = config_draft_action(path).and_then(|(id, _)| {
+            manager
+                .view(id)
+                .ok()
+                .and_then(|value| value.get("etag").and_then(Value::as_str).map(str::to_owned))
+        });
         let if_match = || {
             headers
                 .get(header::IF_MATCH)
                 .and_then(|value| value.to_str().ok())
                 .ok_or_else(|| {
-                    ManagementResponse::json(
-                        StatusCode::PRECONDITION_REQUIRED,
-                        json!({"error": "If-Match is required"}),
+                    ManagementResponse::error_code(
+                        ManagementErrorCode::PreconditionRequired,
+                        "If-Match is required",
                         false,
                     )
                 })
@@ -2592,9 +2755,9 @@ impl ManagementApi {
                 let patch = match serde_json::from_slice::<TypedConfigPatch>(body) {
                     Ok(patch) => patch,
                     Err(_) => {
-                        return ManagementResponse::json(
-                            StatusCode::BAD_REQUEST,
-                            json!({"error": "typed configuration patch is invalid"}),
+                        return ManagementResponse::error_code(
+                            ManagementErrorCode::ValidationFailed,
+                            "typed configuration patch is invalid",
                             false,
                         );
                     }
@@ -2622,9 +2785,9 @@ impl ManagementApi {
                             .map(str::to_owned)
                     });
                 let Some(token) = token else {
-                    return ManagementResponse::json(
-                        StatusCode::BAD_REQUEST,
-                        json!({"error": "confirmation_token is required"}),
+                    return ManagementResponse::error_code(
+                        ManagementErrorCode::ConfirmationInvalid,
+                        "confirmation_token is required",
                         false,
                     );
                 };
@@ -2633,11 +2796,20 @@ impl ManagementApi {
                     .lock()
                     .expect("configuration reload serialization lock poisoned");
                 if self.has_pending_configuration_reload() {
-                    return Self::config_error(ConfigManagementError::Precondition);
+                    return ManagementResponse::error_code(
+                        ManagementErrorCode::OperationInProgress,
+                        "a managed configuration reload is pending",
+                        false,
+                    );
                 }
                 return match manager.commit(id, etag, active_generation, &token) {
                     Ok(commit) => self.queue_config_commit(&manager, commit, "config_commit"),
-                    Err(error) => Self::config_error(error),
+                    Err(error) => Self::config_error(
+                        error,
+                        Some(active_generation),
+                        expected_etag,
+                        current_etag.as_deref(),
+                    ),
                 };
             }
             (&Method::POST, "/config/rollback", _) => {
@@ -2653,9 +2825,9 @@ impl ManagementApi {
                     })
                     .is_some_and(|value| value == "rollback");
                 if !matched || !confirmed {
-                    return ManagementResponse::json(
-                        StatusCode::PRECONDITION_FAILED,
-                        json!({"error": "rollback generation and confirmation are required"}),
+                    return ManagementResponse::error_code(
+                        ManagementErrorCode::ConfigDraftEtagMismatch,
+                        "rollback generation and confirmation are required",
                         false,
                     );
                 }
@@ -2664,17 +2836,26 @@ impl ManagementApi {
                     .lock()
                     .expect("configuration reload serialization lock poisoned");
                 if self.has_pending_configuration_reload() {
-                    return Self::config_error(ConfigManagementError::Precondition);
+                    return ManagementResponse::error_code(
+                        ManagementErrorCode::OperationInProgress,
+                        "a managed configuration reload is pending",
+                        false,
+                    );
                 }
                 return match manager.rollback(active_generation) {
                     Ok(commit) => self.queue_config_commit(&manager, commit, "config_rollback"),
-                    Err(error) => Self::config_error(error),
+                    Err(error) => Self::config_error(
+                        error,
+                        Some(active_generation),
+                        expected_etag,
+                        current_etag.as_deref(),
+                    ),
                 };
             }
             _ => {
-                return ManagementResponse::json(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    json!({"error": "configuration operation is not supported"}),
+                return ManagementResponse::error_code(
+                    ManagementErrorCode::MethodNotAllowed,
+                    "configuration operation is not supported",
                     false,
                 );
             }
@@ -2700,7 +2881,12 @@ impl ManagementApi {
             }
             Err(error) => {
                 self.record_audit(path, None, "failed");
-                Self::config_error(error)
+                Self::config_error(
+                    error,
+                    Some(active_generation),
+                    expected_etag,
+                    current_etag.as_deref(),
+                )
             }
         }
     }
@@ -2738,9 +2924,9 @@ impl ManagementApi {
         let mutation = is_management_mutation(method, path);
         let ui_asset = management_ui::asset(path).is_some() || (management_prefix && path == "/");
         if *method != Method::GET && !head && !mutation {
-            let mut response = ManagementResponse::json(
-                StatusCode::METHOD_NOT_ALLOWED,
-                json!({"error": "management method is not supported"}),
+            let mut response = ManagementResponse::error_code(
+                ManagementErrorCode::MethodNotAllowed,
+                "management method is not supported",
                 false,
             );
             response.headers.insert(
@@ -2750,9 +2936,9 @@ impl ManagementApi {
             return response;
         }
         if !management_request_host_allowed(self, ui_asset, headers) {
-            return ManagementResponse::json(
-                StatusCode::FORBIDDEN,
-                json!({"error": LOOPBACK_HOST_ERROR}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::ForbiddenHost,
+                LOOPBACK_HOST_ERROR,
                 head,
             );
         }
@@ -2760,22 +2946,22 @@ impl ManagementApi {
         if mutation && !is_bodied_management_mutation(method, path) {
             if let Some((status, message)) = mutation_body_rejection(headers) {
                 self.record_audit(path, None, "rejected_body");
-                return ManagementResponse::json(status, json!({"error": message}), false);
+                return ManagementResponse::error_status(status, message, false);
             }
         }
         if mutation && !management_origin_allowed(headers) {
             self.record_audit(path, None, "rejected_origin");
-            return ManagementResponse::json(
-                StatusCode::FORBIDDEN,
-                json!({"error": "management mutation Origin does not match Host"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::ForbiddenOrigin,
+                "management mutation Origin does not match Host",
                 false,
             );
         }
         if mutation && self.plan.auth().is_none() {
             self.record_audit(path, None, "authentication_not_configured");
-            return ManagementResponse::json(
-                StatusCode::FORBIDDEN,
-                json!({"error": "management mutations require configured bearer authentication"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::AuthenticationNotConfigured,
+                "management mutations require configured bearer authentication",
                 false,
             );
         }
@@ -2783,9 +2969,9 @@ impl ManagementApi {
             if mutation {
                 self.record_audit(path, None, "unauthorized");
             }
-            let mut response = ManagementResponse::json(
-                StatusCode::UNAUTHORIZED,
-                json!({"error": "management authentication required"}),
+            let mut response = ManagementResponse::error_code(
+                ManagementErrorCode::AuthenticationRequired,
+                "management authentication required",
                 head,
             );
             if self.plan.auth().is_some() {
@@ -2916,9 +3102,9 @@ impl ManagementApi {
                         .lock()
                         .expect("configuration reload serialization lock poisoned");
                     if self.managed_configuration_reload_pending() {
-                        return ManagementResponse::json(
-                            StatusCode::CONFLICT,
-                            json!({"error": "a managed configuration reload is pending"}),
+                        return ManagementResponse::error_code(
+                            ManagementErrorCode::OperationInProgress,
+                            "a managed configuration reload is pending",
                             false,
                         );
                     }
@@ -2939,7 +3125,7 @@ impl ManagementApi {
                     ),
                     None => {
                         self.record_audit(path, None, "queue_unavailable");
-                        state_unavailable()
+                        capacity_exceeded()
                     }
                 }
             }
@@ -2949,9 +3135,9 @@ impl ManagementApi {
             path if management_model_action(path).is_some() && mutation => {
                 self.mutate_model(path, snapshot, pooling, catalog.as_deref())
             }
-            _ => ManagementResponse::json(
-                StatusCode::NOT_FOUND,
-                json!({"error": "management endpoint not found"}),
+            _ => ManagementResponse::error_code(
+                ManagementErrorCode::NotFound,
+                "management endpoint not found",
                 false,
             ),
         };
@@ -2972,25 +3158,25 @@ impl ManagementApi {
     ) -> Option<ManagementResponse> {
         if !management_origin_allowed(headers) {
             self.record_audit(path, None, "rejected_origin");
-            return Some(ManagementResponse::json(
-                StatusCode::FORBIDDEN,
-                json!({"error": "management mutation Origin does not match Host"}),
+            return Some(ManagementResponse::error_code(
+                ManagementErrorCode::ForbiddenOrigin,
+                "management mutation Origin does not match Host",
                 false,
             ));
         }
         if self.plan.auth().is_none() {
             self.record_audit(path, None, "authentication_not_configured");
-            return Some(ManagementResponse::json(
-                StatusCode::FORBIDDEN,
-                json!({"error": "management mutations require configured bearer authentication"}),
+            return Some(ManagementResponse::error_code(
+                ManagementErrorCode::AuthenticationNotConfigured,
+                "management mutations require configured bearer authentication",
                 false,
             ));
         }
         if !self.authorized(headers) {
             self.record_audit(path, None, "unauthorized");
-            let mut response = ManagementResponse::json(
-                StatusCode::UNAUTHORIZED,
-                json!({"error": "management authentication required"}),
+            let mut response = ManagementResponse::error_code(
+                ManagementErrorCode::AuthenticationRequired,
+                "management authentication required",
                 false,
             );
             response.headers.insert(
@@ -3245,9 +3431,11 @@ impl ManagementApi {
                 json!({"schema_version": 1, "validated": true, "configuration": config}),
                 false,
             ),
-            Err(error) => {
-                ManagementResponse::json(StatusCode::BAD_REQUEST, json!({"error": error}), false)
-            }
+            Err(error) => ManagementResponse::error_code(
+                ManagementErrorCode::ValidationFailed,
+                error,
+                false,
+            ),
         }
     }
 
@@ -3262,9 +3450,11 @@ impl ManagementApi {
                 }),
                 false,
             ),
-            Err(error) => {
-                ManagementResponse::json(StatusCode::BAD_REQUEST, json!({"error": error}), false)
-            }
+            Err(error) => ManagementResponse::error_code(
+                ManagementErrorCode::ValidationFailed,
+                error,
+                false,
+            ),
         }
     }
 
@@ -3276,27 +3466,27 @@ impl ManagementApi {
         pooling: &PoolingCoordinator,
     ) -> ManagementResponse {
         let Ok((provider_id, auth, account_id, model_id, client)) = setup_selection(query) else {
-            return ManagementResponse::json(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "setup request is missing a required selection"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::ValidationFailed,
+                "setup request is missing a required selection",
                 false,
             );
         };
         if let Err(error) =
             generate_setup_config(&provider_id, &auth, &account_id, &model_id, &client)
         {
-            return ManagementResponse::json(
-                StatusCode::BAD_REQUEST,
-                json!({"error": error}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::ValidationFailed,
+                error,
                 false,
             );
         }
         let Some(reload_request_id) = management_query_value(query, "reload_request_id")
             .and_then(|value| value.parse::<u64>().ok())
         else {
-            return ManagementResponse::json(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "setup verification requires a correlated catalog reload request"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::ValidationFailed,
+                "setup verification requires a correlated catalog reload request",
                 false,
             );
         };
@@ -3727,9 +3917,9 @@ impl ManagementApi {
                 }),
                 false,
             ),
-            Err(_) => ManagementResponse::json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({"error": "management state unavailable"}),
+            Err(_) => ManagementResponse::error_code(
+                ManagementErrorCode::StateUnavailable,
+                "management state unavailable",
                 false,
             ),
         }
@@ -3852,9 +4042,9 @@ impl ManagementApi {
                 .bytes()
                 .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
         {
-            return ManagementResponse::json(
-                StatusCode::BAD_REQUEST,
-                json!({"error": "request identifier is invalid"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::InvalidRequest,
+                "request identifier is invalid",
                 false,
             );
         }
@@ -3868,18 +4058,15 @@ impl ManagementApi {
                 .as_bool()
                 .unwrap_or(false)
             {
-                return ManagementResponse::json(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    json!({
-                        "error": "request history is incomplete",
-                        "persistence": persistence,
-                    }),
+                return ManagementResponse::error_code(
+                    ManagementErrorCode::RequestHistoryIncomplete,
+                    "request history is incomplete",
                     false,
                 );
             }
-            return ManagementResponse::json(
-                StatusCode::NOT_FOUND,
-                json!({"error": "request history was not found"}),
+            return ManagementResponse::error_code(
+                ManagementErrorCode::RequestNotFound,
+                "request history was not found",
                 false,
             );
         }
@@ -4653,9 +4840,9 @@ async fn serve_management_connection<I>(
         Ok(Some((path, headers))) => {
             if !management_request_host_allowed(&api, false, &headers) {
                 api.record_audit(&path, None, "rejected_host");
-                Some(ManagementResponse::json(
-                    StatusCode::FORBIDDEN,
-                    json!({"error": LOOPBACK_HOST_ERROR}),
+                Some(ManagementResponse::error_code(
+                    ManagementErrorCode::ForbiddenHost,
+                    LOOPBACK_HOST_ERROR,
                     false,
                 ))
             } else {
@@ -4663,9 +4850,9 @@ async fn serve_management_connection<I>(
             }
         }
         Ok(None) => None,
-        Err(()) => Some(ManagementResponse::json(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "management request headers are invalid"}),
+        Err(()) => Some(ManagementResponse::error_code(
+            ManagementErrorCode::InvalidRequest,
+            "management request headers are invalid",
             false,
         )),
     };
@@ -4691,11 +4878,7 @@ async fn serve_management_connection<I>(
         }
         if let Some((status, message)) = raw_mutation_body_rejection(&prefix) {
             api.record_audit("http_boundary", None, "rejected_body");
-            boundary_response = Some(ManagementResponse::json(
-                status,
-                json!({"error": message}),
-                false,
-            ));
+            boundary_response = Some(ManagementResponse::error_status(status, message, false));
         }
     }
 
@@ -4743,9 +4926,9 @@ async fn serve_management_connection<I>(
                 .await
                 .unwrap_or_else(state_unavailable)
             } else if !management_request_host_allowed(&api, ui_asset, request.headers()) {
-                ManagementResponse::json(
-                    StatusCode::FORBIDDEN,
-                    json!({"error": LOOPBACK_HOST_ERROR}),
+                ManagementResponse::error_code(
+                    ManagementErrorCode::ForbiddenHost,
+                    LOOPBACK_HOST_ERROR,
                     false,
                 )
             } else if is_bodied_management_mutation(request.method(), management_path) {
@@ -4759,9 +4942,9 @@ async fn serve_management_connection<I>(
                 {
                     response
                 } else if request.headers().contains_key(header::TRANSFER_ENCODING) {
-                    ManagementResponse::json(
-                        StatusCode::BAD_REQUEST,
-                        json!({"error": "typed configuration mutations require Content-Length"}),
+                    ManagementResponse::error_code(
+                        ManagementErrorCode::InvalidRequest,
+                        "typed configuration mutations require Content-Length",
                         false,
                     )
                 } else if request
@@ -4771,9 +4954,9 @@ async fn serve_management_connection<I>(
                     .and_then(|value| value.parse::<usize>().ok())
                     .is_some_and(|length| length > body_limit)
                 {
-                    ManagementResponse::json(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        json!({"error": "typed configuration mutation is too large"}),
+                    ManagementResponse::error_code(
+                        ManagementErrorCode::PayloadTooLarge,
+                        "typed configuration mutation is too large",
                         false,
                     )
                 } else {
@@ -4790,16 +4973,16 @@ async fn serve_management_connection<I>(
                             &parts.headers,
                             &collected.to_bytes(),
                         ),
-                        Ok(Err(_)) => ManagementResponse::json(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            json!({"error": "typed configuration mutation is too large"}),
+                        Ok(Err(_)) => ManagementResponse::error_code(
+                            ManagementErrorCode::PayloadTooLarge,
+                            "typed configuration mutation is too large",
                             false,
                         ),
                         Err(_) => {
                             api.record_audit(parts.uri.path(), None, "body_timeout");
-                            ManagementResponse::json(
-                                StatusCode::REQUEST_TIMEOUT,
-                                json!({"error": "typed configuration mutation body timed out"}),
+                            ManagementResponse::error_code(
+                                ManagementErrorCode::RequestTimeout,
+                                "typed configuration mutation body timed out",
                                 false,
                             )
                         }
@@ -4808,12 +4991,12 @@ async fn serve_management_connection<I>(
             } else if is_management_mutation(request.method(), management_path) {
                 if let Some((status, message)) = mutation_body_rejection(request.headers()) {
                     api.record_audit(management_path, None, "rejected_body");
-                    ManagementResponse::json(status, json!({"error": message}), false)
+                    ManagementResponse::error_status(status, message, false)
                 } else if !request.body().is_end_stream() {
                     api.record_audit(management_path, None, "rejected_body");
-                    ManagementResponse::json(
-                        StatusCode::BAD_REQUEST,
-                        json!({"error": "management mutations require an empty HTTP body"}),
+                    ManagementResponse::error_code(
+                        ManagementErrorCode::InvalidRequest,
+                        "management mutations require an empty HTTP body",
                         false,
                     )
                 } else {
@@ -4885,7 +5068,13 @@ fn listener_protocol_name(protocol: pooler_config::ListenerProtocol) -> &'static
 
 fn response_value(response: ManagementResponse) -> Value {
     serde_json::from_slice(&response.body)
-        .unwrap_or_else(|_| json!({"error": "management view serialization failed"}))
+        .unwrap_or_else(|_| {
+            ManagementError::new(
+                ManagementErrorCode::InternalFailure,
+                "management view serialization failed",
+            )
+            .value()
+        })
 }
 
 fn unix_timestamp_ms() -> u64 {
@@ -4897,9 +5086,20 @@ fn unix_timestamp_ms() -> u64 {
 }
 
 fn state_unavailable() -> ManagementResponse {
-    ManagementResponse::json(
-        StatusCode::SERVICE_UNAVAILABLE,
-        json!({"error": "management state unavailable"}),
+    ManagementResponse::error_code(
+        ManagementErrorCode::StateUnavailable,
+        "management state unavailable",
+        false,
+    )
+}
+
+fn capacity_exceeded() -> ManagementResponse {
+    ManagementResponse::error(
+        ManagementError::new(
+            ManagementErrorCode::CapacityExceeded,
+            "management operation capacity is temporarily exhausted",
+        )
+        .with_retry_after_seconds(1),
         false,
     )
 }
@@ -4963,6 +5163,55 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    #[test]
+    fn management_error_responses_are_versioned_and_retryable_capacity_is_bounded() {
+        let flat = ManagementResponse::json(
+            StatusCode::CONFLICT,
+            Value::Object(
+                [("error".to_owned(), Value::String("operation is already running".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            ),
+            false,
+        );
+        let flat = response_value(flat);
+        assert_eq!(flat["schema_version"], 1);
+        assert_eq!(flat["error"]["code"], "operation_in_progress");
+        assert!(flat["error"]["details"].is_object());
+
+        let capacity = capacity_exceeded();
+        assert_eq!(capacity.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(capacity.headers[header::RETRY_AFTER], "1");
+        let capacity = response_value(capacity);
+        assert_eq!(capacity["error"]["code"], "capacity_exceeded");
+        assert_eq!(capacity["error"]["retryable"], true);
+    }
+
+    #[test]
+    fn management_error_capacity_and_unavailable_are_distinct() {
+        let capacity = response_value(capacity_exceeded());
+        let unavailable = response_value(state_unavailable());
+        assert_eq!(capacity["error"]["code"], "capacity_exceeded");
+        assert_eq!(unavailable["error"]["code"], "state_unavailable");
+        assert_eq!(capacity["error"]["retryable"], true);
+        assert_eq!(unavailable["error"]["retryable"], true);
+    }
+
+    #[test]
+    fn every_management_error_uses_envelope() {
+        for response in [capacity_exceeded(), state_unavailable()] {
+            let value = response_value(response);
+            assert_eq!(
+                value["schema_version"],
+                crate::management_error::SCHEMA_VERSION
+            );
+            assert!(value["error"].is_object());
+            for field in ["code", "message", "details", "retryable", "current_generation"] {
+                assert!(value["error"].get(field).is_some(), "missing {field}");
+            }
+        }
+    }
 
     #[derive(Default)]
     struct FakeOAuthBroker {
@@ -5277,13 +5526,14 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "management-test.yaml",
             r#"
-version: 1
+version: 2
 management: {bind: 127.0.0.1:0}
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {provider-a: {url: http://127.0.0.1:1}}
+accounts: {management-account: {provider: provider-a, secret: env:POOLER_MANAGEMENT_PROVIDER_KEY}}
 models:
   - id: public-model
-    targets: [{provider: provider-a, upstream_model: provider-model, capabilities: [text, streaming]}]
+    targets: [{id: public-target, provider: provider-a, account: management-account, priority: 1, upstream_model: provider-model, capabilities: [text, streaming], codecs: [openai], wire_family: openai}]
 routes:
   - id: route-a
     listen: local
@@ -5306,7 +5556,7 @@ routes:
         let config = pooler_config::compile_yaml(
             "authenticated-management-test.yaml",
             &format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{secret_env}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\nmodels: [{{id: public-model, targets: [{{provider: provider-a, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{secret_env}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\naccounts: {{management-account: {{provider: provider-a, secret: env:POOLER_MANAGEMENT_PROVIDER_KEY}}}}\nmodels: [{{id: public-model, targets: [{{id: public-target, provider: provider-a, account: management-account, priority: 1, upstream_model: provider-model, capabilities: [text, streaming], codecs: [openai], wire_family: openai}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
             ),
         )
         .expect("authenticated management config compiles");
@@ -5323,7 +5573,7 @@ routes:
         let config = pooler_config::compile_yaml(
             "oauth-management-test.yaml",
             &format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{secret_env}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  foundry:\n    url: https://example.euw-3.palantirfoundry.co.uk\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: test-client\n      scopes: [api:use-language-models-execute, offline_access]\n      callback: http://127.0.0.1:18477/management/oauth/browser/callback\naccounts:\n  foundry: {{provider: foundry, auth_kind: oauth}}\n  foundry-alt: {{provider: foundry, auth_kind: oauth}}\n"
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{secret_env}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  foundry:\n    url: https://example.euw-3.palantirfoundry.co.uk\n    native: {{kind: palantir_aip}}\n    oauth:\n      client_id: test-client\n      scopes: [api:use-language-models-execute, offline_access]\n      callback: http://127.0.0.1:18477/management/oauth/browser/callback\naccounts:\n  foundry: {{provider: foundry, auth_kind: oauth}}\n  foundry-alt: {{provider: foundry, auth_kind: oauth}}\n"
             ),
         )
         .expect("OAuth management config compiles");
@@ -5573,7 +5823,7 @@ routes:
         let config = pooler_config::compile_yaml(
             "management-failing-store.yaml",
             r#"
-version: 1
+version: 2
 management: {bind: 127.0.0.1:0}
 upstreams: {provider-a: {url: http://127.0.0.1:1}}
 accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
@@ -5595,9 +5845,11 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         for path in ["/health", "/health/providers", "/accounts", "/quota"] {
             let response = api.handle(&Method::GET, path, &headers);
             assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            let value = response_value(response);
+            assert_eq!(value["schema_version"], 1, "{path} error schema");
             assert_eq!(
-                String::from_utf8_lossy(&response.body),
-                r#"{"error":"management state unavailable"}"#,
+                value["error"]["code"],
+                "state_unavailable",
                 "{path} must not report an empty healthy view"
             );
         }
@@ -5607,7 +5859,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
     fn remaining_high_regression_root_health_surfaces_store_failure() {
         let config = pooler_config::compile_yaml(
             "management-root-health-failing-store.yaml",
-            "version: 1\nmanagement: {bind: 127.0.0.1:0}\nupstreams: {provider-a: {url: http://127.0.0.1:1}}\n",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0}\nupstreams: {provider-a: {url: http://127.0.0.1:1}}\n",
         )
         .expect("config compiles");
         let plan = config.management().cloned().expect("management plan");
@@ -5627,10 +5879,9 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         );
         let response = api.handle(&Method::GET, "/health", &loopback_headers());
         assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            String::from_utf8_lossy(&response.body),
-            r#"{"error":"management state unavailable"}"#
-        );
+        let value = response_value(response);
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["error"]["code"], "state_unavailable");
     }
 
     #[test]
@@ -5666,7 +5917,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         let config = pooler_config::compile_yaml(
             "management-mutation-test.yaml",
             &format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:POOLER_MANAGEMENT_MUTATION_KEY}}}}\nupstreams: {{provider: {{url: http://127.0.0.1:1}}}}\naccounts:\n  alpha: {{provider: provider, secret: 'file:{}'}}\n  beta: {{provider: provider, secret: 'file:{}'}}\naccount_pools: {{accounts: {{accounts: [alpha, beta]}}}}\npolicies: {{accounts: {{selection: {{strategy: ordered_fallback, account_pool: accounts}}}}}}\nmodels: [{{id: public, targets: [{{provider: provider, upstream_model: public}}]}}]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nroutes: [{{id: route, listen: local, ingress: {{mode: patch}}, target: {{provider: provider, model_from: request.model, policy: accounts}}}}]\n",
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:POOLER_MANAGEMENT_MUTATION_KEY}}}}\nupstreams: {{provider: {{url: http://127.0.0.1:1}}}}\naccounts:\n  alpha: {{provider: provider, secret: 'file:{}'}}\n  beta: {{provider: provider, secret: 'file:{}'}}\naccount_pools: {{accounts: {{provider: provider, strategy: ordered_fallback, accounts: [alpha, beta]}}}}\npolicies: {{accounts: {{selection: {{strategy: ordered_fallback}}}}}}\nmodels: [{{id: public, targets: [{{id: public-target, provider: provider, account_pool: accounts, priority: 1, upstream_model: public, capabilities: [text, streaming], codecs: [openai], wire_family: openai}}]}}]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nroutes: [{{id: route, listen: local, ingress: {{mode: patch}}, target: {{provider: provider, model_from: request.model, policy: accounts}}}}]\n",
                 first_secret.path().display(),
                 second_secret.path().display(),
             ),
@@ -5856,7 +6107,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
     fn configured_management_auth_is_constant_time_and_never_echoed() {
         let config = pooler_config::compile_yaml(
             "management-auth-test.yaml",
-            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_TEST_KEY}}\n",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_TEST_KEY}}\n",
         )
         .expect("management auth config compiles");
         let plan = config.management().cloned().expect("management plan");
@@ -5901,7 +6152,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
     fn remote_management_is_rejected_without_tls() {
         let error = pooler_config::compile_yaml(
             "management-remote-no-tls.yaml",
-            "version: 1\nmanagement: {bind: 0.0.0.0:0, remote: true, auth: {secret: env:POOLER_MANAGEMENT_TEST_KEY}}\n",
+            "version: 2\nmanagement: {bind: 0.0.0.0:0, remote: true, auth: {secret: env:POOLER_MANAGEMENT_TEST_KEY}}\n",
         )
         .expect_err("remote management must be rejected without TLS");
         assert!(error.to_string().contains("requires TLS"));
@@ -5916,7 +6167,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         let path = parent.path().join("management.sock");
         let config = pooler_config::compile_yaml(
             "management-unix.yaml",
-            &format!("version: 1\nmanagement: {{bind: {}}}\n", path.display()),
+            &format!("version: 2\nmanagement: {{bind: {}}}\n", path.display()),
         )
         .expect("Unix management config compiles");
         let plan = config.management().cloned().expect("management plan");
@@ -5948,7 +6199,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         let config = pooler_config::compile_yaml(
             "management-unix-insecure-parent.yaml",
             &format!(
-                "version: 1\nmanagement: {{bind: {}}}\n",
+                "version: 2\nmanagement: {{bind: {}}}\n",
                 parent.path().join("insecure.sock").display()
             ),
         )
@@ -6335,7 +6586,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         let value: Value = serde_json::from_slice(&response.body).expect("setup test json");
         assert_eq!(
-            value["error"],
+            value["error"]["message"],
             "setup verification requires a correlated catalog reload request"
         );
     }
@@ -6556,7 +6807,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         let detail = api.handle(&Method::GET, "/requests/missing", &headers);
         assert_eq!(detail.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            response_value(detail)["error"],
+            response_value(detail)["error"]["message"],
             "request history is incomplete"
         );
     }
@@ -6648,7 +6899,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         let config = pooler_config::compile_yaml(
             "device-oauth-management.yaml",
             &format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{MANAGEMENT_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{openai: {{known_provider: openai, native: {{kind: codex}}}}}}\naccounts: {{personal: {{provider: openai, auth_kind: oauth}}}}\nmodels: [{{id: public-model, targets: [{{provider: openai, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: openai, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{MANAGEMENT_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{openai: {{known_provider: openai, native: {{kind: codex}}}}}}\naccounts: {{personal: {{provider: openai, auth_kind: oauth}}}}\nmodels: [{{id: public-model, targets: [{{id: public-target, provider: openai, account: personal, priority: 1, upstream_model: provider-model, capabilities: [text, streaming], codecs: [openai], wire_family: openai}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: openai, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
             ),
         )
         .expect("device OAuth configuration");
@@ -6682,6 +6933,13 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             command.action,
             NativeAccountAction::DeviceLogin { request_id }
         );
+        api.record_oauth_device_result(request_id, "failed");
+        let failed = response_value(api.handle(
+            &Method::GET,
+            &format!("/oauth/device/{request_id}"),
+            &headers,
+        ));
+        assert_eq!(failed["error"]["code"], "oauth_authorization_failed");
         api.record_oauth_device_prompt(
             request_id,
             "https://provider.example/device",
@@ -6856,6 +7114,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             response_value(api.handle(&Method::GET, "/oauth/browser/1", &mutation_headers));
         assert_eq!(status["status"], "failed");
         assert!(status["completed_at_ms"].is_u64());
+        assert_eq!(status["error"]["code"], "oauth_authorization_failed");
 
         broker.block_browser.store(false, Ordering::Release);
         let retry = api
@@ -7041,7 +7300,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         std::fs::write(
             &source,
             format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{MANAGEMENT_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\nmodels: [{{id: public-model, targets: [{{provider: provider-a, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{MANAGEMENT_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\naccounts: {{bootstrap: {{provider: provider-a, secret: env:POOLER_PROVIDER_KEY}}}}\nmodels: [{{id: public-model, targets: [{{id: public-target, provider: provider-a, account: bootstrap, priority: 1, upstream_model: provider-model, capabilities: [text, streaming], codecs: [openai], wire_family: openai}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
             ),
         )
         .expect("source configuration");
@@ -7129,7 +7388,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         std::fs::write(
             &source,
             format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{SECRET_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\nmodels: [{{id: public-model, targets: [{{provider: provider-a, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{SECRET_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\naccounts: {{bootstrap: {{provider: provider-a, secret: env:POOLER_PROVIDER_KEY}}}}\nmodels: [{{id: public-model, targets: [{{id: public-target, provider: provider-a, account: bootstrap, priority: 1, upstream_model: provider-model, capabilities: [text, streaming], codecs: [openai], wire_family: openai}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
             ),
         )
         .expect("source configuration written");
@@ -7231,7 +7490,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         assert_eq!(
             std::fs::read_to_string(&source).expect("operator source readable"),
             format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{SECRET_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\nmodels: [{{id: public-model, targets: [{{provider: provider-a, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{SECRET_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\naccounts: {{bootstrap: {{provider: provider-a, secret: env:POOLER_PROVIDER_KEY}}}}\nmodels: [{{id: public-model, targets: [{{id: public-target, provider: provider-a, account: bootstrap, priority: 1, upstream_model: provider-model, capabilities: [text, streaming], codecs: [openai], wire_family: openai}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
             )
         );
         #[cfg(unix)]
@@ -7245,6 +7504,12 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         );
 
         api.complete_reload(request.id, "failed", request.generation, None);
+        let reloads = response_value(api.reloads(request.generation));
+        assert_eq!(reloads["reloads"][0]["status"], "failed");
+        assert_eq!(
+            reloads["reloads"][0]["error"]["code"],
+            "dependency_unavailable"
+        );
         assert!(
             !managed.exists(),
             "a failed publication restores the pre-commit filesystem state"
@@ -7268,7 +7533,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         std::fs::write(
             &source,
             format!(
-                "version: 1\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{SECRET_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\nmodels: [{{id: public-model, targets: [{{provider: provider-a, upstream_model: provider-model}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:{SECRET_ENV}}}}}\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}\naccounts: {{bootstrap: {{provider: provider-a, secret: env:POOLER_PROVIDER_KEY}}}}\nmodels: [{{id: public-model, targets: [{{id: public-target, provider: provider-a, account: bootstrap, priority: 1, upstream_model: provider-model, capabilities: [text, streaming], codecs: [openai], wire_family: openai}}]}}]\nroutes: [{{id: route-a, listen: local, match: {{path: /v1/chat}}, target: {{provider: provider-a, model_from: request.model}}, ingress: {{mode: patch}}}}]\n"
             ),
         )
         .expect("source configuration written");

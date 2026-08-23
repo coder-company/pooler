@@ -255,7 +255,7 @@ pub(crate) fn run(
     println!(
         "{}",
         serde_json::to_string_pretty(&PreflightReport {
-            schema_version: 1,
+            schema_version: 2,
             inference_requests_sent: 0,
             checks,
         })?
@@ -314,7 +314,7 @@ mod tests {
         let path = directory.path().join("pooler.yaml");
         std::fs::write(
             &path,
-            "version: 1\nupstreams:\n  provider:\n    url: wss://127.0.0.1:1\n",
+            "version: 2\nupstreams:\n  provider:\n    url: wss://127.0.0.1:1\n",
         )
         .expect("configuration");
 

@@ -27,7 +27,7 @@ pub use error::{
 };
 pub use id::{
     ComponentId, ConfigGeneration, CredentialId, IdentifierError, ListenerId, ModelId, ProviderId,
-    RequestId, RouteId, SessionId, TargetId, TraceId, MAX_IDENTIFIER_LENGTH,
+    RequestId, RouteId, SessionId, TargetBindingId, TargetId, TraceId, MAX_IDENTIFIER_LENGTH,
 };
 pub use limits::{LimitResource, LimitValidationError, RouteLimits, TimeoutResource};
 pub use mode::{BodyMode, LossPolicy};
@@ -49,5 +49,10 @@ mod tests {
         assert_eq!(BodyMode::default(), BodyMode::Opaque);
         assert_eq!(LossPolicy::default(), LossPolicy::Reject);
         RouteLimits::default().validate().unwrap();
+
+        let binding = TargetBindingId::new("public-model", "primary").unwrap();
+        assert_eq!(binding.to_string(), "public-model/primary");
+        assert_eq!(binding.model().as_str(), "public-model");
+        assert_eq!(binding.target().as_str(), "primary");
     }
 }

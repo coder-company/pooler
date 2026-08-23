@@ -1,11 +1,27 @@
 //! Serializable provider metadata for configuration, diagnostics, and management.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use pooler_core::Capability;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use url::{Host, Url};
 
 /// CLIProxyAPI revision used to establish the compatibility-only contracts.
 pub const CLI_PROXY_API_REFERENCE_REVISION: &str = "2e6b1d83f6c304a102aa33c1faf0a4f94d0d331e";
+
+/// Maximum number of values retained in one structured provider fact.
+pub const MAX_PROVIDER_METADATA_ITEMS: usize = 64;
+/// Maximum length of a provider metadata currency code.
+pub const MAX_PROVIDER_METADATA_CURRENCY_BYTES: usize = 16;
+/// Maximum number of bytes accepted for a Palantir enrollment origin.
+pub const MAX_PALANTIR_ENROLLMENT_BYTES: usize = 512;
+
+/// Foundry OAuth authorization endpoint relative to an enrollment origin.
+pub const PALANTIR_OAUTH_AUTHORIZATION_PATH: &str = "/multipass/api/oauth2/authorize";
+/// Foundry OAuth token endpoint relative to an enrollment origin.
+pub const PALANTIR_OAUTH_TOKEN_PATH: &str = "/multipass/api/oauth2/token";
 
 /// Provider family understood by the integration helpers.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -179,7 +195,9 @@ pub struct ContractEvidence {
 ///
 /// `Unknown` is intentional: a missing observation must not be presented as a
 /// verified provider capability by a later routing policy.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataProvenance {
     /// Established by a provider-owned public contract or a pinned native
@@ -197,7 +215,7 @@ pub enum MetadataProvenance {
 pub type FactProvenance = MetadataProvenance;
 
 /// A value together with the evidence level that permits Pooler to use it.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProviderFact<T> {
     /// The value is absent when the fact is unknown.
     pub value: Option<T>,
@@ -236,8 +254,57 @@ impl<T> ProviderFact<T> {
     /// Whether this fact has a usable value at the declared provenance.
     #[must_use]
     pub const fn is_known(&self) -> bool {
-        self.value.is_some()
+        self.value.is_some() && !matches!(self.provenance, MetadataProvenance::Unknown)
     }
+
+    /// Construct a fact while enforcing the value/provenance invariant.
+    pub fn from_parts(
+        value: Option<T>,
+        provenance: MetadataProvenance,
+    ) -> Result<Self, ProviderFactError> {
+        match (value, provenance) {
+            (Some(value), MetadataProvenance::Verified | MetadataProvenance::OperatorDeclared) => {
+                Ok(Self {
+                    value: Some(value),
+                    provenance,
+                })
+            }
+            (None, MetadataProvenance::Unknown) => Ok(Self::unknown()),
+            (Some(_), MetadataProvenance::Unknown) => Err(ProviderFactError::UnknownValue),
+            (None, _) => Err(ProviderFactError::MissingValue),
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for ProviderFact<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawFact<T> {
+            value: Option<T>,
+            provenance: MetadataProvenance,
+        }
+
+        let raw = RawFact::deserialize(deserializer)?;
+        Self::from_parts(raw.value, raw.provenance).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Contradictory value/provenance combinations are rejected at deserialization
+/// and by [`ProviderFact::from_parts`].
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProviderFactError {
+    /// A verified or operator-declared fact did not carry a value.
+    #[error("provider fact with declared provenance is missing its value")]
+    MissingValue,
+    /// An unknown fact attempted to carry a value.
+    #[error("unknown provider fact cannot carry a value")]
+    UnknownValue,
 }
 
 impl<T> Default for ProviderFact<T> {
@@ -356,7 +423,10 @@ impl ProviderMetadata {
     /// Facts common to an OpenAI Chat Completions provider with no fabricated
     /// model, price, privacy, or context claims.
     #[must_use]
-    pub fn verified_openai_chat(auth: AuthPlacementKind, endpoints: Vec<ProviderEndpointFamily>) -> Self {
+    pub fn verified_openai_chat(
+        auth: AuthPlacementKind,
+        endpoints: Vec<ProviderEndpointFamily>,
+    ) -> Self {
         Self {
             wire_family: ProviderFact::verified(ProviderWireFamily::OpenAiChatCompletions),
             endpoint_families: ProviderFact::verified(endpoints),
@@ -368,7 +438,7 @@ impl ProviderMetadata {
     /// Facts declared by an operator for a custom OpenAI-compatible profile.
     #[must_use]
     pub fn operator_openai(operations: &[ProviderOperation]) -> Self {
-        let endpoints = operations
+        let mut endpoints = operations
             .iter()
             .filter_map(|operation| match operation {
                 ProviderOperation::ListModels => Some(ProviderEndpointFamily::Models),
@@ -385,13 +455,277 @@ impl ProviderMetadata {
                 | ProviderOperation::AudioSpeech => Some(ProviderEndpointFamily::Audio),
                 _ => None,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        endpoints.sort_unstable();
+        endpoints.dedup();
+        let wire_family = match (
+            operations.contains(&ProviderOperation::ChatCompletions),
+            operations.contains(&ProviderOperation::Responses)
+                || operations.contains(&ProviderOperation::ResponsesCompact),
+        ) {
+            (true, false) => {
+                ProviderFact::operator_declared(ProviderWireFamily::OpenAiChatCompletions)
+            }
+            (false, true) => ProviderFact::operator_declared(ProviderWireFamily::OpenAiResponses),
+            _ => ProviderFact::unknown(),
+        };
         Self {
-            wire_family: ProviderFact::operator_declared(ProviderWireFamily::OpenAiChatCompletions),
+            wire_family,
             endpoint_families: ProviderFact::operator_declared(endpoints),
             ..Self::default()
         }
     }
+
+    /// Validate bounds and provenance before a profile crosses a trust boundary.
+    pub fn validate(&self) -> Result<(), ProviderMetadataError> {
+        if self
+            .endpoint_families
+            .value
+            .as_ref()
+            .is_some_and(|values| values.len() > MAX_PROVIDER_METADATA_ITEMS)
+        {
+            return Err(ProviderMetadataError::TooManyValues {
+                field: "endpoint_families",
+            });
+        }
+        if self
+            .parameters
+            .value
+            .as_ref()
+            .is_some_and(|values| values.len() > MAX_PROVIDER_METADATA_ITEMS)
+        {
+            return Err(ProviderMetadataError::TooManyValues {
+                field: "parameters",
+            });
+        }
+        if self
+            .capabilities
+            .value
+            .as_ref()
+            .is_some_and(|values| values.len() > MAX_PROVIDER_METADATA_ITEMS)
+        {
+            return Err(ProviderMetadataError::TooManyValues {
+                field: "capabilities",
+            });
+        }
+        if self
+            .quantization
+            .value
+            .as_ref()
+            .is_some_and(|values| values.len() > MAX_PROVIDER_METADATA_ITEMS)
+        {
+            return Err(ProviderMetadataError::TooManyValues {
+                field: "quantization",
+            });
+        }
+        if let Some(pricing) = &self.pricing.value {
+            if pricing.currency.is_empty()
+                || pricing.currency.len() > MAX_PROVIDER_METADATA_CURRENCY_BYTES
+                || !pricing.currency.is_ascii()
+            {
+                return Err(ProviderMetadataError::InvalidCurrency);
+            }
+        }
+        macro_rules! check_provenance {
+            ($($fact:expr),+ $(,)?) => {
+                $(if $fact.value.is_none()
+                    != matches!($fact.provenance, MetadataProvenance::Unknown)
+                {
+                    return Err(ProviderMetadataError::InconsistentProvenance);
+                })+
+            };
+        }
+        check_provenance!(
+            &self.wire_family,
+            &self.endpoint_families,
+            &self.auth_placement,
+            &self.parameters,
+            &self.capabilities,
+            &self.context_window,
+            &self.quantization,
+            &self.privacy,
+            &self.zdr,
+            &self.data_policy,
+            &self.pricing,
+        );
+        Ok(())
+    }
+}
+
+/// Structured metadata exceeded a non-disableable provider bound.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProviderMetadataError {
+    /// A list-valued fact contains too many entries.
+    #[error("provider metadata field {field} exceeds its item bound")]
+    TooManyValues { field: &'static str },
+    /// A pricing currency is not a short ASCII code.
+    #[error("provider metadata pricing currency is invalid")]
+    InvalidCurrency,
+    /// A value/provenance pair was manually assembled inconsistently.
+    #[error("provider metadata contains inconsistent provenance")]
+    InconsistentProvenance,
+}
+
+/// Non-secret endpoints derived from one operator-supplied Foundry enrollment.
+///
+/// This intentionally contains no model, discovery, or device-flow claim. A
+/// Foundry enrollment establishes where browser/client-credential OAuth lives;
+/// the operator must still configure the model and the supported login method.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PalantirEnrollmentFacts {
+    enrollment_origin: Url,
+    authorization_endpoint: Url,
+    token_endpoint: Url,
+}
+
+impl PalantirEnrollmentFacts {
+    /// Derive both Foundry OAuth endpoints on the exact enrollment origin.
+    pub fn from_origin(origin: Url) -> Result<Self, PalantirEnrollmentError> {
+        if !valid_public_https_origin(&origin)
+            || origin.as_str().len() > MAX_PALANTIR_ENROLLMENT_BYTES
+        {
+            return Err(PalantirEnrollmentError::InvalidOrigin);
+        }
+        let mut enrollment_origin = origin;
+        enrollment_origin.set_path("");
+        let mut authorization_endpoint = enrollment_origin.clone();
+        authorization_endpoint.set_path(PALANTIR_OAUTH_AUTHORIZATION_PATH);
+        let mut token_endpoint = enrollment_origin.clone();
+        token_endpoint.set_path(PALANTIR_OAUTH_TOKEN_PATH);
+        Ok(Self {
+            enrollment_origin,
+            authorization_endpoint,
+            token_endpoint,
+        })
+    }
+
+    /// Alias emphasizing that the input is an enrollment fact, not a generic
+    /// endpoint override.
+    pub fn derive(origin: Url) -> Result<Self, PalantirEnrollmentError> {
+        Self::from_origin(origin)
+    }
+
+    /// Foundry enrollment origin supplied by the operator.
+    #[must_use]
+    pub const fn enrollment_origin(&self) -> &Url {
+        &self.enrollment_origin
+    }
+
+    /// Same-origin browser authorization endpoint.
+    #[must_use]
+    pub const fn authorization_endpoint(&self) -> &Url {
+        &self.authorization_endpoint
+    }
+
+    /// Same-origin token endpoint.
+    #[must_use]
+    pub const fn token_endpoint(&self) -> &Url {
+        &self.token_endpoint
+    }
+
+    /// Whether an endpoint remains on the enrolled origin.
+    #[must_use]
+    pub fn is_same_origin(&self, endpoint: &Url) -> bool {
+        same_origin(&self.enrollment_origin, endpoint)
+    }
+
+    /// Reject an endpoint that would send OAuth material off the enrollment
+    /// origin, including userinfo, query, or fragment-bearing overrides.
+    pub fn validate_same_origin_endpoint(
+        &self,
+        endpoint: &Url,
+    ) -> Result<(), PalantirEnrollmentError> {
+        if !valid_public_https_endpoint(endpoint)
+            || !self.is_same_origin(endpoint)
+            || !matches!(
+                endpoint.path(),
+                PALANTIR_OAUTH_AUTHORIZATION_PATH | PALANTIR_OAUTH_TOKEN_PATH
+            )
+        {
+            return Err(PalantirEnrollmentError::OffOriginEndpoint);
+        }
+        Ok(())
+    }
+}
+
+/// Validation failures for typed Foundry enrollment facts.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PalantirEnrollmentError {
+    /// The enrollment was not a bounded public HTTPS origin.
+    #[error("Palantir enrollment must be a bounded public HTTPS origin")]
+    InvalidOrigin,
+    /// An OAuth endpoint did not remain on the enrolled origin.
+    #[error("Palantir OAuth endpoint is outside the enrolled origin")]
+    OffOriginEndpoint,
+}
+
+fn valid_public_https_origin(url: &Url) -> bool {
+    valid_public_https_endpoint(url)
+        && matches!(url.path(), "" | "/")
+        && !is_forbidden_host(url.host())
+}
+
+fn valid_public_https_endpoint(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host() == right.host()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn is_forbidden_host(host: Option<Host<&str>>) -> bool {
+    match host {
+        Some(Host::Domain(host)) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host == "localhost"
+                || host == "metadata"
+                || host == "metadata.google.internal"
+                || host == "instance-data.ec2.internal"
+                || host.ends_with(".localhost")
+                || host.ends_with(".local")
+                || host.ends_with(".internal")
+                || host.ends_with(".home.arpa")
+                || host.ends_with(".test")
+                || host.ends_with(".invalid")
+                || host.ends_with(".nip.io")
+                || host.ends_with(".xip.io")
+        }
+        Some(Host::Ipv4(address)) => is_forbidden_ipv4(address),
+        Some(Host::Ipv6(address)) => is_forbidden_ipv6(address),
+        None => true,
+    }
+}
+
+fn is_forbidden_ipv4(address: Ipv4Addr) -> bool {
+    let [first, second, ..] = address.octets();
+    address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_documentation()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address.is_broadcast()
+        || first == 0
+        || (first == 100 && (64..=127).contains(&second))
+        || (first == 198 && matches!(second, 18 | 19))
+}
+
+fn is_forbidden_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    address.is_loopback()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || segments[0] & 0xfe00 == 0xfc00
+        || segments[0] & 0xffc0 == 0xfe80
+        || segments[0] == 0x2001 && segments[1] == 0x0db8
+        || address.to_ipv4_mapped().is_some_and(is_forbidden_ipv4)
 }
 
 impl ContractEvidence {
@@ -473,7 +807,10 @@ pub fn kimi_open_platform_profile() -> ProviderProfile {
         ],
         metadata: ProviderMetadata::verified_openai_chat(
             AuthPlacementKind::Bearer,
-            vec![ProviderEndpointFamily::Models, ProviderEndpointFamily::ChatCompletions],
+            vec![
+                ProviderEndpointFamily::Models,
+                ProviderEndpointFamily::ChatCompletions,
+            ],
         ),
     }
 }

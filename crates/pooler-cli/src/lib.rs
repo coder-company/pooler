@@ -926,7 +926,7 @@ mod tests {
     fn configured_native_runtime_does_not_require_a_credential_store() {
         let config = pooler_config::compile_yaml(
             "cli-configured-native.yaml",
-            "version: 1\nupstreams:\n  xai:\n    url: http://127.0.0.1:1\n    native: {kind: xai}\n",
+            "version: 2\nupstreams:\n  xai:\n    url: http://127.0.0.1:1\n    native: {kind: xai}\n",
         )
         .expect("configured native config");
 
@@ -955,7 +955,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "cli-configured-native-persistent.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   xai:
     url: http://127.0.0.1:1
@@ -991,14 +991,14 @@ upstreams:
         let config = pooler_config::compile_yaml(
             "cli-pooling.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 accounts:
   account: {provider: local, secret: env:POOLER_TEST_ACCOUNT}
-account_pools: {pool: {accounts: [account]}}
+account_pools: {pool: {provider: local, accounts: [account]}}
 policies:
-  pooled: {selection: {strategy: fill_first, account_pool: pool}}
+  pooled: {selection: {strategy: fill_first}}
 routes:
   - id: pooled
     listen: local
@@ -1208,7 +1208,7 @@ routes:
         let path = directory.path().join("pooler.yaml");
         std::fs::write(
             &path,
-            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_CLI_MANAGEMENT_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:1}}\n",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_CLI_MANAGEMENT_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:1}}\n",
         )
         .expect("initial config writes");
         let watcher = Arc::new(Mutex::new(
@@ -1239,7 +1239,7 @@ routes:
 
         std::fs::write(
             &path,
-            "version: 1\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_CLI_MANAGEMENT_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:2}}\n",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_CLI_MANAGEMENT_RELOAD_TEST_KEY}}\nupstreams: {provider: {url: http://127.0.0.1:2}}\n",
         )
         .expect("replacement config writes");
         let candidate = watcher

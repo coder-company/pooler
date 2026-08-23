@@ -7,4 +7,4 @@ imports:
       websocket_url: wss://api.x.ai
       secret: env:XAI_API_KEY
 
-version: 1
+version: 2

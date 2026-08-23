@@ -59,7 +59,7 @@ fn initialize_private_directory(output: &Path) -> Result<InitReport> {
     let management_secret_ref = file_reference(&management_token);
     let credential_key_ref = file_reference(&store_key);
     let yaml = format!(
-        "imports:\n  - preset: gateway\n    as: gateway\n    with:\n      bind: 127.0.0.1:8400\n      upstream_url: https://api.openai.com\n      websocket_url: wss://api.openai.com\n      secret: {}\n\nversion: 1\nmanagement:\n  bind: 127.0.0.1:18477\n  auth:\n    secret: {}\n",
+        "imports:\n  - preset: gateway\n    as: gateway\n    with:\n      bind: 127.0.0.1:8400\n      upstream_url: https://api.openai.com\n      websocket_url: wss://api.openai.com\n      secret: {}\n\nversion: 2\nmanagement:\n  bind: 127.0.0.1:18477\n  auth:\n    secret: {}\n",
         yaml_string(&provider_secret_ref),
         yaml_string(&management_secret_ref),
     );
@@ -70,7 +70,7 @@ fn initialize_private_directory(output: &Path) -> Result<InitReport> {
     sync_directory(&directory)?;
 
     Ok(InitReport {
-        schema_version: 1,
+        schema_version: 2,
         directory,
         config: config.clone(),
         credential_store: credential_store.clone(),

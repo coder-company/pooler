@@ -223,7 +223,7 @@ mod tests {
         let error = crate::compile_yaml(
             "price-book.yaml",
             r#"
-version: 1
+version: 2
 upstreams: {known: {url: http://127.0.0.1:1}}
 usage_price_book:
   version: v1

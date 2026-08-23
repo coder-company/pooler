@@ -383,7 +383,7 @@ fn config_text_with_key(
         files.directory.path().join(key_name).display().to_string()
     };
     format!(
-        "version: 1\nlisteners:\n  local:\n    bind: 127.0.0.1:0\n    tls:\n      cert: {:?}\n      key: {:?}\n      alpn: [{alpn}]\n      handshake_timeout: {handshake}\nupstreams:\n  local:\n    url: http://{upstream}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /}}\n    target: local\n",
+        "version: 2\nlisteners:\n  local:\n    bind: 127.0.0.1:0\n    tls:\n      cert: {:?}\n      key: {:?}\n      alpn: [{alpn}]\n      handshake_timeout: {handshake}\nupstreams:\n  local:\n    url: http://{upstream}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: /}}\n    target: local\n",
         files.cert.display(), key
     )
 }

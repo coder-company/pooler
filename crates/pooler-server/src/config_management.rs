@@ -1753,7 +1753,7 @@ mod tests {
         let path = directory.path().join("pooler.yaml");
         fs::write(
             &path,
-            "version: 1\nlisteners: {}\nupstreams: {}\nmodels: []\naccounts: {}\naccount_pools: {}\npolicies: {}\nroutes: []\nextensions: {}\nmanagement: {}\n",
+            "version: 2\nlisteners: {}\nupstreams: {}\nmodels: []\naccounts: {}\naccount_pools: {}\npolicies: {}\nroutes: []\nextensions: {}\nmanagement: {}\n",
         )
         .expect("source");
         #[cfg(unix)]

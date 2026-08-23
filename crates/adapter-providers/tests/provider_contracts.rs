@@ -4,10 +4,11 @@ use adapter_providers::{
     antigravity_compatibility_profile, kimi_coding_profile, kimi_open_platform_profile,
     try_into_catalog_response, vertex_profile, AdapterError, AntigravityAdapter,
     AntigravityCompatibilityConfig, AntigravityCreditParser, AuthPlacement, ContractStability,
-    DangerousCustomEndpoint, KimiAdapter, ModelDiscoveryError, OpenAiCompatibleAdapter,
-    ProviderAdapter, ProviderKind, ProviderModelParser, ProviderOperation, ProviderParseError,
-    ProviderQuotaScope, ProviderResponseClassifier, ProviderSurface, VertexAdapter,
-    VertexAuthentication, CLI_PROXY_API_REFERENCE_REVISION,
+    DangerousCustomEndpoint, KimiAdapter, MetadataProvenance, ModelDiscoveryError,
+    OpenAiCompatibleAdapter, PalantirEnrollmentError, PalantirEnrollmentFacts, ProviderAdapter,
+    ProviderFact, ProviderKind, ProviderMetadataError, ProviderModelParser, ProviderOperation,
+    ProviderParseError, ProviderQuotaScope, ProviderResponseClassifier, ProviderSurface,
+    ProviderWireFamily, VertexAdapter, VertexAuthentication, CLI_PROXY_API_REFERENCE_REVISION,
 };
 use http::{HeaderMap, HeaderName, HeaderValue};
 use pooler_auth::SecretValue;
@@ -87,6 +88,100 @@ fn profiles_keep_official_and_pinned_contracts_distinct() {
     assert!(!serialized.contains("client_secret"));
     assert!(!serialized.contains("client_id"));
     assert!(serialized.contains(CLI_PROXY_API_REFERENCE_REVISION));
+    assert!(kimi.metadata.validate().is_ok());
+    assert!(kimi_code.metadata.validate().is_ok());
+    assert!(vertex.metadata.validate().is_ok());
+    assert!(antigravity.metadata.validate().is_ok());
+}
+
+#[test]
+fn provider_facts_keep_unknown_values_from_becoming_claims() {
+    let unknown = ProviderFact::<String>::unknown();
+    assert_eq!(unknown.value, None);
+    assert_eq!(unknown.provenance, MetadataProvenance::Unknown);
+    assert!(!unknown.is_known());
+
+    let malformed = br#"{"value":"fabricated","provenance":"unknown"}"#;
+    assert!(serde_json::from_slice::<ProviderFact<String>>(malformed).is_err());
+    let malformed = br#"{"value":null,"provenance":"verified"}"#;
+    assert!(serde_json::from_slice::<ProviderFact<String>>(malformed).is_err());
+
+    let custom =
+        adapter_providers::openai_compatible_profile(vec![ProviderOperation::ImageGenerations]);
+    assert_eq!(
+        custom.metadata.wire_family.provenance,
+        MetadataProvenance::Unknown
+    );
+    assert_eq!(
+        custom.metadata.wire_family.value,
+        None::<ProviderWireFamily>
+    );
+    assert!(matches!(
+        ProviderFact::<String>::from_parts(None, MetadataProvenance::OperatorDeclared),
+        Err(adapter_providers::ProviderFactError::MissingValue)
+    ));
+    let mut oversized = custom.metadata.clone();
+    oversized.endpoint_families = ProviderFact::operator_declared(vec![
+        adapter_providers::ProviderEndpointFamily::Models;
+        adapter_providers::MAX_PROVIDER_METADATA_ITEMS + 1
+    ]);
+    assert_eq!(
+        oversized.validate(),
+        Err(ProviderMetadataError::TooManyValues {
+            field: "endpoint_families"
+        })
+    );
+}
+
+#[test]
+fn palantir_enrollment_derives_only_same_origin_oauth_facts() {
+    let facts = PalantirEnrollmentFacts::derive(
+        Url::parse("https://example.euw-3.palantirfoundry.co.uk").expect("enrollment origin"),
+    )
+    .expect("derived enrollment facts");
+    assert_eq!(
+        facts.authorization_endpoint().as_str(),
+        "https://example.euw-3.palantirfoundry.co.uk/multipass/api/oauth2/authorize"
+    );
+    assert_eq!(
+        facts.token_endpoint().as_str(),
+        "https://example.euw-3.palantirfoundry.co.uk/multipass/api/oauth2/token"
+    );
+    assert!(facts.is_same_origin(facts.authorization_endpoint()));
+    assert_eq!(
+        serde_json::to_value(&facts)
+            .expect("serialize enrollment facts")
+            .as_object()
+            .expect("facts object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            "authorization_endpoint".to_owned(),
+            "enrollment_origin".to_owned(),
+            "token_endpoint".to_owned()
+        ]
+    );
+    assert_eq!(
+        facts.validate_same_origin_endpoint(
+            &Url::parse("https://other.example/multipass/api/oauth2/token")
+                .expect("off-origin endpoint")
+        ),
+        Err(PalantirEnrollmentError::OffOriginEndpoint)
+    );
+    for origin in [
+        "http://example.palantirfoundry.com",
+        "https://127.0.0.1",
+        "https://example.palantirfoundry.com/path",
+        "https://user@example.palantirfoundry.com",
+        "https://example.palantirfoundry.com?query=value",
+    ] {
+        assert_eq!(
+            PalantirEnrollmentFacts::derive(Url::parse(origin).expect("test URL")),
+            Err(PalantirEnrollmentError::InvalidOrigin),
+            "unsafe enrollment {origin}"
+        );
+    }
 }
 
 #[test]
@@ -357,6 +452,80 @@ fn generic_openai_compatibility_requires_an_explicit_operation_allow_list() {
         Err(AdapterError::UnsupportedOperation {
             operation: ProviderOperation::ImageEdits
         })
+    );
+}
+
+#[test]
+fn custom_provider_urls_are_bounded_and_redirects_are_same_origin() {
+    let auth = AuthPlacement::Bearer;
+    let first = OpenAiCompatibleAdapter::new(
+        "provider-one",
+        Url::parse("https://shared.example.com/v1").expect("base URL"),
+        auth.clone(),
+        [ProviderOperation::ChatCompletions],
+    )
+    .expect("first custom provider");
+    let second = OpenAiCompatibleAdapter::new(
+        "provider-two",
+        Url::parse("https://shared.example.com/v1").expect("duplicate origin"),
+        auth,
+        [ProviderOperation::ChatCompletions],
+    )
+    .expect("second custom provider with same origin");
+    assert_ne!(first.provider_id(), second.provider_id());
+    assert!(first
+        .validate_redirect(&Url::parse("https://shared.example.com/v1/other?state=1").unwrap())
+        .is_ok());
+    assert_eq!(
+        first.validate_redirect(&Url::parse("https://other.example.com/v1").unwrap()),
+        Err(AdapterError::OffOriginRedirect)
+    );
+    assert_eq!(
+        first.validate_redirect(&Url::parse("https://user:secret@shared.example.com/v1").unwrap()),
+        Err(AdapterError::OffOriginRedirect)
+    );
+
+    for invalid in [
+        "http://public.example.com/v1",
+        "https://10.0.0.1/v1",
+        "https://169.254.169.254/v1",
+        "https://metadata.google.internal/v1",
+        "https://user:secret@shared.example.com/v1",
+        "https://shared.example.com/v1?query=unsafe",
+        "https://shared.example.com/v1#fragment",
+    ] {
+        assert!(
+            OpenAiCompatibleAdapter::new(
+                "invalid-provider",
+                Url::parse(invalid).expect("syntactically valid URL"),
+                AuthPlacement::Bearer,
+                [ProviderOperation::ChatCompletions],
+            )
+            .is_err(),
+            "unsafe custom URL {invalid}"
+        );
+    }
+    assert!(OpenAiCompatibleAdapter::new(
+        "local-provider",
+        Url::parse("http://127.0.0.1:1234/v1").expect("loopback URL"),
+        AuthPlacement::Bearer,
+        [ProviderOperation::ChatCompletions],
+    )
+    .is_ok());
+    assert_eq!(
+        AuthPlacement::custom(
+            "x-provider-key",
+            "x".repeat(adapter_providers::MAX_CUSTOM_AUTH_PREFIX_BYTES + 1),
+        ),
+        Err(AdapterError::InputLimitExceeded {
+            field: "auth_value_prefix"
+        })
+    );
+    assert_eq!(
+        AuthPlacement::from_configured_kind(
+            &"x".repeat(adapter_providers::MAX_CUSTOM_AUTH_KIND_BYTES + 1)
+        ),
+        Err(AdapterError::InputLimitExceeded { field: "auth_kind" })
     );
 }
 

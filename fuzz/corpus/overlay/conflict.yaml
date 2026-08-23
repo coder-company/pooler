@@ -1,4 +1,4 @@
-version: 1
+version: 2
 imports:
   - file: first.yaml
   - file: second.yaml

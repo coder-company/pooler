@@ -1226,7 +1226,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "provider-alias.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   google:
     url: https://generativelanguage.googleapis.com
@@ -1256,7 +1256,7 @@ upstreams:
         let config = pooler_config::compile_yaml(
             "provider-host.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   google:
     url: https://generativelanguage.googleapis.com
@@ -1308,7 +1308,7 @@ upstreams:
         let config = pooler_config::compile_yaml(
             "custom-provider.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   custom:
     url: https://api.operator.example
@@ -1385,7 +1385,7 @@ upstreams:
         let config = pooler_config::compile_yaml(
             "multi-account-auth.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   codex:
     url: https://chatgpt.com
@@ -1427,7 +1427,7 @@ accounts:
         std::fs::write(
             &config_path,
             r#"
-version: 1
+version: 2
 upstreams:
   xai:
     url: https://api.x.ai
@@ -1497,7 +1497,7 @@ accounts:
         std::fs::write(
             &config_path,
             r#"
-version: 1
+version: 2
 upstreams:
   xai:
     url: https://api.x.ai

@@ -1613,6 +1613,7 @@ dependencies = [
  "serde_yaml_ng",
  "thiserror",
  "tokio",
+ "url",
 ]
 
 [[package]]

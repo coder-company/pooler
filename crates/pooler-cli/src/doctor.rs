@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn valid_config_reports_structured_success_without_store() {
-        let (_directory, path) = config("version: 1\nlisteners: {}\nupstreams: {}\nroutes: []\n");
+        let (_directory, path) = config("version: 2\nlisteners: {}\nupstreams: {}\nroutes: []\n");
         let report = diagnose(&path, None, None);
         assert_eq!(report.status, "ok");
         assert!(report
@@ -728,7 +728,7 @@ mod tests {
     #[test]
     fn invalid_config_is_a_failure_and_secret_text_is_not_reported() {
         let (_directory, path) =
-            config("version: 1\nupstreams: {x: {url: 'http://user:super-secret@example.test'}}\n");
+            config("version: 2\nupstreams: {x: {url: 'http://user:super-secret@example.test'}}\n");
         let report = diagnose(&path, None, None);
         assert_eq!(report.status, "failed");
         let encoded = serde_json::to_string(&report).expect("report JSON");
@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn duplicate_binds_are_reported_without_leaving_a_listener() {
         let (_directory, path) = config(
-            "version: 1\nlisteners: {one: {bind: '127.0.0.1:0'}, two: {bind: '127.0.0.1:0'}}\nroutes: []\n",
+            "version: 2\nlisteners: {one: {bind: '127.0.0.1:0'}, two: {bind: '127.0.0.1:0'}}\nroutes: []\n",
         );
         let report = diagnose(&path, None, None);
         assert_eq!(report.status, "failed");
@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn wss_upstreams_are_reported_as_tls_protected() {
         let (_directory, path) =
-            config("version: 1\nupstreams:\n  provider:\n    url: wss://api.example.test\n");
+            config("version: 2\nupstreams:\n  provider:\n    url: wss://api.example.test\n");
         let report = diagnose(&path, None, None);
         let check = report
             .checks
@@ -771,7 +771,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).expect("socket");
         drop(listener);
         let (_directory, path) = config(&format!(
-            "version: 1\nmanagement:\n  bind: unix:{}\n",
+            "version: 2\nmanagement:\n  bind: unix:{}\n",
             socket.display()
         ));
 

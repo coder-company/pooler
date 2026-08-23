@@ -411,9 +411,9 @@ mod tests {
         let dir = TestDir::new();
         let base = dir.write(
             "base.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
         );
-        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 1\n");
+        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 2\n");
         let mut watcher = ConfigWatcher::with_loader_and_debounce(
             ConfigLoader::default(),
             &root,
@@ -426,7 +426,7 @@ mod tests {
 
         fs::write(
             &base,
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
         )
         .expect("rewrite import");
         assert!(watcher.poll().expect("first poll").is_none());
@@ -445,7 +445,7 @@ mod tests {
         let dir = TestDir::new();
         let root = dir.write(
             "root.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
         );
         let mut watcher =
             ConfigWatcher::with_loader_and_debounce(ConfigLoader::default(), &root, Duration::ZERO)
@@ -465,12 +465,12 @@ mod tests {
         let dir = TestDir::new();
         let root = dir.write(
             "root.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
         );
         let mut watcher = ConfigWatcher::new(&root).expect("watcher loads");
         fs::write(
             &root,
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
         )
         .expect("rewrite root");
         let started = Instant::now();
@@ -490,13 +490,13 @@ mod tests {
         let dir = TestDir::new();
         let root = dir.write(
             "root.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
         );
         let missing = dir.0.join("later.yaml");
         let mut watcher =
             ConfigWatcher::with_loader_and_debounce(ConfigLoader::default(), &root, Duration::ZERO)
                 .expect("watcher loads");
-        fs::write(&root, "imports: [{file: later.yaml}]\nversion: 1\n")
+        fs::write(&root, "imports: [{file: later.yaml}]\nversion: 2\n")
             .expect("add missing import");
         assert!(watcher.poll().expect("root change poll").is_none());
         assert!(watcher
@@ -508,7 +508,7 @@ mod tests {
 
         fs::write(
             &missing,
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
         )
         .expect("create missing import");
         assert!(watcher.poll().expect("new dependency poll").is_none());
@@ -528,9 +528,9 @@ mod tests {
         let dir = TestDir::new();
         let base = dir.write(
             "base.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
         );
-        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 1\n");
+        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 2\n");
         let mut watcher =
             ConfigWatcher::with_loader_and_debounce(ConfigLoader::default(), &root, Duration::ZERO)
                 .expect("watcher loads");
@@ -538,7 +538,7 @@ mod tests {
         fs::write(
             &base,
             format!(
-                "version: 1\n#{}\n",
+                "version: 2\n#{}\n",
                 "x".repeat(MAX_CONFIG_FILE_BYTES as usize)
             ),
         )
@@ -556,7 +556,7 @@ mod tests {
 
         fs::write(
             &base,
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:3}}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:3}}\n",
         )
         .expect("replace oversized import");
         assert!(watcher.poll().expect("replacement poll").is_none());

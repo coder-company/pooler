@@ -11,7 +11,7 @@ fn upstream_url_boundary_rejects_non_http_and_credential_bearing_urls() {
     ];
 
     for (index, url) in rejected.into_iter().enumerate() {
-        let yaml = format!("version: 1\nupstreams:\n  target:\n    url: \"{url}\"\n");
+        let yaml = format!("version: 2\nupstreams:\n  target:\n    url: \"{url}\"\n");
         let error = compile_yaml(format!("phase8-security-{index}.yaml"), &yaml)
             .expect_err("unsafe upstream URL should be rejected");
         let rendered = error.to_string();
@@ -29,7 +29,7 @@ fn upstream_url_boundary_accepts_explicit_http_and_https_hosts() {
         .into_iter()
         .enumerate()
     {
-        let yaml = format!("version: 1\nupstreams:\n  target:\n    url: \"{url}\"\n");
+        let yaml = format!("version: 2\nupstreams:\n  target:\n    url: \"{url}\"\n");
         compile_yaml(format!("phase8-security-safe-{index}.yaml"), &yaml)
             .expect("valid upstream URL should compile");
     }

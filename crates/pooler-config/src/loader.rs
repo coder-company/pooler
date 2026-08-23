@@ -202,7 +202,6 @@ impl ConfigLoader {
                     .unwrap_or("invalid YAML")
                     .to_owned(),
             })?;
-        normalize_provider_alias(&mut document, &canonical)?;
         let imports = take_imports(&mut document, &canonical)?;
         let document_origins = collect_origins(&document, &canonical);
         let parent = canonical.parent().unwrap_or_else(|| Path::new("."));
@@ -288,7 +287,6 @@ impl ConfigLoader {
                     .unwrap_or("invalid YAML")
                     .to_owned(),
             })?;
-        normalize_provider_alias(&mut document, &canonical)?;
         if !take_imports(&mut document, &canonical)?.is_empty() {
             return Err(load_error(
                 &canonical,
@@ -1835,21 +1833,6 @@ fn string_value(value: &Value, path: &Path, preset: &str) -> Result<String, Conf
         .ok_or_else(|| load_error(path, &format!("{preset} preset parameters must be strings")))
 }
 
-fn normalize_provider_alias(document: &mut Value, path: &Path) -> Result<(), ConfigError> {
-    let Some(mapping) = document.as_mapping_mut() else {
-        return Err(load_error(path, "configuration root must be a mapping"));
-    };
-    let providers = Value::String("providers".to_owned());
-    let upstreams = Value::String("upstreams".to_owned());
-    if mapping.contains_key(&providers) && mapping.contains_key(&upstreams) {
-        return Err(load_error(path, "use only one of providers or upstreams"));
-    }
-    if let Some(value) = mapping.remove(&providers) {
-        mapping.insert(upstreams, value);
-    }
-    Ok(())
-}
-
 fn collect_origins(document: &Value, path: &Path) -> BTreeMap<String, Arc<str>> {
     let mut origins = BTreeMap::new();
     let Some(root) = document.as_mapping() else {
@@ -2250,15 +2233,15 @@ mod tests {
         let dir = TestDir::new();
         dir.write(
             "base.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\nupstreams: {one: {url: http://127.0.0.1:2}}\nroutes: [{id: old, listen: local, target: one}]\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:1}}\nupstreams: {one: {url: http://127.0.0.1:2}}\nroutes: [{id: old, listen: local, target: one}]\n",
         );
         dir.write(
             "overlay.yaml",
-            "version: 1\nlisteners: {local: {merge: true, bind: 127.0.0.1:3}}\nroutes: [{id: old, remove: true}, {id: new, listen: local, target: one}]\n",
+            "version: 2\nlisteners: {local: {merge: true, bind: 127.0.0.1:3}}\nroutes: [{id: old, remove: true}, {id: new, listen: local, target: one}]\n",
         );
         let root = dir.write(
             "root.yaml",
-            "imports: [{file: base.yaml}, {overlay: overlay.yaml}]\nversion: 1\n",
+            "imports: [{file: base.yaml}, {overlay: overlay.yaml}]\nversion: 2\n",
         );
         let config = load_path(&root)
             .expect("resolved config")
@@ -2276,17 +2259,17 @@ mod tests {
     #[test]
     fn rejects_cycles_duplicates_and_type_changes() {
         let dir = TestDir::new();
-        let first = dir.write("first.yaml", "imports: [{file: second.yaml}]\nversion: 1\n");
-        dir.write("second.yaml", "imports: [{file: first.yaml}]\nversion: 1\n");
+        let first = dir.write("first.yaml", "imports: [{file: second.yaml}]\nversion: 2\n");
+        dir.write("second.yaml", "imports: [{file: first.yaml}]\nversion: 2\n");
         assert!(ConfigLoader::default().load(&first).is_err());
 
         let base = dir.write(
             "base.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
         );
         let duplicate = dir.write(
             "duplicate.yaml",
-            "imports: [{file: base.yaml}]\nversion: 1\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
+            "imports: [{file: base.yaml}]\nversion: 2\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
         );
         assert!(render_path(&duplicate).is_err());
 
@@ -2294,7 +2277,7 @@ mod tests {
         let root = dir.write(
             "bad-root.yaml",
             &format!(
-                "imports: [{{file: {}}}, {{overlay: {}}}]\nversion: 1\n",
+                "imports: [{{file: {}}}, {{overlay: {}}}]\nversion: 2\n",
                 base.file_name().unwrap().to_string_lossy(),
                 overlay.file_name().unwrap().to_string_lossy()
             ),
@@ -2317,7 +2300,7 @@ imports:
       model_prefix: gpt-5.
       upstream_url: http://127.0.0.1:9319
       secret: env:CURSOR_UPSTREAM_KEY
-version: 1
+version: 2
 "#,
         );
         let config = load_path(&root)
@@ -2344,7 +2327,7 @@ version: 1
 imports:
   - {preset: cursor, as: cursor-low, with: {reasoning_effort: low}}
   - {preset: cursor, as: cursor-high, with: {bind: "127.0.0.1:8334", reasoning_effort: high}}
-version: 1
+version: 2
 "#,
         );
         let config = load_path(&root)
@@ -2369,7 +2352,7 @@ imports:
       bind: 127.0.0.1:9443
       upstream_url: http://127.0.0.1:9419
       secret: env:DEVIN_UPSTREAM_KEY
-version: 1
+version: 2
 "#,
         );
         let config = load_path(&root)
@@ -2412,7 +2395,7 @@ imports:
     with:
       bind: 127.0.0.1:9332
       upstream_url: http://127.0.0.1:9319
-version: 1
+version: 2
 "#,
         );
         let config = load_path(&root)
@@ -2441,7 +2424,7 @@ imports:
       bind: 127.0.0.1:9333
       upstream_url: http://127.0.0.1:9319
       secret: env:FX_TEST_KEY
-version: 1
+version: 2
 "#,
         );
         let config = load_path(&root)
@@ -2490,7 +2473,7 @@ version: 1
         let dir = TestDir::new();
         let root = dir.write(
             "fx-invalid.yaml",
-            "imports: [{preset: fx, with: {bind: 9333}}]\nversion: 1\n",
+            "imports: [{preset: fx, with: {bind: 9333}}]\nversion: 2\n",
         );
         let error = load_path(root).expect_err("numeric fx parameter");
         assert!(error
@@ -2513,7 +2496,7 @@ imports:
       rest_url: http://127.0.0.1:9319
       websocket_url: ws://127.0.0.1:9320
       secret: env:XAI_TEST_KEY
-version: 1
+version: 2
 "#,
         );
         let config = load_path(&root)
@@ -2576,7 +2559,7 @@ version: 1
         let dir = TestDir::new();
         let root = dir.write(
             "devin-invalid.yaml",
-            "imports: [{preset: devin, with: {model: custom}}]\nversion: 1\n",
+            "imports: [{preset: devin, with: {model: custom}}]\nversion: 2\n",
         );
         let error = load_path(root).expect_err("unknown preset parameter");
         assert!(error
@@ -2589,15 +2572,15 @@ version: 1
         let dir = TestDir::new();
         dir.write(
             "base.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\nupstreams: {local: {url: http://127.0.0.1:2}}\nroutes: [{id: base, listen: local, match: {path: /same}, target: local}, {id: remove-me, listen: local, match: {path: /other}, target: local}]\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:1}}\nupstreams: {local: {url: http://127.0.0.1:2}}\nroutes: [{id: base, listen: local, match: {path: /same}, target: local}, {id: remove-me, listen: local, match: {path: /other}, target: local}]\n",
         );
         dir.write(
             "overlay.yaml",
-            "version: 1\nroutes: [{id: remove-me, remove: true}, {id: overlay, listen: local, match: {path: /same}, target: local}]\n",
+            "version: 2\nroutes: [{id: remove-me, remove: true}, {id: overlay, listen: local, match: {path: /same}, target: local}]\n",
         );
         let root = dir.write(
             "root.yaml",
-            "imports: [{file: base.yaml}, {overlay: overlay.yaml}]\nversion: 1\n",
+            "imports: [{file: base.yaml}, {overlay: overlay.yaml}]\nversion: 2\n",
         );
         let error = load_path(root)
             .expect("resolved config")
@@ -2613,9 +2596,9 @@ version: 1
         let dir = TestDir::new();
         dir.write(
             "bad.yaml",
-            "version: 1\nlisteners: {local: {bnd: 127.0.0.1:1}}\n",
+            "version: 2\nlisteners: {local: {bnd: 127.0.0.1:1}}\n",
         );
-        let root = dir.write("root.yaml", "imports: [{file: bad.yaml}]\nversion: 1\n");
+        let root = dir.write("root.yaml", "imports: [{file: bad.yaml}]\nversion: 2\n");
         let error = load_path(root).expect_err("unknown imported field");
         let rendered = error.to_string();
         assert!(rendered.contains("bad.yaml"));
@@ -2627,9 +2610,9 @@ version: 1
         let dir = TestDir::new();
         dir.write(
             "bad.yaml",
-            "version: 1\nupstreams: {a.b: {url: http://127.0.0.1:2, bogus: true}}\n",
+            "version: 2\nupstreams: {a.b: {url: http://127.0.0.1:2, bogus: true}}\n",
         );
-        let root = dir.write("root.yaml", "imports: [{file: bad.yaml}]\nversion: 1\n");
+        let root = dir.write("root.yaml", "imports: [{file: bad.yaml}]\nversion: 2\n");
         let error = load_path(root).expect_err("unknown field in dotted upstream id");
         let rendered = error.to_string();
         assert!(rendered.contains("bad.yaml"));
@@ -2670,9 +2653,9 @@ version: 1
     #[test]
     fn import_depth_counts_nested_imports_not_the_root() {
         let dir = TestDir::new();
-        let leaf = dir.write("leaf.yaml", "version: 1\n");
+        let leaf = dir.write("leaf.yaml", "version: 2\n");
         assert!(ConfigLoader::new(0).render(&leaf).is_ok());
-        let root = dir.write("root.yaml", "imports: [{file: leaf.yaml}]\nversion: 1\n");
+        let root = dir.write("root.yaml", "imports: [{file: leaf.yaml}]\nversion: 2\n");
         assert!(ConfigLoader::new(0).render(&root).is_err());
         assert!(ConfigLoader::new(1).render(&root).is_ok());
     }
@@ -2683,7 +2666,7 @@ version: 1
         let path = dir.write(
             "oversized.yaml",
             &format!(
-                "version: 1\n#{}",
+                "version: 2\n#{}",
                 "x".repeat(MAX_CONFIG_FILE_BYTES as usize)
             ),
         );
@@ -2699,10 +2682,10 @@ version: 1
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TestDir::new();
-        let base = dir.write("base.yaml", "version: 1\n");
+        let base = dir.write("base.yaml", "version: 2\n");
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o664))
             .expect("set insecure permissions");
-        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 1\n");
+        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 2\n");
         let error = ConfigLoader::default()
             .load(root)
             .expect_err("insecure import");
@@ -2715,10 +2698,10 @@ version: 1
         use std::os::unix::fs::symlink;
 
         let dir = TestDir::new();
-        let target = dir.write("target.yaml", "version: 1\n");
+        let target = dir.write("target.yaml", "version: 2\n");
         let link = dir.0.join("link.yaml");
         symlink(&target, &link).expect("symlink import");
-        let root = dir.write("root.yaml", "imports: [{file: link.yaml}]\nversion: 1\n");
+        let root = dir.write("root.yaml", "imports: [{file: link.yaml}]\nversion: 2\n");
         let error = ConfigLoader::default()
             .load(root)
             .expect_err("symlink import");
@@ -2729,8 +2712,8 @@ version: 1
     #[test]
     fn secure_import_validation_fails_closed_without_acl_support() {
         let dir = TestDir::new();
-        dir.write("base.yaml", "version: 1\n");
-        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 1\n");
+        dir.write("base.yaml", "version: 2\n");
+        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 2\n");
         let error = ConfigLoader::default()
             .load(root)
             .expect_err("Windows secure import validation must fail closed");

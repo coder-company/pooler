@@ -14,18 +14,22 @@ mod models;
 
 pub use contracts::{
     antigravity_compatibility_profile, kimi_coding_profile, kimi_open_platform_profile,
-    openai_compatible_profile, vertex_profile, AuthEndpointKind, AuthMode, ContractEvidence,
-    AuthPlacementKind, ContractStability, DiscoveryMode, FactProvenance, MetadataProvenance,
-    ProviderAuthEndpoint, ProviderDataPolicy, ProviderEndpointFamily, ProviderFact, ProviderKind,
-    ProviderMetadata, ProviderOperation, ProviderParameter, ProviderPricing, ProviderPrivacy,
+    openai_compatible_profile, vertex_profile, AuthEndpointKind, AuthMode, AuthPlacementKind,
+    ContractEvidence, ContractStability, DiscoveryMode, FactProvenance, MetadataProvenance,
+    PalantirEnrollmentError, PalantirEnrollmentFacts, ProviderAuthEndpoint, ProviderDataPolicy,
+    ProviderEndpointFamily, ProviderFact, ProviderFactError, ProviderKind, ProviderMetadata,
+    ProviderMetadataError, ProviderOperation, ProviderParameter, ProviderPricing, ProviderPrivacy,
     ProviderProfile, ProviderQuantization, ProviderSurface, ProviderWireFamily, QuotaSignal,
-    WireProtocol, CLI_PROXY_API_REFERENCE_REVISION,
+    WireProtocol, CLI_PROXY_API_REFERENCE_REVISION, MAX_PALANTIR_ENROLLMENT_BYTES,
+    MAX_PROVIDER_METADATA_CURRENCY_BYTES, MAX_PROVIDER_METADATA_ITEMS,
+    PALANTIR_OAUTH_AUTHORIZATION_PATH, PALANTIR_OAUTH_TOKEN_PATH,
 };
 pub use endpoint::{
-    AdapterError, AntigravityAdapter, AntigravityCompatibilityConfig,
+    validate_provider_redirect, AdapterError, AntigravityAdapter, AntigravityCompatibilityConfig,
     AntigravityCompatibilityPaths, AuthPlacement, DangerousCustomEndpoint, KimiAdapter,
     KimiSurface, OpenAiCompatibleAdapter, ProviderAdapter, ProviderAuthorization, VertexAdapter,
-    VertexAddressing, VertexAuthentication,
+    VertexAddressing, VertexAuthentication, MAX_CUSTOM_AUTH_HEADER_BYTES,
+    MAX_CUSTOM_AUTH_KIND_BYTES, MAX_CUSTOM_AUTH_PREFIX_BYTES, MAX_CUSTOM_PROVIDER_URL_BYTES,
 };
 pub use failure::{
     AntigravityCreditParser, AntigravityCredits, ProviderParseError, ProviderQuota,

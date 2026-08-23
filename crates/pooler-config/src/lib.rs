@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use http::{uri::PathAndQuery, HeaderName, HeaderValue, Method};
 pub use pooler_core::{
-    BodyMode, Capability, CapabilitySet, ConfigGeneration, LossPolicy, RouteLimits, TargetId,
+    BodyMode, Capability, CapabilitySet, ConfigGeneration, LossPolicy, RouteLimits,
+    TargetBindingId, TargetId,
 };
 use pooler_protocol::{
     DEFAULT_JSON_PATCH_MAX_POINTER_BYTES, DEFAULT_JSON_PATCH_MAX_POINTER_DEPTH,
@@ -484,6 +485,8 @@ pub struct ModelTargetConfig {
     pub id: Option<TargetId>,
     /// Provider/upstream instance ID.
     pub provider: Option<String>,
+    /// Exactly one account or homogeneous account pool may be bound to this target.
+    pub account: Option<String>,
     /// Exactly one homogeneous account pool used by this target.
     pub account_pool: Option<String>,
     /// Lower positive values are higher priority tiers.
@@ -491,9 +494,9 @@ pub struct ModelTargetConfig {
     /// Model name sent to the upstream.
     pub upstream_model: Option<String>,
     /// Capabilities advertised by this target.
-    pub capabilities: Vec<String>,
+    pub capabilities: Option<Vec<String>>,
     /// Semantic codecs advertised by this target.
-    pub codecs: Vec<String>,
+    pub codecs: Option<Vec<String>>,
     /// Provider wire family used by this target.
     pub wire_family: Option<String>,
     /// Optional positive same-tier weight.
@@ -750,7 +753,7 @@ pub struct RetryConfig {
     /// Maximum distinct accounts used by one request.
     pub maximum_credentials: Option<u32>,
     /// Maximum distinct providers used by one request.
-    pub maximum_providers: Option<u32>,
+    pub maximum_upstreams: Option<u32>,
     /// Maximum wall time spent waiting between attempts.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub maximum_elapsed: Option<Duration>,
@@ -1568,13 +1571,12 @@ impl AccountPlan {
     }
 }
 
-/// Compatibility name for credential-oriented callers.
-pub type CredentialPlan = AccountPlan;
-
 /// Immutable account pool plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountPoolPlan {
     id: Arc<str>,
+    provider: Arc<str>,
+    strategy: SelectionStrategy,
     accounts: Vec<Arc<str>>,
     source: SourceLabel,
 }
@@ -1584,6 +1586,18 @@ impl AccountPoolPlan {
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Provider/upstream shared by every member of the pool.
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// Default account-selection strategy for this pool.
+    #[must_use]
+    pub const fn strategy(&self) -> SelectionStrategy {
+        self.strategy
     }
 
     /// Account IDs in deterministic selection order.
@@ -1676,8 +1690,6 @@ impl AffinityPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectionPlan {
     strategy: SelectionStrategy,
-    account_pool: Option<Arc<str>>,
-    accounts: Vec<Arc<str>>,
     affinity: Option<AffinityPlan>,
 }
 
@@ -1686,18 +1698,6 @@ impl SelectionPlan {
     #[must_use]
     pub const fn strategy(&self) -> SelectionStrategy {
         self.strategy
-    }
-
-    /// Referenced named account pool, if any.
-    #[must_use]
-    pub fn account_pool(&self) -> Option<&str> {
-        self.account_pool.as_deref()
-    }
-
-    /// Inline account IDs in declaration order.
-    #[must_use]
-    pub fn accounts(&self) -> &[Arc<str>] {
-        &self.accounts
     }
 
     /// Session-affinity plan, if enabled.
@@ -1712,7 +1712,7 @@ impl SelectionPlan {
 pub struct RetryPlan {
     maximum_attempts: u32,
     maximum_credentials: u32,
-    maximum_providers: u32,
+    maximum_upstreams: u32,
     maximum_elapsed: Option<Duration>,
     maximum_recovery_wait: Option<Duration>,
     base_delay: Duration,
@@ -1747,16 +1747,22 @@ impl RetryPlan {
         self.maximum_credentials
     }
 
-    /// Maximum distinct providers used by a request.
+    /// Maximum distinct upstreams used by a request.
+    #[must_use]
+    pub const fn maximum_upstreams(&self) -> u32 {
+        self.maximum_upstreams
+    }
+
+    /// Compatibility vocabulary for callers that call upstreams providers.
     #[must_use]
     pub const fn maximum_providers(&self) -> u32 {
-        self.maximum_providers
+        self.maximum_upstreams
     }
 
     /// Alias for callers using the shorter policy vocabulary.
     #[must_use]
     pub const fn max_providers(&self) -> u32 {
-        self.maximum_providers
+        self.maximum_upstreams
     }
 
     /// Maximum elapsed retry wait.
@@ -1920,6 +1926,132 @@ impl CooldownPlan {
     }
 }
 
+/// Immutable dashboard-managed routing constraints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutingPolicyPlan {
+    order: Vec<Arc<str>>,
+    allow: Vec<Arc<str>>,
+    deny: Vec<Arc<str>>,
+    allow_fallbacks: bool,
+    required_parameters: Vec<Arc<str>>,
+    required_capabilities: CapabilitySet,
+    minimum_context: Option<u64>,
+    quantization: Vec<Arc<str>>,
+    privacy: Option<Arc<str>>,
+    require_zdr: bool,
+    data_policy: Option<Arc<str>>,
+    max_price: Option<u64>,
+    preference: RoutingPreferencePlan,
+}
+
+impl RoutingPolicyPlan {
+    /// Explicit provider order used as the deterministic tie-breaker.
+    #[must_use]
+    pub fn order(&self) -> &[Arc<str>] {
+        &self.order
+    }
+
+    /// Provider allow-list.
+    #[must_use]
+    pub fn allow(&self) -> &[Arc<str>] {
+        &self.allow
+    }
+
+    /// Provider deny-list.
+    #[must_use]
+    pub fn deny(&self) -> &[Arc<str>] {
+        &self.deny
+    }
+
+    /// Whether lower-priority target tiers may be attempted.
+    #[must_use]
+    pub const fn allow_fallbacks(&self) -> bool {
+        self.allow_fallbacks
+    }
+
+    /// Hard request-parameter requirements.
+    #[must_use]
+    pub fn required_parameters(&self) -> &[Arc<str>] {
+        &self.required_parameters
+    }
+
+    /// Hard capability requirements.
+    #[must_use]
+    pub const fn required_capabilities(&self) -> CapabilitySet {
+        self.required_capabilities
+    }
+
+    /// Minimum verified context window.
+    #[must_use]
+    pub const fn minimum_context(&self) -> Option<u64> {
+        self.minimum_context
+    }
+
+    /// Hard quantization requirements.
+    #[must_use]
+    pub fn quantization(&self) -> &[Arc<str>] {
+        &self.quantization
+    }
+
+    /// Privacy/data-collection requirement.
+    #[must_use]
+    pub fn privacy(&self) -> Option<&str> {
+        self.privacy.as_deref()
+    }
+
+    /// Whether a verified zero-data-retention provider is required.
+    #[must_use]
+    pub const fn require_zdr(&self) -> bool {
+        self.require_zdr
+    }
+
+    /// Provider data-policy requirement.
+    #[must_use]
+    pub fn data_policy(&self) -> Option<&str> {
+        self.data_policy.as_deref()
+    }
+
+    /// Maximum verified price in micro-USD per million tokens.
+    #[must_use]
+    pub const fn max_price(&self) -> Option<u64> {
+        self.max_price
+    }
+
+    /// Soft ranking preferences.
+    #[must_use]
+    pub const fn preference(&self) -> &RoutingPreferencePlan {
+        &self.preference
+    }
+}
+
+/// Immutable soft routing preferences.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RoutingPreferencePlan {
+    price: bool,
+    latency: bool,
+    throughput: bool,
+}
+
+impl RoutingPreferencePlan {
+    /// Prefer lower verified price.
+    #[must_use]
+    pub const fn price(&self) -> bool {
+        self.price
+    }
+
+    /// Prefer lower verified latency.
+    #[must_use]
+    pub const fn latency(&self) -> bool {
+        self.latency
+    }
+
+    /// Prefer higher verified throughput.
+    #[must_use]
+    pub const fn throughput(&self) -> bool {
+        self.throughput
+    }
+}
+
 /// Immutable named policy plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyPlan {
@@ -1928,7 +2060,7 @@ pub struct PolicyPlan {
     retry: RetryPlan,
     stream: StreamPlan,
     cooldown: Option<CooldownPlan>,
-    account_pool: Option<Arc<str>>,
+    routing: RoutingPolicyPlan,
     source: SourceLabel,
 }
 
@@ -1963,10 +2095,10 @@ impl PolicyPlan {
         self.cooldown.as_ref()
     }
 
-    /// Named account pool, if configured.
+    /// Dashboard-managed target eligibility and ranking policy.
     #[must_use]
-    pub fn account_pool(&self) -> Option<&str> {
-        self.account_pool.as_deref()
+    pub const fn routing(&self) -> &RoutingPolicyPlan {
+        &self.routing
     }
 
     /// Source declaration label.
@@ -1979,17 +2111,60 @@ impl PolicyPlan {
 /// Immutable static target for a public model.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelTargetPlan {
+    id: TargetId,
+    binding_id: TargetBindingId,
     provider: Arc<str>,
+    account: Option<Arc<str>>,
+    account_pool: Option<Arc<str>>,
+    priority: u32,
+    weight: u32,
     upstream_model: Arc<str>,
     capabilities: CapabilitySet,
     codecs: Vec<Arc<str>>,
+    wire_family: Arc<str>,
 }
 
 impl ModelTargetPlan {
+    /// Stable target-binding identifier.
+    #[must_use]
+    pub const fn id(&self) -> &TargetId {
+        &self.id
+    }
+
+    /// Composite model/target identity used by affinity and health state.
+    #[must_use]
+    pub const fn binding_id(&self) -> &TargetBindingId {
+        &self.binding_id
+    }
+
     /// Upstream/provider ID.
     #[must_use]
     pub fn provider(&self) -> &str {
         &self.provider
+    }
+
+    /// Explicit single account used by this target, if any.
+    #[must_use]
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+
+    /// Homogeneous account pool used by this target, if any.
+    #[must_use]
+    pub fn account_pool(&self) -> Option<&str> {
+        self.account_pool.as_deref()
+    }
+
+    /// Lower values are higher-priority target tiers.
+    #[must_use]
+    pub const fn priority(&self) -> u32 {
+        self.priority
+    }
+
+    /// Positive same-tier selection weight.
+    #[must_use]
+    pub const fn weight(&self) -> u32 {
+        self.weight
     }
 
     /// Model name sent to the upstream.
@@ -2008,6 +2183,12 @@ impl ModelTargetPlan {
     #[must_use]
     pub fn codecs(&self) -> &[Arc<str>] {
         &self.codecs
+    }
+
+    /// Provider wire family declared for this target, if any.
+    #[must_use]
+    pub fn wire_family(&self) -> &str {
+        &self.wire_family
     }
 }
 
@@ -2831,12 +3012,6 @@ impl CompiledConfig {
         &self.accounts
     }
 
-    /// Compatibility alias for credential-oriented callers.
-    #[must_use]
-    pub const fn credentials(&self) -> &BTreeMap<Arc<str>, AccountPlan> {
-        &self.accounts
-    }
-
     /// Named account pool plans keyed by stable ID.
     #[must_use]
     pub const fn account_pools(&self) -> &BTreeMap<Arc<str>, AccountPoolPlan> {
@@ -2963,6 +3138,16 @@ pub enum ConfigError {
         /// Second declaration.
         second: Box<SourceLabel>,
     },
+    /// Duplicate stable model-target binding ID.
+    #[error("duplicate target {id} at {second}; first declaration is at {first}")]
+    DuplicateTarget {
+        /// Stable target ID.
+        id: String,
+        /// First declaration.
+        first: Box<SourceLabel>,
+        /// Second declaration.
+        second: Box<SourceLabel>,
+    },
     /// Indistinguishable routes at equal precedence.
     #[error("route conflict between `{first_route}` at {first} and `{second_route}` at {second}")]
     RouteConflict {
@@ -3049,8 +3234,8 @@ fn compile_config(
 
     let accounts = compile_accounts(config, source, &upstreams)?;
     let account_pools = compile_account_pools(config, source, &accounts)?;
-    let policies = compile_policies(config, source, &accounts, &account_pools)?;
-    let models = compile_models(config, source, &upstreams)?;
+    let policies = compile_policies(config, source, &upstreams)?;
+    let models = compile_models(config, source, &upstreams, &accounts, &account_pools)?;
     let catalog = compile_catalog(config.catalog.as_ref(), source, &upstreams, &accounts)?;
     let usage_price_book = match config.usage_price_book.as_ref() {
         Some(declaration) => {
@@ -3395,108 +3580,106 @@ fn compile_accounts(
     upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
 ) -> Result<BTreeMap<Arc<str>, AccountPlan>, ConfigError> {
     let mut accounts = BTreeMap::new();
-    for (declarations, collection) in [
-        (&config.accounts, "accounts"),
-        (&config.credentials, "credentials"),
-    ] {
-        for (id, declaration) in declarations {
-            let label = account_label(source, collection, id);
-            validate_id("account", id, &label)?;
-            if accounts.contains_key(id.as_str()) {
-                return Err(invalid(&label, "duplicate account declaration"));
-            }
-            let provider = declaration
-                .provider
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| invalid(&label, "account requires provider"))?;
-            if !upstreams.contains_key(provider) {
-                return Err(ConfigError::MissingReference {
-                    kind: "upstream",
-                    name: provider.to_owned(),
-                    label,
-                });
-            }
-            let upstream = &upstreams[provider];
-            let inferred_oauth = upstream.oauth().is_some()
-                || upstream
-                    .native()
-                    .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"));
-            let auth_kind = declaration.auth_kind.unwrap_or(if inferred_oauth {
-                AccountAuthKind::OAuth
-            } else {
-                AccountAuthKind::ApiKey
-            });
-            let secret = declaration.secret.as_ref();
-            if auth_kind == AccountAuthKind::ApiKey && secret.is_none() {
-                return Err(invalid(
-                    &label,
-                    "API-key account requires a secret reference",
-                ));
-            }
-            if secret.is_some_and(|secret| {
-                !matches!(
-                    secret,
-                    SecretRef::Env(_) | SecretRef::File(_) | SecretRef::Keyring { .. }
-                )
-            }) {
-                return Err(invalid(&label, "account secret reference is unsupported"));
-            }
-            if auth_kind == AccountAuthKind::OAuth
-                && upstream.oauth().is_none()
-                && upstream
-                    .native()
-                    .is_none_or(|native| !native.kind().eq_ignore_ascii_case("codex"))
-            {
-                return Err(invalid(
-                    &label,
-                    "OAuth account requires explicit upstream oauth configuration",
-                ));
-            }
-            if auth_kind == AccountAuthKind::ApiKey
-                && upstream
-                    .native()
-                    .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
-            {
-                return Err(invalid(
-                    &label,
-                    "API-key account cannot use the native Codex subscription upstream",
-                ));
-            }
-            let weight = declaration.weight.unwrap_or(1);
-            if weight == 0 {
-                return Err(invalid(&label, "account weight must be greater than zero"));
-            }
-            if declaration.max_concurrency == Some(0) {
-                return Err(invalid(
-                    &label,
-                    "account max_concurrency must be greater than zero",
-                ));
-            }
-            let quota_project = declaration
-                .quota_project
-                .as_deref()
-                .map(|value| {
-                    validate_id("quota project", value, &label)?;
-                    Ok::<Arc<str>, ConfigError>(Arc::from(value))
-                })
-                .transpose()?;
-            accounts.insert(
-                Arc::from(id.as_str()),
-                AccountPlan {
-                    id: Arc::from(id.as_str()),
-                    provider: Arc::from(provider),
-                    secret: secret.cloned(),
-                    auth_kind,
-                    enabled: declaration.enabled.unwrap_or(true),
-                    weight,
-                    max_concurrency: declaration.max_concurrency,
-                    quota_project,
-                    source: label,
-                },
-            );
+    for (id, declaration) in &config.accounts {
+        let label = account_label(source, "accounts", id);
+        validate_id("account", id, &label)?;
+        if accounts.contains_key(id.as_str()) {
+            return Err(invalid(&label, "duplicate account declaration"));
         }
+        let provider = declaration
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid(&label, "account requires provider"))?;
+        if !upstreams.contains_key(provider) {
+            return Err(ConfigError::MissingReference {
+                kind: "upstream",
+                name: provider.to_owned(),
+                label,
+            });
+        }
+        let upstream = &upstreams[provider];
+        let inferred_oauth = upstream.oauth().is_some()
+            || upstream
+                .native()
+                .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"));
+        let auth_kind = declaration.auth_kind.unwrap_or(if inferred_oauth {
+            AccountAuthKind::OAuth
+        } else {
+            AccountAuthKind::ApiKey
+        });
+        let secret = declaration.secret.as_ref();
+        if auth_kind == AccountAuthKind::ApiKey && secret.is_none() {
+            return Err(invalid(
+                &label,
+                "API-key account requires a secret reference",
+            ));
+        }
+        if secret.is_some_and(|secret| {
+            !matches!(
+                secret,
+                SecretRef::Env(_)
+                    | SecretRef::File(_)
+                    | SecretRef::Keyring { .. }
+                    | SecretRef::Managed(_)
+            )
+        }) {
+            return Err(invalid(&label, "account secret reference is unsupported"));
+        }
+        if auth_kind == AccountAuthKind::OAuth
+            && upstream.oauth().is_none()
+            && upstream
+                .native()
+                .is_none_or(|native| !native.kind().eq_ignore_ascii_case("codex"))
+        {
+            return Err(invalid(
+                &label,
+                "OAuth account requires explicit upstream oauth configuration",
+            ));
+        }
+        if auth_kind == AccountAuthKind::ApiKey
+            && upstream
+                .native()
+                .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+        {
+            return Err(invalid(
+                &label,
+                "API-key account cannot use the native Codex subscription upstream",
+            ));
+        }
+        let weight = declaration.weight.unwrap_or(1);
+        if weight == 0 {
+            return Err(invalid(&label, "account weight must be greater than zero"));
+        }
+        if declaration.max_concurrency == Some(0) {
+            return Err(invalid(
+                &label,
+                "account max_concurrency must be greater than zero",
+            ));
+        }
+        let quota_project = declaration
+            .quota_project
+            .as_deref()
+            .map(|value| {
+                validate_id("quota project", value, &label)?;
+                Ok::<Arc<str>, ConfigError>(Arc::from(value))
+            })
+            .transpose()?;
+        accounts.insert(
+            Arc::from(id.as_str()),
+            AccountPlan {
+                id: Arc::from(id.as_str()),
+                provider: Arc::from(provider),
+                secret: secret.cloned(),
+                auth_kind,
+                enabled: declaration.enabled.unwrap_or(true),
+                weight,
+                max_concurrency: declaration.max_concurrency,
+                quota_project,
+                source: label,
+            },
+        );
     }
     Ok(accounts)
 }
@@ -3518,6 +3701,7 @@ fn compile_account_pools(
         }
         let mut members = Vec::with_capacity(declaration.accounts.len());
         let mut seen = BTreeSet::new();
+        let mut member_provider: Option<&str> = None;
         for account in &declaration.accounts {
             let account = account.trim();
             if account.is_empty() || !seen.insert(account.to_owned()) {
@@ -3526,19 +3710,55 @@ fn compile_account_pools(
                     "account pool contains an empty or duplicate account ID",
                 ));
             }
-            if !accounts.contains_key(account) {
+            let Some(account_plan) = accounts.get(account) else {
                 return Err(ConfigError::MissingReference {
                     kind: "account",
                     name: account.to_owned(),
                     label: label.clone(),
                 });
+            };
+            if let Some(provider) = member_provider {
+                if provider != account_plan.provider() {
+                    return Err(invalid(
+                        &label,
+                        "account pool members must belong to one provider",
+                    ));
+                }
+            } else {
+                member_provider = Some(account_plan.provider());
             }
             members.push(Arc::from(account.to_owned()));
         }
+        let declared_provider = declaration
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let provider =
+            declared_provider.ok_or_else(|| invalid(&label, "account pool requires provider"))?;
+        if member_provider.is_some_and(|member| member != provider) {
+            return Err(invalid(
+                &label,
+                "account pool provider must match every member account",
+            ));
+        }
+        let strategy = declaration
+            .strategy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                SelectionStrategy::parse(value)
+                    .ok_or_else(|| invalid(&label, "account pool strategy is unknown"))
+            })
+            .transpose()?
+            .unwrap_or(SelectionStrategy::OrderedFallback);
         pools.insert(
             Arc::from(id.as_str()),
             AccountPoolPlan {
                 id: Arc::from(id.as_str()),
+                provider: Arc::from(provider),
+                strategy,
                 accounts: members,
                 source: label,
             },
@@ -3550,23 +3770,17 @@ fn compile_account_pools(
 fn compile_policies(
     config: &Config,
     source: &Source,
-    accounts: &BTreeMap<Arc<str>, AccountPlan>,
-    pools: &BTreeMap<Arc<str>, AccountPoolPlan>,
+    upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
 ) -> Result<BTreeMap<Arc<str>, PolicyPlan>, ConfigError> {
     let mut policies = BTreeMap::new();
     for (id, declaration) in &config.policies {
         let label = policy_label(source, id);
         validate_id("policy", id, &label)?;
-        let (selection, selection_pool) = compile_selection(
-            declaration.selection.as_ref(),
-            declaration.account_pool.as_deref(),
-            accounts,
-            pools,
-            &label,
-        )?;
+        let selection = compile_selection(declaration.selection.as_ref(), &label)?;
         let retry = compile_retry(declaration.retry.as_ref(), &label)?;
         let stream = compile_stream(declaration.stream.as_ref(), &label)?;
         let cooldown = compile_cooldown(declaration.cooldown.as_ref(), &label)?;
+        let routing = compile_routing(declaration.routing.as_ref(), upstreams, &label)?;
         policies.insert(
             Arc::from(id.as_str()),
             PolicyPlan {
@@ -3575,7 +3789,7 @@ fn compile_policies(
                 retry,
                 stream,
                 cooldown,
-                account_pool: selection_pool,
+                routing,
                 source: label,
             },
         );
@@ -3585,11 +3799,8 @@ fn compile_policies(
 
 fn compile_selection(
     declaration: Option<&SelectionConfig>,
-    policy_pool: Option<&str>,
-    accounts: &BTreeMap<Arc<str>, AccountPlan>,
-    pools: &BTreeMap<Arc<str>, AccountPoolPlan>,
     label: &SourceLabel,
-) -> Result<(SelectionPlan, Option<Arc<str>>), ConfigError> {
+) -> Result<SelectionPlan, ConfigError> {
     let selection_is_explicit = declaration.is_some();
     let declaration = declaration.cloned().unwrap_or_default();
     let strategy = match declaration.strategy.as_deref().map(str::trim) {
@@ -3605,64 +3816,131 @@ fn compile_selection(
         }
         None => SelectionStrategy::OrderedFallback,
     };
-    let nested_pool = declaration
-        .account_pool
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let policy_pool = policy_pool.map(str::trim).filter(|v| !v.is_empty());
-    if nested_pool.is_some() && policy_pool.is_some() {
+    let affinity = compile_affinity(&declaration, label)?;
+    Ok(SelectionPlan {
+        strategy,
+        affinity,
+    })
+}
+
+fn compile_routing(
+    declaration: Option<&RoutingPolicyConfig>,
+    upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
+    label: &SourceLabel,
+) -> Result<RoutingPolicyPlan, ConfigError> {
+    let declaration = declaration.cloned().unwrap_or_default();
+    let compile_provider_list = |values: &[String], field: &str| {
+        let mut compiled = Vec::with_capacity(values.len());
+        let mut seen = BTreeSet::new();
+        for value in values {
+            let value = value.trim();
+            validate_id(field, value, label)?;
+            if !upstreams.contains_key(value) {
+                return Err(ConfigError::MissingReference {
+                    kind: "upstream",
+                    name: value.to_owned(),
+                    label: label.clone(),
+                });
+            }
+            if !seen.insert(value.to_owned()) {
+                return Err(invalid(label, &format!("{field} entries must be unique")));
+            }
+            compiled.push(Arc::from(value.to_owned()));
+        }
+        Ok::<Vec<Arc<str>>, ConfigError>(compiled)
+    };
+    let order = compile_provider_list(&declaration.order, "routing provider")?;
+    let allow = compile_provider_list(&declaration.allow, "routing provider")?;
+    let deny = compile_provider_list(&declaration.deny, "routing provider")?;
+    if allow.iter().any(|provider| deny.contains(provider)) {
         return Err(invalid(
             label,
-            "selection.account_pool and policy.account_pool cannot both be set",
+            "routing allow and deny lists must not overlap",
         ));
     }
-    let pool = nested_pool.or(policy_pool);
-    if let Some(pool) = pool {
-        if !pools.contains_key(pool) {
-            return Err(ConfigError::MissingReference {
-                kind: "account pool",
-                name: pool.to_owned(),
-                label: label.clone(),
-            });
-        }
+    let required_parameters = compile_routing_values(
+        &declaration.required_parameters,
+        label,
+        "routing required_parameters",
+    )?;
+    let quantization =
+        compile_routing_values(&declaration.quantization, label, "routing quantization")?;
+    let required_capabilities = compile_capabilities(&declaration.required_capabilities, label)?;
+    if declaration.minimum_context == Some(0) {
+        return Err(invalid(
+            label,
+            "routing minimum_context must be greater than zero",
+        ));
     }
-    let mut inline_accounts = Vec::with_capacity(declaration.accounts.len());
+    let privacy =
+        compile_optional_routing_value(declaration.privacy.as_deref(), label, "routing privacy")?;
+    let data_policy = compile_optional_routing_value(
+        declaration.data_policy.as_deref(),
+        label,
+        "routing data_policy",
+    )?;
+    let preference = declaration.preference.unwrap_or_default();
+    Ok(RoutingPolicyPlan {
+        order,
+        allow,
+        deny,
+        allow_fallbacks: declaration.allow_fallbacks.unwrap_or(true),
+        required_parameters,
+        required_capabilities,
+        minimum_context: declaration.minimum_context,
+        quantization,
+        privacy,
+        require_zdr: declaration.require_zdr.unwrap_or(false),
+        data_policy,
+        max_price: declaration.max_price,
+        preference: RoutingPreferencePlan {
+            price: preference.price.unwrap_or(false),
+            latency: preference.latency.unwrap_or(false),
+            throughput: preference.throughput.unwrap_or(false),
+        },
+    })
+}
+
+fn compile_routing_values(
+    values: &[String],
+    label: &SourceLabel,
+    field: &str,
+) -> Result<Vec<Arc<str>>, ConfigError> {
+    let mut compiled = Vec::with_capacity(values.len());
     let mut seen = BTreeSet::new();
-    for account in &declaration.accounts {
-        let account = account.trim();
-        if account.is_empty() || !seen.insert(account.to_owned()) {
+    for value in values {
+        let value = value.trim();
+        if value.is_empty()
+            || value.chars().any(char::is_control)
+            || value.chars().any(char::is_whitespace)
+        {
             return Err(invalid(
                 label,
-                "selection accounts must be non-empty and unique",
+                &format!("{field} entries must be non-empty and contain no whitespace"),
             ));
         }
-        if !accounts.contains_key(account) {
-            return Err(ConfigError::MissingReference {
-                kind: "account",
-                name: account.to_owned(),
-                label: label.clone(),
-            });
+        if !seen.insert(value.to_owned()) {
+            return Err(invalid(label, &format!("{field} entries must be unique")));
         }
-        inline_accounts.push(Arc::from(account.to_owned()));
+        compiled.push(Arc::from(value.to_owned()));
     }
-    if pool.is_some() && !inline_accounts.is_empty() {
-        return Err(invalid(
-            label,
-            "selection cannot combine account_pool with inline accounts",
-        ));
-    }
-    let affinity = compile_affinity(&declaration, label)?;
-    let pool = pool.map(Arc::from);
-    Ok((
-        SelectionPlan {
-            strategy,
-            account_pool: pool.clone(),
-            accounts: inline_accounts,
-            affinity,
-        },
-        pool,
-    ))
+    Ok(compiled)
+}
+
+fn compile_optional_routing_value(
+    value: Option<&str>,
+    label: &SourceLabel,
+    field: &str,
+) -> Result<Option<Arc<str>>, ConfigError> {
+    value
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() || value.chars().any(char::is_control) {
+                return Err(invalid(label, &format!("{field} must not be empty")));
+            }
+            Ok(Arc::from(value.to_owned()))
+        })
+        .transpose()
 }
 
 fn compile_affinity(
@@ -3777,17 +4055,17 @@ fn compile_retry(
         return Err(invalid(label, "retry before_commit_only must be true"));
     }
     let maximum_credentials = declaration.maximum_credentials.unwrap_or(1);
-    let maximum_providers = declaration.maximum_providers.unwrap_or(maximum_attempts);
+    let maximum_upstreams = declaration.maximum_upstreams.unwrap_or(maximum_attempts);
     if maximum_credentials == 0 || maximum_credentials > maximum_attempts {
         return Err(invalid(
             label,
             "retry maximum_credentials must be between one and maximum_attempts",
         ));
     }
-    if maximum_providers == 0 || maximum_providers > maximum_attempts {
+    if maximum_upstreams == 0 || maximum_upstreams > maximum_attempts {
         return Err(invalid(
             label,
-            "retry maximum_providers must be between one and maximum_attempts",
+            "retry maximum_upstreams must be between one and maximum_attempts",
         ));
     }
     let base_delay = declaration.base_delay.unwrap_or(DEFAULT_RETRY_BASE_DELAY);
@@ -3827,7 +4105,7 @@ fn compile_retry(
     Ok(RetryPlan {
         maximum_attempts,
         maximum_credentials,
-        maximum_providers,
+        maximum_upstreams,
         maximum_elapsed: declaration
             .maximum_elapsed
             .or(Some(DEFAULT_RETRY_TOTAL_DELAY)),
@@ -4360,9 +4638,12 @@ fn compile_models(
     config: &Config,
     source: &Source,
     upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
+    accounts: &BTreeMap<Arc<str>, AccountPlan>,
+    account_pools: &BTreeMap<Arc<str>, AccountPoolPlan>,
 ) -> Result<BTreeMap<Arc<str>, ModelPlan>, ConfigError> {
     let mut models = BTreeMap::new();
     let mut model_labels = BTreeMap::new();
+    let mut target_ids = BTreeMap::new();
     for (ordinal, declaration) in config.models.iter().enumerate() {
         let label = model_label(source, ordinal, &declaration.id);
         validate_id("model", &declaration.id, &label)?;
@@ -4379,6 +4660,24 @@ fn compile_models(
         let mut targets = Vec::with_capacity(declaration.targets.len());
         for (target_ordinal, target) in declaration.targets.iter().enumerate() {
             let target_label = model_target_label(source, ordinal, target_ordinal, &declaration.id);
+            let target_id = match target.id.clone() {
+                Some(target_id) => {
+                    validate_id("target", target_id.as_str(), &target_label)?;
+                    target_id
+                }
+                None => {
+                    return Err(invalid(&target_label, "model target requires stable id"));
+                }
+            };
+            if let Some(first) =
+                target_ids.insert(target_id.as_str().to_owned(), target_label.clone())
+            {
+                return Err(ConfigError::DuplicateTarget {
+                    id: target_id.as_str().to_owned(),
+                    first: Box::new(first),
+                    second: Box::new(target_label),
+                });
+            }
             let provider = target
                 .provider
                 .as_deref()
@@ -4392,19 +4691,112 @@ fn compile_models(
                     label: target_label,
                 });
             }
+            let account = target
+                .account
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let account_pool = target
+                .account_pool
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if account.is_some() == account_pool.is_some() {
+                return Err(invalid(
+                    &target_label,
+                    "model target requires exactly one of account or account_pool",
+                ));
+            }
+            if let Some(account) = account {
+                let account_plan =
+                    accounts
+                        .get(account)
+                        .ok_or_else(|| ConfigError::MissingReference {
+                            kind: "account",
+                            name: account.to_owned(),
+                            label: target_label.clone(),
+                        })?;
+                if account_plan.provider() != provider {
+                    return Err(invalid(
+                        &target_label,
+                        "model target account provider does not match target provider",
+                    ));
+                }
+            }
+            if let Some(account_pool) = account_pool {
+                let pool = account_pools.get(account_pool).ok_or_else(|| {
+                    ConfigError::MissingReference {
+                        kind: "account pool",
+                        name: account_pool.to_owned(),
+                        label: target_label.clone(),
+                    }
+                })?;
+                if pool.provider() != provider {
+                    return Err(invalid(
+                        &target_label,
+                        "model target account pool provider does not match target provider",
+                    ));
+                }
+            }
+            let priority = target
+                .priority
+                .ok_or_else(|| invalid(&target_label, "model target requires priority"))?;
+            if priority == 0 {
+                return Err(invalid(
+                    &target_label,
+                    "model target priority must be greater than zero",
+                ));
+            }
+            let weight = target.weight.unwrap_or(1);
+            if weight == 0 {
+                return Err(invalid(
+                    &target_label,
+                    "model target weight must be greater than zero",
+                ));
+            }
             let upstream_model = target
                 .upstream_model
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| invalid(&target_label, "model target requires upstream_model"))?;
-            let capabilities = compile_capabilities(&target.capabilities, &target_label)?;
-            let codecs = compile_codecs(&target.codecs, &target_label)?;
+            let capabilities = compile_capabilities(
+                target.capabilities.as_deref().ok_or_else(|| {
+                    invalid(&target_label, "model target requires capabilities")
+                })?,
+                &target_label,
+            )?;
+            let codecs = compile_codecs(
+                target
+                    .codecs
+                    .as_deref()
+                    .ok_or_else(|| invalid(&target_label, "model target requires codecs"))?,
+                &target_label,
+            )?;
+            let wire_family = target
+                .wire_family
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid(&target_label, "model target requires wire_family"))
+                .and_then(|value| {
+                    validate_component_id(value, &target_label, "model target wire_family")?;
+                    Ok::<Arc<str>, ConfigError>(Arc::from(value))
+                })?;
+            let binding_id = TargetBindingId::new(declaration.id.clone(), target_id.as_str())
+                .map_err(|_| invalid(&target_label, "target binding identity is invalid"))?;
             targets.push(ModelTargetPlan {
+                id: target_id,
+                binding_id,
                 provider: Arc::from(provider),
+                account: account.map(Arc::from),
+                account_pool: account_pool.map(Arc::from),
+                priority,
+                weight,
                 upstream_model: Arc::from(upstream_model),
                 capabilities,
                 codecs,
+                wire_family,
             });
         }
         models.insert(
@@ -4430,7 +4822,7 @@ struct CatalogSourceRuntime {
 
 fn catalog_parser_kind(value: &str) -> Result<CatalogParserKind, &'static str> {
     match value {
-        "openai" | "open_ai" => Ok(CatalogParserKind::OpenAi),
+        "openai" => Ok(CatalogParserKind::OpenAi),
         "kimi" => Ok(CatalogParserKind::Kimi),
         "gemini" => Ok(CatalogParserKind::Gemini),
         "vertex" => Ok(CatalogParserKind::Vertex),
@@ -4939,11 +5331,11 @@ fn compile_auth(
     }
     if !matches!(
         secret,
-        SecretRef::Env(_) | SecretRef::File(_) | SecretRef::Keyring { .. }
+        SecretRef::Env(_) | SecretRef::File(_) | SecretRef::Keyring { .. } | SecretRef::Managed(_)
     ) {
         return Err(invalid(
             label,
-            "auth secrets must use an env:, file:, or keyring: reference",
+            "auth secrets must use an env:, file:, keyring:, or managed: reference",
         ));
     }
     let header = compile_auth_header(auth, &kind, label)?;
@@ -6093,7 +6485,7 @@ mod tests {
     use super::*;
 
     const CONFIG: &str = r#"
-version: 1
+version: 2
 listeners:
   local:
     bind: 127.0.0.1:8400
@@ -6134,7 +6526,7 @@ routes:
     #[test]
     fn detects_equal_precedence_conflicts_with_both_labels() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6157,7 +6549,7 @@ routes:
     #[test]
     fn websocket_validation_uses_explicit_transport_upstream() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams:
   model: {url: http://127.0.0.1:8319}
@@ -6187,7 +6579,7 @@ routes:
     #[test]
     fn wildcard_content_types_conflict_when_their_runtime_sets_overlap() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6210,7 +6602,7 @@ routes:
     #[test]
     fn parser_preserves_supported_content_type_wildcards() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6233,7 +6625,7 @@ routes:
     #[test]
     fn content_type_tokens_accept_all_rfc_tchar_punctuation() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6248,7 +6640,7 @@ routes:
     #[test]
     fn rejects_wildcards_with_a_specific_subtype() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6267,7 +6659,7 @@ routes:
     #[test]
     fn host_matchers_are_canonicalized_and_conflict_like_runtime_authority_matching() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6296,7 +6688,7 @@ routes:
     #[test]
     fn precedence_is_exact_then_headers_then_priority_then_order() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6322,14 +6714,14 @@ routes:
 
     #[test]
     fn rejects_literal_secret_without_echoing_it() {
-        let text = "version: 1\nupstreams:\n  x:\n    url: http://127.0.0.1:1\n    auth: {secret: literal:never-print}\n";
+        let text = "version: 2\nupstreams:\n  x:\n    url: http://127.0.0.1:1\n    auth: {secret: literal:never-print}\n";
         let error = parse_yaml("secret.yaml", text).expect_err("literal");
         assert!(!error.to_string().contains("never-print"));
     }
 
     #[test]
     fn reports_missing_listener_or_upstream() {
-        let text = "version: 1\nlisteners: {local: {bind: 127.0.0.1:8400}}\nroutes: [{id: x, listen: local, target: absent}]\n";
+        let text = "version: 2\nlisteners: {local: {bind: 127.0.0.1:8400}}\nroutes: [{id: x, listen: local, target: absent}]\n";
         let error = compile_yaml("missing.yaml", text).expect_err("missing upstream");
         assert!(matches!(
             error,
@@ -6342,19 +6734,19 @@ routes:
 
     #[test]
     fn rejects_invalid_version_and_bind() {
-        let version = parse_yaml("version.yaml", "version: 2\n").expect_err("version");
+        let version = parse_yaml("version.yaml", "version: 3\n").expect_err("version");
         assert!(version.to_string().contains("version.yaml (version)"));
         let quoted =
-            parse_yaml("quoted.yaml", "{\"version\": 2, \"routes\": []}\n").expect_err("version");
+            parse_yaml("quoted.yaml", "{\"version\": 3, \"routes\": []}\n").expect_err("version");
         assert!(quoted.to_string().contains("quoted.yaml (version)"));
-        let text = "version: 1\nlisteners: {local: {bind: invalid}}\n";
+        let text = "version: 2\nlisteners: {local: {bind: invalid}}\n";
         let bind = compile_yaml("bind.yaml", text).expect_err("bind");
         assert!(bind.to_string().contains("bind.yaml"));
     }
 
     #[test]
     fn supports_provider_alias_and_modes() {
-        let text = "version: 1\nlisteners: {l: {bind: 127.0.0.1:1}}\nproviders: {p: {url: http://127.0.0.1:2}}\nroutes: [{id: r, listen: l, ingress: {mode: semantic}, loss_policy: degrade, target: {provider: p}}]\n";
+        let text = "version: 2\nlisteners: {l: {bind: 127.0.0.1:1}}\nupstreams: {p: {url: http://127.0.0.1:2}}\nroutes: [{id: r, listen: l, ingress: {mode: semantic}, loss_policy: degrade, target: {provider: p}}]\n";
         let compiled = compile_yaml("alias.yaml", text).expect("alias");
         assert_eq!(compiled.routes()[0].ingress().mode(), BodyMode::Semantic);
         assert_eq!(compiled.routes()[0].loss_policy(), LossPolicy::Degrade);
@@ -6364,7 +6756,7 @@ routes:
     fn a_known_provider_supplies_a_base_url_the_operator_did_not_write() {
         let upstream = |body: &str| {
             format!(
-                "version: 1\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{{body}}}}}\n"
+                "version: 2\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{{body}}}}}\n"
             )
         };
 
@@ -6448,7 +6840,7 @@ routes:
     #[test]
     fn an_operator_can_withhold_and_reshape_discovered_models() {
         let text = "\
-version: 1
+version: 2
 listeners: {l: {bind: 127.0.0.1:1}}
 upstreams: {openai: {known_provider: openai}}
 catalog:
@@ -6507,7 +6899,7 @@ catalog:
     #[test]
     fn a_pinned_request_field_requires_a_json_pointer() {
         let text = "\
-version: 1
+version: 2
 listeners: {l: {bind: 127.0.0.1:1}}
 upstreams: {openai: {known_provider: openai}}
 catalog:
@@ -6531,7 +6923,7 @@ catalog:
     #[test]
     fn an_override_that_declares_no_change_is_rejected() {
         let text = "\
-version: 1
+version: 2
 listeners: {l: {bind: 127.0.0.1:1}}
 upstreams: {openai: {known_provider: openai}}
 catalog:
@@ -6558,7 +6950,7 @@ catalog:
         // about each other.
         for (id, provider) in ProviderCatalog::builtin().iter() {
             let text = format!(
-                "version: 1\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{known_provider: {id}}}}}\n"
+                "version: 2\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{known_provider: {id}}}}}\n"
             );
             let compiled = compile_yaml("shipped-providers.yaml", &text)
                 .unwrap_or_else(|error| panic!("`{id}` must compile: {error}"));
@@ -6579,7 +6971,7 @@ catalog:
     fn a_credential_header_and_prefix_belong_only_to_the_header_auth_kind() {
         let upstream = |auth: &str| {
             format!(
-                "version: 1\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{url: http://127.0.0.1:2, auth: {auth}}}}}\n"
+                "version: 2\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{url: http://127.0.0.1:2, auth: {auth}}}}}\n"
             )
         };
 
@@ -6627,7 +7019,7 @@ catalog:
     fn upstream_query_parameters_compile_in_order_and_reject_delimiters() {
         let upstream = |query: &str| {
             format!(
-                "version: 1\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{url: http://127.0.0.1:2, query: {query}}}}}\n"
+                "version: 2\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{u: {{url: http://127.0.0.1:2, query: {query}}}}}\n"
             )
         };
 
@@ -6660,7 +7052,7 @@ catalog:
     fn loss_policy_defaults_by_ingress_mode_and_stays_out_of_opaque_routes() {
         let route = |mode: &str, declared: &str| {
             format!(
-                "version: 1\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{p: {{url: http://127.0.0.1:2}}}}\nroutes: [{{id: r, listen: l, ingress: {{mode: {mode}}}, target: {{provider: p}}{declared}}}]\n"
+                "version: 2\nlisteners: {{l: {{bind: 127.0.0.1:1}}}}\nupstreams: {{p: {{url: http://127.0.0.1:2}}}}\nroutes: [{{id: r, listen: l, ingress: {{mode: {mode}}}, target: {{provider: p}}{declared}}}]\n"
             )
         };
 
@@ -6696,7 +7088,7 @@ catalog:
     #[test]
     fn validates_devin_connect_route_framing_as_ingress_schema() {
         let text = r#"
-version: 1
+version: 2
 listeners: {devin: {bind: 127.0.0.1:18473}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6727,7 +7119,7 @@ routes:
     #[test]
     fn rejects_framing_outside_semantic_ingress() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6742,7 +7134,7 @@ routes:
             .contains("ingress framing requires semantic mode"));
 
         let response = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -6760,7 +7152,7 @@ routes:
 
     #[test]
     fn rejects_unknown_body_schema_fields() {
-        let text = "version: 1\nroutes: [{id: route, ingress: {mode: semantic, framng: decode.connect.envelope}}]\n";
+        let text = "version: 2\nroutes: [{id: route, ingress: {mode: semantic, framng: decode.connect.envelope}}]\n";
         let error = parse_yaml("unknown-body-field.yaml", text).expect_err("unknown body field");
         let rendered = error.to_string();
         assert!(rendered.contains("unknown field"));
@@ -6771,7 +7163,7 @@ routes:
     fn cache_is_disabled_by_default_and_compiles_strict_bounds() {
         let default = compile_yaml(
             "cache-default.yaml",
-            "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\nupstreams: {local: {url: http://127.0.0.1:2}}\nroutes: [{id: route, listen: local, ingress: {mode: patch}, target: local}]\n",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:1}}\nupstreams: {local: {url: http://127.0.0.1:2}}\nroutes: [{id: route, listen: local, ingress: {mode: patch}, target: local}]\n",
         )
         .expect("default cache config");
         assert!(default.routes()[0].cache().is_none());
@@ -6779,7 +7171,7 @@ routes:
         let enabled = compile_yaml(
             "cache-enabled.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:2}}
 routes:
@@ -6816,7 +7208,7 @@ routes:
     #[test]
     fn cache_rejects_unbounded_or_sensitive_settings() {
         let sensitive = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:2}}
 routes:
@@ -6830,7 +7222,7 @@ routes:
         assert!(error.to_string().contains("sensitive header"));
 
         let too_large = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:2}}
 routes:
@@ -6844,7 +7236,7 @@ routes:
         assert!(error.to_string().contains("64 MiB"));
 
         let opaque = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:2}}
 routes:
@@ -6857,7 +7249,7 @@ routes:
         assert!(compiled.routes()[0].cache().is_some());
 
         let policy = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:2}}
 policies:
@@ -6877,7 +7269,7 @@ routes:
     #[test]
     fn cache_rejects_semantic_and_policy_selection_routes() {
         let semantic = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:2}}
 routes:
@@ -6891,7 +7283,7 @@ routes:
         assert!(error.to_string().contains("semantic ingress mode"));
 
         let policy = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:2}}
 policies:
@@ -6908,7 +7300,7 @@ routes:
 
     #[test]
     fn rejects_misspelled_match_method_field() {
-        let text = "version: 1\nroutes:\n  - id: r\n    match: {methd: POST}\n";
+        let text = "version: 2\nroutes:\n  - id: r\n    match: {methd: POST}\n";
         let error = parse_yaml("unknown-field.yaml", text).expect_err("unknown field");
         let rendered = error.to_string();
         assert!(rendered.contains("unknown field"));
@@ -6917,7 +7309,7 @@ routes:
 
     #[test]
     fn provider_alias_invalid_url_reports_source_and_yaml_path() {
-        let text = "version: 1\nlisteners: {local: {bind: 127.0.0.1:8400}}\nproviders:\n  local:\n    url: not-a-url\nroutes: []\n";
+        let text = "version: 2\nlisteners: {local: {bind: 127.0.0.1:8400}}\nupstreams:\n  local:\n    url: not-a-url\nroutes: []\n";
         let error = compile_yaml("provider-alias.yaml", text).expect_err("invalid URL");
         let rendered = error.to_string();
         assert!(rendered.contains("provider-alias.yaml (upstreams.local)"));
@@ -6925,14 +7317,14 @@ routes:
 
     #[test]
     fn flow_style_provider_avoids_fabricated_coordinates() {
-        let text = "version: 1\nlisteners: {local: {bind: 127.0.0.1:8400}}\nproviders: {local: {url: not-a-url}}\nroutes: []\n";
+        let text = "version: 2\nlisteners: {local: {bind: 127.0.0.1:8400}}\nupstreams: {local: {url: not-a-url}}\nroutes: []\n";
         let error = compile_yaml("flow.yaml", text).expect_err("invalid URL");
         assert!(error.to_string().contains("flow.yaml (upstreams.local)"));
     }
 
     #[test]
     fn quoted_flow_style_provider_avoids_fabricated_coordinates() {
-        let text = "version: 1\nlisteners: {local: {bind: 127.0.0.1:8400}}\nproviders: {\"local\": {url: not-a-url}}\nroutes: []\n";
+        let text = "version: 2\nlisteners: {local: {bind: 127.0.0.1:8400}}\nupstreams: {\"local\": {url: not-a-url}}\nroutes: []\n";
         let error = compile_yaml("quoted-flow.yaml", text).expect_err("invalid URL");
         assert!(error
             .to_string()
@@ -6940,8 +7332,8 @@ routes:
     }
 
     #[test]
-    fn quoted_provider_alias_uses_canonical_path() {
-        let text = "version: 1\n\"providers\": {local: {url: not-a-url}}\nroutes: []\n";
+    fn quoted_upstream_uses_canonical_path() {
+        let text = "version: 2\n\"upstreams\": {local: {url: not-a-url}}\nroutes: []\n";
         let error = compile_yaml("quoted-section.yaml", text).expect_err("invalid URL");
         assert!(error
             .to_string()
@@ -6950,23 +7342,23 @@ routes:
 
     #[test]
     fn later_provider_reports_its_own_yaml_path() {
-        let text = "version: 1\nproviders:\n  alpha:\n    url: http://127.0.0.1:1\n  beta:\n    url: not-a-url\nroutes: []\n";
+        let text = "version: 2\nupstreams:\n  alpha:\n    url: http://127.0.0.1:1\n  beta:\n    url: not-a-url\nroutes: []\n";
         let error = compile_yaml("multiple.yaml", text).expect_err("invalid URL");
         assert!(error.to_string().contains("multiple.yaml (upstreams.beta)"));
     }
 
     #[test]
     fn non_loopback_routes_require_downstream_authentication() {
-        let without_auth = "version: 1\nlisteners: {remote: {bind: 0.0.0.0:8400}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes: [{id: r, listen: remote, target: local}]\n";
+        let without_auth = "version: 2\nlisteners: {remote: {bind: 0.0.0.0:8400}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes: [{id: r, listen: remote, target: local}]\n";
         let error = compile_yaml("remote.yaml", without_auth).expect_err("auth required");
         assert!(error
             .to_string()
             .contains("require downstream authentication"));
 
-        let with_auth = "version: 1\nlisteners: {remote: {bind: 0.0.0.0:8400}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes: [{id: r, listen: remote, downstream_auth: {secret: env:POOLER_DOWNSTREAM_KEY}, target: local}]\n";
+        let with_auth = "version: 2\nlisteners: {remote: {bind: 0.0.0.0:8400}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes: [{id: r, listen: remote, downstream_auth: {secret: env:POOLER_DOWNSTREAM_KEY}, target: local}]\n";
         compile_yaml("remote-auth.yaml", with_auth).expect("authenticated remote route");
 
-        let unix_without_auth = "version: 1\nlisteners: {local: {bind: /tmp/pooler.sock}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes: [{id: r, listen: local, target: local}]\n";
+        let unix_without_auth = "version: 2\nlisteners: {local: {bind: /tmp/pooler.sock}}\nupstreams: {local: {url: http://127.0.0.1:1}}\nroutes: [{id: r, listen: local, target: local}]\n";
         let error = compile_yaml("unix.yaml", unix_without_auth).expect_err("Unix auth required");
         assert!(error
             .to_string()
@@ -6975,13 +7367,13 @@ routes:
 
     #[test]
     fn management_is_disabled_by_default_and_compiles_loopback_plan() {
-        let disabled = compile_yaml("management-disabled.yaml", "version: 1\n")
+        let disabled = compile_yaml("management-disabled.yaml", "version: 2\n")
             .expect("minimal config compiles");
         assert!(disabled.management().is_none());
 
         let enabled = compile_yaml(
             "management-loopback.yaml",
-            "version: 1\nmanagement: {bind: 127.0.0.1:0}\n",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0}\n",
         )
         .expect("loopback management compiles");
         let management = enabled.management().expect("management is enabled");
@@ -6993,7 +7385,7 @@ routes:
     #[test]
     fn compiles_strict_catalog_sources_without_copying_credentials_or_static_models() {
         let text = r#"
-version: 1
+version: 2
 upstreams:
   provider-a:
     url: https://provider.example/v1
@@ -7006,7 +7398,7 @@ catalog:
   sources:
     - id: provider-a.primary
       provider: provider-a
-      parser: open_ai
+      parser: openai
       path: /v1/models?active=true
       max_response_bytes: 4096
       prefix: team
@@ -7053,14 +7445,14 @@ catalog:
     #[test]
     fn catalog_model_facts_provider_defaults_to_the_source_provider() {
         let text = r#"
-version: 1
+version: 2
 upstreams:
   provider-a: {url: https://provider.example/v1}
   gateway: {url: https://gateway.example/v1}
 catalog:
   sources:
-    - {id: provider-a.primary, provider: provider-a, parser: open_ai}
-    - {id: gateway.primary, provider: gateway, parser: open_ai, model_facts_provider: openai}
+    - {id: provider-a.primary, provider: provider-a, parser: openai}
+    - {id: gateway.primary, provider: gateway, parser: openai, model_facts_provider: openai}
 "#;
         let config = compile_yaml("catalog-model-facts.yaml", text).expect("catalog compiles");
         let catalog = config.catalog().expect("catalog plan");
@@ -7081,28 +7473,28 @@ catalog:
     #[test]
     fn catalog_rejects_unknown_providers_unsafe_paths_and_unknown_fields() {
         let missing = r#"
-version: 1
+version: 2
 catalog:
-  sources: [{id: missing.primary, provider: missing, parser: open_ai}]
+  sources: [{id: missing.primary, provider: missing, parser: openai}]
 "#;
         let error = compile_yaml("catalog-missing.yaml", missing).expect_err("missing provider");
         assert!(error.to_string().contains("missing upstream `missing`"));
 
         let unsafe_path = r#"
-version: 1
+version: 2
 upstreams: {local: {url: http://127.0.0.1:1}}
 catalog:
-  sources: [{id: local.primary, provider: local, parser: open_ai, path: //other.example/models}]
+  sources: [{id: local.primary, provider: local, parser: openai, path: //other.example/models}]
 "#;
         let error =
             compile_yaml("catalog-path.yaml", unsafe_path).expect_err("authority-like path");
         assert!(error.to_string().contains("no authority or fragment"));
 
         let unknown = r#"
-version: 1
+version: 2
 upstreams: {local: {url: http://127.0.0.1:1}}
 catalog:
-  sources: [{id: local.primary, provider: local, parser: open_ai, surprise: true}]
+  sources: [{id: local.primary, provider: local, parser: openai, surprise: true}]
 "#;
         let error = parse_yaml("catalog-unknown.yaml", unknown).expect_err("unknown field");
         assert!(error.to_string().contains("unknown field `surprise`"));
@@ -7112,21 +7504,21 @@ catalog:
     fn management_requires_explicit_remote_enablement_and_authentication() {
         let without_enablement = compile_yaml(
             "management-remote-disabled.yaml",
-            "version: 1\nmanagement: {bind: 0.0.0.0:9090}\n",
+            "version: 2\nmanagement: {bind: 0.0.0.0:9090}\n",
         )
         .expect_err("remote bind needs explicit enablement");
         assert!(without_enablement.to_string().contains("remote: true"));
 
         let without_auth = compile_yaml(
             "management-remote-unauthenticated.yaml",
-            "version: 1\nmanagement: {bind: 0.0.0.0:9090, remote: true}\n",
+            "version: 2\nmanagement: {bind: 0.0.0.0:9090, remote: true}\n",
         )
         .expect_err("remote management needs TLS");
         assert!(without_auth.to_string().contains("requires TLS"));
 
         let authenticated = compile_yaml(
             "management-remote-authenticated.yaml",
-            "version: 1\nmanagement: {bind: 0.0.0.0:9090, remote: true, auth: {secret: env:POOLER_MANAGEMENT_KEY}}\n",
+            "version: 2\nmanagement: {bind: 0.0.0.0:9090, remote: true, auth: {secret: env:POOLER_MANAGEMENT_KEY}}\n",
         )
         .expect_err("authenticated remote management still needs TLS");
         assert!(authenticated.to_string().contains("requires TLS"));
@@ -7134,7 +7526,7 @@ catalog:
 
     #[test]
     fn compiles_supported_auth_sources_and_rejects_unsupported_kinds() {
-        let keyring = "version: 1\nupstreams: {local: {url: http://127.0.0.1:1, auth: {secret: keyring:pooler/account}}}\n";
+        let keyring = "version: 2\nupstreams: {local: {url: http://127.0.0.1:1, auth: {secret: keyring:pooler/account}}}\n";
         let config = compile_yaml("keyring.yaml", keyring).expect("keyring source");
         assert_eq!(
             config.upstreams()["local"]
@@ -7145,7 +7537,7 @@ catalog:
             "keyring"
         );
 
-        let kind = "version: 1\nupstreams: {local: {url: http://127.0.0.1:1, auth: {kind: basic, secret: env:POOLER_KEY}}}\n";
+        let kind = "version: 2\nupstreams: {local: {url: http://127.0.0.1:1, auth: {kind: basic, secret: env:POOLER_KEY}}}\n";
         let error = compile_yaml("kind.yaml", kind).expect_err("unsupported kind");
         assert!(error.to_string().contains("x_goog_api_key"));
 
@@ -7155,7 +7547,7 @@ catalog:
             ("x-goog-api-key", "x_goog_api_key"),
         ] {
             let text = format!(
-                "version: 1\nupstreams: {{local: {{url: http://127.0.0.1:1, auth: {{kind: {kind}, secret: env:POOLER_KEY}}}}}}\n"
+                "version: 2\nupstreams: {{local: {{url: http://127.0.0.1:1, auth: {{kind: {kind}, secret: env:POOLER_KEY}}}}}}\n"
             );
             let config = compile_yaml("provider-header.yaml", &text).expect("provider auth kind");
             assert_eq!(
@@ -7164,7 +7556,7 @@ catalog:
             );
         }
 
-        let downstream = "version: 1\nlisteners: {local: {bind: 127.0.0.1:1}}\nupstreams: {local: {url: http://127.0.0.1:2}}\nroutes: [{id: r, listen: local, downstream_auth: {kind: x-api-key, secret: env:POOLER_KEY}, target: {provider: local}}]\n";
+        let downstream = "version: 2\nlisteners: {local: {bind: 127.0.0.1:1}}\nupstreams: {local: {url: http://127.0.0.1:2}}\nroutes: [{id: r, listen: local, downstream_auth: {kind: x-api-key, secret: env:POOLER_KEY}, target: {provider: local}}]\n";
         let error = compile_yaml("downstream-header.yaml", downstream)
             .expect_err("downstream auth remains bearer-only");
         assert!(error.to_string().contains("requires a bearer auth kind"));
@@ -7197,13 +7589,14 @@ catalog:
     #[test]
     fn compiles_model_registry_and_bounded_patch_steps() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 models:
   - id: gpt-public
     targets:
       - provider: local
+        id: gpt-public-target
         upstream_model: gpt-upstream
         capabilities: [text, tools, text]
 routes:
@@ -7236,9 +7629,186 @@ routes:
     }
 
     #[test]
+    fn compiles_v2_target_identity_pool_isolation_and_routing_policy() {
+        let text = r#"
+version: 2
+upstreams:
+  primary:
+    url: http://127.0.0.1:8319
+  backup:
+    url: http://127.0.0.1:8320
+accounts:
+  primary-a: {provider: primary, secret: managed:secret-a}
+  primary-b: {provider: primary, secret: managed:secret-b}
+account_pools:
+  primary-pool:
+    provider: primary
+    strategy: round_robin
+    accounts: [primary-a, primary-b]
+policies:
+  deterministic:
+    selection: {strategy: round_robin}
+    routing:
+      order: [primary, backup]
+      allow: [primary]
+      deny: [backup]
+      allow_fallbacks: false
+      required_parameters: [temperature]
+      required_capabilities: [text, streaming]
+      minimum_context: 8192
+      quantization: [int8]
+      privacy: no_training
+      require_zdr: true
+      data_policy: zero_retention
+      max_price: 250
+      preference: {price: true, latency: true}
+models:
+  - id: public
+    targets:
+      - id: primary-target
+        provider: primary
+        account_pool: primary-pool
+        priority: 1
+        weight: 2
+        upstream_model: primary-model
+        wire_family: openai
+        capabilities: [text, streaming]
+      - id: backup-target
+        provider: backup
+        priority: 2
+        weight: 1
+        upstream_model: backup-model
+"#;
+        let config = compile_yaml("v2-topology.yaml", text).expect("v2 topology");
+        let pool = &config.account_pools()["primary-pool"];
+        assert_eq!(pool.provider(), "primary");
+        assert_eq!(pool.strategy(), SelectionStrategy::RoundRobin);
+        assert_eq!(pool.accounts().len(), 2);
+        assert_eq!(
+            config.policies()["deterministic"].selection().strategy(),
+            SelectionStrategy::RoundRobin
+        );
+        let routing = config.policies()["deterministic"].routing();
+        assert_eq!(
+            routing
+                .order()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            ["primary", "backup"]
+        );
+        assert_eq!(
+            routing
+                .required_parameters()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            ["temperature"]
+        );
+        assert!(routing.required_capabilities().contains(Capability::Text));
+        assert_eq!(routing.minimum_context(), Some(8192));
+        assert!(routing.require_zdr());
+        assert_eq!(routing.max_price(), Some(250));
+        assert!(routing.preference().price());
+        let targets = &config.models()["public"].targets();
+        assert_eq!(targets[0].id().as_str(), "primary-target");
+        assert_eq!(targets[0].account_pool(), Some("primary-pool"));
+        assert_eq!(targets[0].priority(), 1);
+        assert_eq!(targets[0].weight(), 2);
+        assert_eq!(targets[0].wire_family(), "openai");
+        assert_eq!(targets[1].priority(), 2);
+    }
+
+    #[test]
+    fn rejects_unstable_or_ambiguous_v2_target_bindings() {
+        assert!(matches!(
+            compile_yaml("legacy-version.yaml", "version: 1\n"),
+            Err(ConfigError::UnsupportedVersion { version: 1, .. })
+        ));
+        let missing_id = r#"
+version: 2
+upstreams: {provider: {url: http://127.0.0.1:8319}}
+models:
+  - id: public
+    targets: [{provider: provider, upstream_model: model}]
+"#;
+        assert!(compile_yaml("missing-target-id.yaml", missing_id)
+            .expect_err("v2 target IDs are required")
+            .to_string()
+            .contains("requires stable id"));
+
+        let duplicate_id = r#"
+version: 2
+upstreams: {provider: {url: http://127.0.0.1:8319}}
+models:
+  - id: first
+    targets: [{id: duplicate, provider: provider, upstream_model: first}]
+  - id: second
+    targets: [{id: duplicate, provider: provider, upstream_model: second}]
+"#;
+        assert!(compile_yaml("duplicate-target-id.yaml", duplicate_id)
+            .expect_err("target IDs are globally unique")
+            .to_string()
+            .contains("duplicate target"));
+
+        let zero_priority = r#"
+version: 2
+upstreams: {provider: {url: http://127.0.0.1:8319}}
+models:
+  - id: public
+    targets: [{id: target, provider: provider, priority: 0, upstream_model: model}]
+"#;
+        assert!(compile_yaml("zero-target-priority.yaml", zero_priority)
+            .expect_err("target priority must be positive")
+            .to_string()
+            .contains("priority must be greater than zero"));
+    }
+
+    #[test]
+    fn rejects_mixed_provider_account_pools_and_accepts_managed_upstream_auth() {
+        let mixed = r#"
+version: 2
+upstreams:
+  first: {url: http://127.0.0.1:8319}
+  second: {url: http://127.0.0.1:8320}
+accounts:
+  one: {provider: first, secret: managed:one}
+  two: {provider: second, secret: managed:two}
+account_pools:
+  mixed: {provider: first, accounts: [one, two]}
+"#;
+        assert!(compile_yaml("mixed-pool.yaml", mixed)
+            .expect_err("pool members must be homogeneous")
+            .to_string()
+            .contains("one provider"));
+
+        let managed = r#"
+version: 2
+upstreams:
+  provider:
+    url: http://127.0.0.1:8319
+    auth: {secret: managed:provider-secret}
+accounts:
+  account: {provider: provider, secret: managed:account-secret}
+"#;
+        let config = compile_yaml("managed-secrets.yaml", managed).expect("managed references");
+        assert_eq!(
+            config.upstreams()["provider"]
+                .auth()
+                .expect("auth")
+                .secret(),
+            &SecretRef::Managed(Arc::from("provider-secret"))
+        );
+        assert_eq!(
+            config.accounts()["account"].secret(),
+            Some(&SecretRef::Managed(Arc::from("account-secret")))
+        );
+    }
+
+    #[test]
     fn rejects_patch_steps_on_non_patch_routes() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -7257,7 +7827,7 @@ routes:
     #[test]
     fn preserves_pointer_and_prefix_semantics_and_accepts_null_root_value() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 routes:
@@ -7283,12 +7853,12 @@ routes:
 
     #[test]
     fn rejects_unknown_capability_and_unused_transform_prefix() {
-        let capability = "version: 1\nupstreams: {local: {url: http://127.0.0.1:1}}\nmodels: [{id: m, targets: [{provider: local, upstream_model: m, capabilities: [tolos]}]}]\n";
+        let capability = "version: 2\nupstreams: {local: {url: http://127.0.0.1:1}}\nmodels: [{id: m, targets: [{id: target, provider: local, upstream_model: m, capabilities: [tolos]}]}]\n";
         let error = compile_yaml("capability.yaml", capability).expect_err("unknown capability");
         assert!(error.to_string().contains("unknown model capability"));
 
         let prefix = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 routes:
@@ -7309,7 +7879,7 @@ routes:
     #[test]
     fn compiles_account_pool_policy_and_immutable_budgets() {
         let text = r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
 accounts:
@@ -7323,10 +7893,9 @@ accounts:
     provider: local
     secret: file:/run/pooler/backup.token
 account_pools:
-  default: {accounts: [primary, backup]}
+  default: {provider: local, accounts: [primary, backup]}
 policies:
   default:
-    account_pool: default
     selection:
       strategy: health_weighted
       session_affinity: 30m
@@ -7365,7 +7934,6 @@ routes:
             policy.selection().strategy(),
             SelectionStrategy::HealthWeighted
         );
-        assert_eq!(policy.selection().account_pool(), Some("default"));
         assert_eq!(
             policy.selection().affinity().expect("affinity").ttl(),
             Duration::from_secs(30 * 60)
@@ -7382,7 +7950,7 @@ routes:
     #[test]
     fn rejects_unbounded_or_ambiguous_retry_configuration() {
         let missing_commit = r#"
-version: 1
+version: 2
 policies:
   default:
     retry: {maximum_attempts: 2, maximum_credentials: 2, statuses: [503]}
@@ -7392,7 +7960,7 @@ policies:
         assert!(error.to_string().contains("before_commit_only"));
 
         let missing_credentials = r#"
-version: 1
+version: 2
 policies:
   default:
     retry: {maximum_attempts: 2, before_commit_only: true, statuses: [503]}
@@ -7402,7 +7970,7 @@ policies:
         assert!(error.to_string().contains("maximum_credentials"));
 
         let invalid_status = r#"
-version: 1
+version: 2
 policies:
   default:
     retry: {maximum_attempts: 2, maximum_credentials: 2, before_commit_only: true, statuses: [400]}
@@ -7414,12 +7982,12 @@ policies:
 
     #[test]
     fn rejects_invalid_strategy_affinity_and_budget_literals() {
-        let strategy = "version: 1\npolicies: {default: {selection: {strategy: random}}}\n";
+        let strategy = "version: 2\npolicies: {default: {selection: {strategy: random}}}\n";
         let error = compile_yaml("strategy.yaml", strategy).expect_err("unknown strategy");
         assert!(error.to_string().contains("unknown selection strategy"));
 
         let affinity = r#"
-version: 1
+version: 2
 policies:
   default:
     selection:
@@ -7430,7 +7998,7 @@ policies:
         assert!(error.to_string().contains("affinity"));
 
         let bytes = r#"
-version: 1
+version: 2
 policies:
   default:
     stream: {bootstrap_bytes: 2XB}
@@ -7442,7 +8010,7 @@ policies:
     #[test]
     fn account_and_policy_references_are_strict() {
         let missing_provider = r#"
-version: 1
+version: 2
 accounts: {primary: {provider: absent, secret: env:POOLER_PRIMARY}}
 "#;
         let error =
@@ -7450,7 +8018,7 @@ accounts: {primary: {provider: absent, secret: env:POOLER_PRIMARY}}
         assert!(error.to_string().contains("missing upstream `absent`"));
 
         let invalid_quota_project = r#"
-version: 1
+version: 2
 upstreams: {local: {url: http://127.0.0.1:1}}
 accounts:
   primary: {provider: local, secret: env:POOLER_PRIMARY, quota_project: "tenant/unsafe"}
@@ -7460,13 +8028,13 @@ accounts:
         assert!(error.to_string().contains("invalid quota project ID"));
 
         let missing_account = r#"
-version: 1
-account_pools: {default: {accounts: [absent]}}
+version: 2
+account_pools: {default: {provider: local, accounts: [absent]}}
 "#;
         let error = compile_yaml("account-ref.yaml", missing_account).expect_err("missing account");
         assert!(error.to_string().contains("missing account `absent`"));
 
-        let unknown = "version: 1\npolicies: {default: {rety: {maximum_attempts: 2}}}\n";
+        let unknown = "version: 2\npolicies: {default: {rety: {maximum_attempts: 2}}}\n";
         let error = parse_yaml("policy-field.yaml", unknown).expect_err("unknown policy field");
         assert!(error.to_string().contains("rety"));
     }
@@ -7474,7 +8042,7 @@ account_pools: {default: {accounts: [absent]}}
     #[test]
     fn compiles_strict_oauth_provider_and_retains_no_token_material() {
         let text = r#"
-version: 1
+version: 2
 upstreams:
   codex:
     url: https://api.example.test
@@ -7504,7 +8072,7 @@ upstreams:
     #[test]
     fn palantir_oauth_endpoints_are_derived_from_the_enrollment_origin() {
         let text = r#"
-version: 1
+version: 2
 upstreams:
   foundry:
     url: https://example.euw-3.palantirfoundry.co.uk
@@ -7549,7 +8117,7 @@ accounts:
     #[test]
     fn palantir_client_credentials_requires_a_protected_secret_reference() {
         let without_secret = r#"
-version: 1
+version: 2
 upstreams:
   foundry:
     url: https://example.palantirfoundry.com
@@ -7585,7 +8153,7 @@ upstreams:
     #[test]
     fn palantir_rejects_off_origin_oauth_endpoints_and_unsafe_enrollment_urls() {
         let off_origin = r#"
-version: 1
+version: 2
 upstreams:
   foundry:
     url: https://example.palantirfoundry.com
@@ -7631,7 +8199,7 @@ upstreams:
     #[test]
     fn palantir_grants_enforce_refresh_scope_semantics() {
         let browser_without_offline = r#"
-version: 1
+version: 2
 upstreams:
   foundry:
     url: https://example.palantirfoundry.com
@@ -7694,7 +8262,7 @@ upstreams:
     #[test]
     fn rejects_unsafe_oauth_callback_and_duplicate_scopes() {
         let public_callback = r#"
-version: 1
+version: 2
 upstreams:
   codex:
     url: https://api.example.test
@@ -7720,7 +8288,7 @@ upstreams:
         assert!(error.to_string().contains("non-empty and unique"));
 
         let fallback = r#"
-version: 1
+version: 2
 upstreams:
   codex:
     url: https://api.example.test
@@ -7744,7 +8312,7 @@ upstreams:
     #[test]
     fn compiles_native_provider_with_oauth_authentication() {
         let text = r#"
-version: 1
+version: 2
 upstreams:
   provider:
     url: https://api.example.test
@@ -7775,7 +8343,7 @@ upstreams:
     #[test]
     fn native_codex_oauth_compiles_without_identity_endpoint() {
         let text = r#"
-version: 1
+version: 2
 upstreams:
   provider:
     known_provider: openai
@@ -7799,7 +8367,7 @@ accounts:
         let explicit = compile_yaml(
             "oauth-native-codex-gateway.yaml",
             r#"
-version: 1
+version: 2
 upstreams:
   provider:
     url: https://gateway.example.test/openai
@@ -7817,7 +8385,7 @@ upstreams:
     #[test]
     fn compiles_native_provider_quota_endpoint() {
         let text = r#"
-version: 1
+version: 2
 upstreams:
   codex:
     url: https://api.example.test
@@ -7834,7 +8402,7 @@ upstreams:
     #[test]
     fn compiles_vertex_resource_addressing_and_rejects_partial_location() {
         let text = r#"
-version: 1
+version: 2
 upstreams:
   vertex:
     url: https://us-central1-aiplatform.googleapis.com
@@ -7866,7 +8434,7 @@ upstreams:
     #[test]
     fn compiles_external_extension_component_plan() {
         let text = r#"
-version: 1
+version: 2
 extensions:
   local:
     command: /bin/cat
@@ -7876,7 +8444,7 @@ listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 models:
   - id: selected
-    targets: [{provider: local, upstream_model: selected}]
+    targets: [{id: selected-target, provider: local, upstream_model: selected}]
 routes:
   - id: external
     listen: local
@@ -7916,7 +8484,7 @@ routes:
 
         let wasm_config = compile_yaml(
             "wasm-extension.yaml",
-            "version: 1\nextensions: {module: {wasm: /tmp/module.wasm, capabilities: [inspect]}}\n",
+            "version: 2\nextensions: {module: {wasm: /tmp/module.wasm, capabilities: [inspect]}}\n",
         )
         .expect("WASM extension declaration");
         assert_eq!(wasm_config.extensions()["module"].command(), None);
@@ -7929,7 +8497,7 @@ routes:
     #[test]
     fn rejects_external_extension_without_a_granted_capability() {
         let text = r#"
-version: 1
+version: 2
 extensions:
   local: {command: /bin/cat, capabilities: [inspect]}
 listeners: {local: {bind: 127.0.0.1:0}}

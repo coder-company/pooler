@@ -152,6 +152,63 @@ named_identifier!(SessionId, validate_named);
 named_identifier!(TargetId, validate_named);
 named_identifier!(ComponentId, validate_component);
 
+/// Composite identity for one public-model target binding.
+///
+/// A target ID is stable in configuration, while the model component keeps
+/// affinity and health state from colliding when a legacy or imported source
+/// reuses the same target spelling under a different public model.
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct TargetBindingId {
+    model: ModelId,
+    target: TargetId,
+}
+
+impl TargetBindingId {
+    /// Construct a composite model/target identity.
+    pub fn new(
+        model: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Result<Self, IdentifierError> {
+        Ok(Self {
+            model: ModelId::new(model)?,
+            target: TargetId::new(target)?,
+        })
+    }
+
+    /// Public model component.
+    #[must_use]
+    pub fn model(&self) -> &ModelId {
+        &self.model
+    }
+
+    /// Stable target component.
+    #[must_use]
+    pub fn target(&self) -> &TargetId {
+        &self.target
+    }
+
+    /// Canonical persisted representation.
+    #[must_use]
+    pub fn as_str(&self) -> String {
+        format!("{}/{}", self.model, self.target)
+    }
+}
+
+impl fmt::Debug for TargetBindingId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("TargetBindingId")
+            .field(&self.as_str())
+            .finish()
+    }
+}
+
+impl fmt::Display for TargetBindingId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.model, self.target)
+    }
+}
+
 macro_rules! uuid_identifier {
     ($name:ident) => {
         /// A UUID-backed identifier generated for one runtime request or trace.

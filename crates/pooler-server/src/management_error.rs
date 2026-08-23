@@ -15,6 +15,8 @@ pub const SCHEMA_VERSION: u8 = 1;
 const MAX_DETAIL_KEY_BYTES: usize = 64;
 const MAX_DETAIL_VALUE_BYTES: usize = 256;
 const MAX_DETAILS: usize = 8;
+const MAX_MESSAGE_BYTES: usize = 256;
+const MAX_RETRY_AFTER_SECONDS: u64 = 3_600;
 
 /// Stable management error codes and their HTTP semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +33,7 @@ pub enum ManagementErrorCode {
     DependencyUnavailable,
     AuthenticationRequired,
     AuthenticationNotConfigured,
+    ManagementNotConfigured,
     ForbiddenHost,
     ForbiddenOrigin,
     NotFound,
@@ -70,6 +73,7 @@ impl ManagementErrorCode {
             Self::DependencyUnavailable => "dependency_unavailable",
             Self::AuthenticationRequired => "authentication_required",
             Self::AuthenticationNotConfigured => "authentication_not_configured",
+            Self::ManagementNotConfigured => "management_not_configured",
             Self::ForbiddenHost => "forbidden_host",
             Self::ForbiddenOrigin => "forbidden_origin",
             Self::NotFound => "not_found",
@@ -98,12 +102,13 @@ impl ManagementErrorCode {
     pub const fn status(self) -> StatusCode {
         match self {
             Self::ConfigDraftEtagMismatch
-            | Self::ConfigGenerationConflict
-            | Self::PreconditionRequired => StatusCode::PRECONDITION_FAILED,
+            | Self::ConfigGenerationConflict => StatusCode::PRECONDITION_FAILED,
+            Self::PreconditionRequired => StatusCode::PRECONDITION_REQUIRED,
             Self::OperationInProgress
             | Self::OAuthTokenGenerationConflict
             | Self::ConfirmationInvalid
-            | Self::OAuthUnsupported => StatusCode::CONFLICT,
+            | Self::OAuthUnsupported
+            | Self::ManagementNotConfigured => StatusCode::CONFLICT,
             Self::DraftExpired => StatusCode::GONE,
             Self::ValidationFailed | Self::InvalidModelIdentifier => {
                 StatusCode::UNPROCESSABLE_ENTITY
@@ -136,6 +141,29 @@ impl ManagementErrorCode {
             },
             Self::OAuthUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::InternalFailure => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Choose the least-specific stable code for a legacy status/message
+    /// response while callers are migrated to typed constructors.
+    #[must_use]
+    pub const fn for_status(status: StatusCode) -> Self {
+        match status {
+            StatusCode::BAD_REQUEST => Self::InvalidRequest,
+            StatusCode::UNAUTHORIZED => Self::AuthenticationRequired,
+            StatusCode::FORBIDDEN => Self::ForbiddenOrigin,
+            StatusCode::NOT_FOUND => Self::NotFound,
+            StatusCode::METHOD_NOT_ALLOWED => Self::MethodNotAllowed,
+            StatusCode::REQUEST_TIMEOUT => Self::RequestTimeout,
+            StatusCode::PAYLOAD_TOO_LARGE => Self::PayloadTooLarge,
+            StatusCode::CONFLICT => Self::OperationInProgress,
+            StatusCode::GONE => Self::DraftExpired,
+            StatusCode::PRECONDITION_FAILED => Self::ConfigDraftEtagMismatch,
+            StatusCode::PRECONDITION_REQUIRED => Self::PreconditionRequired,
+            StatusCode::UNPROCESSABLE_ENTITY => Self::ValidationFailed,
+            StatusCode::TOO_MANY_REQUESTS => Self::CapacityExceeded,
+            StatusCode::SERVICE_UNAVAILABLE => Self::StateUnavailable,
+            _ => Self::InternalFailure,
         }
     }
 
@@ -188,10 +216,10 @@ impl ManagementError {
     /// Construct a contract error using the stable code's status and retry
     /// semantics.
     #[must_use]
-    pub fn new(code: ManagementErrorCode, message: &'static str) -> Self {
+    pub fn new(code: ManagementErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
-            message: message.to_owned(),
+            message: bounded_message(message.into()),
             details: BTreeMap::new(),
             current_generation: None,
             retry_after_seconds: None,
@@ -229,8 +257,19 @@ impl ManagementError {
     /// Add a bounded `Retry-After` value for capacity errors.
     #[must_use]
     pub const fn with_retry_after_seconds(mut self, seconds: u64) -> Self {
-        self.retry_after_seconds = Some(seconds);
+        self.retry_after_seconds = Some(if seconds > MAX_RETRY_AFTER_SECONDS {
+            MAX_RETRY_AFTER_SECONDS
+        } else {
+            seconds
+        });
         self
+    }
+
+    /// Construct a typed error for a response that has not yet been migrated
+    /// to a more specific code. The message is bounded and control-free.
+    #[must_use]
+    pub fn from_status(status: StatusCode, message: impl Into<String>) -> Self {
+        Self::new(ManagementErrorCode::for_status(status), message)
     }
 
     fn with_value(mut self, key: &'static str, value: Value) -> Self {
@@ -276,11 +315,40 @@ impl ManagementError {
         }
     }
 
+    /// Return the bounded error object used by asynchronous status records.
+    #[must_use]
+    pub fn body(&self) -> ManagementErrorBody {
+        self.envelope().error
+    }
+
+    /// Return the bounded error object as JSON for status records.
+    #[must_use]
+    pub fn body_value(&self) -> Value {
+        serde_json::to_value(self.body()).expect("management error body is serializable")
+    }
+
     /// Convert this failure to a JSON value for response serialization.
     #[must_use]
     pub fn value(&self) -> Value {
         serde_json::to_value(self.envelope()).expect("management error envelope is serializable")
     }
+}
+
+fn bounded_message(message: String) -> String {
+    if message.is_empty() || message.chars().any(char::is_control) {
+        return "management request failed".to_owned();
+    }
+    let mut bounded = String::with_capacity(message.len().min(MAX_MESSAGE_BYTES));
+    let mut bytes = 0;
+    for character in message.chars() {
+        let width = character.len_utf8();
+        if bytes + width > MAX_MESSAGE_BYTES {
+            break;
+        }
+        bounded.push(character);
+        bytes += width;
+    }
+    bounded
 }
 
 #[cfg(test)]
@@ -316,5 +384,69 @@ mod tests {
         assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(error.retry_after_seconds(), Some(3));
         assert!(error.value()["error"]["details"].get("secret").is_none());
+    }
+
+    #[test]
+    fn management_error_contract_has_stable_status_mappings() {
+        let cases = [
+            (
+                ManagementErrorCode::ConfigDraftEtagMismatch,
+                StatusCode::PRECONDITION_FAILED,
+                "config_draft_etag_mismatch",
+            ),
+            (
+                ManagementErrorCode::ConfigGenerationConflict,
+                StatusCode::PRECONDITION_FAILED,
+                "config_generation_conflict",
+            ),
+            (
+                ManagementErrorCode::OperationInProgress,
+                StatusCode::CONFLICT,
+                "operation_in_progress",
+            ),
+            (
+                ManagementErrorCode::DraftExpired,
+                StatusCode::GONE,
+                "draft_expired",
+            ),
+            (
+                ManagementErrorCode::ValidationFailed,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_failed",
+            ),
+            (
+                ManagementErrorCode::CapacityExceeded,
+                StatusCode::TOO_MANY_REQUESTS,
+                "capacity_exceeded",
+            ),
+            (
+                ManagementErrorCode::StateUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "state_unavailable",
+            ),
+        ];
+        for (code, status, wire_code) in cases {
+            let error = ManagementError::new(code, "bounded message");
+            let value = error.value();
+            assert_eq!(error.status(), status);
+            assert_eq!(value["schema_version"], SCHEMA_VERSION);
+            assert_eq!(value["error"]["code"], wire_code);
+            assert!(value["error"].get("message").and_then(Value::as_str).is_some());
+            assert!(value["error"].get("retryable").is_some());
+            assert!(value["error"].get("details").is_some_and(Value::is_object));
+            assert!(value["error"].get("current_generation").is_some());
+        }
+    }
+
+    #[test]
+    fn status_fallback_and_retry_after_are_bounded() {
+        let error = ManagementError::from_status(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("{}\nsecret", "x".repeat(MAX_MESSAGE_BYTES + 20)),
+        )
+        .with_retry_after_seconds(u64::MAX);
+        assert_eq!(error.code(), ManagementErrorCode::CapacityExceeded);
+        assert_eq!(error.retry_after_seconds(), Some(MAX_RETRY_AFTER_SECONDS));
+        assert_eq!(error.envelope().error.message, "management request failed");
     }
 }
