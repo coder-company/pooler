@@ -47,7 +47,13 @@ Run:
 pooler --config pooler-starter/pooler.yaml preflight
 ```
 
-Preflight performs bounded DNS, native-root TLS, endpoint, authentication-placement, and documented discovery checks. It sends no inference request and reports `inference_requests_sent: 0`. A provider without a documented quota endpoint is reported as unsupported, not passed. Preflight success therefore does not claim quota availability, model output correctness, or live-provider conformance.
+Preflight performs bounded DNS, native-root TLS, and base-endpoint reachability
+checks. When catalog discovery is configured, it also exercises that configured
+authenticated discovery path. It sends no inference request and reports
+`inference_requests_sent: 0`. Provider-specific authentication placement and
+quota endpoints are not probed; quota is reported as unsupported. Preflight
+success therefore does not claim quota availability, model output correctness,
+or live-provider conformance.
 
 ## Typed account creation and OAuth
 

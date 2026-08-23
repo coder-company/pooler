@@ -57,7 +57,7 @@ A patch is one of:
 {"op":"replace","section":"catalog","value":{"sources":[],"refresh":{},"overrides":[]}}
 ```
 
-`upsert` and `remove` support `listeners`, `upstreams` (provider declarations), `accounts`, `credentials`, `account_pools`, `policies` (including retry policy), `extensions`, `models`, and `routes`. Typed `replace` supports `catalog` (sources, aliases, inclusion/exclusion rules, refresh settings, and model overrides), `management`, and the complete explicit `usage_price_book`. Compilation rejects any malformed or incomplete typed value.
+`upsert` and `remove` support `listeners`, `upstreams` (provider declarations), `accounts`, `credentials`, `account_pools`, `policies` (including retry policy), `extensions`, `models`, and `routes`. Typed `replace` supports `catalog` (sources, aliases, inclusion/exclusion rules, refresh settings, and model overrides), `management`, and the complete explicit `usage_price_book`. Compilation rejects any malformed or incomplete typed value. A live reload that adds, removes, or alters a native provider binding or its OAuth plan is rejected as restart-required, preventing stale runtime bindings from being published.
 
 A successful commit or rollback returns `202 Accepted` with a reload request ID. Follow `/management/reloads` for the final audited result; acceptance is not publication.
 

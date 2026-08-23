@@ -425,6 +425,9 @@ pub enum HttpProxyServerError {
     /// Reload tried to change sockets that were already bound.
     #[error("configuration reload cannot change the bound listener set; restart is required")]
     ListenerSetChanged,
+    /// Reload tried to change provider bindings owned by the native runtime.
+    #[error("configuration reload cannot change native provider bindings; restart is required")]
+    NativeRuntimeChanged,
     /// The configured management listener could not be started.
     #[error(transparent)]
     Management(#[from] ManagementServerError),
@@ -992,6 +995,9 @@ impl HttpProxyServer {
         if current.config.management() != candidate.management() {
             return Err(HttpProxyServerError::ListenerSetChanged);
         }
+        if !same_native_runtime_bindings(&current.config, &candidate) {
+            return Err(HttpProxyServerError::NativeRuntimeChanged);
+        }
         let tls = prepare_tls_map(&candidate)?;
         if current.config.equivalent(&candidate) && same_tls_map(&current.tls, &tls) {
             return Ok(HttpReloadOutcome::Unchanged {
@@ -1342,6 +1348,28 @@ fn same_listener_bindings(current: &CompiledConfig, candidate: &CompiledConfig) 
         && current.listeners().iter().all(|(id, plan)| {
             candidate.listeners().get(id).is_some_and(|other| {
                 other.bind() == plan.bind() && other.protocol() == plan.protocol()
+            })
+        })
+}
+
+fn same_native_runtime_bindings(current: &CompiledConfig, candidate: &CompiledConfig) -> bool {
+    let current_count = current
+        .upstreams()
+        .values()
+        .filter(|upstream| upstream.native().is_some())
+        .count();
+    let candidate_count = candidate
+        .upstreams()
+        .values()
+        .filter(|upstream| upstream.native().is_some())
+        .count();
+    current_count == candidate_count
+        && current.upstreams().iter().all(|(id, upstream)| {
+            let Some(native) = upstream.native() else {
+                return true;
+            };
+            candidate.upstreams().get(id).is_some_and(|other| {
+                other.native() == Some(native) && other.oauth() == upstream.oauth()
             })
         })
 }
@@ -4741,6 +4769,27 @@ mod tests {
         first_upstream.await.expect("first upstream");
         second_upstream.await.expect("second upstream");
         stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_native_provider_binding_changes() {
+        let config = pooler_config::compile_yaml(
+            "native-reload.yaml",
+            "version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  provider: {url: https://example.com}\n",
+        )
+        .expect("initial config");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let candidate = pooler_config::compile_yaml(
+            "native-reload.yaml",
+            "version: 1\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  provider:\n    url: https://example.com\n    native: {kind: antigravity}\n",
+        )
+        .expect("native candidate");
+
+        assert!(matches!(
+            server.reload(candidate).await,
+            Err(HttpProxyServerError::NativeRuntimeChanged)
+        ));
+        assert_eq!(server.config_generation(), 1);
     }
 
     #[tokio::test]

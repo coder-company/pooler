@@ -13,18 +13,23 @@ name or advertised without conformance evidence.
 
 ## Current status
 
-- Phases 0–8 and prompt workstreams 1–9 are implemented and covered by local
-  executable tests. This includes bounded opaque and semantic transports, strict
+- Phases 0–8 and the core product paths from prompt workstreams 1–9 are
+  implemented and covered by local executable tests. This includes bounded
+  opaque and semantic transports, strict
   imports/overlays, current-client adapters, account pooling, native provider
   contracts, typed durable configuration, encrypted request/usage history, secure
   onboarding, brokered documented OAuth, migration, dashboard and management-API
   TUI. Compatibility tiers remain separate: declared or fixture-verified behavior
   is not promoted to current-client, direct live-provider, artifact, or released
-  conformance.
+  conformance. Advanced gaps remain explicit: downstream Responses WebSocket is
+  bounded same-wire forwarding, video status is caller-polled, and preflight
+  verifies reachability plus configured catalog authentication rather than every
+  provider-specific quota surface.
 - The turnkey `gateway` preset is provider-aware rather than protocol-blind.
   OpenAI mounts models, Chat and legacy Completions, Embeddings, strict Files and
-  Batches actions, Responses and Compact, native image/audio/video lifecycles,
-  semantic Responses-over-WebSocket transport, Realtime and explicit SIP actions.
+  Batches actions, Responses and Compact, native image/audio/video request
+  lifecycles, semantic REST-to-provider-WebSocket Responses transport, bounded
+  same-wire downstream Responses WebSocket, Realtime and explicit SIP actions.
   xAI mounts its documented OpenAI-shaped subset; Anthropic mounts models, messages
   and token counting; Gemini mounts alias-aware model actions and versioned
   Interactions lifecycles. Unsupported provider/family combinations fail
@@ -42,7 +47,7 @@ name or advertised without conformance evidence.
   commit `50f9e66` CLIProxyAPI Plus comparison measured Pooler matched p50 overhead
   12.05 times lower and p95 5.81 times lower. Neither historical run establishes
   release acceptance for a later commit.
-- Exact-SHA CI, Hardening and Secret Scan passed for `9313fa1`; later commits must
+- Exact-SHA CI, Hardening and Secret Scan passed for `43d4327`; later commits must
   obtain their own hosted and benchmark evidence. Product workflows use explicit
   2-vCPU Blacksmith Ubuntu x64/ARM64 classes and retain only the minimum available
   `blacksmith-6vcpu-macos-15` class for required macOS coverage.
