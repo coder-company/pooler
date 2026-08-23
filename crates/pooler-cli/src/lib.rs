@@ -14,6 +14,7 @@ use pooler_store::{SqliteOAuthTokenStore, SqliteStore};
 mod auth;
 mod bootstrap;
 mod catalog;
+mod config_recovery;
 mod dashboard;
 mod doctor;
 mod fixture_replay;
@@ -215,6 +216,12 @@ pub enum ConfigCommand {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Inspect and safely recover a blocked managed-configuration transaction.
+    Recovery {
+        /// Recovery operation.
+        #[command(subcommand)]
+        command: config_recovery::ConfigRecoveryCommand,
+    },
 }
 
 /// Runs one CLI command.
@@ -273,6 +280,9 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Command::Config {
+            command: ConfigCommand::Recovery { command },
+        } => config_recovery::run(&cli.config, command),
         Command::Routes => {
             let config = load(&cli.config)?;
             for route in config.routes() {
@@ -813,6 +823,28 @@ mod tests {
                 command: ConfigCommand::Schema { output: Some(path) }
             } if path == PathBuf::from("schema.json")
         ));
+    }
+
+    #[test]
+    fn managed_config_recovery_commands_are_available() {
+        for operation in ["status", "verify", "resume", "rollback", "abort"] {
+            let cli = Cli::try_parse_from([
+                "pooler",
+                "--config",
+                "pooler.yaml",
+                "config",
+                "recovery",
+                operation,
+                "--compact",
+            ])
+            .unwrap_or_else(|error| panic!("{operation} should parse: {error}"));
+            assert!(matches!(
+                cli.command,
+                Command::Config {
+                    command: ConfigCommand::Recovery { .. }
+                }
+            ));
+        }
     }
 
     #[test]

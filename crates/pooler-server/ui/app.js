@@ -629,6 +629,22 @@
     else root.prepend(banner);
   }
 
+  function persistenceWarning(payload, streamKey, label) {
+    const persistence = payload?.persistence;
+    const stream = persistence?.[streamKey];
+    if (!persistence || !stream) return "";
+    if (persistence.enabled === false) {
+      return `<div class="callout callout-warning" role="status"><strong>Historical ${esc(label)} persistence is disabled.</strong> This view cannot be treated as a complete record.</div>`;
+    }
+    if (stream.complete !== false) return "";
+    const lost = fmtInt(stream.lost_writes ?? stream.write_failures ?? 0);
+    const failure = stream.last_failure_class
+      ? ` Last failure: ${esc(stream.last_failure_class)}${stream.last_failure_at_ms ? ` at ${esc(fmtTime(stream.last_failure_at_ms))}` : ""}.`
+      : "";
+    const lostCount = Number(stream.lost_writes ?? stream.write_failures) || 0;
+    return `<div class="callout callout-warning" role="status"><strong>Historical ${esc(label)} is incomplete.</strong> ${lost} write${lostCount === 1 ? "" : "s"} were lost, so an empty or partial result does not prove that no activity occurred.${failure}</div>`;
+  }
+
   /* ---------------- Data loading ---------------- */
 
   function usageRangeParams() {
@@ -2478,6 +2494,7 @@
 
     root.innerHTML = `
       ${viewHeader("Usage", views.usage.subtitle)}
+      ${persistenceWarning(ledger, "usage_records", "usage")}
       <div class="toolbar">
         <label class="field"><span class="field-label">Time range</span><select id="usage-range">
           ${[
@@ -2768,6 +2785,7 @@
       : `<div class="panel empty"><h2 class="section-title">Select a request</h2><p class="muted">Load its admission-to-completion timeline without exposing request or response content.</p></div>`;
     root.innerHTML = `
       ${viewHeader("Request explorer", views.requests.subtitle)}
+      ${persistenceWarning(page, "request_events", "request history")}
       ${filters}
       ${section("Retained requests", requestTable, `${fmtInt(page.retention?.max_events)} total events · ${fmtInt(page.retention?.max_events_per_request)} per request · ${fmtInt(page.retention?.ttl_ms)} ms retention`)}
       ${page.next_cursor ? `<div class="toolbar"><button class="btn btn-outline btn-sm" type="button" data-request-action="more"${explorer.busy ? ' disabled aria-busy="true"' : ""}>Load more</button></div>` : ""}

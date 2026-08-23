@@ -49,6 +49,41 @@ pub fn managed_configuration_source(
     })
 }
 
+/// Inspect the durable managed-configuration recovery transaction without
+/// changing any files. The returned JSON contains marker, identity, digest,
+/// permission, compiler, generation, and backup state.
+pub fn managed_configuration_recovery_status(
+    source: impl AsRef<std::path::Path>,
+) -> Result<serde_json::Value, config_management::ConfigManagementError> {
+    config_management::recovery_status(source)
+}
+
+/// Verify that the managed-configuration recovery state is known and safe.
+/// This operation is read-only and fails closed when the marker or either
+/// generated file cannot be proved safe.
+pub fn verify_managed_configuration_recovery(
+    source: impl AsRef<std::path::Path>,
+) -> Result<serde_json::Value, config_management::ConfigManagementError> {
+    config_management::verify_recovery(source)
+}
+
+/// Resume a proved-safe managed-configuration transaction and clear its
+/// durable marker. Legacy or ambiguous markers are never modified.
+pub fn resume_managed_configuration_recovery(
+    source: impl AsRef<std::path::Path>,
+) -> Result<serde_json::Value, config_management::ConfigManagementError> {
+    config_management::resume_recovery(source)
+}
+
+/// Abort a proved-safe managed-configuration transaction, restoring the
+/// previous generated revision where the durable digests make that exact
+/// restoration possible. Ambiguous states remain fail-closed.
+pub fn abort_managed_configuration_recovery(
+    source: impl AsRef<std::path::Path>,
+) -> Result<serde_json::Value, config_management::ConfigManagementError> {
+    config_management::abort_recovery(source)
+}
+
 // Re-export the source/config crates used by this crate.  Keeping the server
 // generic over its compiled configuration avoids coupling process lifecycle
 // to a particular route-plan representation while still making the intended

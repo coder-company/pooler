@@ -2885,6 +2885,7 @@ impl ManagementApi {
             "requests": summaries,
             "limit": limit,
             "next_cursor": next_cursor,
+            "persistence": pooling.persistence_status().json(),
             "retention": {
                 "max_events": pooling.store().retention().max_request_events,
                 "max_events_per_request": pooler_store::MAX_REQUEST_EVENTS_PER_REQUEST,
@@ -2909,37 +2910,34 @@ impl ManagementApi {
             Err(_) => return state_unavailable(),
         };
         let policy = pooler_observe::RedactionPolicy::strict();
+        let persistence = pooling.persistence_status().json();
         match representation {
-            UsageRepresentation::List => ManagementResponse::json(
-                StatusCode::OK,
-                policy.sanitize_json(&usage_list(
-                    records,
-                    query,
-                    pooling.store().retention(),
-                    false,
-                )),
-                false,
-            ),
-            UsageRepresentation::Export => ManagementResponse::json(
-                StatusCode::OK,
-                policy.sanitize_json(&usage_list(
-                    records,
-                    query,
-                    pooling.store().retention(),
-                    true,
-                )),
-                false,
-            ),
-            UsageRepresentation::Aggregate => ManagementResponse::json(
-                StatusCode::OK,
-                policy.sanitize_json(&usage_aggregate(records, query)),
-                false,
-            ),
+            UsageRepresentation::List => {
+                let value = with_persistence(
+                    usage_list(records, query, pooling.store().retention(), false),
+                    persistence,
+                );
+                ManagementResponse::json(StatusCode::OK, policy.sanitize_json(&value), false)
+            }
+            UsageRepresentation::Export => {
+                let value = with_persistence(
+                    usage_list(records, query, pooling.store().retention(), true),
+                    persistence,
+                );
+                ManagementResponse::json(StatusCode::OK, policy.sanitize_json(&value), false)
+            }
+            UsageRepresentation::Aggregate => {
+                let value = with_persistence(usage_aggregate(records, query), persistence);
+                ManagementResponse::json(StatusCode::OK, policy.sanitize_json(&value), false)
+            }
             UsageRepresentation::Prometheus => ManagementResponse::body(
                 StatusCode::OK,
                 "text/plain; version=0.0.4; charset=utf-8",
                 policy
-                    .sanitize_text(&usage_prometheus(records, query))
+                    .sanitize_text(&format_persistence_prometheus(
+                        usage_prometheus(records, query),
+                        &persistence,
+                    ))
                     .into_bytes(),
                 false,
             ),
@@ -2972,7 +2970,21 @@ impl ManagementApi {
             Ok(events) => events,
             Err(_) => return state_unavailable(),
         };
+        let persistence = pooling.persistence_status().json();
         if events.is_empty() {
+            if !persistence["request_events"]["complete"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                return ManagementResponse::json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({
+                        "error": "request history is incomplete",
+                        "persistence": persistence,
+                    }),
+                    false,
+                );
+            }
             return ManagementResponse::json(
                 StatusCode::NOT_FOUND,
                 json!({"error": "request history was not found"}),
@@ -2984,6 +2996,7 @@ impl ManagementApi {
                 "schema_version": 1,
                 "request_id": request_id,
                 "timeline": events,
+                "persistence": persistence,
             })
         } else {
             let summary = summarize_request_events(&events)
@@ -2993,6 +3006,7 @@ impl ManagementApi {
             json!({
                 "schema_version": 1,
                 "request": summary,
+                "persistence": persistence,
             })
         };
         ManagementResponse::json(
@@ -3001,6 +3015,51 @@ impl ManagementApi {
             false,
         )
     }
+}
+
+fn with_persistence(mut value: Value, persistence: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("persistence".to_owned(), persistence);
+    }
+    value
+}
+
+fn format_persistence_prometheus(mut output: String, persistence: &Value) -> String {
+    let enabled = persistence["enabled"].as_bool().unwrap_or(false);
+    let complete = persistence["complete"].as_bool().unwrap_or(false);
+    output.push_str(
+        "# HELP pooler_persistence_enabled Whether historical persistence is enabled.\n# TYPE pooler_persistence_enabled gauge\npooler_persistence_enabled ",
+    );
+    output.push_str(if enabled { "1\n" } else { "0\n" });
+    output.push_str(
+        "# HELP pooler_persistence_complete Whether no historical writes have been lost.\n# TYPE pooler_persistence_complete gauge\npooler_persistence_complete ",
+    );
+    output.push_str(if complete { "1\n" } else { "0\n" });
+    output.push_str(
+        "# HELP pooler_persistence_complete_stream Whether a historical stream has no lost writes.\n# TYPE pooler_persistence_complete_stream gauge\n",
+    );
+    output.push_str(
+        "# HELP pooler_persistence_lost_writes Historical records that could not be persisted.\n# TYPE pooler_persistence_lost_writes gauge\n",
+    );
+    output.push_str(
+        "# HELP pooler_persistence_successful_writes Historical records persisted successfully.\n# TYPE pooler_persistence_successful_writes gauge\n",
+    );
+    for stream in ["request_events", "usage_records"] {
+        let value = &persistence[stream];
+        output.push_str(&format!(
+            "pooler_persistence_complete_stream{{stream=\"{stream}\"}} {}\n",
+            value["complete"].as_bool().unwrap_or(false) as u8
+        ));
+        output.push_str(&format!(
+            "pooler_persistence_lost_writes{{stream=\"{stream}\"}} {}\n",
+            value["lost_writes"].as_u64().unwrap_or_default()
+        ));
+        output.push_str(&format!(
+            "pooler_persistence_successful_writes{{stream=\"{stream}\"}} {}\n",
+            value["successful_writes"].as_u64().unwrap_or_default()
+        ));
+    }
+    output
 }
 
 #[derive(Default)]
@@ -4422,6 +4481,8 @@ routes:
         assert!(js_body.contains("downloadExport"));
         assert!(js_body.contains("`${BASE}${path}`"));
         assert!(js_body.contains("/requests/export?"));
+        assert!(js_body.contains("persistenceWarning"));
+        assert!(js_body.contains("lost_writes"));
         assert!(!js_body.contains("localStorage"));
         assert!(!js_body.contains("sessionStorage"));
         assert!(!js_body.contains("?token="));
@@ -5303,6 +5364,55 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
     }
 
     #[test]
+    fn historical_write_loss_is_explicit_in_requests_usage_and_missing_details() {
+        let api = api();
+        let pooling = api.state.load_full().pooling.clone();
+        let status = pooling.persistence_status();
+        status.record_failure(
+            pooler_http::PersistenceStream::RequestEvents,
+            &StoreError::Sqlite("operator-secret-path".to_owned()),
+        );
+        status.record_failure(
+            pooler_http::PersistenceStream::UsageRecords,
+            &StoreError::Io("operator-secret-path".to_owned()),
+        );
+
+        let headers = loopback_headers();
+        let requests = api.handle(&Method::GET, "/requests", &headers);
+        assert_eq!(requests.status, StatusCode::OK);
+        let requests = response_value(requests);
+        assert_eq!(requests["persistence"]["request_events"]["complete"], false);
+        assert_eq!(requests["persistence"]["request_events"]["lost_writes"], 1);
+        assert_eq!(
+            requests["persistence"]["request_events"]["last_failure_class"],
+            "database"
+        );
+        assert!(!requests.to_string().contains("operator-secret-path"));
+
+        let usage = api.handle(&Method::GET, "/usage/aggregate", &headers);
+        assert_eq!(usage.status, StatusCode::OK);
+        let usage = response_value(usage);
+        assert_eq!(usage["persistence"]["usage_records"]["complete"], false);
+        assert_eq!(usage["persistence"]["usage_records"]["lost_writes"], 1);
+        assert_eq!(
+            usage["persistence"]["usage_records"]["last_failure_class"],
+            "io"
+        );
+        let prometheus = api.handle(&Method::GET, "/usage/prometheus", &headers);
+        assert_eq!(prometheus.status, StatusCode::OK);
+        let prometheus = String::from_utf8(prometheus.body).expect("Prometheus text");
+        assert!(prometheus.contains("pooler_persistence_complete 0"));
+        assert!(prometheus.contains("pooler_persistence_lost_writes{stream=\"usage_records\"} 1"));
+
+        let detail = api.handle(&Method::GET, "/requests/missing", &headers);
+        assert_eq!(detail.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_value(detail)["error"],
+            "request history is incomplete"
+        );
+    }
+
+    #[test]
     fn usage_ledger_filters_aggregates_and_exports_redacted_formats() {
         let api = api();
         let store = api.state.load_full().pooling.store();
@@ -5374,6 +5484,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             otlp["resourceMetrics"][0]["scopeMetrics"][0]["scope"]["name"],
             "pooler.usage"
         );
+        assert!(otlp.get("persistence").is_none());
         assert!(!otlp.to_string().contains("raw-usage-secret"));
         let export = api.handle(&Method::GET, "/usage/export", &headers);
         assert!(!String::from_utf8(export.body)

@@ -88,6 +88,7 @@ async fn anthropic_semantic_route_injects_configured_x_api_key_only() {
     assert!(!String::from_utf8_lossy(&upstream_request).contains(CLIENT_AUTHORIZATION));
     assert!(!String::from_utf8_lossy(&upstream_request).contains(CLIENT_X_API_KEY));
     assert!(!String::from_utf8_lossy(&upstream_request).contains(CLIENT_X_GOOG_API_KEY));
+    assert!(!String::from_utf8_lossy(&upstream_request).contains(CLIENT_API_KEY));
 
     running.stop().await;
     secret_file
@@ -142,6 +143,7 @@ async fn gemini_semantic_route_injects_configured_x_goog_api_key_only() {
     assert!(!String::from_utf8_lossy(&upstream_request).contains(CLIENT_AUTHORIZATION));
     assert!(!String::from_utf8_lossy(&upstream_request).contains(CLIENT_X_API_KEY));
     assert!(!String::from_utf8_lossy(&upstream_request).contains(CLIENT_X_GOOG_API_KEY));
+    assert!(!String::from_utf8_lossy(&upstream_request).contains(CLIENT_API_KEY));
 
     running.stop().await;
     secret_file

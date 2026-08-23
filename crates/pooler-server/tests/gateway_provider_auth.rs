@@ -741,6 +741,70 @@ async fn kimi_open_platform_is_mounted_with_its_native_contract() {
 }
 
 #[tokio::test]
+async fn kimi_code_preserves_the_provider_base_path_and_rejects_unknown_routes() {
+    let body = br#"{"model":"kimi-for-coding","messages":[{"role":"user","content":"sanitized"}],"stream":false}"#;
+    let sentinels = "authorization: Bearer downstream-sentinel\r\napi-key: downstream-sentinel\r\nx-api-key: downstream-sentinel\r\nx-goog-api-key: downstream-sentinel\r\n";
+    let calls = [
+        Call {
+            method: "POST",
+            path: "/v1/chat/completions",
+            content_type: Some("application/json"),
+            body,
+            extra_headers: sentinels,
+        },
+        call_without_body("GET", "/v1/not-a-kimi-code-route"),
+    ];
+    let (log, responses) =
+        exchange(ProviderContract::kimi_coding(), "kimi-for-coding", &calls).await;
+
+    assert!(
+        log.rejected.is_empty(),
+        "the unknown downstream route must be rejected by Pooler before the provider: {log:?}"
+    );
+    assert!(
+        log.accepted.iter().all(|request| matches!(
+            request.path.as_str(),
+            "/coding/v1/models" | "/coding/v1/chat/completions"
+        )),
+        "Pooler sent a path outside the Kimi Code contract: {log:?}"
+    );
+    let chat = log
+        .accepted_for("/coding/v1/chat/completions")
+        .expect("Kimi Code chat reached the provider-owned base path");
+    assert_eq!(
+        chat.header("authorization"),
+        Some(format!("Bearer {SECRET}").as_str())
+    );
+    assert_eq!(chat.header("api-key"), None);
+    assert_eq!(chat.header("x-api-key"), None);
+    assert_eq!(chat.header("x-goog-api-key"), None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&chat.body).expect("upstream JSON"),
+        serde_json::from_slice::<serde_json::Value>(body).expect("fixture JSON")
+    );
+    let models = log
+        .accepted_for("/coding/v1/models")
+        .expect("model discovery reached the provider-owned base path");
+    assert_eq!(
+        models.header("authorization"),
+        Some(format!("Bearer {SECRET}").as_str())
+    );
+    assert_eq!(models.header("api-key"), None);
+    assert_eq!(models.header("x-api-key"), None);
+    assert_eq!(models.header("x-goog-api-key"), None);
+    assert!(
+        responses[0].starts_with("HTTP/1.1 200"),
+        "chat response: {}; provider log: {log:?}",
+        responses[0]
+    );
+    assert!(
+        responses[1].starts_with("HTTP/1.1 404"),
+        "unknown Kimi Code route must be rejected: {}",
+        responses[1]
+    );
+}
+
+#[tokio::test]
 async fn vertex_model_actions_use_project_paths_and_google_access_tokens() {
     const MANIFEST_FIXTURE: &str =
         include_str!("../../../fixtures/vertex/gateway-native-2026-08-22.json");

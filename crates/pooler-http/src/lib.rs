@@ -46,8 +46,8 @@ pub use native::{
     NativeAuthorization, NativeAuthorizationRequest, NativeRuntime, NativeRuntimeError,
 };
 pub use pool::{
-    apply_configured_account_auth, PoolError, PoolFailure, PoolSelection, PoolingCoordinator,
-    SelectionContext, SelectionTiming,
+    apply_configured_account_auth, PersistenceStatus, PersistenceStream, PoolError, PoolFailure,
+    PoolSelection, PoolingCoordinator, SelectionContext, SelectionTiming,
 };
 pub use proxy::{
     apply_configured_upstream_auth, apply_configured_upstream_headers, BoxError, HttpProxy,

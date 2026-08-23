@@ -54,6 +54,7 @@ const FOREIGN_CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "x-api-key", "x-
 
 const OPENAI_MODELS: &str = r#"{"data":[{"id":"gpt-4o"},{"id":"text-embedding-3-small"}]}"#;
 const KIMI_MODELS: &str = r#"{"data":[{"id":"kimi-k2.5","object":"model"}]}"#;
+const KIMI_CODING_MODELS: &str = r#"{"data":[{"id":"kimi-for-coding","object":"model"}]}"#;
 const VERTEX_MODELS: &str = r#"{"publisherModels":[{"name":"publishers/google/models/gemini-2.5-pro","supportedActions":["generateContent","streamGenerateContent","countTokens"]}]}"#;
 const VERTEX_GENERATE_RESPONSE: &str = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"sanitized"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2},"modelVersion":"gemini-2.5-pro"}"#;
 const VERTEX_STREAM_RESPONSE: &str = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"sanitized\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2},\"modelVersion\":\"gemini-2.5-pro\"}\n\n";
@@ -332,6 +333,34 @@ impl ProviderContract {
                 ProviderRoute {
                     method: "POST",
                     path: "/v1/chat/completions",
+                    content_type: Some("application/json"),
+                    required_body_fields: &["model", "messages"],
+                    response: ACCEPTED,
+                },
+            ],
+        }
+    }
+
+    /// Kimi Code subscription: bearer credential and the provider-owned
+    /// `/coding/v1` OpenAI-compatible paths.
+    #[must_use]
+    pub const fn kimi_coding() -> Self {
+        Self {
+            name: "kimi-for-coding",
+            credential_header: "authorization",
+            credential_prefix: "Bearer ",
+            required_headers: &[],
+            routes: &[
+                ProviderRoute {
+                    method: "GET",
+                    path: "/coding/v1/models",
+                    content_type: None,
+                    required_body_fields: &[],
+                    response: KIMI_CODING_MODELS,
+                },
+                ProviderRoute {
+                    method: "POST",
+                    path: "/coding/v1/chat/completions",
                     content_type: Some("application/json"),
                     required_body_fields: &["model", "messages"],
                     response: ACCEPTED,

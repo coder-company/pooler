@@ -120,6 +120,49 @@ fn endpoint_builders_preserve_provider_specific_paths() {
         "kimi-for-coding(high)"
     );
 
+    // The shipped known-provider catalog uses the complete OpenAI-compatible
+    // base (`/coding/v1`), while the native profile's canonical root is
+    // `/coding`. Both forms must address the same wire endpoint exactly once.
+    let kimi_code_versioned = kimi_code
+        .clone()
+        .with_base_url(Url::parse("https://api.kimi.com/coding/v1").expect("Kimi Code URL"))
+        .expect("versioned Kimi Code base");
+    assert_eq!(
+        kimi_code_versioned
+            .endpoint_candidates(ProviderOperation::ChatCompletions, None)
+            .expect("versioned Kimi Code endpoint")[0]
+            .as_str(),
+        "https://api.kimi.com/coding/v1/chat/completions"
+    );
+    assert_eq!(
+        kimi_code
+            .openai_endpoint_path("/v1/chat/completions")
+            .expect("Kimi Code route path"),
+        "/coding/v1/chat/completions"
+    );
+    assert_eq!(
+        kimi_code_versioned
+            .openai_endpoint_path("/v1/chat/completions")
+            .expect("versioned Kimi Code route path"),
+        "/coding/v1/chat/completions"
+    );
+    assert!(matches!(
+        kimi_code.openai_endpoint_path("/v2/chat/completions"),
+        Err(AdapterError::InvalidOverridePath)
+    ));
+
+    let kimi_open_platform_versioned = kimi
+        .clone()
+        .with_base_url(Url::parse("https://api.moonshot.ai/v1").expect("Moonshot URL"))
+        .expect("versioned Moonshot base");
+    assert_eq!(
+        kimi_open_platform_versioned
+            .endpoint_candidates(ProviderOperation::ListModels, None)
+            .expect("versioned Moonshot model endpoint")[0]
+            .as_str(),
+        "https://api.moonshot.ai/v1/models"
+    );
+
     let vertex = VertexAdapter::project("fixture-project", "global").expect("Vertex adapter");
     assert_eq!(
         vertex

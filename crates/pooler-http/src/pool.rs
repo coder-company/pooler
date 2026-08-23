@@ -7,7 +7,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -34,12 +37,157 @@ use pooler_policy::{
 };
 use pooler_store::{
     CooldownState, CredentialHealthState, CredentialHealthStatus, CredentialState,
-    DecisionCandidate, DecisionRecord, MemoryStore, SessionAffinity, Store,
+    DecisionCandidate, DecisionRecord, MemoryStore, SessionAffinity, Store, StoreError,
 };
 use thiserror::Error;
 
 const TYPED_QUOTA_STORE_SCOPE: &str = "typed_quota_v1";
 const MAX_DISABLED_MODELS: usize = 4_096;
+
+/// The two historical streams written by the request lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistenceStream {
+    /// Metadata-only request lifecycle events.
+    RequestEvents,
+    /// Metadata-only completed usage records.
+    UsageRecords,
+}
+
+#[derive(Debug, Default)]
+struct PersistenceStreamState {
+    successful_writes: AtomicU64,
+    lost_writes: AtomicU64,
+    last_success_at_ms: AtomicU64,
+    last_failure_at_ms: AtomicU64,
+    last_failure_class: Mutex<Option<&'static str>>,
+}
+
+#[derive(Debug, Default)]
+struct PersistenceStatusInner {
+    enabled: AtomicBool,
+    request_events: PersistenceStreamState,
+    usage_records: PersistenceStreamState,
+}
+
+/// Bounded, process-local visibility into historical persistence.
+///
+/// This status intentionally stores only counters, timestamps, and a
+/// fixed-vocabulary error class. It never retains storage error text, which
+/// may contain paths or other operator-controlled values. The handle is
+/// shared by all listeners serving one pooling coordinator.
+#[derive(Clone, Debug, Default)]
+pub struct PersistenceStatus {
+    inner: Arc<PersistenceStatusInner>,
+}
+
+impl PersistenceStatus {
+    /// Construct status for an enabled or disabled historical persistence
+    /// stream. Pooler currently always mounts a store, but keeping this bit
+    /// explicit lets management distinguish disabled persistence from an
+    /// enabled store that has lost writes.
+    #[must_use]
+    pub fn new(enabled: bool) -> Self {
+        let status = Self::default();
+        status.inner.enabled.store(enabled, Ordering::Release);
+        status
+    }
+
+    /// Record one successful write to a historical stream.
+    pub fn record_success(&self, stream: PersistenceStream, recorded_at_ms: u64) {
+        let state = self.stream(stream);
+        state.successful_writes.fetch_add(1, Ordering::Relaxed);
+        state
+            .last_success_at_ms
+            .store(recorded_at_ms, Ordering::Release);
+    }
+
+    /// Record one lost write using a fixed, redacted error class.
+    pub fn record_failure(&self, stream: PersistenceStream, error: &StoreError) {
+        let state = self.stream(stream);
+        state.lost_writes.fetch_add(1, Ordering::Relaxed);
+        state
+            .last_failure_at_ms
+            .store(timestamp_now(), Ordering::Release);
+        *state
+            .last_failure_class
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store_error_class(error));
+    }
+
+    /// Return a redacted JSON snapshot suitable for management responses.
+    #[must_use]
+    pub fn json(&self) -> serde_json::Value {
+        let request_events = self.stream_json(PersistenceStream::RequestEvents);
+        let usage_records = self.stream_json(PersistenceStream::UsageRecords);
+        let complete = self.inner.enabled.load(Ordering::Acquire)
+            && request_events["complete"].as_bool().unwrap_or(false)
+            && usage_records["complete"].as_bool().unwrap_or(false);
+        serde_json::json!({
+            "enabled": self.inner.enabled.load(Ordering::Acquire),
+            "complete": complete,
+            "request_events": request_events,
+            "usage_records": usage_records,
+        })
+    }
+
+    fn stream(&self, stream: PersistenceStream) -> &PersistenceStreamState {
+        match stream {
+            PersistenceStream::RequestEvents => &self.inner.request_events,
+            PersistenceStream::UsageRecords => &self.inner.usage_records,
+        }
+    }
+
+    fn stream_json(&self, stream: PersistenceStream) -> serde_json::Value {
+        let state = self.stream(stream);
+        let lost_writes = state.lost_writes.load(Ordering::Acquire);
+        let last_success_at_ms = state.last_success_at_ms.load(Ordering::Acquire);
+        let last_failure_at_ms = state.last_failure_at_ms.load(Ordering::Acquire);
+        let last_failure_class = state
+            .last_failure_class
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(str::to_owned);
+        serde_json::json!({
+            "complete": self.inner.enabled.load(Ordering::Acquire) && lost_writes == 0,
+            "successful_writes": state.successful_writes.load(Ordering::Acquire),
+            "lost_writes": lost_writes,
+            "write_failures": lost_writes,
+            "dropped_records": lost_writes,
+            "last_success_at_ms": (last_success_at_ms != 0).then_some(last_success_at_ms),
+            "last_failure_at_ms": (last_failure_at_ms != 0).then_some(last_failure_at_ms),
+            "last_failure_class": last_failure_class,
+        })
+    }
+}
+
+fn store_error_class(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::EmptyField { .. }
+        | StoreError::InvalidRetention
+        | StoreError::CredentialNotFound(_) => "validation",
+        StoreError::DecisionIdExhausted
+        | StoreError::RequestEventIdExhausted
+        | StoreError::UsageRecordIdExhausted => "identifier_exhausted",
+        StoreError::InvalidPath(_) | StoreError::UnsafePath(_) => "path",
+        StoreError::Io(_) => "io",
+        StoreError::Sqlite(_) => "database",
+        StoreError::Serialization(_) => "serialization",
+        StoreError::MasterKeyReferenceRejected
+        | StoreError::MasterKeyUnavailable
+        | StoreError::EmptyMasterKey
+        | StoreError::EmptyCredentialPayload
+        | StoreError::EncryptionRequired
+        | StoreError::InvalidCredentialEnvelope
+        | StoreError::UnsupportedCredentialEnvelopeVersion(_)
+        | StoreError::UnsupportedCredentialEnvelopeAlgorithm
+        | StoreError::WrongMasterKey
+        | StoreError::CredentialEnvelopeAuthenticationFailed
+        | StoreError::EncryptionFailed => "encryption",
+        StoreError::CredentialRevisionConflict => "concurrency",
+        StoreError::UnsupportedSchemaVersion(_) | StoreError::Migration { .. } => "migration",
+        StoreError::LockPoisoned => "lock",
+    }
+}
 
 /// Request-local semantic information needed by account selection.
 ///
@@ -424,6 +572,7 @@ pub struct PoolingCoordinator {
     store: Arc<dyn Store>,
     catalog: Option<Arc<CatalogService>>,
     disabled_models: Arc<RwLock<BTreeSet<String>>>,
+    persistence: PersistenceStatus,
 }
 
 /// Non-secret snapshot of the selected account and compatible registries used
@@ -450,6 +599,7 @@ impl std::fmt::Debug for PoolingCoordinator {
                     .read()
                     .map_or(0, |disabled| disabled.len()),
             )
+            .field("persistence", &self.persistence)
             .finish_non_exhaustive()
     }
 }
@@ -521,6 +671,7 @@ impl PoolingCoordinator {
             store,
             catalog: None,
             disabled_models: Arc::new(RwLock::new(BTreeSet::new())),
+            persistence: PersistenceStatus::new(true),
         };
         coordinator.restore_account_state(config)?;
         Ok(coordinator)
@@ -534,6 +685,7 @@ impl PoolingCoordinator {
         let mut coordinator = Self::with_store(config, Arc::clone(&self.store))?;
         coordinator.catalog.clone_from(&self.catalog);
         coordinator.disabled_models = Arc::clone(&self.disabled_models);
+        coordinator.persistence = self.persistence.clone();
         Ok(coordinator)
     }
 
@@ -555,6 +707,12 @@ impl PoolingCoordinator {
     #[must_use]
     pub fn store(&self) -> Arc<dyn Store> {
         Arc::clone(&self.store)
+    }
+
+    /// Return the process-local status for request and usage persistence.
+    #[must_use]
+    pub fn persistence_status(&self) -> PersistenceStatus {
+        self.persistence.clone()
     }
 
     /// Allocate one process-unique logical request identifier. The caller owns
@@ -2472,6 +2630,34 @@ upstreams:
             Some(&HeaderValue::from_static("Token account-secret"))
         );
         assert!(!headers.contains_key(http::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn persistence_status_tracks_redacted_write_loss_and_recovery() {
+        let status = PersistenceStatus::new(true);
+        let initial = status.json();
+        assert_eq!(initial["enabled"], true);
+        assert_eq!(initial["complete"], true);
+
+        status.record_failure(
+            PersistenceStream::RequestEvents,
+            &StoreError::Sqlite("/private/operator/path".to_owned()),
+        );
+        let failed = status.json();
+        assert_eq!(failed["complete"], false);
+        assert_eq!(failed["request_events"]["complete"], false);
+        assert_eq!(failed["request_events"]["lost_writes"], 1);
+        assert_eq!(failed["request_events"]["last_failure_class"], "database");
+        assert!(!failed.to_string().contains("/private/operator/path"));
+
+        status.record_success(PersistenceStream::RequestEvents, 1_700_000_000_000);
+        let recovered = status.json();
+        assert_eq!(recovered["request_events"]["complete"], false);
+        assert_eq!(recovered["request_events"]["successful_writes"], 1);
+        assert_eq!(
+            recovered["request_events"]["last_success_at_ms"],
+            1_700_000_000_000_u64
+        );
     }
 
     fn pooled_config(affinity: bool) -> CompiledConfig {

@@ -277,6 +277,25 @@ impl KimiAdapter {
     pub const fn surface(&self) -> KimiSurface {
         self.surface
     }
+
+    /// Rewrite one OpenAI-compatible `/v1/...` route to this surface's
+    /// provider-owned endpoint path.
+    ///
+    /// Kimi Code documents `/coding/v1` as its OpenAI base while a number of
+    /// clients expose `/v1/...` as the route they append to that base. Keep
+    /// the product path and collapse an already-versioned base to one `/v1`.
+    pub fn openai_endpoint_path(&self, path: &str) -> Result<String, AdapterError> {
+        validate_override_path(path)?;
+        let suffix = path
+            .strip_prefix("/v1")
+            .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+            .ok_or(AdapterError::InvalidOverridePath)?;
+        let base = self.base_url.path().trim_end_matches('/');
+        let base = base.strip_suffix("/v1").unwrap_or(base);
+        let mut endpoint = format!("{base}/v1");
+        endpoint.push_str(suffix);
+        Ok(endpoint)
+    }
 }
 
 impl ProviderAdapter for KimiAdapter {
@@ -298,18 +317,34 @@ impl ProviderAdapter for KimiAdapter {
         operation: ProviderOperation,
         _model: Option<&str>,
     ) -> Result<Vec<Url>, AdapterError> {
-        let path = match (self.surface, operation) {
-            (_, ProviderOperation::ChatCompletions) => "v1/chat/completions",
-            (KimiSurface::OpenPlatform, ProviderOperation::ListModels) => "v1/models",
+        let suffix = match (self.surface, operation) {
+            (_, ProviderOperation::ChatCompletions) => "chat/completions",
+            (KimiSurface::OpenPlatform, ProviderOperation::ListModels) => "models",
             (KimiSurface::OpenPlatform, ProviderOperation::EstimateTokens) => {
-                "v1/tokenizers/estimate-token-count"
+                "tokenizers/estimate-token-count"
             }
-            (KimiSurface::OpenPlatform, ProviderOperation::Balance) => "v1/users/me/balance",
-            (KimiSurface::OpenPlatform, ProviderOperation::Files) => "v1/files",
-            (KimiSurface::OpenPlatform, ProviderOperation::Batches) => "v1/batches",
+            (KimiSurface::OpenPlatform, ProviderOperation::Balance) => "users/me/balance",
+            (KimiSurface::OpenPlatform, ProviderOperation::Files) => "files",
+            (KimiSurface::OpenPlatform, ProviderOperation::Batches) => "batches",
             _ => return Err(AdapterError::UnsupportedOperation { operation }),
         };
-        Ok(vec![append_path(&self.base_url, path)?])
+        // The catalog may provide either the product root (`/coding`) or the
+        // already-versioned endpoint root (`/coding/v1`). Treat `/v1` as part
+        // of the base when it is present so endpoint construction never emits
+        // `/coding/v1/v1/...` and never loses the `/coding` product path.
+        let path = if self
+            .base_url
+            .path()
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            == Some("v1")
+        {
+            suffix.to_owned()
+        } else {
+            format!("v1/{suffix}")
+        };
+        Ok(vec![append_path(&self.base_url, &path)?])
     }
 
     fn authorization(&self, secret: &SecretValue) -> Result<ProviderAuthorization, AdapterError> {

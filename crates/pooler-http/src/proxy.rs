@@ -19,8 +19,8 @@ use std::{
 };
 
 use adapter_providers::{
-    AuthPlacement, ProviderAdapter, ProviderKind, ProviderOperation, ProviderResponseClassifier,
-    VertexAdapter,
+    AuthPlacement, KimiAdapter, ProviderAdapter, ProviderKind, ProviderOperation,
+    ProviderResponseClassifier, VertexAdapter,
 };
 use base64::Engine;
 use bytes::Bytes;
@@ -74,9 +74,9 @@ use crate::{
     safe_request_for_cache, safe_response_for_cache, strip_hop_by_hop_headers, CacheKey,
     CacheKeyInput, CacheLeader, CacheLookup, CachePolicy, CachedResponse, DrainController,
     DrainGuard, DrainedBody, FrameLimitedBody, LimitedBody, NativeAuthorization,
-    NativeAuthorizationRequest, NativeRuntime, NativeRuntimeError, PoolError, PoolSelection,
-    PoolingCoordinator, ResponseCache, RuntimeResources, SelectionContext, SelectionTiming,
-    SseLimits, SseParser,
+    NativeAuthorizationRequest, NativeRuntime, NativeRuntimeError, PersistenceStatus,
+    PersistenceStream, PoolError, PoolSelection, PoolingCoordinator, ResponseCache,
+    RuntimeResources, SelectionContext, SelectionTiming, SseLimits, SseParser,
 };
 
 /// The erased body type used by responses returned from [`HttpProxy`].
@@ -462,6 +462,7 @@ struct RequestLifecycleState {
 #[derive(Clone)]
 struct RequestLifecycle {
     store: Arc<dyn Store>,
+    persistence: PersistenceStatus,
     request_id: Arc<str>,
     listener: Arc<str>,
     route: Arc<str>,
@@ -476,7 +477,7 @@ struct RequestLifecycle {
 
 impl RequestLifecycle {
     fn new(
-        store: Arc<dyn Store>,
+        history: (Arc<dyn Store>, PersistenceStatus),
         request_id: impl Into<Arc<str>>,
         listener: Arc<str>,
         route: impl Into<Arc<str>>,
@@ -484,8 +485,10 @@ impl RequestLifecycle {
         catalog_generation: Option<u64>,
         price_book: Option<Arc<UsagePriceBookPlan>>,
     ) -> Self {
+        let (store, persistence) = history;
         let lifecycle = Self {
             store,
+            persistence,
             request_id: request_id.into(),
             listener,
             route: route.into(),
@@ -533,8 +536,15 @@ impl RequestLifecycle {
         event.catalog_generation = self.catalog_generation;
         drop(state);
         update(&mut event);
-        if self.store.append_request_event(event).is_err() {
-            tracing::warn!(request_id = %self.request_id, "request history event was not persisted");
+        match self.store.append_request_event(event) {
+            Ok(_) => self
+                .persistence
+                .record_success(PersistenceStream::RequestEvents, request_timestamp_now()),
+            Err(error) => {
+                self.persistence
+                    .record_failure(PersistenceStream::RequestEvents, &error);
+                tracing::warn!(request_id = %self.request_id, error = %error, "request history event was not persisted");
+            }
         }
     }
 
@@ -690,12 +700,19 @@ impl RequestLifecycle {
                 }
             }
         }
-        if let Err(error) = self.store.append_usage_record(record) {
-            tracing::warn!(
-                request_id = %self.request_id,
-                error = %error,
-                "usage record was not persisted"
-            );
+        match self.store.append_usage_record(record) {
+            Ok(_) => self
+                .persistence
+                .record_success(PersistenceStream::UsageRecords, request_timestamp_now()),
+            Err(error) => {
+                self.persistence
+                    .record_failure(PersistenceStream::UsageRecords, &error);
+                tracing::warn!(
+                    request_id = %self.request_id,
+                    error = %error,
+                    "usage record was not persisted"
+                );
+            }
         }
     }
 }
@@ -994,7 +1011,7 @@ where
             "request routed"
         );
         let lifecycle = RequestLifecycle::new(
-            self.pooling.store(),
+            (self.pooling.store(), self.pooling.persistence_status()),
             self.pooling.next_logical_request_id(),
             Arc::clone(&self.listener),
             route.id(),
@@ -3774,7 +3791,18 @@ fn upstream_uri(
             downstream.path()
         }
     });
-    url.set_path(path);
+    let path = if upstream
+        .known_provider()
+        .is_some_and(|provider| provider.eq_ignore_ascii_case("kimi-for-coding"))
+    {
+        KimiAdapter::coding_subscription()
+            .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?
+            .openai_endpoint_path(path)
+            .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?
+    } else {
+        path.to_owned()
+    };
+    url.set_path(&path);
     url.set_query(downstream.query());
     apply_upstream_query(&mut url, upstream.query());
     url.as_str().parse().map_err(|_| ProxyError::InvalidUri)
@@ -4820,12 +4848,12 @@ pub fn apply_configured_upstream_auth(
 /// Remove caller-supplied provider credential headers when Pooler supplies its
 /// own credential for this attempt.
 ///
-/// Without this a downstream caller could attach `authorization`, `x-api-key`,
-/// or `x-goog-api-key` and have it forwarded to the provider alongside — or
-/// instead of — Pooler's credential. Only the semantic body mode stripped them
-/// before, so every opaque, inspect, and patch route was a credential
-/// smuggling path. When Pooler supplies no credential the route is a pure
-/// tunnel and the caller's headers remain its own business.
+/// Without this a downstream caller could attach `authorization`, `api-key`,
+/// `x-api-key`, or `x-goog-api-key` and have it forwarded to the provider
+/// alongside — or instead of — Pooler's credential. Only the semantic body
+/// mode stripped them before, so every opaque, inspect, and patch route was a
+/// credential smuggling path. When Pooler supplies no credential the route is
+/// a pure tunnel and the caller's headers remain its own business.
 fn strip_caller_credentials_when_authenticating(
     headers: &mut HeaderMap,
     native: bool,
@@ -4839,6 +4867,7 @@ fn strip_caller_credentials_when_authenticating(
 
 fn strip_provider_credential_headers(headers: &mut HeaderMap) {
     headers.remove(header::AUTHORIZATION);
+    headers.remove("api-key");
     headers.remove("x-api-key");
     headers.remove("x-goog-api-key");
 }
@@ -5272,7 +5301,7 @@ routes:
     fn request_completion_persists_full_usage_ledger_record() {
         let store = Arc::new(pooler_store::MemoryStore::new());
         let lifecycle = RequestLifecycle::new(
-            store.clone(),
+            (store.clone(), PersistenceStatus::new(true)),
             "request-id",
             Arc::from("listener"),
             "route",
@@ -5322,6 +5351,33 @@ routes:
     }
 
     #[test]
+    fn failed_store_writes_update_persistence_status() {
+        let store: Arc<dyn Store> = Arc::new(
+            pooler_store::SqliteStore::open_in_memory().expect("unencrypted SQLite store"),
+        );
+        let persistence = PersistenceStatus::new(true);
+        let lifecycle = RequestLifecycle::new(
+            (store, persistence.clone()),
+            "request-id",
+            Arc::from("listener"),
+            "route",
+            1,
+            None,
+            None,
+        );
+        lifecycle.complete_with_usage(CompletionClass::Success, Some(200), None);
+
+        let status = persistence.json();
+        assert_eq!(status["complete"], false);
+        assert!(status["request_events"]["lost_writes"]
+            .as_u64()
+            .is_some_and(|lost| lost >= 1));
+        assert_eq!(status["request_events"]["last_failure_class"], "encryption");
+        assert_eq!(status["usage_records"]["lost_writes"], 1);
+        assert_eq!(status["usage_records"]["last_failure_class"], "encryption");
+    }
+
+    #[test]
     fn request_completion_estimates_cost_only_from_a_versioned_operator_price_book() {
         let config = compile_yaml(
             "usage-price-book.yaml",
@@ -5341,7 +5397,7 @@ usage_price_book:
         let price_book = Arc::new(config.usage_price_book().expect("price book plan").clone());
         let store = Arc::new(pooler_store::MemoryStore::new());
         let lifecycle = RequestLifecycle::new(
-            store.clone(),
+            (store.clone(), PersistenceStatus::new(true)),
             "request-id",
             Arc::from("listener"),
             "route",
