@@ -109,7 +109,11 @@ fn the_gateway_preset_selects_models_and_mounts_semantic_responses_transport() {
         responses.response().decoder(),
         Some("decode.openai.responses.events")
     );
-    assert_eq!(responses.target().upstream(), "gateway-websocket");
+    assert_eq!(responses.target().upstream(), "gateway");
+    assert_eq!(
+        responses.target().transport_upstream(),
+        Some("gateway-websocket")
+    );
     assert_eq!(responses.target().path(), Some("/v1/responses"));
     assert_eq!(responses.loss_policy(), LossPolicy::Reject);
 
@@ -276,7 +280,11 @@ fn the_gateway_websocket_routes_use_the_websocket_upstream() {
     let semantic = config
         .route("gateway-responses")
         .expect("semantic Responses route");
-    assert_eq!(semantic.target().upstream(), "gateway-websocket");
+    assert_eq!(semantic.target().upstream(), "gateway");
+    assert_eq!(
+        semantic.target().transport_upstream(),
+        Some("gateway-websocket")
+    );
 
     let realtime = config
         .route("gateway-realtime-websocket")
@@ -499,7 +507,89 @@ fn xai_gateway_uses_xai_semantics_for_the_responses_websocket_transport() {
         responses.response().decoder(),
         Some("decode.xai.responses.events")
     );
-    assert_eq!(responses.target().upstream(), "gw-websocket");
+    assert_eq!(responses.target().upstream(), "gw");
+    assert_eq!(
+        responses.target().transport_upstream(),
+        Some("gw-websocket")
+    );
+}
+
+#[test]
+fn route_transport_upstream_accepts_an_arbitrary_ws_upstream_name() {
+    let config = pooler_config::compile_yaml(
+        "explicit-transport-upstream.yaml",
+        r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  model-provider: {url: http://127.0.0.1:1}
+  dedicated-semantic-socket: {url: ws://127.0.0.1:2}
+routes:
+  - id: responses
+    listen: local
+    ingress: {mode: semantic, decoder: decode.openai.responses}
+    target:
+      provider: model-provider
+      transport_upstream: dedicated-semantic-socket
+    response: {mode: semantic, decoder: decode.openai.responses.events}
+"#,
+    )
+    .expect("explicit transport config");
+    let target = config.route("responses").expect("responses route").target();
+    assert_eq!(target.upstream(), "model-provider");
+    assert_eq!(
+        target.transport_upstream(),
+        Some("dedicated-semantic-socket")
+    );
+}
+
+#[test]
+fn route_transport_upstream_rejects_a_missing_upstream() {
+    let error = pooler_config::compile_yaml(
+        "missing-transport-upstream.yaml",
+        r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {model-provider: {url: http://127.0.0.1:1}}
+routes:
+  - id: responses
+    listen: local
+    ingress: {mode: semantic}
+    target:
+      provider: model-provider
+      transport_upstream: absent-socket
+"#,
+    )
+    .expect_err("missing transport upstream must fail compilation");
+    assert!(error.to_string().contains("absent-socket"), "{error}");
+}
+
+#[test]
+fn route_transport_upstream_rejects_a_non_websocket_upstream() {
+    let error = pooler_config::compile_yaml(
+        "incompatible-transport-upstream.yaml",
+        r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  model-provider: {url: http://127.0.0.1:1}
+  http-transport: {url: http://127.0.0.1:2}
+routes:
+  - id: responses
+    listen: local
+    ingress: {mode: semantic}
+    target:
+      provider: model-provider
+      transport_upstream: http-transport
+"#,
+    )
+    .expect_err("non-WebSocket transport upstream must fail compilation");
+    assert!(
+        error
+            .to_string()
+            .contains("transport_upstream must use a ws or wss transport"),
+        "{error}"
+    );
 }
 
 /// An endpoint family the provider does not document is a configuration error,

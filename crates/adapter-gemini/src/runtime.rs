@@ -264,19 +264,26 @@ fn interaction_selection_context(body: &[u8]) -> Result<SelectionContext, BoxErr
         return Err(Box::new(GeminiRuntimeError::MissingInteractionInput));
     }
     let mut context = SelectionContext::default();
-    if let Some(model) = value.get("model") {
-        let model = model
-            .as_str()
-            .filter(|model| !model.trim().is_empty())
-            .ok_or(GeminiRuntimeError::InvalidInteractionModel)?;
-        context.with_model(model);
-    } else if let Some(agent) = value.get("agent") {
-        agent
-            .as_str()
-            .filter(|agent| !agent.trim().is_empty())
-            .ok_or(GeminiRuntimeError::InvalidInteractionAgent)?;
-    } else {
-        return Err(Box::new(GeminiRuntimeError::MissingInteractionTarget));
+    let model = match value.get("model") {
+        None => None,
+        Some(Value::String(model)) if model.trim().is_empty() => None,
+        Some(Value::String(model)) => Some(normalize_model_resource_name(model)),
+        Some(_) => return Err(Box::new(GeminiRuntimeError::InvalidInteractionModel)),
+    };
+    let agent = match value.get("agent") {
+        None => None,
+        Some(Value::String(agent)) if agent.trim().is_empty() => None,
+        Some(Value::String(agent)) => Some(agent.as_str()),
+        Some(_) => return Err(Box::new(GeminiRuntimeError::InvalidInteractionAgent)),
+    };
+    match (model, agent) {
+        (Some(model), None) => {
+            context.with_model(model);
+            context.require_known_model();
+        }
+        (None, Some(_agent)) => {}
+        (Some(_), Some(_)) => return Err(Box::new(GeminiRuntimeError::MultipleInteractionTargets)),
+        (None, None) => return Err(Box::new(GeminiRuntimeError::MissingInteractionTarget)),
     }
     context.require(pooler_core::Capability::Text);
     if let Some(stream) = value.get("stream") {
@@ -304,6 +311,14 @@ fn interaction_selection_context(body: &[u8]) -> Result<SelectionContext, BoxErr
         context.with_affinity_value("gemini.interaction_id", previous);
     }
     Ok(context)
+}
+
+fn normalize_model_resource_name(model: &str) -> &str {
+    model
+        .trim()
+        .strip_prefix("models/")
+        .filter(|model| !model.is_empty())
+        .unwrap_or(model.trim())
 }
 
 fn require_json_object(body: &[u8]) -> Result<serde_json::Map<String, Value>, BoxError> {
@@ -678,6 +693,8 @@ enum GeminiRuntimeError {
     InvalidPreviousInteractionId,
     #[error("Gemini Interaction requires either `model` or `agent`")]
     MissingInteractionTarget,
+    #[error("Gemini Interaction requires exactly one of `model` or `agent`")]
+    MultipleInteractionTargets,
     #[error("Gemini upstream URI could not be constructed")]
     InvalidUpstreamUri,
     #[error("Gemini model changed while encoding the same-wire request")]
@@ -822,6 +839,17 @@ mod tests {
         assert!(
             interaction_selection_context(br#"{"model":"public","input":"hi","tools":null}"#)
                 .is_err()
+        );
+
+        let prefixed = interaction_selection_context(br#"{"model":"models/public","input":"hi"}"#)
+            .expect("prefixed interaction model");
+        assert_eq!(prefixed.model(), Some("public"));
+        assert!(interaction_selection_context(
+            br#"{"model":"public","agent":"agent","input":"hi"}"#,
+        )
+        .is_err());
+        assert!(
+            interaction_selection_context(br#"{"model":"","agent":"agent","input":"hi"}"#).is_ok()
         );
     }
 }

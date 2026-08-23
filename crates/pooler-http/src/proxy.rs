@@ -1228,7 +1228,7 @@ where
                 }
             };
         lifecycle.selected(&selection, 1);
-        let upstream = self
+        let selected_upstream = self
             .config
             .upstreams()
             .get(selection.upstream_id())
@@ -1236,6 +1236,18 @@ where
                 route: route.id().to_owned(),
                 upstream: selection.upstream_id().to_owned(),
             })?;
+        let upstream = route.target().transport_upstream().map_or(
+            Ok(selected_upstream),
+            |transport_upstream| {
+                self.config
+                    .upstreams()
+                    .get(transport_upstream)
+                    .ok_or_else(|| ProxyError::MissingUpstream {
+                        route: route.id().to_owned(),
+                        upstream: transport_upstream.to_owned(),
+                    })
+            },
+        )?;
         if !matches!(upstream.transport(), "ws" | "wss") {
             return Err(ProxyError::InvalidWebSocketHandshake(
                 "the selected upstream does not use ws or wss".to_owned(),
@@ -1809,7 +1821,7 @@ where
                 credentials_used.insert(credential.clone());
             }
             providers_used.insert(selection.provider().clone());
-            let upstream = self
+            let selected_upstream = self
                 .config
                 .upstreams()
                 .get(selection.upstream_id())
@@ -1817,6 +1829,34 @@ where
                     route: route.id().to_owned(),
                     upstream: selection.upstream_id().to_owned(),
                 })?;
+            let websocket_transport = self.semantic.websocket_transport(route);
+            // Semantic Responses selection uses the REST provider identity so
+            // catalog aliases and account state match the discovered target.
+            // An explicit target transport binding supplies the WebSocket
+            // endpoint only for the transport attempt.
+            let upstream = if websocket_transport.is_some() {
+                route.target().transport_upstream().map_or(
+                    Ok(selected_upstream),
+                    |transport_upstream| {
+                        self.config
+                            .upstreams()
+                            .get(transport_upstream)
+                            .ok_or_else(|| ProxyError::MissingUpstream {
+                                route: route.id().to_owned(),
+                                upstream: transport_upstream.to_owned(),
+                            })
+                    },
+                )?
+            } else {
+                selected_upstream
+            };
+            if route.target().transport_upstream().is_some()
+                && !matches!(upstream.transport(), "ws" | "wss")
+            {
+                return Err(ProxyError::InvalidWebSocketHandshake(
+                    "semantic WebSocket transport requires a ws or wss target transport".to_owned(),
+                ));
+            }
             let retry_deadline = retry_deadline(started, limits, upstream, selection.policy());
             let _secret = (upstream.native().is_some()
                 || selection.account_secret().is_some()
@@ -1869,7 +1909,6 @@ where
                 cancellation: &cancellation,
                 started,
             };
-            let websocket_transport = self.semantic.websocket_transport(route);
             let response = match (
                 websocket_transport,
                 matches!(upstream.transport(), "ws" | "wss"),

@@ -48,6 +48,7 @@ const MAX_DISABLED_MODELS: usize = 4_096;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SelectionContext {
     model: Option<String>,
+    model_must_resolve: bool,
     required_capabilities: CapabilitySet,
     codec: Option<String>,
     affinity_values: BTreeMap<String, String>,
@@ -123,6 +124,12 @@ impl SelectionContext {
         }
     }
 
+    /// Require the decoded model to resolve through the configured or
+    /// discovered public model namespace before any upstream attempt.
+    pub const fn require_known_model(&mut self) {
+        self.model_must_resolve = true;
+    }
+
     /// Add a route-level requirement discovered by an adapter.
     pub const fn require(&mut self, capability: Capability) {
         self.required_capabilities.insert(capability);
@@ -154,6 +161,12 @@ impl SelectionContext {
     #[must_use]
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    /// Whether an adapter requires its decoded model to be a known public ID.
+    #[must_use]
+    pub const fn model_must_resolve(&self) -> bool {
+        self.model_must_resolve
     }
 
     /// Required codec identifier, if the route has one.
@@ -871,6 +884,26 @@ impl PoolingCoordinator {
                         .any(|target| target.provider().as_str() == route.target().upstream())
                 })
         });
+        let route_has_model_namespace = config.models().values().any(|model| {
+            model
+                .targets()
+                .iter()
+                .any(|target| target.provider() == route.target().upstream())
+        }) || catalog.as_deref().is_some_and(|catalog| {
+            catalog.models().values().any(|model| {
+                model
+                    .targets()
+                    .iter()
+                    .any(|target| target.provider().as_str() == route.target().upstream())
+            })
+        });
+        if contextual_model.is_none() && context.model_must_resolve() && route_has_model_namespace {
+            if let Some(model) = context.model() {
+                return Err(PoolError::UnknownModel {
+                    model: model.to_owned(),
+                });
+            }
+        }
         let requested_model = model.or_else(|| {
             if route.target().model_source().is_some() {
                 context.model()

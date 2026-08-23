@@ -2578,6 +2578,7 @@ impl ManagementApi {
                     "response": route.response().mode(),
                     "target": {
                         "upstream": route.target().upstream(),
+                        "transport_upstream": route.target().transport_upstream(),
                         "path": route.target().path(),
                         "model_source": route.target().model_source().map(|source| match source {
                             pooler_config::ModelSource::Request => "request",

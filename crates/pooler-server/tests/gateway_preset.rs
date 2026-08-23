@@ -344,6 +344,18 @@ fn gateway_config(
     upstream: SocketAddr,
     websocket: SocketAddr,
 ) -> pooler_config::CompiledConfig {
+    gateway_config_with_models(directory, upstream, websocket, "")
+}
+
+/// Compile the gateway preset with explicit model metadata. This keeps the
+/// alias-to-upstream assertion deterministic without depending on asynchronous
+/// catalog discovery timing.
+fn gateway_config_with_models(
+    directory: &TempDir,
+    upstream: SocketAddr,
+    websocket: SocketAddr,
+    models: &str,
+) -> pooler_config::CompiledConfig {
     let mut secret_file = tempfile::NamedTempFile::new_in(directory.path()).expect("secret file");
     secret_file
         .write_all(SECRET.as_bytes())
@@ -354,7 +366,7 @@ fn gateway_config(
     std::fs::write(
         &path,
         format!(
-            "imports:\n  - preset: gateway\n    as: gateway\n    with:\n      bind: 127.0.0.1:0\n      upstream_url: http://{upstream}\n      websocket_url: ws://{websocket}\n      secret: 'file:{secret}'\n\nversion: 1\n"
+            "imports:\n  - preset: gateway\n    as: gateway\n    with:\n      bind: 127.0.0.1:0\n      upstream_url: http://{upstream}\n      websocket_url: ws://{websocket}\n      secret: 'file:{secret}'\n\nversion: 1\n{models}"
         ),
     )
     .expect("gateway config");
@@ -665,10 +677,13 @@ async fn the_gateway_preset_uses_semantic_responses_websocket_with_continuation(
         include_str!("../../../fixtures/openai/responses-websocket-semantic-2026-08-21.json");
     let fixture: Value =
         serde_json::from_str(MANIFEST_FIXTURE).expect("semantic Responses fixture");
-    let downstream_turns = fixture["downstream_turns"]
+    let mut downstream_turns = fixture["downstream_turns"]
         .as_array()
         .expect("downstream fixture turns")
         .clone();
+    for turn in &mut downstream_turns {
+        turn["model"] = Value::String("semantic-responses".to_owned());
+    }
     let provider_turns = fixture["provider_turns"]
         .as_array()
         .expect("provider fixture turns")
@@ -680,7 +695,20 @@ async fn the_gateway_preset_uses_semantic_responses_websocket_with_continuation(
     let (websocket_address, websocket_task) =
         spawn_semantic_responses_upstream(provider_turns).await;
     let directory = TempDir::new().expect("config directory");
-    let config = gateway_config(&directory, upstream.address(), websocket_address);
+    let config = gateway_config_with_models(
+        &directory,
+        upstream.address(),
+        websocket_address,
+        r#"
+models:
+  - id: semantic-responses
+    targets:
+      - provider: gateway
+        upstream_model: gpt-4o
+        capabilities: [text, streaming, tools, reasoning, function_calling, continuation]
+        codecs: [decode.openai.responses]
+"#,
+    );
     let server = bind_gateway(config).await;
     let proxy = server.listener_addresses()[0].address().to_owned();
     let runner = {
@@ -760,6 +788,82 @@ async fn the_gateway_preset_uses_semantic_responses_websocket_with_continuation(
         .map(|item| &item["type"])
         .collect();
     assert_eq!(actual_types, expected_types.iter().collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn semantic_responses_rewrites_public_alias_before_websocket_transport() {
+    const MANIFEST_FIXTURE: &str =
+        include_str!("../../../fixtures/openai/responses-websocket-semantic-2026-08-21.json");
+    let fixture: Value =
+        serde_json::from_str(MANIFEST_FIXTURE).expect("semantic Responses fixture");
+    let provider_turns = fixture["provider_turns"]
+        .as_array()
+        .expect("provider fixture turns")
+        .iter()
+        .map(|turn| turn.as_array().expect("provider events").clone())
+        .collect();
+
+    let upstream = StrictProvider::start(ProviderContract::openai(), SECRET).await;
+    let (websocket_address, websocket_task) =
+        spawn_semantic_responses_upstream(provider_turns).await;
+    let directory = TempDir::new().expect("config directory");
+    let config = gateway_config_with_models(
+        &directory,
+        upstream.address(),
+        websocket_address,
+        r#"
+models:
+  - id: public-responses
+    targets:
+      - provider: gateway
+        upstream_model: private-responses
+        capabilities: [text, streaming, tools, reasoning, function_calling, continuation]
+        codecs: [decode.openai.responses]
+"#,
+    );
+    let server = bind_gateway(config).await;
+    let proxy = server.listener_addresses()[0].address().to_owned();
+    let runner = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+
+    let mut first_turn = fixture["downstream_turns"][0].clone();
+    first_turn["model"] = Value::String("public-responses".to_owned());
+    let first_response = send_responses_request(
+        &proxy,
+        &serde_json::to_vec(&first_turn).expect("first JSON"),
+    )
+    .await;
+    assert!(
+        first_response.starts_with("HTTP/1.1 200"),
+        "{first_response}"
+    );
+
+    let mut second_turn = fixture["downstream_turns"][1].clone();
+    second_turn["model"] = Value::String("public-responses".to_owned());
+    let second_response = send_responses_request(
+        &proxy,
+        &serde_json::to_vec(&second_turn).expect("second JSON"),
+    )
+    .await;
+    assert!(
+        second_response.starts_with("HTTP/1.1 200"),
+        "{second_response}"
+    );
+
+    let (authorized, first, second) = websocket_task.await.expect("semantic websocket task");
+    server.begin_drain();
+    runner.await.expect("server task").expect("server shutdown");
+    let log = upstream.finish().await;
+
+    log.assert_accepted_everything();
+    assert!(
+        authorized,
+        "the WebSocket sibling must receive provider auth"
+    );
+    assert_eq!(first["model"], "private-responses");
+    assert_eq!(second["model"], "private-responses");
 }
 
 #[tokio::test]

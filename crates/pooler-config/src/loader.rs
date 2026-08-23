@@ -1215,6 +1215,25 @@ fn rewrite_gateway_routes(
             Value::String("provider".to_owned()),
             Value::String(provider.to_owned()),
         );
+        if let Some(transport_upstream) = target
+            .get(Value::String("transport_upstream".to_owned()))
+            .and_then(Value::as_str)
+        {
+            let transport_upstream = match transport_upstream {
+                "gateway" => alias,
+                "gateway-websocket" => websocket_alias,
+                _ => {
+                    return Err(load_error(
+                        path,
+                        "gateway preset transport_upstream is invalid",
+                    ));
+                }
+            };
+            target.insert(
+                Value::String("transport_upstream".to_owned()),
+                Value::String(transport_upstream.to_owned()),
+            );
+        }
     }
     Ok(())
 }

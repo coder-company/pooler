@@ -92,7 +92,12 @@ async fn installed_droid_responses_shape_routes_through_semantic_runtime() {
     }))
     .expect("Droid request JSON");
     let response = send_request(running.address, "/v1/responses", &request).await;
-    assert_eq!(response_status(&response), 200);
+    assert_eq!(
+        response_status(&response),
+        200,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
     let body = decoded_response_body(&response);
     let mut parser = SseParser::new();
     let mut events = parser.feed(&body).expect("downstream Responses SSE");
@@ -371,6 +376,56 @@ async fn gemini_model_get_alias_rewrites_path_and_preserves_query() {
 }
 
 #[tokio::test]
+async fn gemini_unknown_model_action_is_rejected_before_upstream() {
+    let upstream = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream binds");
+    let upstream_address = upstream.local_addr().expect("upstream address");
+    let config = gemini_alias_config(upstream_address);
+    let running = start_server(config).await;
+    let response = send_request(
+        running.address,
+        "/v1beta/models/not-published:generateContent?trace=unknown",
+        br#"{"contents":[{"parts":[{"text":"should not forward"}]}]}"#,
+    )
+    .await;
+
+    assert_eq!(response_status(&response), 400);
+    assert!(
+        timeout(Duration::from_millis(100), upstream.accept())
+            .await
+            .is_err(),
+        "unknown Gemini models must not reach the upstream"
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn gemini_unknown_interaction_model_is_rejected_before_upstream() {
+    let upstream = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream binds");
+    let upstream_address = upstream.local_addr().expect("upstream address");
+    let config = gemini_same_wire_alias_config(upstream_address, "POST", "/v1beta/interactions");
+    let running = start_server(config).await;
+    let response = send_request(
+        running.address,
+        "/v1beta/interactions?trace=unknown",
+        br#"{"model":"models/not-published","input":"should not forward"}"#,
+    )
+    .await;
+
+    assert_eq!(response_status(&response), 400);
+    assert!(
+        timeout(Duration::from_millis(100), upstream.accept())
+            .await
+            .is_err(),
+        "unknown Gemini Interaction models must not reach the upstream"
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn gemini_returned_interaction_id_keeps_follow_ups_on_the_creating_account() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -540,7 +595,7 @@ async fn gemini_interaction_alias_rewrites_body_and_preserves_query() {
     let (upstream_address, upstream_task) = spawn_upstream("application/json", upstream_body).await;
     let config = gemini_same_wire_alias_config(upstream_address, "POST", "/v1beta/interactions");
     let running = start_server(config).await;
-    let request = br#"{"model":"public-gemini","input":"hello","stream":true}"#;
+    let request = br#"{"model":"models/public-gemini","input":"hello","stream":true}"#;
 
     let response = send_request(
         running.address,
@@ -563,6 +618,29 @@ async fn gemini_interaction_alias_rewrites_body_and_preserves_query() {
     assert_eq!(forwarded["model"], "private-gemini");
     assert_eq!(forwarded["input"], "hello");
     assert_eq!(forwarded["stream"], true);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn gemini_agent_interaction_routes_without_a_model_selection() {
+    let upstream_body = br#"{"id":"int_agent","status":"completed"}"#.to_vec();
+    let (upstream_address, upstream_task) = spawn_upstream("application/json", upstream_body).await;
+    let config = gemini_same_wire_alias_config(upstream_address, "POST", "/v1beta/interactions");
+    let running = start_server(config).await;
+    let request = br#"{"agent":"deep-research","input":"hello"}"#;
+
+    let response = send_request(running.address, "/v1beta/interactions?trace=agent", request).await;
+    assert_eq!(response_status(&response), 200);
+
+    let upstream_request = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("upstream timeout")
+        .expect("upstream task");
+    assert_request_line(
+        &upstream_request,
+        "/v1beta/interactions?trace=agent&key=server-key",
+    );
+    assert_eq!(http_body(&upstream_request), request);
     running.stop().await;
 }
 

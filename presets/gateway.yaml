@@ -296,7 +296,11 @@ routes:
       encoder: encode.openai.responses
     target:
       endpoint_family: responses
-      provider: gateway-websocket
+      # Model selection belongs to the REST upstream so automatic discovery
+      # can resolve public aliases. The explicit transport binding below is
+      # used only after selection commits.
+      provider: gateway
+      transport_upstream: gateway-websocket
       path: /v1/responses
     response:
       mode: semantic

@@ -992,6 +992,7 @@ fn target_schema() -> Value {
         properties([
             ("upstream", optional_string()),
             ("provider", optional_string()),
+            ("transport_upstream", optional_string()),
             ("path", optional_string()),
             ("upstream_path", optional_string()),
             ("model_from", optional_string()),

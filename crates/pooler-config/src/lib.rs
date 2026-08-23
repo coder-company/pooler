@@ -1073,6 +1073,11 @@ pub struct TargetConfig {
     /// Upstream ID (`provider` is accepted as an alias).
     #[serde(alias = "provider")]
     pub upstream: Option<String>,
+    /// Explicit ws/wss upstream used only for semantic WebSocket transport.
+    ///
+    /// Model, provider, account, and quota selection always use `upstream`;
+    /// this binding only supplies the transport endpoint after selection.
+    pub transport_upstream: Option<String>,
     /// Upstream path override.
     #[serde(alias = "upstream_path")]
     pub path: Option<String>,
@@ -2463,6 +2468,7 @@ impl BodyPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetPlan {
     upstream: Arc<str>,
+    transport_upstream: Option<Arc<str>>,
     path: Option<Arc<str>>,
     model_source: Option<ModelSource>,
     policy: Option<Arc<str>>,
@@ -2484,6 +2490,15 @@ impl TargetPlan {
     #[must_use]
     pub fn upstream(&self) -> &str {
         &self.upstream
+    }
+
+    /// Optional explicit ws/wss upstream used for semantic WebSocket transport.
+    ///
+    /// This does not participate in model, provider, account, or quota
+    /// selection; it is only the endpoint used after selection commits.
+    #[must_use]
+    pub fn transport_upstream(&self) -> Option<&str> {
+        self.transport_upstream.as_deref()
     }
 
     /// Optional path override.
@@ -5211,36 +5226,47 @@ fn compile_target(
     policies: &BTreeMap<Arc<str>, PolicyPlan>,
 ) -> Result<TargetPlan, ConfigError> {
     let target = declaration.target.as_ref();
-    let (upstream, path, model_from, target_policy, capabilities, codecs, endpoint_family) =
-        match target {
-            Some(TargetValue::Name(name)) => (
-                Some(name.as_str()),
-                None,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-                None,
-            ),
-            Some(TargetValue::Config(config)) => (
-                config.upstream.as_deref(),
-                config.path.as_deref(),
-                config.model_from.as_deref(),
-                config.policy.as_deref(),
-                config.capabilities.clone(),
-                config.codecs.clone(),
-                config.endpoint_family.as_deref(),
-            ),
-            None => (
-                declaration.upstream.as_deref(),
-                None,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-                None,
-            ),
-        };
+    let (
+        upstream,
+        transport_upstream,
+        path,
+        model_from,
+        target_policy,
+        capabilities,
+        codecs,
+        endpoint_family,
+    ) = match target {
+        Some(TargetValue::Name(name)) => (
+            Some(name.as_str()),
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+        ),
+        Some(TargetValue::Config(config)) => (
+            config.upstream.as_deref(),
+            config.transport_upstream.as_deref(),
+            config.path.as_deref(),
+            config.model_from.as_deref(),
+            config.policy.as_deref(),
+            config.capabilities.clone(),
+            config.codecs.clone(),
+            config.endpoint_family.as_deref(),
+        ),
+        None => (
+            declaration.upstream.as_deref(),
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+        ),
+    };
     let upstream = upstream
         .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| invalid(label, "route requires target upstream/provider"))?;
@@ -5250,6 +5276,24 @@ fn compile_target(
             name: upstream.to_owned(),
             label: label.clone(),
         });
+    }
+    let transport_upstream = transport_upstream
+        .filter(|name| !name.trim().is_empty())
+        .map(str::trim);
+    if let Some(transport_upstream) = transport_upstream {
+        let Some(transport) = upstreams.get(transport_upstream) else {
+            return Err(ConfigError::MissingReference {
+                kind: "upstream",
+                name: transport_upstream.to_owned(),
+                label: label.clone(),
+            });
+        };
+        if !matches!(transport.transport(), "ws" | "wss") {
+            return Err(invalid(
+                label,
+                "target transport_upstream must use a ws or wss transport",
+            ));
+        }
     }
     if let Some(family) = endpoint_family {
         validate_endpoint_family(family, upstream, upstreams, label)?;
@@ -5291,6 +5335,7 @@ fn compile_target(
         }
         return Ok(TargetPlan {
             upstream: Arc::from(upstream),
+            transport_upstream: transport_upstream.map(Arc::from),
             path,
             model_source,
             policy: Some(Arc::from(policy)),
@@ -5300,6 +5345,7 @@ fn compile_target(
     }
     Ok(TargetPlan {
         upstream: Arc::from(upstream),
+        transport_upstream: transport_upstream.map(Arc::from),
         path,
         model_source,
         policy: None,
