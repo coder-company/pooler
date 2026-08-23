@@ -282,7 +282,12 @@ fn check_bind(report: &mut DoctorReport, name: String, bind: &str, seen: &mut BT
             Ok(_) => match UnixStream::connect(path) {
                 Ok(_) => report.check(name, "failed", "Unix bind is already in use"),
                 Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    report.check(name, "warning", "Unix bind has a stale socket path")
+                    // The server passes this path directly to
+                    // UnixListener::bind, which rejects an existing socket
+                    // even when no process is listening. Treat a stale path
+                    // as a failure so doctor cannot report an installation as
+                    // ready when serve will fail before it starts.
+                    report.check(name, "failed", "Unix bind has a stale socket path")
                 }
                 Err(error) => report.check(
                     name,
@@ -331,23 +336,23 @@ fn check_provider_urls(
             scheme,
             safe_detail(policy, host)
         );
-        if scheme == "https" {
+        if matches!(scheme, "https" | "wss") {
             report.check(
                 format!("providers.tls.{}", safe_detail(policy, id)),
                 "passed",
                 format!("{detail}; TLS is required and URL credentials are absent"),
             );
-        } else if is_loopback_host(host) {
+        } else if matches!(scheme, "http" | "ws") && is_loopback_host(host) {
             report.check(
                 format!("providers.tls.{}", safe_detail(policy, id)),
                 "warning",
-                format!("{detail}; plaintext HTTP is limited to a loopback endpoint"),
+                format!("{detail}; plaintext HTTP/WebSocket is limited to a loopback endpoint"),
             );
         } else {
             report.check(
                 format!("providers.tls.{}", safe_detail(policy, id)),
                 "failed",
-                format!("{detail}; non-loopback provider URLs must use HTTPS"),
+                format!("{detail}; non-loopback provider URLs must use HTTPS or WSS"),
             );
         }
     }
@@ -741,5 +746,43 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.detail.contains("duplicated")));
+    }
+
+    #[test]
+    fn wss_upstreams_are_reported_as_tls_protected() {
+        let (_directory, path) =
+            config("version: 1\nupstreams:\n  provider:\n    url: wss://api.example.test\n");
+        let report = diagnose(&path, None, None);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "providers.tls.provider")
+            .expect("provider TLS check");
+        assert_eq!(check.status, "passed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_unix_socket_is_a_failure_because_serve_cannot_bind_it() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let socket = directory.path().join("management.sock");
+        let listener = UnixListener::bind(&socket).expect("socket");
+        drop(listener);
+        let (_directory, path) = config(&format!(
+            "version: 1\nmanagement:\n  bind: unix:{}\n",
+            socket.display()
+        ));
+
+        let report = diagnose(&path, None, None);
+        assert_eq!(report.status, "failed");
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "management.bind")
+            .expect("management bind check");
+        assert_eq!(check.status, "failed");
+        assert!(check.detail.contains("stale"));
     }
 }

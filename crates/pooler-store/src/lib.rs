@@ -773,11 +773,73 @@ impl MemoryStore {
                 .map(|state| state.credential_id.clone());
             if let Some(key) = key {
                 inner.credentials.remove(&key);
-                inner.health.remove(&key);
+                Self::purge_credential_dependents(inner, &key);
                 count += 1;
             }
         }
         count
+    }
+
+    fn purge_credential_dependents(inner: &mut Inner, credential_id: &str) {
+        inner.health.remove(credential_id);
+        inner
+            .affinities
+            .retain(|_, affinity| affinity.credential_id != credential_id);
+        inner.cooldowns.retain(|(scope, key), _| {
+            !((scope == "credential" && key == credential_id)
+                || (scope == "credential_model"
+                    && Self::cooldown_belongs_to_credential(scope, key, credential_id)))
+        });
+    }
+
+    fn decode_compound_cooldown_key(key: &str) -> Option<(String, String)> {
+        let value = key.strip_prefix("v2:")?;
+        let (left_length, value) = value.split_once(':')?;
+        let (right_length, value) = value.split_once(':')?;
+        let left_length = left_length.parse::<usize>().ok()?;
+        let right_length = right_length.parse::<usize>().ok()?;
+        let bytes = value.as_bytes();
+        let total = left_length.checked_add(right_length)?;
+        if bytes.len() != total {
+            return None;
+        }
+        Some((
+            String::from_utf8(bytes[..left_length].to_vec()).ok()?,
+            String::from_utf8(bytes[left_length..].to_vec()).ok()?,
+        ))
+    }
+
+    fn cooldown_credential_id(scope: &str, key: &str) -> Option<String> {
+        match scope {
+            "credential" => Some(key.to_owned()),
+            "credential_model" => Self::decode_compound_cooldown_key(key)
+                .map(|(credential_id, _)| credential_id)
+                .or_else(|| {
+                    (key.matches(':').count() == 1)
+                        .then(|| {
+                            key.split_once(':')
+                                .map(|(credential_id, _)| credential_id.to_owned())
+                        })
+                        .flatten()
+                }),
+            _ => None,
+        }
+    }
+
+    fn cooldown_belongs_to_credential(scope: &str, key: &str, credential_id: &str) -> bool {
+        Self::cooldown_credential_id(scope, key).as_deref() == Some(credential_id)
+    }
+
+    fn require_cooldown_credential(inner: &Inner, scope: &str, key: &str) -> StoreResult<()> {
+        let credential_id = Self::cooldown_credential_id(scope, key);
+        if let Some(credential_id) = credential_id {
+            if !inner.credentials.contains_key(&credential_id) {
+                return Err(StoreError::CredentialNotFound(credential_id));
+            }
+        } else if matches!(scope, "credential" | "credential_model") {
+            return Err(StoreError::CredentialNotFound(key.to_owned()));
+        }
+        Ok(())
     }
 
     fn purge_expired(inner: &mut Inner, now: Timestamp) -> usize {
@@ -1010,7 +1072,9 @@ impl Store for MemoryStore {
     fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool> {
         non_empty("credential_id", credential_id)?;
         let mut inner = self.inner.write().map_err(lock_error)?;
-        Ok(inner.credentials.remove(credential_id).is_some())
+        let removed = inner.credentials.remove(credential_id).is_some();
+        Self::purge_credential_dependents(&mut inner, credential_id);
+        Ok(removed)
     }
 
     fn upsert_credential_health(
@@ -1019,6 +1083,9 @@ impl Store for MemoryStore {
     ) -> StoreResult<CredentialHealthState> {
         non_empty("credential_id", &state.credential_id)?;
         let mut inner = self.inner.write().map_err(lock_error)?;
+        if !inner.credentials.contains_key(&state.credential_id) {
+            return Err(StoreError::CredentialNotFound(state.credential_id));
+        }
         inner
             .health
             .insert(state.credential_id.clone(), state.clone());
@@ -1040,6 +1107,7 @@ impl Store for MemoryStore {
         non_empty("scope", &state.scope)?;
         non_empty("key", &state.key)?;
         let mut inner = self.inner.write().map_err(lock_error)?;
+        Self::require_cooldown_credential(&inner, &state.scope, &state.key)?;
         let key = (state.scope.clone(), state.key.clone());
         if let Some(previous) = inner.cooldowns.get(&key) {
             if previous.until > state.until {
@@ -1086,6 +1154,9 @@ impl Store for MemoryStore {
     fn upsert_session_affinity(&self, affinity: SessionAffinity) -> StoreResult<SessionAffinity> {
         Self::validate_affinity(&affinity)?;
         let mut inner = self.inner.write().map_err(lock_error)?;
+        if !inner.credentials.contains_key(&affinity.credential_id) {
+            return Err(StoreError::CredentialNotFound(affinity.credential_id));
+        }
         inner
             .affinities
             .insert(affinity.key.clone(), affinity.clone());
@@ -1159,22 +1230,20 @@ impl Store for MemoryStore {
         event.id = id;
         inner.request_events.push_back(event.clone());
 
-        let mut matching = inner
+        let matching = inner
             .request_events
             .iter()
             .filter(|candidate| candidate.request_id == event.request_id)
-            .count();
-        while matching > MAX_REQUEST_EVENTS_PER_REQUEST {
-            if let Some(position) = inner
-                .request_events
-                .iter()
-                .position(|candidate| candidate.request_id == event.request_id)
-            {
-                inner.request_events.remove(position);
-                matching -= 1;
-            } else {
-                break;
-            }
+            .map(|candidate| (candidate.event_index, candidate.id))
+            .collect::<Vec<_>>();
+        if matching.len() > MAX_REQUEST_EVENTS_PER_REQUEST {
+            let mut keep = matching;
+            keep.sort_unstable_by(|left, right| right.cmp(left));
+            keep.truncate(MAX_REQUEST_EVENTS_PER_REQUEST);
+            inner.request_events.retain(|candidate| {
+                candidate.request_id != event.request_id
+                    || keep.contains(&(candidate.event_index, candidate.id))
+            });
         }
         let cutoff = event
             .recorded_at
@@ -1326,6 +1395,115 @@ mod tests {
     }
 
     #[test]
+    fn credential_removal_purges_health_affinity_and_cooldowns() {
+        let store = MemoryStore::new();
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
+        store
+            .upsert_credential_health(CredentialHealthState::new(
+                "credential",
+                CredentialHealthStatus::CoolingDown,
+                2,
+            ))
+            .expect("health");
+        store
+            .upsert_session_affinity(SessionAffinity::new(
+                "session",
+                "provider",
+                "credential",
+                "model",
+                1,
+                100,
+            ))
+            .expect("affinity");
+        store
+            .upsert_cooldown(CooldownState::new("credential", "credential", 100, 2))
+            .expect("cooldown");
+        store
+            .upsert_cooldown(CooldownState::new(
+                "credential_model",
+                "credential:model",
+                100,
+                2,
+            ))
+            .expect("model cooldown");
+
+        assert!(store
+            .remove_credential_state("credential")
+            .expect("remove credential"));
+        assert!(store
+            .credential_health("credential")
+            .expect("health lookup")
+            .is_none());
+        assert!(store
+            .session_affinity("session", 2)
+            .expect("affinity lookup")
+            .is_none());
+        assert!(store
+            .cooldown("credential", "credential", 2)
+            .expect("cooldown lookup")
+            .is_none());
+        assert!(store
+            .cooldown("credential_model", "credential:model", 2)
+            .expect("model cooldown lookup")
+            .is_none());
+        assert_eq!(
+            store.upsert_credential_health(CredentialHealthState::new(
+                "credential",
+                CredentialHealthStatus::Healthy,
+                3,
+            )),
+            Err(StoreError::CredentialNotFound("credential".to_owned()))
+        );
+        assert_eq!(
+            store.upsert_cooldown(CooldownState::new("credential", "credential", 100, 3)),
+            Err(StoreError::CredentialNotFound("credential".to_owned()))
+        );
+        assert_eq!(
+            store.upsert_session_affinity(SessionAffinity::new(
+                "late-session",
+                "provider",
+                "credential",
+                "model",
+                3,
+                100,
+            )),
+            Err(StoreError::CredentialNotFound("credential".to_owned()))
+        );
+
+        let collision_store = MemoryStore::new();
+        collision_store
+            .upsert_credential_state(CredentialState::new("a", "provider", true, 1))
+            .expect("short credential");
+        collision_store
+            .upsert_credential_state(CredentialState::new("a:b", "provider", true, 1))
+            .expect("long credential");
+        collision_store
+            .upsert_cooldown(CooldownState::new(
+                "credential_model",
+                "v2:3:5:a:bmodel",
+                100,
+                1,
+            ))
+            .expect("long credential cooldown");
+        collision_store
+            .remove_credential_state("a")
+            .expect("remove short credential");
+        assert!(collision_store
+            .cooldown("credential_model", "v2:3:5:a:bmodel", 2)
+            .expect("long cooldown lookup")
+            .is_some());
+        collision_store
+            .remove_credential_state("a:b")
+            .expect("remove long credential");
+        assert!(collision_store
+            .cooldown("credential_model", "v2:3:5:a:bmodel", 2)
+            .expect("removed cooldown lookup")
+            .is_none());
+    }
+
+    #[test]
     fn malformed_and_missing_credentials_are_rejected() {
         let store = MemoryStore::new();
         assert_eq!(
@@ -1344,6 +1522,9 @@ mod tests {
     fn affinity_lookup_refreshes_last_use_and_expires() {
         let store = MemoryStore::with_retention(policy(2, 2, 2));
         store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
+        store
             .upsert_session_affinity(affinity("a", 1, 100))
             .expect("insert succeeds");
         let found = store
@@ -1360,6 +1541,9 @@ mod tests {
     #[test]
     fn affinity_retention_uses_last_use_then_key() {
         let store = MemoryStore::with_retention(policy(2, 2, 2));
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
         for key in ["b", "a"] {
             store
                 .upsert_session_affinity(affinity(key, 1, 100))
@@ -1456,7 +1640,9 @@ mod tests {
                     ))
                     .expect("credential succeeds");
                 store
-                    .upsert_session_affinity(affinity(&id, worker, 100))
+                    .upsert_session_affinity(SessionAffinity::new(
+                        &id, "provider", &id, "model", worker, 100,
+                    ))
                     .expect("affinity succeeds");
                 store
                     .append_decision(DecisionRecord::new(
@@ -1542,6 +1728,37 @@ mod tests {
     }
 
     #[test]
+    fn request_event_cap_keeps_highest_logical_phases_for_out_of_order_writes() {
+        let store = MemoryStore::new();
+        for event_index in 0..=MAX_REQUEST_EVENTS_PER_REQUEST as u32 {
+            store
+                .append_request_event(RequestEvent::new(
+                    "request",
+                    event_index,
+                    RequestEventKind::Attempt,
+                    "listener",
+                    "route",
+                    u64::from(event_index),
+                ))
+                .expect("event");
+        }
+        store
+            .append_request_event(RequestEvent::new(
+                "request",
+                0,
+                RequestEventKind::Retry,
+                "listener",
+                "route",
+                100,
+            ))
+            .expect("out-of-order event");
+        let events = store.request_events_for("request").expect("timeline");
+        assert_eq!(events.len(), MAX_REQUEST_EVENTS_PER_REQUEST);
+        assert_eq!(events.first().map(|event| event.event_index), Some(1));
+        assert_eq!(events.last().map(|event| event.event_index), Some(64));
+    }
+
+    #[test]
     fn request_event_body_hashes_cannot_carry_arbitrary_content() {
         let store = MemoryStore::new();
         let mut event = RequestEvent::new(
@@ -1587,6 +1804,9 @@ mod tests {
     #[test]
     fn prune_reports_expired_affinities() {
         let store = MemoryStore::with_retention(policy(2, 2, 2));
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
         store
             .upsert_session_affinity(affinity("expired", 1, 5))
             .expect("insert succeeds");

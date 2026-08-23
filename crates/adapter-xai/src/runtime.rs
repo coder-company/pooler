@@ -13,7 +13,8 @@ use http_body_util::BodyExt;
 use pooler_config::RoutePlan;
 use pooler_http::{
     BoxError, ProxyBody, SelectionContext, SemanticAdapter, SemanticRequestBody,
-    SemanticResponseBody, SemanticWebSocketTransport, SseEncoder, SseEvent, SseLimits, SseParser,
+    SemanticResponseBody, SemanticResponseHint, SemanticResponseMode, SemanticWebSocketTransport,
+    SseEncoder, SseEvent, SseLimits, SseParser,
 };
 use pooler_protocol::{
     EncodedResponsesEvent, ExtensionKey, LossPolicy, OpenAiResponsesCodec,
@@ -47,7 +48,10 @@ pub const XAI_RESPONSES_EVENT_DECODER: &str = "decode.xai.responses.events";
 /// Semantic encoder for named xAI Responses SSE events.
 pub const XAI_RESPONSES_EVENT_ENCODER: &str = "encode.xai.responses.events";
 
-/// Runtime adapter for xAI's streaming REST endpoints.
+/// Runtime adapter for xAI's REST endpoints.
+///
+/// Streaming requests use the semantic SSE pipeline; unary requests retain
+/// the provider's bounded JSON response representation.
 ///
 /// Long-lived xAI Responses WebSocket routes intentionally remain opaque.
 /// Their messages are independently bounded by the route and can be checked
@@ -82,12 +86,30 @@ impl SemanticAdapter for XaiSemanticAdapter {
     ) -> Result<SemanticRequestBody, BoxError> {
         let (request_wire, upstream_wire) = route_wires(route)
             .ok_or_else(|| Box::new(XaiRuntimeError::UnsupportedRoute) as BoxError)?;
-        let request = decode_request(request_wire, body, route.loss_policy())?;
-        let body = encode_upstream_request(upstream_wire, &request, route.loss_policy())?;
+        let (request, streaming) = decode_request(request_wire, body, route.loss_policy())?;
+        let downstream_wire = match request_wire {
+            RequestWire::Chat => EventWire::Chat,
+            RequestWire::Responses => EventWire::Responses,
+        };
+        if !streaming && downstream_wire != upstream_wire {
+            return Err(Box::new(XaiRuntimeError::UnaryCrossProtocolUnsupported {
+                downstream: downstream_wire,
+                upstream: upstream_wire,
+            }));
+        }
+        let body =
+            encode_upstream_request(upstream_wire, &request, streaming, route.loss_policy())?;
         Ok(SemanticRequestBody {
             body,
             content_type: HeaderValue::from_static("application/json"),
-            response_hint: pooler_http::SemanticResponseHint::default(),
+            response_hint: SemanticResponseHint {
+                mode: if streaming {
+                    SemanticResponseMode::ServerSentEvents
+                } else {
+                    SemanticResponseMode::Json
+                },
+                ..SemanticResponseHint::default()
+            },
         })
     }
 
@@ -99,9 +121,11 @@ impl SemanticAdapter for XaiSemanticAdapter {
     ) -> Result<SelectionContext, BoxError> {
         let (request_wire, _) = route_wires(route)
             .ok_or_else(|| Box::new(XaiRuntimeError::UnsupportedRoute) as BoxError)?;
-        let request = decode_request(request_wire, body, route.loss_policy())?;
+        let (request, streaming) = decode_request(request_wire, body, route.loss_policy())?;
         let mut context = SelectionContext::from_semantic_request(&request);
-        context.require(pooler_core::Capability::Streaming);
+        if streaming {
+            context.require(pooler_core::Capability::Streaming);
+        }
         if let Some(codec) = route.ingress().decoder() {
             context.with_codec(codec);
         }
@@ -128,25 +152,82 @@ impl SemanticAdapter for XaiSemanticAdapter {
             RequestWire::Chat => EventWire::Chat,
             RequestWire::Responses => EventWire::Responses,
         };
-        let limits = SseLimits::new(
-            usize_limit(route.limits().max_frame_bytes),
-            usize_limit(route.limits().max_event_bytes),
-        );
-        let stream = XaiResponseBody::new(
+        decode_response_for_mode(
+            route,
             body,
             upstream_wire,
             downstream_wire,
-            route.loss_policy(),
-            limits,
-            usize_limit(u64::from(route.limits().max_queue_items)),
-            usize_limit(route.limits().max_queue_bytes),
+            SemanticResponseMode::ServerSentEvents,
             cancellation,
-        );
-        Ok(SemanticResponseBody {
-            body: stream.boxed(),
-            content_type: HeaderValue::from_static("text/event-stream"),
-        })
+        )
     }
+
+    fn decode_response_with_hint(
+        &self,
+        route: &RoutePlan,
+        body: ProxyBody,
+        _request_headers: &HeaderMap,
+        hint: &SemanticResponseHint,
+        cancellation: CancellationToken,
+    ) -> Result<SemanticResponseBody, BoxError> {
+        let (request_wire, upstream_wire) = route_wires(route)
+            .ok_or_else(|| Box::new(XaiRuntimeError::UnsupportedRoute) as BoxError)?;
+        let downstream_wire = match request_wire {
+            RequestWire::Chat => EventWire::Chat,
+            RequestWire::Responses => EventWire::Responses,
+        };
+        decode_response_for_mode(
+            route,
+            body,
+            upstream_wire,
+            downstream_wire,
+            hint.mode,
+            cancellation,
+        )
+    }
+}
+
+fn decode_response_for_mode(
+    route: &RoutePlan,
+    body: ProxyBody,
+    upstream_wire: EventWire,
+    downstream_wire: EventWire,
+    mode: SemanticResponseMode,
+    cancellation: CancellationToken,
+) -> Result<SemanticResponseBody, BoxError> {
+    if mode == SemanticResponseMode::Json {
+        if upstream_wire != downstream_wire {
+            return Err(Box::new(XaiRuntimeError::UnaryCrossProtocolUnsupported {
+                downstream: downstream_wire,
+                upstream: upstream_wire,
+            }));
+        }
+        return Ok(unary_response(
+            route,
+            body,
+            upstream_wire,
+            downstream_wire,
+            cancellation,
+        ));
+    }
+    let limits = SseLimits::new(
+        usize_limit(route.limits().max_frame_bytes),
+        usize_limit(route.limits().max_event_bytes),
+    );
+    let stream = XaiResponseBody::new(
+        body,
+        upstream_wire,
+        downstream_wire,
+        route.loss_policy(),
+        limits,
+        usize_limit(u64::from(route.limits().max_queue_items)),
+        usize_limit(route.limits().max_queue_bytes),
+        cancellation,
+    );
+    Ok(SemanticResponseBody {
+        body: stream.boxed(),
+        content_type: HeaderValue::from_static("text/event-stream"),
+    })
 }
 
 fn route_wires(route: &RoutePlan) -> Option<(RequestWire, EventWire)> {
@@ -188,14 +269,14 @@ fn decode_request(
     wire: RequestWire,
     body: &[u8],
     policy: LossPolicy,
-) -> Result<SemanticRequest, BoxError> {
+) -> Result<(SemanticRequest, bool), BoxError> {
     match wire {
         RequestWire::Chat => {
-            require_streaming(body)?;
             let decoded = XaiRestAdapter::default()
                 .decode_chat_request(body, policy)
                 .map_err(|error| Box::new(error) as BoxError)?;
-            Ok(decoded.request)
+            let streaming = request_streaming(body)?;
+            Ok((decoded.request, streaming))
         }
         RequestWire::Responses => {
             let prepared = XaiRestAdapter::default()
@@ -208,34 +289,29 @@ fn decode_request(
                 .map_err(|error| Box::new(error) as BoxError)?;
             let decoded = OpenAiResponsesCodec::decode_request_with_report(&prepared.body)
                 .map_err(|error| Box::new(error) as BoxError)?;
-            if !decoded.stream {
-                return Err(Box::new(XaiRuntimeError::StreamingRequired));
-            }
             let mut report = decoded.report;
             report.merge(prepared.report);
             report
                 .validate(policy)
                 .map_err(|error| Box::new(error) as BoxError)?;
-            Ok(decoded.request)
+            Ok((decoded.request, decoded.stream))
         }
     }
 }
 
-fn require_streaming(body: &[u8]) -> Result<(), BoxError> {
+fn request_streaming(body: &[u8]) -> Result<bool, BoxError> {
     let value: Value = serde_json::from_slice(body)?;
-    match value
+    Ok(value
         .as_object()
         .and_then(|object| object.get("stream"))
         .and_then(Value::as_bool)
-    {
-        Some(true) => Ok(()),
-        Some(false) | None => Err(Box::new(XaiRuntimeError::StreamingRequired)),
-    }
+        .unwrap_or(false))
 }
 
 fn encode_upstream_request(
     wire: EventWire,
     request: &SemanticRequest,
+    streaming: bool,
     policy: LossPolicy,
 ) -> Result<Vec<u8>, BoxError> {
     let (request, passthrough) = prepare_request_for_wire(wire, request, policy)?;
@@ -259,13 +335,17 @@ fn encode_upstream_request(
     for (key, value) in passthrough {
         object.entry(key).or_insert(value);
     }
-    object.insert("stream".to_owned(), Value::Bool(true));
+    object.insert("stream".to_owned(), Value::Bool(streaming));
     match wire {
         EventWire::Chat => {
-            object.insert(
-                "stream_options".to_owned(),
-                serde_json::json!({"include_usage": true}),
-            );
+            if streaming {
+                object.insert(
+                    "stream_options".to_owned(),
+                    serde_json::json!({"include_usage": true}),
+                );
+            } else {
+                object.remove("stream_options");
+            }
         }
         EventWire::Responses => {
             object.entry("store").or_insert(Value::Bool(false));
@@ -327,12 +407,19 @@ fn prepare_request_for_wire(
 enum XaiRuntimeError {
     #[error("route is not a supported xAI REST semantic route")]
     UnsupportedRoute,
-    #[error("xAI REST semantic routes require stream=true")]
-    StreamingRequired,
+    #[error(
+        "xAI unary REST responses cannot translate between {downstream:?} and {upstream:?} wires"
+    )]
+    UnaryCrossProtocolUnsupported {
+        downstream: EventWire,
+        upstream: EventWire,
+    },
     #[error("encoded xAI request is not a JSON object")]
     EncodedRequestNotObject,
     #[error("xAI transport extension is not a JSON object")]
     InvalidTransportExtension,
+    #[error("xAI unary response JSON must be an object")]
+    UnaryResponseNotObject,
     #[error("xAI field `{0}` cannot be preserved across Responses and Chat")]
     UnsupportedCrossProtocolField(String),
 }
@@ -662,48 +749,42 @@ impl Body for XaiResponseBody {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.as_mut().get_mut();
-        if this.cancellation.is_cancelled() {
-            this.ended = true;
-            return Poll::Ready(Some(Err(Box::new(XaiStreamError::Cancelled))));
-        }
-        if let Some(bytes) = this.queue.pop_front() {
-            this.queued_bytes = this.queued_bytes.saturating_sub(bytes.len());
-            return Poll::Ready(Some(Ok(Frame::data(bytes))));
-        }
-        if let Some(error) = this.error.take() {
-            this.ended = true;
-            return Poll::Ready(Some(Err(error)));
-        }
-        if this.ended {
-            return Poll::Ready(None);
-        }
-        match this.inner.as_mut().poll_frame(context) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => {
-                if let Err(error) = this.finish_upstream() {
-                    this.set_error(error);
-                }
-                Pin::new(this).poll_frame(context)
+        loop {
+            if this.cancellation.is_cancelled() {
+                this.ended = true;
+                return Poll::Ready(Some(Err(Box::new(XaiStreamError::Cancelled))));
             }
-            Poll::Ready(Some(Err(error))) => {
-                this.set_error(error);
-                Pin::new(this).poll_frame(context)
+            if let Some(bytes) = this.queue.pop_front() {
+                this.queued_bytes = this.queued_bytes.saturating_sub(bytes.len());
+                return Poll::Ready(Some(Ok(Frame::data(bytes))));
             }
-            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                Ok(data) => {
-                    if let Err(error) = this.process_chunk(&data) {
+            if let Some(error) = this.error.take() {
+                this.ended = true;
+                return Poll::Ready(Some(Err(error)));
+            }
+            if this.ended {
+                return Poll::Ready(None);
+            }
+            match this.inner.as_mut().poll_frame(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    if let Err(error) = this.finish_upstream() {
                         this.set_error(error);
                     }
-                    Pin::new(this).poll_frame(context)
                 }
-                Err(frame) => match frame.into_trailers() {
-                    Ok(_) => Pin::new(this).poll_frame(context),
-                    Err(_) => {
-                        this.set_error(Box::new(XaiStreamError::InvalidFrame));
-                        Pin::new(this).poll_frame(context)
+                Poll::Ready(Some(Err(error))) => this.set_error(error),
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => {
+                        if let Err(error) = this.process_chunk(&data) {
+                            this.set_error(error);
+                        }
                     }
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(_) => {}
+                        Err(_) => this.set_error(Box::new(XaiStreamError::InvalidFrame)),
+                    },
                 },
-            },
+            }
         }
     }
 
@@ -720,6 +801,8 @@ impl Body for XaiResponseBody {
 enum XaiStreamError {
     #[error("xAI semantic response JSON was not UTF-8")]
     InvalidJsonUtf8,
+    #[error("xAI unary response is too large: {observed} bytes exceeds limit {limit}")]
+    UnaryTooLarge { observed: usize, limit: usize },
     #[error("xAI semantic response queue exceeded {items} items or {bytes} bytes")]
     QueueLimit { items: usize, bytes: usize },
     #[error("xAI semantic response contained an invalid body frame")]
@@ -728,21 +811,205 @@ enum XaiStreamError {
     Cancelled,
 }
 
+fn unary_response(
+    route: &RoutePlan,
+    body: ProxyBody,
+    upstream: EventWire,
+    downstream: EventWire,
+    cancellation: CancellationToken,
+) -> SemanticResponseBody {
+    let body = XaiUnaryResponseBody::new(
+        body,
+        upstream,
+        downstream,
+        usize_limit(route.limits().max_response_body_bytes),
+        cancellation,
+    );
+    SemanticResponseBody {
+        body: body.boxed(),
+        content_type: HeaderValue::from_static("application/json"),
+    }
+}
+
+/// Bounded xAI unary response forwarding.
+///
+/// Same-wire xAI Chat and Responses responses already use the downstream
+/// protocol's complete JSON representation. We still parse the body before
+/// forwarding it so malformed or non-object provider output cannot be
+/// presented as a successful semantic response. Cross-wire unary conversion
+/// is rejected by [`XaiSemanticAdapter`] until a complete response codec can
+/// account for provider-specific fields without silently dropping them.
+struct XaiUnaryResponseBody {
+    inner: Pin<Box<ProxyBody>>,
+    upstream: EventWire,
+    downstream: EventWire,
+    buffer: Vec<u8>,
+    limit: usize,
+    cancellation: CancellationToken,
+    output: Option<Bytes>,
+    ended: bool,
+    error: Option<BoxError>,
+}
+
+impl XaiUnaryResponseBody {
+    fn new(
+        body: ProxyBody,
+        upstream: EventWire,
+        downstream: EventWire,
+        limit: usize,
+        cancellation: CancellationToken,
+    ) -> Self {
+        Self {
+            inner: Box::pin(body),
+            upstream,
+            downstream,
+            buffer: Vec::new(),
+            limit,
+            cancellation,
+            output: None,
+            ended: false,
+            error: None,
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), BoxError> {
+        if self.upstream != self.downstream {
+            return Err(Box::new(XaiRuntimeError::UnaryCrossProtocolUnsupported {
+                downstream: self.downstream,
+                upstream: self.upstream,
+            }));
+        }
+        let value: Value = serde_json::from_slice(&self.buffer)?;
+        if !value.is_object() {
+            return Err(Box::new(XaiRuntimeError::UnaryResponseNotObject));
+        }
+        self.output = Some(Bytes::from(std::mem::take(&mut self.buffer)));
+        self.ended = true;
+        Ok(())
+    }
+}
+
+impl Body for XaiUnaryResponseBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        loop {
+            if this.cancellation.is_cancelled() {
+                this.ended = true;
+                return Poll::Ready(Some(Err(Box::new(XaiStreamError::Cancelled))));
+            }
+            if let Some(output) = this.output.take() {
+                return Poll::Ready(Some(Ok(Frame::data(output))));
+            }
+            if let Some(error) = this.error.take() {
+                this.ended = true;
+                return Poll::Ready(Some(Err(error)));
+            }
+            if this.ended {
+                return Poll::Ready(None);
+            }
+            match this.inner.as_mut().poll_frame(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    if let Err(error) = this.finish() {
+                        this.error = Some(error);
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => this.error = Some(error),
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => {
+                        let observed = this.buffer.len().saturating_add(data.len());
+                        if observed > this.limit {
+                            this.error = Some(Box::new(XaiStreamError::UnaryTooLarge {
+                                observed,
+                                limit: this.limit,
+                            }));
+                        } else {
+                            this.buffer.extend_from_slice(&data);
+                        }
+                    }
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(_) => {}
+                        Err(_) => this.error = Some(Box::new(XaiStreamError::InvalidFrame)),
+                    },
+                },
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.ended && self.output.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::new()
+    }
+}
+
 fn usize_limit(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use bytes::Bytes;
-    use http::HeaderMap;
+    use http::{HeaderMap, HeaderValue};
+    use http_body::{Body, Frame, SizeHint};
     use http_body_util::{BodyExt, Full};
     use pooler_config::{compile_yaml, RoutePlan};
-    use pooler_http::{SemanticAdapter, SseParser};
+    use pooler_http::{BoxError, ProxyBody, SemanticAdapter, SseParser};
     use serde_json::Value;
     use tokio_util::sync::CancellationToken;
 
     use super::{XaiSemanticAdapter, XAI_CHAT_REQUEST_DECODER, XAI_RESPONSES_REQUEST_DECODER};
+
+    struct ImmediateFrames {
+        frames: VecDeque<Bytes>,
+    }
+
+    impl Body for ImmediateFrames {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(
+                self.as_mut()
+                    .get_mut()
+                    .frames
+                    .pop_front()
+                    .map(|data| Ok(Frame::data(data))),
+            )
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.frames.is_empty()
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::new()
+        }
+    }
+
+    fn immediate_frames(frames: impl IntoIterator<Item = Bytes>) -> ProxyBody {
+        ImmediateFrames {
+            frames: frames.into_iter().collect(),
+        }
+        .boxed()
+    }
 
     fn route(decoder: &str, response_decoder: &str, response_encoder: &str) -> RoutePlan {
         compile_yaml(
@@ -755,6 +1022,68 @@ mod tests {
         .route("xai")
         .expect("xAI route")
         .clone()
+    }
+
+    #[tokio::test]
+    async fn response_bodies_handle_many_immediately_ready_frames_without_recursion() {
+        const READY_FRAMES: usize = 100_000;
+
+        let route = route(
+            XAI_CHAT_REQUEST_DECODER,
+            super::XAI_CHAT_EVENT_DECODER,
+            super::XAI_CHAT_EVENT_ENCODER,
+        );
+        let mut streaming_chunks = Vec::with_capacity(READY_FRAMES + 2);
+        streaming_chunks.extend(std::iter::repeat_n(
+            Bytes::from_static(b": keepalive\n\n"),
+            READY_FRAMES,
+        ));
+        streaming_chunks.push(Bytes::from_static(
+            br#"data: {"id":"chat-1","model":"grok-4.6","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        streaming_chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
+        let streaming = immediate_frames(streaming_chunks);
+        let response = XaiSemanticAdapter
+            .decode_response(&route, streaming, CancellationToken::new())
+            .expect("xAI streaming response transformer");
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .expect("many ready streaming frames")
+            .to_bytes();
+        assert!(
+            !bytes.is_empty(),
+            "the terminal Chat stream should produce output"
+        );
+
+        let mut unary_chunks = Vec::with_capacity(READY_FRAMES + 2);
+        unary_chunks.push(Bytes::from_static(b"{"));
+        unary_chunks.extend(std::iter::repeat_n(Bytes::from_static(b" "), READY_FRAMES));
+        unary_chunks.push(Bytes::from_static(b"}"));
+        let response = XaiSemanticAdapter
+            .decode_response_with_hint(
+                &route,
+                immediate_frames(unary_chunks),
+                &HeaderMap::new(),
+                &pooler_http::SemanticResponseHint {
+                    mode: pooler_http::SemanticResponseMode::Json,
+                    ..pooler_http::SemanticResponseHint::default()
+                },
+                CancellationToken::new(),
+            )
+            .expect("xAI unary response transformer");
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .expect("many ready unary frames")
+            .to_bytes();
+        assert_eq!(bytes.len(), READY_FRAMES + 2);
+        assert_eq!(bytes.first(), Some(&b'{'));
+        assert_eq!(bytes.last(), Some(&b'}'));
     }
 
     #[test]
@@ -793,20 +1122,151 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_streaming_rest_request_before_upstream() {
+    fn non_streaming_chat_request_uses_json_mode_and_preserves_false() {
         let route = route(
             XAI_CHAT_REQUEST_DECODER,
             super::XAI_CHAT_EVENT_DECODER,
+            super::XAI_CHAT_EVENT_ENCODER,
+        );
+        let encoded = XaiSemanticAdapter
+            .encode_request(
+                &route,
+                &HeaderMap::new(),
+                br#"{"model":"grok-4.6","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+            )
+            .expect("non-streaming request");
+        let body: Value = serde_json::from_slice(&encoded.body).expect("request JSON");
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
+        assert_eq!(
+            encoded.response_hint.mode,
+            pooler_http::SemanticResponseMode::Json
+        );
+
+        let context = XaiSemanticAdapter
+            .selection_context(
+                &route,
+                &HeaderMap::new(),
+                br#"{"model":"grok-4.6","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+            )
+            .expect("selection context");
+        assert!(!context
+            .required_capabilities()
+            .contains(pooler_core::Capability::Streaming));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_chat_response_is_bounded_json_not_sse() {
+        let route = route(
+            XAI_CHAT_REQUEST_DECODER,
+            super::XAI_CHAT_EVENT_DECODER,
+            super::XAI_CHAT_EVENT_ENCODER,
+        );
+        let response_body = br#"{"id":"chat-1","object":"chat.completion","model":"grok-4.6","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        let body = Full::new(Bytes::from_static(response_body))
+            .map_err(|never| match never {})
+            .boxed();
+        let response = XaiSemanticAdapter
+            .decode_response_with_hint(
+                &route,
+                body,
+                &HeaderMap::new(),
+                &pooler_http::SemanticResponseHint {
+                    mode: pooler_http::SemanticResponseMode::Json,
+                    ..pooler_http::SemanticResponseHint::default()
+                },
+                CancellationToken::new(),
+            )
+            .expect("xAI unary response transformer");
+        assert_eq!(
+            response.content_type,
+            HeaderValue::from_static("application/json")
+        );
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .expect("translated xAI JSON")
+            .to_bytes();
+        assert_eq!(bytes.as_ref(), response_body);
+    }
+
+    #[test]
+    fn non_streaming_responses_request_uses_json_mode_and_preserves_false() {
+        let route = route(
+            XAI_RESPONSES_REQUEST_DECODER,
+            super::XAI_RESPONSES_EVENT_DECODER,
+            super::XAI_RESPONSES_EVENT_ENCODER,
+        );
+        let encoded = XaiSemanticAdapter
+            .encode_request(
+                &route,
+                &HeaderMap::new(),
+                br#"{"model":"grok-4.6","input":"hello","stream":false,"store":false}"#,
+            )
+            .expect("non-streaming Responses request");
+        let body: Value = serde_json::from_slice(&encoded.body).expect("request JSON");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["store"], false);
+        assert_eq!(
+            encoded.response_hint.mode,
+            pooler_http::SemanticResponseMode::Json
+        );
+    }
+
+    #[test]
+    fn rejects_non_streaming_cross_wire_translation_before_upstream() {
+        let route = route(
+            XAI_CHAT_REQUEST_DECODER,
+            super::XAI_RESPONSES_EVENT_DECODER,
             super::XAI_CHAT_EVENT_ENCODER,
         );
         let error = XaiSemanticAdapter
             .encode_request(
                 &route,
                 &HeaderMap::new(),
-                br#"{"model":"grok-4.6","messages":[],"stream":false}"#,
+                br#"{"model":"grok-4.6","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
             )
-            .expect_err("non-streaming request");
-        assert!(error.to_string().contains("stream=true"));
+            .expect_err("cross-wire unary request");
+        assert!(error
+            .to_string()
+            .contains("cannot translate between Chat and Responses wires"));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_responses_response_is_bounded_json_not_sse() {
+        let route = route(
+            XAI_RESPONSES_REQUEST_DECODER,
+            super::XAI_RESPONSES_EVENT_DECODER,
+            super::XAI_RESPONSES_EVENT_ENCODER,
+        );
+        let response_body = br#"{"id":"resp-1","object":"response","status":"completed","model":"grok-4.6","output":[{"id":"msg-1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#;
+        let body = Full::new(Bytes::from_static(response_body))
+            .map_err(|never| match never {})
+            .boxed();
+        let response = XaiSemanticAdapter
+            .decode_response_with_hint(
+                &route,
+                body,
+                &HeaderMap::new(),
+                &pooler_http::SemanticResponseHint {
+                    mode: pooler_http::SemanticResponseMode::Json,
+                    ..pooler_http::SemanticResponseHint::default()
+                },
+                CancellationToken::new(),
+            )
+            .expect("xAI unary Responses transformer");
+        assert_eq!(
+            response.content_type,
+            HeaderValue::from_static("application/json")
+        );
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .expect("translated xAI Responses JSON")
+            .to_bytes();
+        assert_eq!(bytes.as_ref(), response_body);
     }
 
     #[tokio::test]

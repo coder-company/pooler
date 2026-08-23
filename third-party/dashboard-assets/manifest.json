@@ -27,7 +27,7 @@
       "name": "LobeHub Icons",
       "sbom_type": "library",
       "version": "5.16.0",
-      "version_evidence": "Recovered from /tmp/brand-icons/lobehub/package.json, the package used to create the generator input at the time the committed dashboard assets were generated.",
+      "version_evidence": "Recorded from the @lobehub/icons package used to generate the committed dashboard assets.",
       "license_expression": "MIT",
       "license_file": "licenses/LobeHub-Icons-MIT.txt",
       "copyright_text": "Copyright (c) 2023 LobeHub",
@@ -35,7 +35,7 @@
         "kind": "npm-package",
         "package": "@lobehub/icons",
         "url": "https://www.npmjs.com/package/@lobehub/icons/v/5.16.0",
-        "generator_input": "/tmp/brand-icons/provider-icons.json, produced by scripts/extract-lobehub-icons.mjs"
+        "generator_input": "Provider icon JSON produced by scripts/extract-lobehub-icons.mjs"
       },
       "embedded_assets": [
         "crates/pooler-server/ui/providers.js"
@@ -48,7 +48,7 @@
       "name": "Simple Icons",
       "sbom_type": "library",
       "version": "16.28.0",
-      "version_evidence": "Recovered from /tmp/brand-icons/package/package.json, the package at the generator's recorded input location when the committed dashboard assets were generated.",
+      "version_evidence": "Recorded from the simple-icons package used to generate the committed dashboard assets.",
       "license_expression": "CC0-1.0",
       "license_file": "licenses/Simple-Icons-CC0-1.0.md",
       "copyright_text": "NOASSERTION",
@@ -56,7 +56,7 @@
         "kind": "npm-package",
         "package": "simple-icons",
         "url": "https://www.npmjs.com/package/simple-icons/v/16.28.0",
-        "generator_input": "/tmp/brand-icons/package/icons"
+        "generator_input": "The simple-icons package icon directory supplied to scripts/generate-management-ui-assets.py"
       },
       "embedded_assets": [
         "crates/pooler-server/ui/providers.js"

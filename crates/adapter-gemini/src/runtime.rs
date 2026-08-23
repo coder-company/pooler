@@ -181,6 +181,7 @@ fn encode_request_for_path(
         response_hint: SemanticResponseHint {
             mode,
             requested_model: path.model.map(ToOwned::to_owned),
+            ..SemanticResponseHint::default()
         },
     })
 }

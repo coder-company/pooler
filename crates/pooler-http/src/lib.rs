@@ -51,8 +51,9 @@ pub use pool::{
 };
 pub use proxy::{
     apply_configured_upstream_auth, apply_configured_upstream_headers, BoxError, HttpProxy,
-    NoSemanticAdapter, ProxyBody, ProxyError, SemanticAdapter, SemanticRequestBody,
-    SemanticResponseBody, SemanticResponseHint, SemanticResponseMode, SemanticWebSocketTransport,
+    NoSemanticAdapter, ProxyBody, ProxyError, ResponseDeadline, ResponseDeadlineCleanupGuard,
+    SemanticAdapter, SemanticRequestBody, SemanticResponseBody, SemanticResponseHint,
+    SemanticResponseMode, SemanticWebSocketTransport,
 };
 pub use resources::{RuntimeResourceGuard, RuntimeResourceSnapshot, RuntimeResources};
 pub use sse::{

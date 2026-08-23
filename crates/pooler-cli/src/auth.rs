@@ -281,17 +281,20 @@ pub fn run(
             true,
             config_path,
             &credential_store_path(explicit_store_path)?,
+            credential_key_ref,
         ),
         AuthCommand::Disable { account } => set_account_enabled(
             &account,
             false,
             config_path,
             &credential_store_path(explicit_store_path)?,
+            credential_key_ref,
         ),
         AuthCommand::Switch { account } => switch_account(
             &account,
             config_path,
             &credential_store_path(explicit_store_path)?,
+            credential_key_ref,
         ),
     }
 }
@@ -820,10 +823,16 @@ fn set_account_enabled(
     enabled: bool,
     config_path: &Path,
     store_path: &Path,
+    credential_key_ref: Option<&str>,
 ) -> Result<()> {
     let config = Config::from_path(config_path)?.compile()?;
     let account = configured_account(&config, account_id)?;
-    let store = SqliteStore::open(store_path).context("could not open credential store")?;
+    let store = if let Some(reference) = credential_key_ref {
+        SqliteStore::open_encrypted(store_path, load_master_key(Some(reference))?)
+            .context("could not open encrypted credential store")?
+    } else {
+        SqliteStore::open(store_path).context("could not open credential store")?
+    };
     let state = ensure_credential_state(&store, account)?;
     if state.enabled != enabled {
         store
@@ -839,10 +848,20 @@ fn set_account_enabled(
     Ok(())
 }
 
-fn switch_account(account_id: &str, config_path: &Path, store_path: &Path) -> Result<()> {
+fn switch_account(
+    account_id: &str,
+    config_path: &Path,
+    store_path: &Path,
+    credential_key_ref: Option<&str>,
+) -> Result<()> {
     let config = Config::from_path(config_path)?.compile()?;
     let selected = configured_account(&config, account_id)?;
-    let store = SqliteStore::open(store_path).context("could not open credential store")?;
+    let store = if let Some(reference) = credential_key_ref {
+        SqliteStore::open_encrypted(store_path, load_master_key(Some(reference))?)
+            .context("could not open encrypted credential store")?
+    } else {
+        SqliteStore::open(store_path).context("could not open credential store")?
+    };
     ensure_credential_state(&store, selected)?;
     let siblings = config
         .accounts()
@@ -1420,7 +1439,7 @@ accounts:
         )
         .expect("config");
 
-        switch_account("personal", &config_path, &store_path).expect("switch account");
+        switch_account("personal", &config_path, &store_path, None).expect("switch account");
         let store = SqliteStore::open(&store_path).expect("credential store");
         assert!(
             store
@@ -1437,8 +1456,93 @@ accounts:
                 .enabled
         );
 
-        set_account_enabled("work", true, &config_path, &store_path).expect("enable account");
-        set_account_enabled("personal", false, &config_path, &store_path).expect("disable account");
+        set_account_enabled("work", true, &config_path, &store_path, None).expect("enable account");
+        set_account_enabled("personal", false, &config_path, &store_path, None)
+            .expect("disable account");
+        assert!(
+            store
+                .credential_state("work")
+                .expect("work state")
+                .expect("work account")
+                .enabled
+        );
+        assert!(
+            !store
+                .credential_state("personal")
+                .expect("personal state")
+                .expect("personal account")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn encrypted_account_mutations_use_key_and_fail_without_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private directory");
+        let config_path = directory.path().join("pooler.yaml");
+        let store_path = directory.path().join("credentials.sqlite3");
+        let key_path = directory.path().join("store-key");
+        std::fs::write(&key_path, b"cli-auth-mutation-key").expect("key file");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &key_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("private key file");
+        std::fs::write(
+            &config_path,
+            r#"
+version: 1
+upstreams:
+  xai:
+    url: https://api.x.ai
+    native: {kind: xai}
+accounts:
+  work: {provider: xai, auth_kind: api_key, secret: env:XAI_WORK_KEY}
+  personal: {provider: xai, auth_kind: api_key, secret: env:XAI_PERSONAL_KEY}
+"#,
+        )
+        .expect("config");
+        SqliteStore::open_encrypted(
+            &store_path,
+            MasterKey::from_bytes(b"cli-auth-mutation-key").expect("master key"),
+        )
+        .expect("encrypted store");
+        let key_reference = format!("file:{}", key_path.display());
+
+        let error = switch_account("personal", &config_path, &store_path, None)
+            .expect_err("missing key must not mutate an encrypted store");
+        assert!(format!("{error:#}").contains("encryption key"), "{error:#}");
+
+        switch_account("personal", &config_path, &store_path, Some(&key_reference))
+            .expect("switch account with key");
+        set_account_enabled(
+            "work",
+            true,
+            &config_path,
+            &store_path,
+            Some(&key_reference),
+        )
+        .expect("enable account with key");
+        set_account_enabled(
+            "personal",
+            false,
+            &config_path,
+            &store_path,
+            Some(&key_reference),
+        )
+        .expect("disable account with key");
+
+        let store = SqliteStore::open_encrypted(
+            &store_path,
+            MasterKey::from_bytes(b"cli-auth-mutation-key").expect("master key"),
+        )
+        .expect("reopen encrypted store");
         assert!(
             store
                 .credential_state("work")

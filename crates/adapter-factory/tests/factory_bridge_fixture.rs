@@ -75,16 +75,16 @@ fn compare_event_chunks(expected: &[ScriptedChunk], actual: &[ScriptedChunk]) ->
 }
 
 #[tokio::test]
-async fn replays_local_bridge_request_and_semantic_stream() {
+async fn replays_factory_reference_request_and_semantic_stream() {
     const MANIFEST_FIXTURE: &str =
-        include_str!("../../../fixtures/factory/fx-cliproxy-bridge-v3.json");
+        include_str!("../../../fixtures/factory/factory-v3-reference.json");
     let fixture = fixture(MANIFEST_FIXTURE);
     assert_eq!(fixture.metadata.equivalence, Equivalence::EventSemantic);
     assert!(fixture
         .metadata
         .notes
         .as_deref()
-        .is_some_and(|notes| notes.contains("Local reference bridge")));
+        .is_some_and(|notes| notes.contains("Sanitized reference provenance")));
 
     let downstream = fixture
         .downstream_request

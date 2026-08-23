@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "third-party" / "dashboard-assets" / "manifest.json"
 SBOM_PATH = ROOT / "scripts" / "sbom.py"
+ASSET_STAGER = ROOT / "scripts" / "stage-release-assets.sh"
 SPEC = importlib.util.spec_from_file_location("pooler_sbom", SBOM_PATH)
 assert SPEC is not None and SPEC.loader is not None
 SBOM = importlib.util.module_from_spec(SPEC)
@@ -108,6 +110,17 @@ class DashboardAssetProvenanceTests(unittest.TestCase):
         self.assertNotIn("versionInfo", coder_spdx)
         self.assertEqual(coder_spdx["licenseDeclared"], "NOASSERTION")
         self.assertEqual(coder_spdx["downloadLocation"], "NOASSERTION")
+        self.assertEqual(
+            cdx_by_name["Iconoir"]["licenses"],
+            [{"expression": "MIT"}],
+        )
+        for component in [
+            cyclonedx["metadata"]["component"],
+            *cyclonedx["components"],
+        ]:
+            for choice in component.get("licenses", []):
+                self.assertEqual(set(choice), {"expression"})
+                self.assertIsInstance(choice["expression"], str)
 
         root_dependency = next(
             dependency
@@ -127,6 +140,198 @@ class DashboardAssetProvenanceTests(unittest.TestCase):
             and relationship["relationshipType"] == "DEPENDS_ON"
         }
         self.assertTrue(embedded_spdx_ids.issubset(root_relationships))
+
+    def test_runtime_closure_uses_resolved_package_ids(self) -> None:
+        cli_id = "path+file:///workspace/pooler-cli#pooler-cli@0.1.0"
+        runtime_id = "registry+https://example.invalid#index#shared@1.0.0"
+        other_version_id = "registry+https://example.invalid#index#shared@2.0.0"
+        dev_id = "registry+https://example.invalid#index#dev-only@1.0.0"
+        unrelated_id = "registry+https://example.invalid#index#unrelated@1.0.0"
+
+        def package(identifier: str, name: str, version: str) -> dict[str, object]:
+            return {
+                "id": identifier,
+                "name": name,
+                "version": version,
+                "source": None if identifier.startswith("path+") else "registry+https://example.invalid/index",
+                "license": "MIT",
+                "dependencies": [],
+            }
+
+        metadata = {
+            "packages": [
+                package(cli_id, "pooler-cli", "0.1.0"),
+                package(runtime_id, "shared", "1.0.0"),
+                package(other_version_id, "shared", "2.0.0"),
+                package(dev_id, "dev-only", "1.0.0"),
+                package(unrelated_id, "unrelated", "1.0.0"),
+            ],
+            "resolve": {
+                "nodes": [
+                    {
+                        "id": cli_id,
+                        "deps": [
+                            {
+                                "pkg": runtime_id,
+                                "dep_kinds": [{"kind": None, "target": None}],
+                            },
+                            {
+                                "pkg": dev_id,
+                                "dep_kinds": [{"kind": "dev", "target": None}],
+                            },
+                        ],
+                    },
+                    {"id": runtime_id, "deps": []},
+                    {"id": other_version_id, "deps": []},
+                    {"id": dev_id, "deps": []},
+                    {"id": unrelated_id, "deps": []},
+                ]
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            metadata_path = Path(temporary_directory) / "metadata.json"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            packages, graph, root_id = SBOM.read_release_metadata(metadata_path)
+
+        self.assertEqual(root_id, cli_id)
+        self.assertEqual({package["id"] for package in packages}, {cli_id, runtime_id})
+        self.assertEqual(graph[cli_id], [runtime_id])
+        cyclonedx = SBOM.render_cyclonedx(
+            packages, "0.1.0", 0, [], graph, root_id
+        )
+        cli_component = next(
+            component for component in cyclonedx["components"] if component["name"] == "pooler-cli"
+        )
+        cli_dependency = next(
+            dependency
+            for dependency in cyclonedx["dependencies"]
+            if dependency["ref"] == cli_component["bom-ref"]
+        )
+        shared_component = next(
+            component
+            for component in cyclonedx["components"]
+            if component["name"] == "shared"
+        )
+        self.assertEqual(cli_dependency["dependsOn"], [shared_component["bom-ref"]])
+
+    def test_legacy_cargo_license_spellings_are_normalized_semantically(self) -> None:
+        self.assertEqual(
+            SBOM.normalize_license_expression("MIT/Apache-2.0"),
+            "MIT OR Apache-2.0",
+        )
+        self.assertEqual(
+            SBOM.normalize_license_expression("Apache-2.0 / MIT"),
+            "Apache-2.0 OR MIT",
+        )
+        self.assertEqual(
+            SBOM.normalize_license_expression("BSD-3-Clause"),
+            "BSD-3-Clause",
+        )
+
+        for raw, expected in (
+            ("MIT/Apache-2.0", "MIT OR Apache-2.0"),
+            ("Apache-2.0 / MIT", "Apache-2.0 OR MIT"),
+        ):
+            package = {
+                "name": "legacy-license",
+                "version": "1.0.0",
+                "source": None,
+                "license": raw,
+                "dependencies": [],
+            }
+            cyclonedx = SBOM.render_cyclonedx([package], "1.0.0", 0)
+            component = cyclonedx["components"][0]
+            self.assertEqual(component["licenses"], [{"expression": expected}])
+            spdx = SBOM.render_spdx([package], "1.0.0", 0)
+            self.assertEqual(spdx["packages"][1]["licenseDeclared"], expected)
+
+    def test_release_rejects_target_argument_splitting_and_binary_mismatch(self) -> None:
+        release = ROOT / "scripts" / "release.sh"
+        binary = shutil.which("true")
+        self.assertIsNotNone(binary)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            split_target = subprocess.run(
+                [
+                    str(release),
+                    "--target",
+                    "x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu",
+                    "--binary",
+                    binary or "true",
+                    "--epoch",
+                    "0",
+                    "--output",
+                    temporary_directory,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(split_target.returncode, 2)
+            self.assertIn("whitespace", split_target.stderr)
+
+            mismatched_binary = subprocess.run(
+                [
+                    str(release),
+                    "--target",
+                    "aarch64-unknown-linux-gnu",
+                    "--binary",
+                    binary or "true",
+                    "--epoch",
+                    "0",
+                    "--output",
+                    temporary_directory,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(mismatched_binary.returncode, 0)
+            self.assertIn("architecture does not match", mismatched_binary.stderr)
+
+    def test_release_asset_stager_copies_runtime_assets_and_rejects_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "root"
+            stage = Path(temporary_directory) / "stage"
+            (root / "config").mkdir(parents=True)
+            (root / "deploy" / "config").mkdir(parents=True)
+            (root / "deploy" / "data").mkdir()
+            (root / "deploy" / "secrets").mkdir()
+            (root / "docs").mkdir()
+            (root / "scripts").mkdir()
+            (root / "config" / "pooler.example.yaml").write_text("version: 1\n")
+            (root / "deploy" / "pooler.example.yaml").write_text("version: 1\n")
+            (root / "deploy" / "pooler.service").write_text("[Unit]\n")
+            (root / "docs" / "deployment.md").write_text("# Deployment\n")
+            (root / "scripts" / "check-deployment-config.py").write_text("# check\n")
+            (root / ".dockerignore").write_text("target\n")
+            (root / "Dockerfile").write_text("FROM scratch\n")
+            (root / "docker-compose.example.yml").write_text("services: {}\n")
+
+            staged = subprocess.run(
+                [str(ASSET_STAGER), str(root), str(stage)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(staged.returncode, 0, staged.stderr)
+            for relative_path in (
+                "config/pooler.example.yaml",
+                "deploy/pooler.example.yaml",
+                "deploy/pooler.service",
+                "docs/deployment.md",
+                "scripts/check-deployment-config.py",
+            ):
+                self.assertTrue((stage / relative_path).is_file(), relative_path)
+            self.assertFalse((stage / "deploy/config").exists())
+            self.assertFalse((stage / "Dockerfile").exists())
+
+            (root / "config" / "unsafe.example.yaml").symlink_to(
+                root / "config" / "pooler.example.yaml"
+            )
+            rejected = subprocess.run(
+                [str(ASSET_STAGER), str(root), str(Path(temporary_directory) / "stage-unsafe")],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("symlink", rejected.stderr)
 
     def test_sbom_cli_output_is_deterministic(self) -> None:
         metadata = {
@@ -173,6 +378,31 @@ class DashboardAssetProvenanceTests(unittest.TestCase):
                 )
             self.assertEqual(outputs[0], outputs[1])
 
+    def test_target_specific_sbom_documents_have_unique_identities(self) -> None:
+        package = {
+            "name": "pooler-cli",
+            "version": "0.1.0",
+            "source": None,
+            "license": "Apache-2.0",
+            "dependencies": [],
+        }
+        linux_cdx = SBOM.render_cyclonedx(
+            [package], "0.1.0", 0, target="x86_64-unknown-linux-gnu"
+        )
+        arm_cdx = SBOM.render_cyclonedx(
+            [package], "0.1.0", 0, target="aarch64-unknown-linux-gnu"
+        )
+        linux_spdx = SBOM.render_spdx(
+            [package], "0.1.0", 0, target="x86_64-unknown-linux-gnu"
+        )
+        arm_spdx = SBOM.render_spdx(
+            [package], "0.1.0", 0, target="aarch64-unknown-linux-gnu"
+        )
+        self.assertNotEqual(linux_cdx["serialNumber"], arm_cdx["serialNumber"])
+        self.assertNotEqual(
+            linux_spdx["documentNamespace"], arm_spdx["documentNamespace"]
+        )
+
     def test_local_and_hosted_release_paths_copy_the_inventory(self) -> None:
         local_release = (ROOT / "scripts" / "release.sh").read_text(encoding="utf-8")
         hosted_release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
@@ -186,6 +416,7 @@ class DashboardAssetProvenanceTests(unittest.TestCase):
             'cp -R third-party/dashboard-assets "$stage/third-party/"',
             hosted_release,
         )
+        self.assertIn('"$asset_stager" "$root_directory" "$stage"', local_release)
         self.assertEqual(hosted_release.count("--assets-manifest"), 2)
 
 

@@ -13,6 +13,7 @@ use pooler_auth::{OsKeyringBackend, SecretBackend, SecretRef, SecretResolveOptio
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::digest::{digest, SHA256};
 use ring::hkdf::{KeyType, Salt, HKDF_SHA256};
+use ring::hmac::{self, HMAC_SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
 use zeroize::Zeroizing;
 
@@ -24,6 +25,7 @@ const ENVELOPE_ALGORITHM_AES_256_GCM: u8 = 1;
 const KEY_ID_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
 const TAG_LENGTH: usize = 16;
+const REQUEST_INDEX_LENGTH: usize = 32;
 const HEADER_LENGTH: usize = 4 + 1 + 1 + 1 + KEY_ID_LENGTH + NONCE_LENGTH;
 const DERIVATION_SALT: &[u8] = b"pooler credential payload key v1";
 const DERIVATION_INFO: &[u8] = b"pooler credential payload aes-256-gcm v1";
@@ -210,6 +212,21 @@ impl CredentialCipher {
 
     pub(crate) fn key_id(&self) -> [u8; KEY_ID_LENGTH] {
         self.key.key_id()
+    }
+
+    /// Derive a stable, database-local index for a request identifier.
+    ///
+    /// Request history keeps the identifier inside its encrypted envelope.
+    /// This keyed digest gives SQLite an equality/index predicate for
+    /// retention and timeline reads without placing the identifier itself in
+    /// the database. Callers must still authenticate the matching envelope;
+    /// the digest is only a query hint and is not trusted metadata.
+    pub(crate) fn request_index(&self, request_id: &str) -> [u8; REQUEST_INDEX_LENGTH] {
+        let key = hmac::Key::new(HMAC_SHA256, self.key.key.as_ref().as_ref());
+        let digest = hmac::sign(&key, request_id.as_bytes());
+        let mut index = [0_u8; REQUEST_INDEX_LENGTH];
+        index.copy_from_slice(digest.as_ref());
+        index
     }
 
     pub(crate) fn seal_for(

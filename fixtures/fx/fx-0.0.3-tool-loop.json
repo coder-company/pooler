@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "id": "vercel-fx-0.0.3-cliproxy-tool-loop-v1",
+  "id": "vercel-fx-0.0.3-tool-loop-v1",
   "client": {
     "name": "Vercel Labs fx",
     "version": "0.0.3"

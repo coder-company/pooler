@@ -1,7 +1,12 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use pooler_auth::{CredentialId, MemoryOAuthTokenStore, OAuthTokens};
 use pooler_config::compile_yaml;
-use pooler_http::SseParser;
+use pooler_http::{NativeRuntime, SseParser};
 use pooler_server::{HttpProxyServer, HttpProxyServerError};
 use serde_json::{json, Value};
 use tokio::{
@@ -11,7 +16,7 @@ use tokio::{
     time::timeout,
 };
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn installed_droid_responses_shape_routes_through_semantic_runtime() {
@@ -122,6 +127,472 @@ async fn installed_droid_responses_shape_routes_through_semantic_runtime() {
     assert_eq!(forwarded["store"], false);
     assert_eq!(forwarded["include"][0], "reasoning.encrypted_content");
     assert_eq!(forwarded["tools"][0]["name"], "Read");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn same_wire_responses_stream_preserves_provider_events_exactly() {
+    let message = json!({
+        "id":"msg-exact-stream","type":"message","status":"completed","role":"assistant",
+        "content":[{
+            "type":"output_text","text":"STREAM_EXACT_OK",
+            "annotations":[{
+                "type":"url_citation","start_index":0,"end_index":6,
+                "url":"https://example.test/stream","title":"Stream citation"
+            }]
+        }]
+    });
+    let created_response = json!({
+        "id":"resp-exact-stream","object":"response","created_at":1_777_777_781_u64,
+        "model":"provider-model","status":"in_progress","output":[],
+        "parallel_tool_calls":false,"tool_choice":"none",
+        "tools":[{"type":"function","name":"provider_tool"}],
+        "reasoning":{"effort":"high","summary":"detailed"},
+        "service_tier":"priority","metadata":{"trace_id":"stream-trace"}
+    });
+    let completed_response = json!({
+        "id":"resp-exact-stream","object":"response","created_at":1_777_777_781_u64,
+        "model":"provider-model","status":"completed","output":[message.clone()],
+        "parallel_tool_calls":false,"tool_choice":"none",
+        "tools":[{"type":"function","name":"provider_tool"}],
+        "reasoning":{"effort":"high","summary":"detailed"},
+        "service_tier":"priority","metadata":{"trace_id":"stream-trace"},
+        "usage":{
+            "input_tokens":9,"input_tokens_details":{"cached_tokens":2},
+            "output_tokens":3,"output_tokens_details":{"reasoning_tokens":1},
+            "total_tokens":12
+        }
+    });
+    let events = [
+        (
+            "response.created",
+            json!({
+                "type":"response.created","sequence_number":0,
+                "response":created_response.clone()
+            }),
+        ),
+        (
+            "response.in_progress",
+            json!({
+                "type":"response.in_progress","sequence_number":1,
+                "response":created_response
+            }),
+        ),
+        (
+            "response.output_item.added",
+            json!({
+                "type":"response.output_item.added","sequence_number":2,"output_index":0,
+                "item":{"id":"msg-exact-stream","type":"message","status":"in_progress","role":"assistant","content":[]}
+            }),
+        ),
+        (
+            "response.content_part.added",
+            json!({
+                "type":"response.content_part.added","item_id":"msg-exact-stream",
+                "sequence_number":3,"output_index":0,"content_index":0,
+                "part":{"type":"output_text","text":"","annotations":[]}
+            }),
+        ),
+        (
+            "response.output_text.delta",
+            json!({
+                "type":"response.output_text.delta","item_id":"msg-exact-stream",
+                "sequence_number":4,"output_index":0,"content_index":0,
+                "delta":"STREAM_EXACT_OK","logprobs":[]
+            }),
+        ),
+        (
+            "response.output_text.done",
+            json!({
+                "type":"response.output_text.done","item_id":"msg-exact-stream",
+                "sequence_number":5,"output_index":0,"content_index":0,
+                "text":"STREAM_EXACT_OK","logprobs":[]
+            }),
+        ),
+        (
+            "response.content_part.done",
+            json!({
+                "type":"response.content_part.done","item_id":"msg-exact-stream",
+                "sequence_number":6,"output_index":0,"content_index":0,
+                "part":message["content"][0].clone()
+            }),
+        ),
+        (
+            "response.output_item.done",
+            json!({
+                "type":"response.output_item.done","sequence_number":7,
+                "output_index":0,"item":message
+            }),
+        ),
+        (
+            "response.completed",
+            json!({
+                "type":"response.completed","sequence_number":8,
+                "response":completed_response
+            }),
+        ),
+    ];
+    let upstream_body = events
+        .iter()
+        .map(|(name, event)| format!("event:{name}\ndata:{event}\n\n"))
+        .collect::<String>()
+        .into_bytes();
+    let (upstream_address, upstream_task) =
+        spawn_upstream("text/event-stream", upstream_body.clone()).await;
+    let running = start_server(droid_config(upstream_address)).await;
+    let request = serde_json::to_vec(&json!({
+        "model":"droid-model","input":"hello","stream":true,"store":false
+    }))
+    .expect("streaming request JSON");
+
+    let response = send_request(running.address, "/v1/responses", &request).await;
+    assert_eq!(response_status(&response), 200);
+    assert_eq!(decoded_response_body(&response), upstream_body);
+    let upstream_request = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("exact stream upstream timeout")
+        .expect("exact stream upstream task");
+    let forwarded: Value =
+        serde_json::from_slice(http_body(&upstream_request)).expect("forwarded request JSON");
+    assert_eq!(forwarded["stream"], true);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn unary_responses_to_chat_reject_before_upstream() {
+    let upstream = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("unused Chat upstream binds");
+    let upstream_address = upstream.local_addr().expect("unused Chat upstream address");
+    let config = compile_yaml(
+        "droid-unary-chat-unsupported.yaml",
+        &format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: droid-unary-chat\n    listen: local\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.openai.responses}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.openai.responses.events}}\n    loss_policy: reject\n"
+        ),
+    )
+    .expect("unsupported unary Chat bridge config");
+    let running = start_server(config).await;
+    let request = serde_json::to_vec(&json!({
+        "model":"droid-model","input":"hello","stream":false
+    }))
+    .expect("unary request JSON");
+
+    let response = send_request(running.address, "/v1/responses", &request).await;
+    assert_eq!(response_status(&response), 400);
+    assert!(
+        timeout(Duration::from_millis(100), upstream.accept())
+            .await
+            .is_err(),
+        "unsupported unary cross-protocol request reached the upstream"
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn codex_native_unary_responses_force_upstream_streaming_and_return_json() {
+    let response_id = "resp-codex-unary";
+    let reasoning_id = "rs-codex-unary";
+    let function_id = "fc-codex-unary";
+    let call_id = "call-codex-unary";
+    let message_id = "msg-codex-unary";
+    let reasoning_item = json!({
+        "id":reasoning_id,"type":"reasoning","status":"completed",
+        "summary":[{"type":"summary_text","text":"checked"}],
+        "encrypted_content":"encrypted-reasoning"
+    });
+    let function_item = json!({
+        "id":function_id,"type":"function_call","status":"completed",
+        "call_id":call_id,"name":"lookup","arguments":"{\"query\":\"status\"}"
+    });
+    let message_item = json!({
+        "id":message_id,"type":"message","status":"completed","role":"assistant",
+        "content":[{
+            "type":"output_text","text":"CODEX_UNARY_OK",
+            "annotations":[{
+                "type":"url_citation","start_index":0,"end_index":5,
+                "url":"https://example.test/source","title":"Exact source"
+            }]
+        }]
+    });
+    let terminal_response = json!({
+        "id":response_id,
+        "object":"response",
+        "created_at":1_777_777_777,
+        "status":"completed",
+        "background":false,
+        "error":null,
+        "incomplete_details":null,
+        "instructions":"preserve this instruction",
+        "max_output_tokens":32,
+        "model":"private-luna",
+        "output":[],
+        "parallel_tool_calls":false,
+        "previous_response_id":"resp-previous",
+        "reasoning":{"effort":"none","summary":"auto"},
+        "service_tier":"priority",
+        "store":false,
+        "temperature":null,
+        "text":{"format":{"type":"text"},"verbosity":"low"},
+        "tool_choice":"auto",
+        "tools":[{
+            "type":"function","name":"lookup","description":"lookup exactly",
+            "parameters":{"type":"object","properties":{},"additionalProperties":false},
+            "strict":true
+        }],
+        "top_p":null,
+        "truncation":"disabled",
+        "usage":{
+            "input_tokens":11,"input_tokens_details":{"cached_tokens":3},
+            "output_tokens":7,"output_tokens_details":{"reasoning_tokens":2},
+            "total_tokens":18,
+            "details":{"cost_in_usd_ticks":42}
+        },
+        "metadata":{"trace_id":"trace-live-shaped","tenant":"test"}
+    });
+    let events = vec![
+        json!({
+            "type":"response.created",
+            "response":{
+                "id":response_id,"object":"response","model":"private-luna",
+                "status":"in_progress","output":[]
+            }
+        }),
+        json!({
+            "type":"response.output_item.added","output_index":0,
+            "item":{
+                "id":reasoning_id,"type":"reasoning","status":"in_progress","summary":[]
+            }
+        }),
+        json!({
+            "type":"response.reasoning_summary_part.added","item_id":reasoning_id,
+            "output_index":0,"summary_index":0,
+            "part":{"type":"summary_text","text":""}
+        }),
+        json!({
+            "type":"response.reasoning_summary_text.delta","item_id":reasoning_id,
+            "output_index":0,"summary_index":0,"delta":"checked"
+        }),
+        json!({
+            "type":"response.output_item.done","output_index":0,
+            "item":reasoning_item.clone()
+        }),
+        json!({
+            "type":"response.output_item.added","output_index":1,
+            "item":{
+                "id":function_id,"type":"function_call","status":"in_progress",
+                "call_id":call_id,"name":"lookup","arguments":""
+            }
+        }),
+        json!({
+            "type":"response.function_call_arguments.delta","item_id":function_id,
+            "output_index":1,"delta":"{\"query\":\"status\"}"
+        }),
+        json!({
+            "type":"response.function_call_arguments.done","item_id":function_id,
+            "output_index":1,"name":"lookup","arguments":"{\"query\":\"status\"}"
+        }),
+        json!({
+            "type":"response.output_item.done","output_index":1,
+            "item":function_item.clone()
+        }),
+        json!({
+            "type":"response.output_item.added","output_index":2,
+            "item":{
+                "id":message_id,"type":"message","status":"in_progress",
+                "role":"assistant","content":[]
+            }
+        }),
+        json!({
+            "type":"response.content_part.added","item_id":message_id,
+            "output_index":2,"content_index":0,
+            "part":{"type":"output_text","text":"","annotations":[]}
+        }),
+        json!({
+            "type":"response.output_text.delta","item_id":message_id,
+            "output_index":2,"content_index":0,"delta":"CODEX_UNARY_OK"
+        }),
+        json!({
+            "type":"response.output_item.done","output_index":2,
+            "item":message_item.clone()
+        }),
+        json!({
+            "type":"response.completed",
+            "response":terminal_response.clone()
+        }),
+    ];
+    let upstream_body = events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>()
+        .into_bytes();
+    let (upstream_address, upstream_task) =
+        spawn_strict_codex_streaming_upstream(upstream_body).await;
+    let config = codex_unary_config(upstream_address);
+    let token_store = Arc::new(MemoryOAuthTokenStore::new());
+    token_store.insert(
+        CredentialId::new("codex-account").expect("credential ID"),
+        OAuthTokens::bearer("codex-access-token", Some("codex-refresh-token"), None),
+    );
+    let native = Arc::new(
+        NativeRuntime::new(&config, token_store)
+            .expect("Codex native runtime")
+            .with_account_id("codex-account", "chatgpt-account"),
+    );
+    let running = start_server_with_native(config, native).await;
+    let request = serde_json::to_vec(&json!({
+        "model":"public-luna",
+        "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
+        "tools":[{
+            "type":"function","name":"lookup","description":"lookup",
+            "parameters":{"type":"object","properties":{},"additionalProperties":false}
+        }],
+        "reasoning":{"effort":"none","summary":"auto"},
+        "store":false,
+        "stream":false
+    }))
+    .expect("unary Responses request JSON");
+
+    let response = send_request(running.address, "/v1/responses", &request).await;
+    assert_eq!(
+        response_status(&response),
+        200,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(response_headers(&response)
+        .to_ascii_lowercase()
+        .contains("content-type: application/json"));
+    let body: Value = serde_json::from_slice(&decoded_response_body(&response))
+        .expect("downstream unary Responses JSON");
+    let mut expected = terminal_response;
+    expected["output"] = Value::Array(vec![reasoning_item, function_item, message_item]);
+    assert_eq!(
+        body, expected,
+        "unary response must retain raw wire fidelity"
+    );
+    assert_eq!(body["id"], response_id);
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["model"], "private-luna");
+    assert!(body.get("type").is_none(), "terminal event wrapper leaked");
+    assert_eq!(body["usage"]["input_tokens"], 11);
+    assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 3);
+    assert_eq!(
+        body["usage"]["output_tokens_details"]["reasoning_tokens"],
+        2
+    );
+    let output = body["output"].as_array().expect("Responses output array");
+    let reasoning = output
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("reasoning output survives");
+    assert_eq!(reasoning["summary"][0]["text"], "checked");
+    assert_eq!(reasoning["encrypted_content"], "encrypted-reasoning");
+    assert_eq!(reasoning["id"], reasoning_id);
+    let tool = output
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .expect("tool output survives");
+    assert_eq!(tool["call_id"], call_id);
+    assert_eq!(tool["id"], function_id);
+    assert_eq!(tool["arguments"], "{\"query\":\"status\"}");
+    let message = output
+        .iter()
+        .find(|item| item["type"] == "message")
+        .expect("message output survives");
+    assert_eq!(message["content"][0]["text"], "CODEX_UNARY_OK");
+    assert_eq!(
+        message["content"][0]["annotations"][0]["url"],
+        "https://example.test/source"
+    );
+    assert_eq!(message["id"], message_id);
+
+    let upstream_request = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("strict Codex upstream timeout")
+        .expect("strict Codex upstream task");
+    assert_request_line(&upstream_request, "/backend-api/codex/responses");
+    assert_eq!(
+        header_value(&upstream_request, "authorization"),
+        Some("Bearer codex-access-token")
+    );
+    assert_eq!(
+        header_value(&upstream_request, "chatgpt-account-id"),
+        Some("chatgpt-account")
+    );
+    let forwarded: Value = serde_json::from_slice(http_body(&upstream_request))
+        .expect("forwarded Codex Responses JSON");
+    assert_eq!(forwarded["model"], "private-luna");
+    assert_eq!(forwarded["stream"], true);
+    assert_eq!(forwarded["store"], false);
+    assert_eq!(forwarded["reasoning"]["effort"], "none");
+    assert_eq!(forwarded["tools"][0]["name"], "lookup");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn response_headers_may_arrive_after_connect_timeout_within_request_timeout() {
+    let header_delay = Duration::from_millis(5_200);
+    let (upstream_address, upstream_task) = spawn_delayed_header_upstream(header_delay).await;
+    let config = timeout_route_config(&format!("http://{upstream_address}"), "5s", "8s");
+    let running = start_server(config).await;
+
+    let started = Instant::now();
+    let response = send_request(running.address, "/delayed", br#"{"request":true}"#).await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        response_status(&response),
+        200,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&decoded_response_body(&response))
+            .expect("delayed response JSON"),
+        json!({"ok":true})
+    );
+    assert!(
+        elapsed >= header_delay,
+        "response returned before header delay"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "response exceeded request timeout: {elapsed:?}"
+    );
+    let upstream_request = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("delayed upstream timeout")
+        .expect("delayed upstream task");
+    assert_request_line(&upstream_request, "/delayed");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn stalled_tls_connection_is_bounded_by_connect_timeout() {
+    let (upstream_address, upstream_task) = spawn_stalled_tls_upstream().await;
+    let config = timeout_route_config(&format!("https://{upstream_address}"), "100ms", "3s");
+    let running = start_server(config).await;
+
+    let started = Instant::now();
+    let response = send_request(running.address, "/delayed", br#"{"request":true}"#).await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        response_status(&response),
+        504,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "stalled TLS connect ignored its bound: {elapsed:?}"
+    );
+    let client_hello = timeout(Duration::from_secs(1), upstream_task)
+        .await
+        .expect("stalled TLS upstream did not observe disconnect")
+        .expect("stalled TLS upstream task");
+    assert!(
+        !client_hello.is_empty(),
+        "TLS connection was never attempted"
+    );
     running.stop().await;
 }
 
@@ -691,6 +1162,35 @@ fn droid_config(upstream_address: SocketAddr) -> pooler_config::CompiledConfig {
     .expect("Droid runtime config")
 }
 
+fn codex_unary_config(upstream_address: SocketAddr) -> pooler_config::CompiledConfig {
+    compile_yaml(
+        "codex-unary-runtime.yaml",
+        &format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{upstream_address}\n    native: {{kind: codex}}\naccounts:\n  codex-account: {{provider: codex, auth_kind: oauth}}\nmodels:\n  - id: public-luna\n    targets:\n      - {{provider: codex, upstream_model: private-luna, capabilities: [text, streaming, tools, reasoning, function_calling], codecs: [decode.openai.responses]}}\npolicies:\n  codex-responses:\n    selection: {{strategy: fill_first, accounts: [codex-account]}}\nroutes:\n  - id: codex-responses\n    listen: local\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    limits: {{max_request_body_bytes: 1048576, max_response_body_bytes: 1048576, max_frame_bytes: 1048576, max_event_bytes: 1048576}}\n    ingress: {{mode: semantic, decoder: decode.openai.responses, encoder: encode.openai.responses}}\n    target: {{provider: codex, model_from: request.model, policy: codex-responses}}\n    response: {{mode: semantic, decoder: decode.openai.responses.events, encoder: encode.openai.responses.events}}\n    loss_policy: reject\n"
+        ),
+    )
+    .expect("Codex unary runtime config")
+}
+
+fn timeout_route_config(
+    upstream_url: &str,
+    connect_timeout: &str,
+    request_timeout: &str,
+) -> pooler_config::CompiledConfig {
+    let transport = if upstream_url.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    compile_yaml(
+        "separated-timeout-runtime.yaml",
+        &format!(
+            "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  delayed:\n    transport: {{kind: {transport}, base_url: '{upstream_url}', connect_timeout: {connect_timeout}, request_timeout: {request_timeout}}}\nroutes:\n  - id: delayed\n    listen: local\n    match: {{method: POST, path: /delayed}}\n    ingress: {{mode: opaque}}\n    target: {{provider: delayed}}\n    response: {{mode: opaque}}\n"
+        ),
+    )
+    .expect("separated timeout runtime config")
+}
+
 struct RunningServer {
     server: HttpProxyServer,
     address: SocketAddr,
@@ -710,6 +1210,26 @@ impl RunningServer {
 
 async fn start_server(config: pooler_config::CompiledConfig) -> RunningServer {
     let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+    let address = server.listener_addresses()[0]
+        .address()
+        .parse()
+        .expect("proxy address");
+    let runner_server = server.clone();
+    let runner = tokio::spawn(async move { runner_server.run().await });
+    RunningServer {
+        server,
+        address,
+        runner,
+    }
+}
+
+async fn start_server_with_native(
+    config: pooler_config::CompiledConfig,
+    native: Arc<NativeRuntime>,
+) -> RunningServer {
+    let server = HttpProxyServer::bind_with_native_runtime(config, native)
+        .await
+        .expect("native proxy binds");
     let address = server.listener_addresses()[0]
         .address()
         .parse()
@@ -744,6 +1264,115 @@ async fn spawn_upstream(
             .expect("response headers");
         stream.write_all(&body).await.expect("response body");
         request
+    });
+    (address, task)
+}
+
+async fn spawn_strict_codex_streaming_upstream(
+    streaming_body: Vec<u8>,
+) -> (SocketAddr, JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("strict Codex upstream binds");
+    let address = listener.local_addr().expect("strict Codex address");
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("strict Codex upstream accepts");
+        let request = read_request(&mut stream)
+            .await
+            .expect("strict Codex upstream request");
+        let body = serde_json::from_slice::<Value>(http_body(&request)).ok();
+        let is_streaming = body
+            .as_ref()
+            .and_then(|value| value.get("stream"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let request_line_ok =
+            request.starts_with(b"POST /backend-api/codex/responses HTTP/1.1\r\n");
+        let authorization_ok = header_value(&request, "authorization")
+            == Some("Bearer codex-access-token")
+            && header_value(&request, "chatgpt-account-id") == Some("chatgpt-account");
+        let (status, reason, content_type, response_body) = if !is_streaming {
+            (
+                400,
+                "Bad Request",
+                "application/json",
+                br#"{"error":{"message":"Stream must be set to true"}}"#.to_vec(),
+            )
+        } else if !request_line_ok || !authorization_ok {
+            (
+                401,
+                "Unauthorized",
+                "application/json",
+                br#"{"error":{"message":"strict Codex contract rejected request"}}"#.to_vec(),
+            )
+        } else {
+            (200, "OK", "text/event-stream", streaming_body)
+        };
+        let headers = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response_body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("strict Codex response headers");
+        stream
+            .write_all(&response_body)
+            .await
+            .expect("strict Codex response body");
+        request
+    });
+    (address, task)
+}
+
+async fn spawn_delayed_header_upstream(delay: Duration) -> (SocketAddr, JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("delayed-header upstream binds");
+    let address = listener.local_addr().expect("delayed-header address");
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("delayed-header upstream accepts");
+        let request = read_request(&mut stream)
+            .await
+            .expect("delayed-header upstream request");
+        tokio::time::sleep(delay).await;
+        let body = br#"{"ok":true}"#;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("delayed response headers");
+        stream.write_all(body).await.expect("delayed response body");
+        request
+    });
+    (address, task)
+}
+
+async fn spawn_stalled_tls_upstream() -> (SocketAddr, JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stalled TLS upstream binds");
+    let address = listener.local_addr().expect("stalled TLS address");
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("stalled TLS upstream accepts");
+        let mut client_hello = Vec::new();
+        stream
+            .read_to_end(&mut client_hello)
+            .await
+            .expect("stalled TLS client disconnect");
+        client_hello
     });
     (address, task)
 }

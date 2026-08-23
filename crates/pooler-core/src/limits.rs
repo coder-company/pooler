@@ -105,7 +105,8 @@ pub struct RouteLimits {
     /// End-to-end request timeout. `None` is allowed for an explicitly managed stream.
     #[serde(with = "optional_duration_millis")]
     pub request_timeout: Option<Duration>,
-    /// Upstream connection/header timeout.
+    /// Upstream TCP/TLS connection timeout. Response headers remain bounded
+    /// by `request_timeout`.
     #[serde(with = "optional_duration_millis")]
     pub connect_timeout: Option<Duration>,
 }

@@ -22,6 +22,7 @@ script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root_directory=$(CDPATH= cd -- "$script_directory/.." && pwd)
 archive_helper=$script_directory/archive.py
 sbom_helper=$script_directory/sbom.py
+asset_stager=$script_directory/stage-release-assets.sh
 assets_manifest=$root_directory/third-party/dashboard-assets/manifest.json
 checksum_helper=$script_directory/checksums.sh
 
@@ -32,10 +33,22 @@ provided_binary=
 reproducibility_check=1
 epoch=${SOURCE_DATE_EPOCH-}
 
+validate_target() {
+    target_value=$1
+    case "$target_value" in
+        ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*|*[!A-Za-z0-9])
+            printf 'release target contains unsafe characters or whitespace: %s\n' \
+                "$target_value" >&2
+            return 1
+            ;;
+    esac
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --target)
             [ "$#" -ge 2 ] || usage
+            validate_target "$2" || exit 2
             if [ "$target_count" -eq 4 ]; then
                 targets=
                 target_count=0
@@ -79,6 +92,10 @@ if [ -n "$provided_binary" ] && [ "$target_count" -ne 1 ]; then
     exit 2
 fi
 
+for target in $targets; do
+    validate_target "$target" || exit 2
+done
+
 case "$epoch" in
     '')
         epoch=$(git -C "$root_directory" log -1 --format=%ct)
@@ -93,7 +110,24 @@ if [ -z "$epoch" ]; then
     epoch=0
 fi
 
+if [ -n "$provided_binary" ] && [ ! -f "$provided_binary" ]; then
+    printf 'provided binary is not a regular file: %s\n' "$provided_binary" >&2
+    exit 2
+fi
+
 mkdir -p "$output_directory"
+
+# Never delete or overwrite a prior release. A fresh output boundary also
+# prevents stale archives from being mixed into the new checksum manifest.
+for existing_artifact in \
+    "$output_directory"/pooler-*.tar.gz \
+    "$output_directory"/SHA256SUMS; do
+    [ -e "$existing_artifact" ] || [ -L "$existing_artifact" ] || continue
+    printf 'release output already contains an artifact: %s\n' \
+        "$existing_artifact" >&2
+    exit 1
+done
+
 work_directory=$(mktemp -d "${TMPDIR:-/tmp}/pooler-release.XXXXXX")
 trap 'rm -rf "$work_directory"' EXIT HUP INT TERM
 
@@ -131,10 +165,69 @@ print(next(iter(versions)))
 
 hash_file() {
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | awk '{print $1}'
+        sha256sum -- "$1" | awk '{print $1}'
     else
-        shasum -a 256 "$1" | awk '{print $1}'
+        shasum -a 256 -- "$1" | awk '{print $1}'
     fi
+}
+
+verify_binary_target() {
+    target_value=$1
+    binary_path=$2
+    command -v file >/dev/null 2>&1 || {
+        printf 'file is required to verify a provided binary\n' >&2
+        exit 1
+    }
+    description=$(file -b -- "$binary_path")
+    case "$target_value" in
+        x86_64-*)
+            case "$description" in
+                *x86-64*|*x86_64*) ;;
+                *)
+                    printf 'provided binary architecture does not match %s: %s\n' \
+                        "$target_value" "$description" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        aarch64-*)
+            case "$description" in
+                *ARM\ aarch64*|*arm64*) ;;
+                *)
+                    printf 'provided binary architecture does not match %s: %s\n' \
+                        "$target_value" "$description" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            printf 'cannot verify provided binary architecture for target %s\n' \
+                "$target_value" >&2
+            exit 2
+            ;;
+    esac
+    case "$target_value" in
+        *-unknown-linux-gnu)
+            case "$description" in
+                *ELF*) ;;
+                *)
+                    printf 'provided binary format does not match %s: %s\n' \
+                        "$target_value" "$description" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *-apple-darwin)
+            case "$description" in
+                *Mach-O*) ;;
+                *)
+                    printf 'provided binary format does not match %s: %s\n' \
+                        "$target_value" "$description" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+    esac
 }
 
 build_binary() {
@@ -172,11 +265,13 @@ for target in $targets; do
         --metadata "$metadata" \
         --version "$metadata_version" \
         --epoch "$epoch" \
+        --target "$target" \
         --assets-manifest "$assets_manifest" \
         --cyclonedx "$cdx" \
         --spdx "$spdx"
 
     if [ -n "$provided_binary" ]; then
+        verify_binary_target "$target" "$provided_binary"
         binary="$work_directory/pooler-$target_safe"
         cp "$provided_binary" "$binary"
         chmod 755 "$binary"
@@ -208,7 +303,7 @@ for target in $targets; do
     package_name="pooler-$metadata_version-$target"
     stage_parent="$work_directory/stage-$target_safe"
     stage="$stage_parent/$package_name"
-    mkdir -p "$stage/bin" "$stage/config" "$stage/compatibility" "$stage/sbom" \
+    mkdir -p "$stage/bin" "$stage/compatibility" "$stage/sbom" \
         "$stage/schema" "$stage/third-party"
     cp "$binary" "$stage/bin/pooler"
     chmod 755 "$stage/bin/pooler"
@@ -217,9 +312,7 @@ for target in $targets; do
     cp "$root_directory/NOTICE" "$stage/NOTICE"
     cp -R "$root_directory/third-party/dashboard-assets" "$stage/third-party/"
     cp "$root_directory/schema/pooler.schema.json" "$stage/schema/pooler.schema.json"
-    cp "$root_directory/config/pooler.example.yaml" "$stage/config/pooler.example.yaml"
-    cp "$root_directory/config/cursor.example.yaml" "$stage/config/cursor.example.yaml"
-    cp "$root_directory/config/media.example.yaml" "$stage/config/media.example.yaml"
+    "$asset_stager" "$root_directory" "$stage"
     cp "$report" "$stage/compatibility/MATRIX.md"
     cp "$root_directory/fixtures/compatibility/manifest.json" "$stage/compatibility/manifest.json"
     cp "$cdx" "$stage/sbom/pooler.cdx.json"

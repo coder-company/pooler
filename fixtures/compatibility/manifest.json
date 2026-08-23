@@ -5,10 +5,10 @@
       "adapter": "factory",
       "protocol": "language-model-v3",
       "version": "v3",
-      "fixture": "../factory/fx-cliproxy-bridge-v3.json",
+      "fixture": "../factory/factory-v3-reference.json",
       "equivalence": "event_semantic",
       "status": "sanitized_local_reference",
-      "source": "sanitized fx-cliproxy-bridge local reference",
+      "source": "sanitized Factory V3 translation reference",
       "supported_capabilities": [
         "text",
         "reasoning",
@@ -31,10 +31,10 @@
       "adapter": "factory",
       "protocol": "language-model-v3",
       "version": "v3-text",
-      "fixture": "../factory/fx-cliproxy-bridge-text.json",
+      "fixture": "../factory/factory-v3-text-reference.json",
       "equivalence": "json_structural",
       "status": "sanitized_local_reference",
-      "source": "sanitized fx-cliproxy-bridge local reference",
+      "source": "sanitized Factory V3 text translation reference",
       "supported_capabilities": [
         "text",
         "tools",
@@ -144,10 +144,10 @@
       "adapter": "fx",
       "protocol": "ai-language-model-v4",
       "version": "fx-0.0.3",
-      "fixture": "../fx/fx-0.0.3-cliproxy-tool-loop.json",
+      "fixture": "../fx/fx-0.0.3-tool-loop.json",
       "equivalence": "event_semantic",
       "status": "sanitized_local_reference",
-      "source": "Installed Vercel Labs fx/0.0.3 wire and sanitized fx-cliproxy-bridge tool-loop reference",
+      "source": "Installed Vercel Labs fx/0.0.3 wire and sanitized tool-loop reference",
       "supported_capabilities": [
         "prompt_text",
         "reasoning",
@@ -169,7 +169,7 @@
       ],
       "notes": [
         "This fixture distinguishes the Vercel Labs fx terminal agent from Factory Droid and the legacy Factory adapter.",
-        "The installed fx client previously completed a tool loop through the temporary local bridge; the committed replay uses deterministic sanitized OpenAI SSE rather than a live provider.",
+        "The committed replay uses deterministic sanitized OpenAI SSE rather than a live provider.",
         "The native adapter preserves the reasoning alias delta, emits one completed tool-call event, and preserves the nested tool-result invocation ID on the follow-up request.",
         "Replay: cargo test -p adapter-fx --test fx_tool_loop replays_streaming_tool_call_and_follow_up --locked."
       ]

@@ -1,0 +1,13 @@
+# systemd variant of pooler.example.yaml. The imported container-shaped
+# configuration is overlaid with a loopback inference bind so plaintext
+# traffic cannot be exposed on a host interface. Put a TLS/authenticated edge
+# in front of 127.0.0.1:8400 when remote clients are required.
+imports:
+  - file: pooler.example.yaml
+
+version: 1
+
+listeners:
+  gateway:
+    merge: true
+    bind: 127.0.0.1:8400

@@ -15,13 +15,29 @@ output=${2-}
 }
 
 if command -v sha256sum >/dev/null 2>&1; then
-    hash_command=sha256sum
+    hash_archive() {
+        sha256sum -- "$1" | awk '{print $1}'
+    }
 else
-    hash_command='shasum -a 256'
+    hash_archive() {
+        shasum -a 256 -- "$1" | awk '{print $1}'
+    }
 fi
 
-set -- "$directory"/*.tar.gz
-if [ "$1" = "$directory/*.tar.gz" ]; then
+for archive in "$directory"/*.tar.gz; do
+    [ -e "$archive" ] || [ -L "$archive" ] || continue
+    case "$(basename "$archive")" in
+        pooler-*.tar.gz) ;;
+        *)
+            printf 'unexpected non-Pooler archive in %s: %s\n' "$directory" \
+                "$(basename "$archive")" >&2
+            exit 1
+            ;;
+    esac
+done
+
+set -- "$directory"/pooler-*.tar.gz
+if [ "$1" = "$directory/pooler-*.tar.gz" ]; then
     printf 'no release archives found in %s\n' "$directory" >&2
     exit 1
 fi
@@ -30,19 +46,24 @@ checksums=$(mktemp)
 trap 'rm -f "$checksums"' EXIT
 
 for archive in "$@"; do
-    name=$(basename "$archive")
-    if [ "$hash_command" = sha256sum ]; then
-        digest=$(sha256sum "$archive" | awk '{print $1}')
-    else
-        digest=$(shasum -a 256 "$archive" | awk '{print $1}')
+    # Checksums must cover regular release files only.  Refuse a matching
+    # directory or symlink rather than following it into an unexpected path.
+    if [ ! -f "$archive" ] || [ -L "$archive" ]; then
+        printf 'unsafe release archive path: %s\n' "$archive" >&2
+        exit 1
     fi
+    name=$(basename "$archive")
+    digest=$(hash_archive "$archive")
     printf '%s  %s\n' "$digest" "$name" >>"$checksums"
 done
 
 if [ -n "$output" ]; then
     output_directory=$(dirname "$output")
     mkdir -p "$output_directory"
-    sort "$checksums" >"$output"
+    temporary_output=$(mktemp "$output.tmp.XXXXXX")
+    trap 'rm -f "$checksums" "$temporary_output"' EXIT
+    LC_ALL=C sort "$checksums" >"$temporary_output"
+    mv -f "$temporary_output" "$output"
 else
-    sort "$checksums"
+    LC_ALL=C sort "$checksums"
 fi

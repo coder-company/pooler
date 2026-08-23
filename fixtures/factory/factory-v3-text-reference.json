@@ -1,6 +1,6 @@
 {
-  "id": "fx-cliproxy-bridge.factory.v3.text",
-  "source": "fx-cliproxy-bridge/server.mjs",
+  "id": "factory.v3.text.reference",
+  "source": "sanitized Factory V3 reference implementation",
   "equivalence": "json_structural",
   "model_header": "gpt-test",
   "intentional_corrections": [

@@ -24,7 +24,7 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::{body::Incoming, http, http::Request, service::service_fn};
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto,
 };
 use pooler_config::{CompiledConfig, ListenerProtocol};
@@ -33,15 +33,15 @@ use pooler_extension::{
 };
 use pooler_http::{
     BoxError, DrainError, HttpProxy, MediaSemanticAdapter, NativeRuntime, PoolingCoordinator,
-    ProxyBody, ProxyError, RuntimeResourceGuard, RuntimeResourceSnapshot, RuntimeResources,
-    SelectionContext, SemanticAdapter, SemanticRequestBody, SemanticResponseBody,
-    SemanticResponseHint, SemanticWebSocketTransport,
+    ProxyBody, ProxyError, ResponseDeadline, ResponseDeadlineCleanupGuard, RuntimeResourceGuard,
+    RuntimeResourceSnapshot, RuntimeResources, SelectionContext, SemanticAdapter,
+    SemanticRequestBody, SemanticResponseBody, SemanticResponseHint, SemanticWebSocketTransport,
 };
 use pooler_observe::MetricsRegistry;
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixListener},
-    sync::{mpsc, Mutex as AsyncMutex},
+    sync::{mpsc, Mutex as AsyncMutex, Semaphore},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -57,6 +57,20 @@ use crate::{
 };
 
 const FORCE_CANCEL_GRACE: Duration = Duration::from_secs(1);
+/// Maximum number of downstream connections supervised by one listener.
+///
+/// Admission is applied before spawning a connection task, so a peer flood
+/// cannot create an unbounded number of Tokio tasks or per-connection state.
+const MAX_CONNECTIONS_PER_LISTENER: usize = 1024;
+/// Retain only a small number of quiescent generations between reloads.
+///
+/// Generations with active requests are retained regardless of this value so
+/// graceful drain can still reach every in-flight request.  Idle generations
+/// are disposable once a newer generation has been published.
+const MAX_RETIRED_GENERATIONS: usize = 2;
+/// Bound only the HTTP/1 header phase.  Streaming response bodies and keep-
+/// alive connections are intentionally not subject to this deadline.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 type RuntimeProxy = HttpProxy<RuntimeSemanticAdapter>;
 
@@ -1035,11 +1049,14 @@ impl HttpProxyServer {
             proxies.insert(id, proxy);
         }
 
-        self.state
+        let mut retired = self
+            .state
             .retired
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(current.proxies.values().cloned().collect());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retired.push(current.proxies.values().cloned().collect());
+        prune_retired_generations(&mut retired, true);
+        drop(retired);
         self.state.dispatch.store(Arc::new(RuntimeGeneration {
             config: Arc::clone(&config),
             proxies,
@@ -1188,20 +1205,43 @@ impl HttpProxyServer {
             .retired
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        retired.retain(|group| {
-            let active = group
-                .iter()
-                .map(|proxy| proxy.drain_controller().active())
-                .sum::<usize>();
-            if active > 0 {
-                proxies.extend(group.iter().cloned());
-                true
-            } else {
-                false
-            }
-        });
+        prune_retired_generations(&mut retired, false);
+        for group in retired.iter() {
+            proxies.extend(group.iter().cloned());
+        }
         proxies
     }
+}
+
+/// Remove retired generations that no longer own in-flight requests and cap
+/// the number of idle generations retained across reloads.
+///
+/// Active groups cannot be discarded: the server's drain path uses these
+/// proxy handles to reject new work and wait for old response bodies.  Once a
+/// group becomes idle, it is safe to drop and the newest idle groups win the
+/// bounded retention policy. `all_proxies` passes `false` so its drain view
+/// drops idle groups immediately, matching the original drain behavior.
+fn prune_retired_generations(retired: &mut Vec<Vec<Arc<RuntimeProxy>>>, retain_idle: bool) {
+    let mut active_groups = Vec::with_capacity(retired.len());
+    let mut idle_groups = Vec::with_capacity(retired.len());
+    for group in retired.drain(..) {
+        if group
+            .iter()
+            .any(|proxy| proxy.drain_controller().active() > 0)
+        {
+            active_groups.push(group);
+        } else {
+            idle_groups.push(group);
+        }
+    }
+    if retain_idle {
+        if idle_groups.len() > MAX_RETIRED_GENERATIONS {
+            let keep_from = idle_groups.len() - MAX_RETIRED_GENERATIONS;
+            idle_groups.drain(..keep_from);
+        }
+        active_groups.extend(idle_groups);
+    }
+    *retired = active_groups;
 }
 
 async fn run_native_account_commands(
@@ -1478,14 +1518,28 @@ fn bounded_extension_usize(value: u64) -> usize {
 struct ActiveBody {
     inner: Pin<Box<ProxyBody>>,
     guard: Option<ActiveGuard>,
+    deadline_guard: Option<ResponseDeadlineCleanupGuard>,
 }
 
 impl ActiveBody {
-    fn new(inner: ProxyBody, guard: ActiveGuard) -> Self {
-        Self {
-            inner: Box::pin(inner),
-            guard: Some(guard),
+    fn new(inner: ProxyBody, guard: ActiveGuard, deadline: Option<ResponseDeadline>) -> Self {
+        match deadline {
+            Some(deadline) => Self {
+                inner: Box::pin(inner),
+                guard: None,
+                deadline_guard: Some(deadline.attach_cleanup(move || drop(guard))),
+            },
+            None => Self {
+                inner: Box::pin(inner),
+                guard: Some(guard),
+                deadline_guard: None,
+            },
         }
+    }
+
+    fn release(&mut self) {
+        self.guard.take();
+        self.deadline_guard.take();
     }
 }
 
@@ -1499,7 +1553,7 @@ impl Body for ActiveBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let result = self.inner.as_mut().poll_frame(context);
         if matches!(result, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
-            self.guard.take();
+            self.release();
         }
         result
     }
@@ -1526,14 +1580,27 @@ async fn accept_loop(
             dispatch,
         } => {
             let mut connections = JoinSet::new();
+            let admission = Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_LISTENER));
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
-                    result = listener.accept() => {
+                    result = listener.accept(), if admission.available_permits() > 0 => {
                         let (stream, peer) = result.map_err(|source| HttpProxyServerError::Listener {
                             listener: id.to_string(),
                             message: source.to_string(),
                         })?;
+                        let permit = match admission.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                // The availability guard above makes this
+                                // path unlikely, but keep admission fail-closed
+                                // if the semaphore is ever changed to have
+                                // another consumer.
+                                debug!(listener = %id, "connection admission limit reached");
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let generation = dispatch.load_full();
                         let dispatch = Arc::clone(&dispatch);
                         let connection_id = Arc::clone(&id);
@@ -1548,6 +1615,7 @@ async fn accept_loop(
                         let task = resources.task();
                         connections.spawn(async move {
                             let _task = task;
+                            let _permit = permit;
                             serve_tcp_connection(
                                 stream,
                                 connection_id,
@@ -1581,14 +1649,23 @@ async fn accept_loop(
             dispatch,
         } => {
             let mut connections = JoinSet::new();
+            let admission = Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_LISTENER));
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
-                    result = listener.accept() => {
+                    result = listener.accept(), if admission.available_permits() > 0 => {
                         let (stream, _) = result.map_err(|source| HttpProxyServerError::Listener {
                             listener: id.to_string(),
                             message: source.to_string(),
                         })?;
+                        let permit = match admission.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                debug!(listener = %id, "connection admission limit reached");
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let dispatch = Arc::clone(&dispatch);
                         let id = Arc::clone(&id);
                         let protocol = dispatch
@@ -1602,6 +1679,7 @@ async fn accept_loop(
                         let task = resources.task();
                         connections.spawn(async move {
                             let _task = task;
+                            let _permit = permit;
                             serve_connection(
                                 TokioIo::new(stream),
                                 id,
@@ -1653,7 +1731,8 @@ async fn serve_connection<I>(
         async move {
             let guard = active.enter(listener.as_ref());
             let response = proxy.handle(request).await;
-            let response = response.map(|body| ActiveBody::new(body, guard).boxed());
+            let deadline = response.extensions().get::<ResponseDeadline>().cloned();
+            let response = response.map(|body| ActiveBody::new(body, guard, deadline).boxed());
             Ok::<_, Infallible>(response)
         }
     });
@@ -1663,7 +1742,17 @@ async fn serve_connection<I>(
     // one service implementation for both protocols and runs HTTP/2 streams
     // concurrently on the same connection.
     let mut builder = auto::Builder::new(TokioExecutor::new());
-    builder.http1().keep_alive(true).max_headers(100);
+    {
+        let mut http1 = builder.http1();
+        http1
+            .keep_alive(true)
+            .max_headers(100)
+            // Hyper's timer is used only while waiting for the next complete
+            // HTTP/1 request header.  It does not impose a lifetime on a
+            // keep-alive connection or on a streaming response body.
+            .header_read_timeout(HEADER_READ_TIMEOUT)
+            .timer(TokioTimer::new());
+    }
     {
         let mut http2 = builder.http2();
         http2
@@ -2100,6 +2189,285 @@ mod tests {
             .await
             .expect("proxy task does not panic")
             .expect("proxy task succeeds");
+    }
+
+    const BACKPRESSURE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+    async fn spawn_backpressure_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("backpressure upstream binds");
+        let address = listener
+            .local_addr()
+            .expect("backpressure upstream address");
+        let task = tokio::spawn(async move {
+            let mut handlers = JoinSet::new();
+            for request_index in 0..2 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("backpressure upstream accepts request");
+                handlers.spawn(async move {
+                    read_request(&mut stream)
+                        .await
+                        .expect("backpressure upstream reads request");
+                    if request_index == 0 {
+                        let headers = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {BACKPRESSURE_RESPONSE_BYTES}\r\nConnection: close\r\n\r\n"
+                        );
+                        stream
+                            .write_all(headers.as_bytes())
+                            .await
+                            .expect("backpressure upstream writes first headers");
+                        let chunk = vec![b'x'; 64 * 1024];
+                        let mut written = 0;
+                        while written < BACKPRESSURE_RESPONSE_BYTES {
+                            let remaining = BACKPRESSURE_RESPONSE_BYTES - written;
+                            let bytes = &chunk[..remaining.min(chunk.len())];
+                            if stream.write_all(bytes).await.is_err() {
+                                break;
+                            }
+                            written += bytes.len();
+                        }
+                        assert!(
+                            written < BACKPRESSURE_RESPONSE_BYTES,
+                            "the unconsumed response must be truncated by its deadline"
+                        );
+                    } else {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await
+                            .expect("backpressure upstream writes second response");
+                    }
+                });
+            }
+            while let Some(result) = handlers.join_next().await {
+                result.expect("backpressure upstream handler does not panic");
+            }
+        });
+        (address, task)
+    }
+
+    fn backpressure_config(
+        protocol: &str,
+        upstream: SocketAddr,
+        secret: &TestSecret,
+    ) -> CompiledConfig {
+        pooler_config::compile_yaml(
+            "response-deadline-backpressure.yaml",
+            &format!(
+                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0, protocol: {protocol}}}}}\nupstreams: {{local: {{url: http://{upstream}}}}}\naccounts:\n  only: {{provider: local, secret: {}, max_concurrency: 1}}\npolicies:\n  only:\n    selection: {{strategy: fill_first, accounts: [only]}}\nroutes:\n  - id: deadline\n    listen: local\n    match: {{method: GET, path: /deadline}}\n    limits: {{request_timeout: 1s, max_response_body_bytes: 134217728}}\n    target: {{provider: local, policy: only}}\n    ingress: {{mode: opaque}}\n    response: {{mode: opaque}}\n",
+                secret.reference()
+            ),
+        )
+        .expect("response deadline backpressure config compiles")
+    }
+
+    async fn wait_for_runtime_tasks(server: &HttpProxyServer, minimum: u64) {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while server.resource_snapshot().tasks < minimum {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime reaches expected task count");
+    }
+
+    async fn assert_deadline_resources_released(
+        server: &HttpProxyServer,
+        connection_task_count: u64,
+    ) {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                let resources = server.resource_snapshot();
+                if server.active() == 0
+                    && resources.permits == 0
+                    && resources.secret_material == 0
+                    && resources.refresh_leases == 0
+                    && resources.tasks <= connection_task_count
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unpolled response releases active count, permit, lease body, and timer task");
+    }
+
+    fn assert_first_deadline_lifecycle_is_single_completion(server: &HttpProxyServer) {
+        let events = server
+            .pooling()
+            .request_events()
+            .expect("deadline request history is readable");
+        let request_id = events
+            .iter()
+            .find(|event| event.kind == pooler_store::RequestEventKind::Admission)
+            .expect("first deadline admission exists")
+            .request_id
+            .clone();
+        let first = events
+            .iter()
+            .filter(|event| event.request_id == request_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first
+                .iter()
+                .filter(|event| event.kind == pooler_store::RequestEventKind::Commitment)
+                .count(),
+            1,
+            "response headers commit exactly once"
+        );
+        let completions = first
+            .iter()
+            .filter(|event| event.kind == pooler_store::RequestEventKind::Completion)
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 1, "deadline completes exactly once");
+        assert_eq!(
+            completions[0].error_class.as_deref(),
+            Some("incomplete_stream")
+        );
+        assert!(
+            first
+                .iter()
+                .all(|event| event.kind != pooler_store::RequestEventKind::Retry),
+            "a committed response is never retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn http1_unread_response_releases_all_request_resources_at_deadline() {
+        let (upstream_address, upstream) = spawn_backpressure_upstream().await;
+        let secret = TestSecret::new("deadline-secret\n");
+        let config = backpressure_config("http1", upstream_address, &secret);
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        wait_for_runtime_tasks(&server, 1).await;
+        let mut downstream = TcpStream::connect(address)
+            .await
+            .expect("HTTP/1 downstream connects");
+        wait_for_runtime_tasks(&server, 2).await;
+        let connection_task_count = server.resource_snapshot().tasks;
+        downstream
+            .write_all(b"GET /deadline HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("HTTP/1 deadline request writes");
+        let first_headers = tokio::time::timeout(TEST_TIMEOUT, read_headers(&mut downstream))
+            .await
+            .expect("HTTP/1 response headers arrive")
+            .expect("HTTP/1 response headers read");
+        assert_eq!(status(&first_headers), 200);
+        assert_eq!(server.active(), 1);
+        let active_resources = server.resource_snapshot();
+        assert_eq!(active_resources.permits, 1);
+        assert!(active_resources.tasks > connection_task_count);
+
+        // Keep the socket alive without reading another response byte. The
+        // request deadline must own cancellation rather than rely on a body
+        // poll caused by downstream progress.
+        assert_deadline_resources_released(&server, connection_task_count).await;
+
+        let second = send_request(
+            address,
+            b"GET /deadline HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&second), 200);
+        assert_eq!(response_body(&second), b"ok");
+        assert_first_deadline_lifecycle_is_single_completion(&server);
+
+        drop(downstream);
+        stop_server(&server, runner).await;
+        tokio::time::timeout(TEST_TIMEOUT, upstream)
+            .await
+            .expect("HTTP/1 upstream exits")
+            .expect("HTTP/1 upstream task does not panic");
+        assert!(server.resource_snapshot().is_zero());
+    }
+
+    #[tokio::test]
+    async fn h2_unpolled_response_releases_all_request_resources_at_deadline() {
+        let (upstream_address, upstream) = spawn_backpressure_upstream().await;
+        let secret = TestSecret::new("deadline-secret\n");
+        let config = backpressure_config("h2c", upstream_address, &secret);
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        wait_for_runtime_tasks(&server, 1).await;
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("h2 downstream connects");
+        let (mut sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(stream),
+        )
+        .await
+        .expect("h2 downstream handshake");
+        let connection_task = tokio::spawn(connection);
+        wait_for_runtime_tasks(&server, 2).await;
+        let connection_task_count = server.resource_snapshot().tasks;
+        let request = || {
+            Request::builder()
+                .method("GET")
+                .uri("http://localhost/deadline")
+                .version(http::Version::HTTP_2)
+                .header("host", "localhost")
+                .body(Full::new(Bytes::new()))
+                .expect("h2 deadline request")
+        };
+        let first_response = sender
+            .send_request(request())
+            .await
+            .expect("first h2 response headers");
+        assert_eq!(first_response.status(), http::StatusCode::OK);
+        assert_eq!(server.active(), 1);
+        let active_resources = server.resource_snapshot();
+        assert_eq!(active_resources.permits, 1);
+        assert!(active_resources.tasks > connection_task_count);
+
+        // Retain Incoming without polling it. Exhausted h2 flow control must
+        // not retain Pooler's request-owned resources past the deadline.
+        assert_deadline_resources_released(&server, connection_task_count).await;
+
+        let second_response = sender
+            .send_request(request())
+            .await
+            .expect("second h2 stream remains usable");
+        assert_eq!(second_response.status(), http::StatusCode::OK);
+        assert_eq!(
+            second_response
+                .into_body()
+                .collect()
+                .await
+                .expect("second h2 body")
+                .to_bytes(),
+            Bytes::from_static(b"ok")
+        );
+        assert_first_deadline_lifecycle_is_single_completion(&server);
+
+        drop(first_response);
+        drop(sender);
+        stop_server(&server, runner).await;
+        connection_task
+            .await
+            .expect("h2 connection task does not panic")
+            .expect("h2 connection closes cleanly");
+        tokio::time::timeout(TEST_TIMEOUT, upstream)
+            .await
+            .expect("h2 upstream exits")
+            .expect("h2 upstream task does not panic");
+        assert!(server.resource_snapshot().is_zero());
     }
 
     #[tokio::test]
@@ -4772,6 +5140,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_prunes_idle_retired_generations_to_the_configured_cap() {
+        let config_for = |path: &str| {
+            pooler_config::compile_yaml(
+                "reload-retired-cap.yaml",
+                &format!(
+                    "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  local: {{url: http://127.0.0.1:1}}\nroutes:\n  - id: route\n    listen: local\n    match: {{path: {path}}}\n    target: local\n"
+                ),
+            )
+            .expect("reload cap config")
+        };
+        let server = HttpProxyServer::bind(config_for("/reload-0"))
+            .await
+            .expect("proxy binds");
+        let reloads = MAX_RETIRED_GENERATIONS + 3;
+
+        for index in 1..=reloads {
+            let candidate = config_for(&format!("/reload-{index}"));
+            assert_eq!(
+                server.reload(candidate).await.expect("reload succeeds"),
+                HttpReloadOutcome::Reloaded {
+                    generation: (index + 1) as u64,
+                }
+            );
+            let retired = server
+                .state
+                .retired
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(retired.len(), index.min(MAX_RETIRED_GENERATIONS));
+            assert!(retired
+                .iter()
+                .flatten()
+                .all(|proxy| proxy.drain_controller().active() == 0));
+        }
+
+        assert_eq!(server.config_generation(), (reloads + 1) as u64);
+    }
+
+    #[tokio::test]
     async fn reload_rejects_native_provider_binding_changes() {
         let config = pooler_config::compile_yaml(
             "native-reload.yaml",
@@ -5171,12 +5578,31 @@ mod tests {
         .expect("replacement config");
         let outcome = server.reload(replacement).await.expect("reload succeeds");
         assert_eq!(outcome, HttpReloadOutcome::Reloaded { generation: 2 });
+        {
+            let retired = server
+                .state
+                .retired
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(retired.iter().any(|group| {
+                group
+                    .iter()
+                    .any(|proxy| proxy.drain_controller().active() > 0)
+            }));
+        }
         let new_request =
             send_request(address, b"GET /reload HTTP/1.1\r\nHost: test\r\n\r\n").await;
         assert_eq!(response_body(&new_request), b"new");
         release.notify_one();
         let old_response = old_request.await.expect("old request task");
         assert_eq!(response_body(&old_response), b"old");
+        let _ = server.all_proxies();
+        assert!(server
+            .state
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
         first_upstream.await.expect("first upstream");
         second_upstream.await.expect("second upstream");
         stop_server(&server, runner).await;

@@ -1456,7 +1456,7 @@
       "type": "object"
     },
     "secret_ref": {
-      "pattern": "^(env:[A-Za-z_][A-Za-z0-9_]*|file:.+|keyring:[^/]+/.+)$",
+      "pattern": "^(env:[A-Za-z_][A-Za-z0-9_]*|file:(/.*|[A-Za-z]:[/\\\\].*|\\\\\\\\[^\\\\/]+[/\\\\].*)|keyring:[^/]+/.+)$",
       "type": "string"
     },
     "selection": {

@@ -36,20 +36,6 @@ from PIL import Image
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UI_DIR = REPO_ROOT / "crates" / "pooler-server" / "ui"
 
-DEFAULT_BRAND_KIT = Path.home() / "Coder Company Assets"
-DEFAULT_ICONOIR = Path(
-    "/home/chaitanya/codevault/arcXiv/apps/web/node_modules/@iconify-icons/iconoir"
-)
-DEFAULT_GEIST = Path(
-    "/home/chaitanya/codevault/arcXiv/node_modules/.pnpm/"
-    "@fontsource-variable+geist@5.2.8/node_modules/@fontsource-variable/geist/files"
-)
-DEFAULT_GEIST_MONO = Path(
-    "/home/chaitanya/codevault/arcXiv/workers/og-image/fonts/GeistMono-Regular.ttf"
-)
-DEFAULT_PROVIDER_ICONS = Path("/tmp/brand-icons/provider-icons.json")
-DEFAULT_SIMPLE_ICONS = Path("/tmp/brand-icons/package/icons")
-
 # Simple Icons (CC0) slugs merged in when @lobehub/icons has no equivalent.
 SIMPLE_ICONS_GAP_FILLS = [
     "deepgram",
@@ -481,12 +467,12 @@ def write_fonts(geist_dir: Path, geist_mono_ttf: Path) -> list[Path]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--brand-kit", type=Path, default=DEFAULT_BRAND_KIT)
-    parser.add_argument("--iconoir", type=Path, default=DEFAULT_ICONOIR)
-    parser.add_argument("--geist", type=Path, default=DEFAULT_GEIST)
-    parser.add_argument("--geist-mono", type=Path, default=DEFAULT_GEIST_MONO)
-    parser.add_argument("--provider-icons", type=Path, default=DEFAULT_PROVIDER_ICONS)
-    parser.add_argument("--simple-icons", type=Path, default=DEFAULT_SIMPLE_ICONS)
+    parser.add_argument("--brand-kit", type=Path, required=True)
+    parser.add_argument("--iconoir", type=Path, required=True)
+    parser.add_argument("--geist", type=Path, required=True)
+    parser.add_argument("--geist-mono", type=Path, required=True)
+    parser.add_argument("--provider-icons", type=Path, required=True)
+    parser.add_argument("--simple-icons", type=Path, required=True)
     return parser.parse_args()
 
 

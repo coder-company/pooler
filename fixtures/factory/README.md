@@ -1,8 +1,7 @@
 # Factory reference fixture
 
-`fx-cliproxy-bridge-text.json` is a sanitized, deterministic text-stream
-reference for
-the translation implemented by `/home/chaitanya/fx-cliproxy-bridge/server.mjs`.
+`factory-v3-text-reference.json` is a sanitized, deterministic text-stream
+reference captured during the initial Factory compatibility work.
 It contains no credentials, provider URLs, workspace paths, or live-client
 capture. The replay test uses the bridge's documented request and streamed
 response shapes as a compatibility baseline for Pooler's Factory and OpenAI
@@ -23,7 +22,7 @@ source-shaped projection.
 This fixture proves codec behavior against a sanitized local reference. It is
 not evidence of compatibility with a live Factory client or service.
 
-`fx-cliproxy-bridge-v3.json` is the broader event-semantic fixture. It adds
+`factory-v3-reference.json` is the broader event-semantic fixture. It adds
 reasoning and fragmented tool-call input coverage while keeping the same local
 reference and compatibility limitation.
 

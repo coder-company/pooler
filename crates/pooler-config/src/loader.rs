@@ -1,6 +1,7 @@
 //! File imports and deterministic overlay resolution.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use pooler_model_catalog::ProviderCatalog;
 use serde::Deserialize;
 use serde_yml::{Mapping, Value};
 
-use crate::{validate_version, Config, ConfigError, Source, SourceLabel};
+use crate::{validate_version, Config, ConfigError, Source, SourceLabel, MAX_CONFIG_FILE_BYTES};
 
 struct ResolvedDocument {
     value: Value,
@@ -102,10 +103,7 @@ impl ConfigLoader {
     /// Resolve and parse a configuration file.
     pub fn load(&self, path: impl AsRef<Path>) -> Result<Config, ConfigError> {
         let path = path.as_ref();
-        let raw = std::fs::read_to_string(path).map_err(|error| ConfigError::Io {
-            path: path.display().to_string(),
-            message: error.to_string(),
-        })?;
+        let raw = read_config_file(path, false)?;
         let has_imports = serde_yml::from_str::<Value>(&raw)
             .ok()
             .is_some_and(|value| {
@@ -127,6 +125,7 @@ impl ConfigLoader {
     /// regular [`Self::load`] fast path retains parser coordinates for the
     /// common case; reload watchers need the dependency graph as well.
     pub fn load_tracked(&self, path: impl AsRef<Path>) -> Result<LoadedConfig, ConfigError> {
+        ensure_config_file(path.as_ref())?;
         let root = std::fs::canonicalize(path.as_ref()).map_err(|error| ConfigError::Io {
             path: path.as_ref().display().to_string(),
             message: error.to_string(),
@@ -165,6 +164,7 @@ impl ConfigLoader {
                 "maximum configuration import depth exceeded",
             ));
         }
+        ensure_config_file(path)?;
         let canonical = std::fs::canonicalize(path).map_err(|error| ConfigError::Io {
             path: path.display().to_string(),
             message: error.to_string(),
@@ -180,12 +180,10 @@ impl ConfigLoader {
                 &format!("configuration import cycle: {}", chain.join(" -> ")),
             ));
         }
+        let secure = !stack.is_empty();
         stack.push(canonical.clone());
 
-        let text = std::fs::read_to_string(&canonical).map_err(|error| ConfigError::Io {
-            path: canonical.display().to_string(),
-            message: error.to_string(),
-        })?;
+        let text = read_config_file(&canonical, secure)?;
         let mut document: Value =
             serde_yml::from_str(&text).map_err(|error| ConfigError::Parse {
                 source_name: canonical.display().to_string(),
@@ -263,6 +261,7 @@ impl ConfigLoader {
         path: &Path,
         stack: &[PathBuf],
     ) -> Result<ResolvedDocument, ConfigError> {
+        ensure_config_file(path)?;
         let canonical = std::fs::canonicalize(path).map_err(|error| ConfigError::Io {
             path: path.display().to_string(),
             message: error.to_string(),
@@ -270,10 +269,7 @@ impl ConfigLoader {
         if stack.contains(&canonical) {
             return Err(load_error(path, "configuration import cycle"));
         }
-        let text = std::fs::read_to_string(&canonical).map_err(|error| ConfigError::Io {
-            path: canonical.display().to_string(),
-            message: error.to_string(),
-        })?;
+        let text = read_config_file(&canonical, true)?;
         let mut document: Value =
             serde_yml::from_str(&text).map_err(|error| ConfigError::Parse {
                 source_name: canonical.display().to_string(),
@@ -382,6 +378,176 @@ pub fn load_path(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
 /// Render deterministic expanded YAML with default limits.
 pub fn render_path(path: impl AsRef<Path>) -> Result<String, ConfigError> {
     ConfigLoader::default().render(path)
+}
+
+fn ensure_config_file(path: &Path) -> Result<(), ConfigError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| ConfigError::Io {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(ConfigError::Io {
+            path: path.display().to_string(),
+            message: "configuration file must be a regular file".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn read_config_file(path: &Path, secure: bool) -> Result<String, ConfigError> {
+    ensure_config_file(path)?;
+    let file = open_config_file(path, secure)?;
+    let metadata = file.metadata().map_err(|error| ConfigError::Io {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(ConfigError::Io {
+            path: path.display().to_string(),
+            message: "configuration file must be a regular file".to_owned(),
+        });
+    }
+    if metadata.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::Io {
+            path: path.display().to_string(),
+            message: format!(
+                "configuration file exceeds the {MAX_CONFIG_FILE_BYTES}-byte size limit"
+            ),
+        });
+    }
+    let capacity = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_CONFIG_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ConfigError::Io {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+    if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::Io {
+            path: path.display().to_string(),
+            message: format!(
+                "configuration file exceeds the {MAX_CONFIG_FILE_BYTES}-byte size limit"
+            ),
+        });
+    }
+    String::from_utf8(bytes).map_err(|error| ConfigError::Io {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })
+}
+
+fn open_config_file(path: &Path, secure: bool) -> Result<std::fs::File, ConfigError> {
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{open, Mode, OFlags};
+
+        let descriptor = open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| ConfigError::Io {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        std::fs::File::from(descriptor)
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options.open(path).map_err(|error| ConfigError::Io {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = std::fs::File::open(path).map_err(|error| ConfigError::Io {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+
+    let metadata = file.metadata().map_err(|error| ConfigError::Io {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+    if !metadata.file_type().is_file() || is_reparse_point(&metadata) {
+        return Err(ConfigError::Io {
+            path: path.display().to_string(),
+            message: "configuration file must be a regular file".to_owned(),
+        });
+    }
+    if secure {
+        validate_secure_metadata(path, &metadata)?;
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+const fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+const fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn validate_secure_metadata(path: &Path, metadata: &std::fs::Metadata) -> Result<(), ConfigError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o400 == 0
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(ConfigError::Io {
+            path: path.display().to_string(),
+            message: "configuration file must be owner-readable and not group- or world-writable"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_secure_metadata(path: &Path, metadata: &std::fs::Metadata) -> Result<(), ConfigError> {
+    if is_reparse_point(metadata) {
+        return Err(ConfigError::Io {
+            path: path.display().to_string(),
+            message: "configuration file must not be a symlink or reparse point".to_owned(),
+        });
+    }
+    // Windows ACLs do not have a portable std-only owner/mode representation,
+    // and this crate forbids unsafe Win32 security-descriptor calls. Fail
+    // closed for imported/overlay files until a reviewed ACL implementation is
+    // available; root-only configuration files still use `secure: false`.
+    Err(ConfigError::Io {
+        path: path.display().to_string(),
+        message: "secure imported/overlay configuration file permission validation is unavailable on Windows".to_owned(),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_secure_metadata(
+    _path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> Result<(), ConfigError> {
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2509,6 +2675,66 @@ version: 1
         let root = dir.write("root.yaml", "imports: [{file: leaf.yaml}]\nversion: 1\n");
         assert!(ConfigLoader::new(0).render(&root).is_err());
         assert!(ConfigLoader::new(1).render(&root).is_ok());
+    }
+
+    #[test]
+    fn rejects_oversized_configuration_sources_before_yaml_parsing() {
+        let dir = TestDir::new();
+        let path = dir.write(
+            "oversized.yaml",
+            &format!(
+                "version: 1\n#{}",
+                "x".repeat(MAX_CONFIG_FILE_BYTES as usize)
+            ),
+        );
+        let error = ConfigLoader::default()
+            .load(path)
+            .expect_err("oversized source");
+        assert!(error.to_string().contains("size limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_group_or_world_writable_imports() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new();
+        let base = dir.write("base.yaml", "version: 1\n");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o664))
+            .expect("set insecure permissions");
+        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 1\n");
+        let error = ConfigLoader::default()
+            .load(root)
+            .expect_err("insecure import");
+        assert!(error.to_string().contains("group- or world-writable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_imports_before_resolution() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new();
+        let target = dir.write("target.yaml", "version: 1\n");
+        let link = dir.0.join("link.yaml");
+        symlink(&target, &link).expect("symlink import");
+        let root = dir.write("root.yaml", "imports: [{file: link.yaml}]\nversion: 1\n");
+        let error = ConfigLoader::default()
+            .load(root)
+            .expect_err("symlink import");
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn secure_import_validation_fails_closed_without_acl_support() {
+        let dir = TestDir::new();
+        dir.write("base.yaml", "version: 1\n");
+        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 1\n");
+        let error = ConfigLoader::default()
+            .load(root)
+            .expect_err("Windows secure import validation must fail closed");
+        assert!(error.to_string().contains("unavailable on Windows"));
     }
 
     #[test]

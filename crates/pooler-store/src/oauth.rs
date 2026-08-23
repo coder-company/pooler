@@ -13,7 +13,7 @@ use pooler_auth::{
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::{CredentialPayload, SqliteStore, Store, StoreError};
+use crate::{CredentialPayload, SqliteStore, StoreError};
 
 /// SQLite-backed encrypted OAuth token store.
 #[derive(Clone)]
@@ -168,30 +168,37 @@ impl SqliteOAuthTokenStore {
         if identity.subject.trim().is_empty() {
             return Err(OAuthStoreError::Unavailable);
         }
-        let payload = self
-            .store
-            .credential_payload(credential.as_str())
-            .map_err(Self::map_store_error)?
-            .ok_or(OAuthStoreError::NotFound)?;
-        let mut persisted = decode_persisted(payload)?;
-        persisted.account_id = Some(identity.subject.clone());
-        persisted.email = identity.email.clone();
-        persisted.name = identity.name.clone();
-        let payload = encode_persisted(&persisted)?;
-        let state = self
-            .store
-            .credential_state(credential.as_str())
-            .map_err(Self::map_store_error)?
-            .ok_or(OAuthStoreError::NotFound)?;
-        self.store
-            .compare_and_swap_credential_payload(
+        // Read the payload and revision as one snapshot. Reading them through
+        // separate store calls lets a concurrent token refresh advance the
+        // revision between the two reads, after which this identity write
+        // could overwrite the refresh payload while presenting the newer
+        // revision. A bounded retry preserves both updates when a refresh
+        // wins between this snapshot and the CAS commit.
+        for _ in 0..8 {
+            let Some((state, Some(payload))) = self
+                .store
+                .credential_payload_with_state(credential.as_str())
+                .map_err(Self::map_store_error)?
+            else {
+                return Err(OAuthStoreError::NotFound);
+            };
+            let mut persisted = decode_persisted(payload)?;
+            persisted.account_id = Some(identity.subject.clone());
+            persisted.email = identity.email.clone();
+            persisted.name = identity.name.clone();
+            let payload = encode_persisted(&persisted)?;
+            match self.store.compare_and_swap_credential_payload(
                 credential.as_str(),
                 state.revision,
                 &payload,
                 now_millis(),
-            )
-            .map_err(Self::map_store_error)
-            .map(|_| ())
+            ) {
+                Ok(_) => return Ok(()),
+                Err(StoreError::CredentialRevisionConflict) => continue,
+                Err(error) => return Err(Self::map_store_error(error)),
+            }
+        }
+        Err(OAuthStoreError::Conflict)
     }
 
     /// Return the persisted provider subject without exposing token material.
@@ -389,6 +396,9 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use super::*;
     use crate::{CredentialState, MasterKey, Store};
     use tempfile::tempdir;
@@ -442,8 +452,153 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn identity_update_preserves_a_concurrent_token_rotation() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"oauth-identity-race-key").expect("master key"),
+        )
+        .expect("store");
+        store
+            .upsert_credential_state(CredentialState::new("account", "codex", true, 1))
+            .expect("metadata");
+        let payload = encode_preserving_identity(
+            &OAuthTokens::bearer("old-access", Some("old-refresh"), None),
+            None,
+        )
+        .expect("payload");
+        store
+            .upsert_credential_payload("account", &payload, 1)
+            .expect("payload");
+        let token_store = SqliteOAuthTokenStore::new(store);
+        let credential = CredentialId::new("account").expect("credential");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let identity_store = token_store.clone();
+        let identity_credential = credential.clone();
+        let identity_barrier = Arc::clone(&barrier);
+        let identity_thread = thread::spawn(move || {
+            identity_barrier.wait();
+            identity_store.set_identity(
+                &identity_credential,
+                &OAuthIdentity {
+                    subject: "chatgpt-account".to_owned(),
+                    email: Some("user@example.test".to_owned()),
+                    name: Some("User".to_owned()),
+                },
+            )
+        });
+
+        let refresh_store = token_store.clone();
+        let refresh_credential = credential.clone();
+        let refresh_thread = thread::spawn(move || -> Result<(), StoreError> {
+            barrier.wait();
+            for _ in 0..8 {
+                let Some((state, Some(existing))) = refresh_store
+                    .store()
+                    .credential_payload_with_state(refresh_credential.as_str())
+                    .expect("refresh snapshot")
+                else {
+                    panic!("credential payload disappeared");
+                };
+                let replacement = encode_preserving_identity(
+                    &OAuthTokens::bearer("refreshed-access", Some("refreshed-refresh"), None),
+                    Some(existing),
+                )
+                .expect("replacement payload");
+                match refresh_store.store().compare_and_swap_credential_payload(
+                    refresh_credential.as_str(),
+                    state.revision,
+                    &replacement,
+                    2,
+                ) {
+                    Ok(_) => return Ok(()),
+                    Err(StoreError::CredentialRevisionConflict) => continue,
+                    Err(error) => panic!("token rotation failed: {error}"),
+                }
+            }
+            panic!("token rotation did not commit");
+        });
+
+        identity_thread
+            .join()
+            .expect("identity thread")
+            .expect("identity update");
+        refresh_thread
+            .join()
+            .expect("refresh thread")
+            .expect("token rotation");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let snapshot = runtime
+            .block_on(token_store.load(&credential))
+            .expect("load")
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.tokens().access_token().expose_secret(),
+            "refreshed-access"
+        );
+        assert_eq!(
+            token_store
+                .account_id(&credential)
+                .expect("account ID")
+                .as_deref(),
+            Some("chatgpt-account")
+        );
+    }
+
     #[tokio::test]
-    async fn wrong_key_cas_leaves_existing_tokens_and_generation_unchanged() {
+    async fn revoke_advances_generation_and_fences_in_flight_refresh() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"oauth-revoke-fence-key").expect("master key"),
+        )
+        .expect("store");
+        store
+            .upsert_credential_state(CredentialState::new("account", "codex", true, 1))
+            .expect("metadata");
+        let payload =
+            encode_preserving_identity(&OAuthTokens::bearer("access", Some("refresh"), None), None)
+                .expect("payload");
+        store
+            .upsert_credential_payload("account", &payload, 1)
+            .expect("payload");
+        let token_store = SqliteOAuthTokenStore::new(store.clone());
+        let credential = CredentialId::new("account").expect("credential");
+        let snapshot = token_store
+            .load(&credential)
+            .await
+            .expect("load")
+            .expect("snapshot");
+        token_store.remove(&credential).await.expect("revoke");
+
+        assert_eq!(
+            token_store
+                .compare_and_swap(
+                    &credential,
+                    snapshot.generation(),
+                    OAuthTokens::bearer("late-access", Some("late-refresh"), None),
+                )
+                .await,
+            Err(OAuthStoreError::Conflict)
+        );
+        assert_eq!(
+            store
+                .credential_state("account")
+                .expect("state")
+                .expect("credential")
+                .revision,
+            snapshot.generation() + 1
+        );
+        assert!(store
+            .credential_payload("account")
+            .expect("payload")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn wrong_key_open_leaves_existing_tokens_and_generation_unchanged() {
         let directory = tempdir().expect("temporary directory");
         #[cfg(unix)]
         {
@@ -468,24 +623,14 @@ mod tests {
                 .expect("payload persisted");
         }
 
-        let wrong_store = SqliteStore::open_encrypted(
-            &path,
-            MasterKey::from_bytes(b"oauth-wrong-key").expect("wrong key"),
-        )
-        .expect("wrong-key store");
-        let wrong_token_store = SqliteOAuthTokenStore::new(wrong_store);
         let credential = CredentialId::new("account").expect("credential");
-        assert_eq!(
-            wrong_token_store
-                .compare_and_swap(
-                    &credential,
-                    1,
-                    OAuthTokens::bearer("new-access", Some("new-refresh"), None),
-                )
-                .await,
-            Err(OAuthStoreError::Unavailable)
-        );
-        drop(wrong_token_store);
+        assert!(matches!(
+            SqliteStore::open_encrypted(
+                &path,
+                MasterKey::from_bytes(b"oauth-wrong-key").expect("wrong key"),
+            ),
+            Err(StoreError::WrongMasterKey)
+        ));
 
         let correct_store = SqliteStore::open_encrypted(&path, correct_key).expect("reopen");
         let token_store = SqliteOAuthTokenStore::new(correct_store);

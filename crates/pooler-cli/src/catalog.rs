@@ -1,5 +1,6 @@
 //! Maintenance of the vendored per-model request-facts snapshot.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -145,11 +146,10 @@ pub fn providers(search: Option<&str>, json: bool) -> Result<()> {
                 })
             })
             .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({"providers": rendered}))
-                .context("could not render the provider table")?
-        );
+        let mut rendered = serde_json::to_vec_pretty(&serde_json::json!({"providers": rendered}))
+            .context("could not render the provider table")?;
+        rendered.push(b'\n');
+        write_stdout(&rendered)?;
         return Ok(());
     }
 
@@ -188,12 +188,10 @@ pub fn providers(search: Option<&str>, json: bool) -> Result<()> {
 fn facts(provider: Option<&str>, json: bool) -> Result<()> {
     let facts = ModelFacts::builtin();
     if json {
-        print!(
-            "{}",
-            facts
-                .to_canonical_json()
-                .context("could not render the model-facts snapshot")?
-        );
+        let rendered = facts
+            .to_canonical_json()
+            .context("could not render the model-facts snapshot")?;
+        write_stdout(rendered.as_bytes())?;
         return Ok(());
     }
     if let Some(provider) = provider {
@@ -213,9 +211,37 @@ fn facts(provider: Option<&str>, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Write command output without panicking when a downstream consumer closes
+/// stdout early.
+///
+/// Rust's print macros panic when stdout closes early. CLI JSON output is
+/// commonly piped into bounded consumers, so a broken pipe is a successful
+/// early termination rather than an operator error.
+fn write_stdout(bytes: &[u8]) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    write_output(&mut stdout, bytes)
+}
+
+fn write_output<W: io::Write>(writer: &mut W, bytes: &[u8]) -> Result<()> {
+    if let Err(error) = writer.write_all(bytes) {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error).context("could not write catalog output");
+    }
+    if let Err(error) = writer.flush() {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error).context("could not flush catalog output");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
 
     #[test]
     fn projecting_a_local_document_writes_a_snapshot_the_runtime_can_load() {
@@ -283,5 +309,23 @@ mod tests {
             ModelFacts::from_json(&text).expect("committed snapshot loads"),
             *ModelFacts::builtin()
         );
+    }
+
+    #[test]
+    fn broken_pipe_is_treated_as_successful_json_termination() {
+        struct BrokenPipeWriter;
+
+        impl io::Write for BrokenPipeWriter {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        write_output(&mut BrokenPipeWriter, br#"{"models":[]}"#)
+            .expect("broken pipe should stop JSON output cleanly");
     }
 }

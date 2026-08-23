@@ -7,12 +7,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde_yml::Value;
 
-use crate::{ConfigError, ConfigLoader, LoadedConfig};
+use crate::{ConfigError, ConfigLoader, LoadedConfig, MAX_CONFIG_FILE_BYTES};
 
 /// Default quiet period used to coalesce an editor's write burst.
 pub const DEFAULT_RELOAD_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -216,11 +217,13 @@ impl ConfigWatcher {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FileStamp {
     exists: bool,
     length: u64,
     digest: u64,
+    modified: u128,
+    permissions: u32,
 }
 
 fn file_stamps(paths: &[PathBuf]) -> BTreeMap<PathBuf, FileStamp> {
@@ -231,17 +234,13 @@ fn file_stamps(paths: &[PathBuf]) -> BTreeMap<PathBuf, FileStamp> {
 }
 
 fn file_stamp(path: &Path) -> FileStamp {
-    let Ok(bytes) = fs::read(path) else {
-        return FileStamp {
-            exists: false,
-            length: 0,
-            digest: 0,
-        };
-    };
-    FileStamp {
-        exists: true,
-        length: bytes.len() as u64,
-        digest: fnv1a(&bytes),
+    match read_bounded_file(path) {
+        BoundedRead::Missing => FileStamp::default(),
+        BoundedRead::Unreadable(stamp) => stamp,
+        BoundedRead::Read { bytes, mut stamp } => {
+            stamp.digest = fnv1a(&bytes);
+            stamp
+        }
     }
 }
 
@@ -250,7 +249,11 @@ fn collect_import_paths(path: &Path, paths: &mut BTreeSet<PathBuf>, stack: &mut 
     if !stack.insert(identity.clone()) {
         return;
     }
-    let Ok(text) = fs::read_to_string(path) else {
+    let BoundedRead::Read { bytes, .. } = read_bounded_file(path) else {
+        stack.remove(&identity);
+        return;
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
         stack.remove(&identity);
         return;
     };
@@ -284,6 +287,76 @@ fn collect_import_paths(path: &Path, paths: &mut BTreeSet<PathBuf>, stack: &mut 
         }
     }
     stack.remove(&identity);
+}
+
+#[derive(Debug)]
+enum BoundedRead {
+    Missing,
+    Unreadable(FileStamp),
+    Read { bytes: Vec<u8>, stamp: FileStamp },
+}
+
+impl FileStamp {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        #[cfg(unix)]
+        let permissions = metadata.permissions().mode();
+        #[cfg(not(unix))]
+        let permissions = u32::from(metadata.permissions().readonly());
+
+        Self {
+            exists: true,
+            length: metadata.len(),
+            digest: 0,
+            modified: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos()),
+            permissions,
+        }
+    }
+}
+
+fn read_bounded_file(path: &Path) -> BoundedRead {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return match fs::metadata(path) {
+                Ok(metadata) => BoundedRead::Unreadable(FileStamp::from_metadata(&metadata)),
+                Err(_) if error.kind() == std::io::ErrorKind::NotFound => BoundedRead::Missing,
+                Err(_) => BoundedRead::Unreadable(FileStamp {
+                    exists: true,
+                    ..FileStamp::default()
+                }),
+            };
+        }
+    };
+    let Ok(metadata) = file.metadata() else {
+        return BoundedRead::Unreadable(FileStamp {
+            exists: true,
+            ..FileStamp::default()
+        });
+    };
+    let stamp = FileStamp::from_metadata(&metadata);
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CONFIG_FILE_BYTES {
+        return BoundedRead::Unreadable(stamp);
+    }
+    let Ok(capacity) = usize::try_from(metadata.len()) else {
+        return BoundedRead::Unreadable(stamp);
+    };
+    let mut bytes = Vec::with_capacity(capacity);
+    if file
+        .take(MAX_CONFIG_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_CONFIG_FILE_BYTES
+    {
+        return BoundedRead::Unreadable(stamp);
+    }
+    BoundedRead::Read { bytes, stamp }
 }
 
 fn canonical_or_path(path: &Path) -> PathBuf {
@@ -448,5 +521,52 @@ mod tests {
             "127.0.0.1:2"
         );
         watcher.accept(candidate);
+    }
+
+    #[test]
+    fn failed_oversized_dependency_is_retried_when_replaced() {
+        let dir = TestDir::new();
+        let base = dir.write(
+            "base.yaml",
+            "version: 1\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
+        );
+        let root = dir.write("root.yaml", "imports: [{file: base.yaml}]\nversion: 1\n");
+        let mut watcher =
+            ConfigWatcher::with_loader_and_debounce(ConfigLoader::default(), &root, Duration::ZERO)
+                .expect("watcher loads");
+
+        fs::write(
+            &base,
+            format!(
+                "version: 1\n#{}\n",
+                "x".repeat(MAX_CONFIG_FILE_BYTES as usize)
+            ),
+        )
+        .expect("oversized import");
+        assert!(watcher.poll().expect("oversized change poll").is_none());
+        assert!(watcher
+            .poll()
+            .expect_err("oversized import is rejected")
+            .to_string()
+            .contains("size limit"));
+        assert!(watcher
+            .poll()
+            .expect("same oversized source is quiet")
+            .is_none());
+
+        fs::write(
+            &base,
+            "version: 1\nlisteners: {local: {bind: 127.0.0.1:3}}\n",
+        )
+        .expect("replace oversized import");
+        assert!(watcher.poll().expect("replacement poll").is_none());
+        let candidate = watcher
+            .poll()
+            .expect("candidate poll")
+            .expect("replacement candidate");
+        assert_eq!(
+            candidate.loaded().config().listeners["local"].bind,
+            "127.0.0.1:3"
+        );
     }
 }

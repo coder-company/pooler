@@ -135,26 +135,30 @@
         ></button>
       </div>
       <p class="dialog-copy" id="session-copy">
-        Mutations require the bearer secret configured under
-        <code class="mono">management.auth</code>. The token is held in memory
-        for this tab only and is never stored or sent anywhere except this
-        listener&rsquo;s <code class="mono">Authorization</code> header.
+        Enter the management secret configured under
+        <code class="mono">management.auth.secret</code>. Pooler adds the
+        <code class="mono">Bearer</code> scheme when it sends the
+        <code class="mono">Authorization</code> header, so enter only the
+        secret value, without the <code class="mono">Bearer</code> prefix. The
+        secret is held in memory for this tab only and is never stored or sent
+        anywhere except this listener. Leave it empty when this loopback
+        listener permits anonymous read-only access.
       </p>
       <label class="field">
-        <span class="field-label">Bearer token</span>
+        <span class="field-label">Management secret</span>
         <span class="field-control">
           <input
             id="token-input"
             type="password"
             autocomplete="off"
             spellcheck="false"
-            placeholder="Optional for read-only loopback"
+            placeholder="Secret value (without Bearer prefix; optional on loopback)"
           />
           <button
             id="token-visibility"
             class="btn btn-ghost btn-icon"
             type="button"
-            aria-label="Show token"
+            aria-label="Show management secret"
           ></button>
         </span>
       </label>

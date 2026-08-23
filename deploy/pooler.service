@@ -1,0 +1,57 @@
+[Unit]
+Description=Pooler AI protocol runtime
+Documentation=https://github.com/coder-company/pooler/blob/main/docs/deployment.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/pooler/pooler.yaml
+ConditionPathExists=/etc/pooler/pooler.example.yaml
+ConditionPathExists=/etc/pooler/store.key
+ConditionPathExists=/etc/pooler/upstream.key
+ConditionPathExists=/etc/pooler/downstream.key
+
+[Service]
+Type=simple
+User=pooler
+Group=pooler
+UMask=0077
+WorkingDirectory=/var/lib/pooler
+StateDirectory=pooler
+StateDirectoryMode=0700
+
+# Check syntax before every start. Secret references are not resolved by the
+# check, so this command never prints or persists provider credentials.
+ExecStartPre=/usr/local/bin/pooler --config /etc/pooler/pooler.yaml check
+ExecStart=/usr/local/bin/pooler --config /etc/pooler/pooler.yaml --credential-store /var/lib/pooler/credentials.sqlite3 --credential-key-ref file:/etc/pooler/store.key serve
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35s
+KillSignal=SIGTERM
+LimitNOFILE=65536
+
+# The service needs network access to configured providers and write access
+# only to its encrypted, owner-private SQLite state directory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/pooler
+BindReadOnlyPaths=/etc/pooler/upstream.key:/run/secrets/upstream.key
+BindReadOnlyPaths=/etc/pooler/downstream.key:/run/secrets/downstream.key
+
+[Install]
+WantedBy=multi-user.target

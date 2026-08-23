@@ -4,7 +4,7 @@
     "client_version": "0.149.0",
     "captured_at": "2026-08-20",
     "provenance": "sanitized deterministic loopback capture",
-    "notes": "Prompt text, system text, tool descriptions, tool output, API key, and transport-only values are synthetic. The installed client wire-shape capture is recorded separately under .omo/evidence."
+    "notes": "Prompt text, system text, tool descriptions, tool output, API key, and transport-only values are synthetic."
   },
   "request": {
     "model": "droid-anthropic-fixture",

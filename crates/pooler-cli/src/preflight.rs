@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use pooler_auth::{HyperOAuthTransport, OAuthHttpRequest, OAuthTransport, OAuthTransportError};
 use serde::Serialize;
+use tokio_tungstenite::{connect_async, tungstenite::Error as TungsteniteError};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -91,7 +92,7 @@ pub(crate) fn run(
                     CheckStatus::Failed,
                     "not reached because DNS failed",
                 ));
-                if url.scheme() == "https" {
+                if tls_scheme(url.scheme()) {
                     checks.push(check(
                         "tls",
                         target,
@@ -99,6 +100,61 @@ pub(crate) fn run(
                         "not reached because DNS failed",
                     ));
                 }
+                continue;
+            }
+
+            if websocket_scheme(url.scheme()) {
+                // HyperOAuthTransport intentionally supports HTTP(S) only.
+                // Use a bounded WebSocket handshake instead of downgrading a
+                // ws/wss URL into an HTTP GET, which is not a WebSocket
+                // handshake and can trigger provider-side work.
+                let websocket_probe =
+                    tokio::time::timeout(Duration::from_secs(10), connect_async(url.as_str()))
+                        .await;
+                let (reached, tls_reached) = match websocket_probe {
+                    Ok(Ok((stream, _response))) => {
+                        drop(stream);
+                        (true, true)
+                    }
+                    // A provider can reject an unauthenticated handshake with
+                    // an HTTP response. That still proves TCP and, for WSS,
+                    // TLS connectivity, so it is a reached endpoint rather
+                    // than a dead one.
+                    Ok(Err(TungsteniteError::Http(_))) => (true, true),
+                    Ok(Err(_)) | Err(_) => (false, false),
+                };
+                checks.push(check(
+                    "endpoint",
+                    target.clone(),
+                    if reached {
+                        CheckStatus::Passed
+                    } else {
+                        CheckStatus::Failed
+                    },
+                    if reached {
+                        "bounded WebSocket handshake reached the endpoint"
+                    } else {
+                        "bounded WebSocket handshake failed"
+                    },
+                ));
+                checks.push(check(
+                    "tls",
+                    target,
+                    if url.scheme() == "wss" && tls_reached {
+                        CheckStatus::Passed
+                    } else if url.scheme() == "wss" {
+                        CheckStatus::Failed
+                    } else {
+                        CheckStatus::Unsupported
+                    },
+                    if url.scheme() == "wss" && tls_reached {
+                        "native-root TLS and WebSocket handshake reached the endpoint"
+                    } else if url.scheme() == "wss" {
+                        "native-root TLS or WebSocket handshake failed"
+                    } else {
+                        "cleartext WebSocket endpoint has no TLS handshake"
+                    },
+                ));
                 continue;
             }
 
@@ -210,6 +266,14 @@ pub(crate) fn run(
     Ok(())
 }
 
+fn websocket_scheme(scheme: &str) -> bool {
+    matches!(scheme, "ws" | "wss")
+}
+
+fn tls_scheme(scheme: &str) -> bool {
+    matches!(scheme, "https" | "wss")
+}
+
 fn check(
     category: &'static str,
     target: String,
@@ -221,5 +285,39 @@ fn check(
         target,
         status,
         detail,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_schemes_are_not_http_probe_targets() {
+        assert!(websocket_scheme("ws"));
+        assert!(websocket_scheme("wss"));
+        assert!(!websocket_scheme("http"));
+        assert!(!websocket_scheme("https"));
+    }
+
+    #[test]
+    fn wss_is_an_encrypted_scheme_for_dns_failures() {
+        assert!(tls_scheme("https"));
+        assert!(tls_scheme("wss"));
+        assert!(!tls_scheme("http"));
+        assert!(!tls_scheme("ws"));
+    }
+
+    #[test]
+    fn dead_websocket_upstream_fails_preflight() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("pooler.yaml");
+        std::fs::write(
+            &path,
+            "version: 1\nupstreams:\n  provider:\n    url: wss://127.0.0.1:1\n",
+        )
+        .expect("configuration");
+
+        assert!(run(&path, None, None).is_err());
     }
 }

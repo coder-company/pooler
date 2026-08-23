@@ -328,9 +328,10 @@ fn normalize_content_type(value: &str) -> String {
 }
 
 fn media_type_wildcard_matches(expected: &str, actual: &str) -> bool {
-    expected.strip_suffix("/*").is_some_and(|prefix| {
-        actual.starts_with(prefix) && actual.as_bytes().get(prefix.len()) == Some(&b'/')
-    })
+    expected == "*/*"
+        || expected.strip_suffix("/*").is_some_and(|prefix| {
+            actual.starts_with(prefix) && actual.as_bytes().get(prefix.len()) == Some(&b'/')
+        })
 }
 
 fn websocket_matches(expected: Option<bool>, actual: bool) -> bool {
@@ -358,10 +359,15 @@ fn header_text(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-fn normalize_authority(value: &str) -> Option<(String, Option<u16>)> {
+pub(crate) fn normalize_authority(value: &str) -> Option<(String, Option<u16>)> {
     let authority = value.trim().parse::<Authority>().ok()?;
     let host = authority.host().trim_end_matches('.').to_ascii_lowercase();
     Some((host, authority.port_u16()))
+}
+
+pub(crate) fn canonical_authority(value: &str) -> Option<String> {
+    let (host, port) = normalize_authority(value)?;
+    Some(port.map_or(host.clone(), |port| format!("{host}:{port}")))
 }
 
 #[cfg(test)]
@@ -534,5 +540,58 @@ routes:
             compiled.match_route_request(&near_prefix),
             Err(RouteMatchError::NoMatch { .. })
         ));
+    }
+
+    #[test]
+    fn matches_media_type_wildcards() {
+        let compiled = compile_yaml(
+            "wildcard.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: wildcard
+    listen: local
+    match: {method: POST, path: /content, content_types: ['application/*']}
+    target: local
+  - id: any
+    listen: local
+    match: {method: POST, path: /any, content_types: ['*/*']}
+    target: local
+"#,
+        )
+        .expect("wildcard config");
+        assert_eq!(
+            compiled
+                .match_route_request(
+                    &RouteRequest::new("local", Method::POST, "/content")
+                        .with_content_type("application/json; charset=utf-8"),
+                )
+                .expect("application wildcard")
+                .id(),
+            "wildcard"
+        );
+        assert_eq!(
+            compiled
+                .match_route_request(
+                    &RouteRequest::new("local", Method::POST, "/any")
+                        .with_content_type("text/plain"),
+                )
+                .expect("global wildcard")
+                .id(),
+            "any"
+        );
+    }
+
+    #[test]
+    fn matcher_does_not_treat_subtype_specific_wildcards_as_matches() {
+        assert!(!media_type_wildcard_matches("*/json", "application/json"));
+        assert!(!media_type_wildcard_matches("*/json", "text/json"));
+        assert!(media_type_wildcard_matches(
+            "application/*",
+            "application/json"
+        ));
+        assert!(media_type_wildcard_matches("*/*", "text/plain"));
     }
 }

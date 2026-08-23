@@ -1058,7 +1058,9 @@ fn upstream_schema() -> Value {
 }
 
 fn secret_ref_schema() -> Value {
-    string_pattern(r"^(env:[A-Za-z_][A-Za-z0-9_]*|file:.+|keyring:[^/]+/.+)$")
+    string_pattern(
+        r"^(env:[A-Za-z_][A-Za-z0-9_]*|file:(/.*|[A-Za-z]:[/\\].*|\\\\[^\\/]+[/\\].*)|keyring:[^/]+/.+)$",
+    )
 }
 
 fn string_map_schema() -> Value {
@@ -1304,6 +1306,7 @@ mod tests {
         assert!(first.contains("\"imports\""));
         assert!(first.contains("\"providers\""));
         assert!(first.contains("keyring:[^/]+/.+"));
+        assert!(first.contains("file:(/.*|[A-Za-z]:"));
     }
 
     #[test]

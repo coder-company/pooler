@@ -1,0 +1,62 @@
+# Production container baseline. Replace the mounted file with a deployment-
+# specific configuration when you need another provider or route plan.
+#
+# The gateway listener binds all container interfaces so Docker can publish it;
+# management stays loopback-only and is used only by the in-container health
+# check. The provider key is mounted as a file at runtime and is never stored
+# in this YAML. Every generated gateway route also requires the separate
+# downstream bearer file, so publishing the host port never creates an
+# unauthenticated inference endpoint.
+imports:
+  - preset: gateway
+    as: gateway
+    with:
+      provider: openai
+      bind: 0.0.0.0:8400
+      upstream_url: https://api.openai.com
+      websocket_url: wss://api.openai.com
+      secret: file:/run/secrets/upstream.key
+
+version: 1
+
+management:
+  bind: 127.0.0.1:18477
+
+# The gateway preset has many routes. Merge one owner-private downstream
+# bearer reference into each generated route before compilation. `merge: true`
+# is intentional: route IDs are generated as `gateway-<route-id>` by the
+# preset loader.
+routes:
+  - {id: gateway-models, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-chat-completions, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-completions, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-embeddings, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-files-list, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-files-create, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-files-content, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-files-resource, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-batches-list, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-batches-create, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-batches-cancel, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-batches-resource, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-responses, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-responses-compact, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-image-generations, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-image-edits, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-audio-transcriptions, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-video-creations, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-video-edits, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-video-extensions, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-video-remixes, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-video-retrieval, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-video-content, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-video-deletions, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-realtime-client-secrets, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-realtime-sessions, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-realtime-transcription-sessions, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-realtime-calls-accept, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-realtime-calls-reject, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-realtime-calls-refer, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-realtime-calls-hangup, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-realtime-websocket, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}
+  - {id: gateway-responses-websocket, merge: true, downstream_auth: {secret: file:/run/secrets/downstream.key}}

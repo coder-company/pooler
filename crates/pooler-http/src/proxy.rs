@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::{Duration, Instant as StdInstant},
 };
 
@@ -54,10 +54,11 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
-    time::{self, Instant, Sleep},
+    time::{self, Instant},
 };
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
+use tower_service::Service;
 
 use crate::openai_realtime::{
     OpenAiRealtimeValidator, CLIENT_DECODER as OPENAI_REALTIME_CLIENT_DECODER,
@@ -104,6 +105,11 @@ pub struct SemanticRequestBody {
 pub struct SemanticResponseHint {
     /// Response representation selected from the decoded request.
     pub mode: SemanticResponseMode,
+    /// Actual representation requested from the selected upstream.
+    ///
+    /// This differs from `mode` only for provider bridges that must consume a
+    /// streaming upstream before returning one unary downstream document.
+    pub upstream_mode: SemanticResponseMode,
     /// Model resolved from the downstream request before upstream translation.
     pub requested_model: Option<String>,
 }
@@ -312,27 +318,294 @@ impl SemanticAdapter for NoSemanticAdapter {
     }
 }
 
-type UpstreamClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, ProxyBody>;
+#[derive(Clone)]
+struct ConnectTimeoutConnector<C> {
+    inner: C,
+    timeout: Duration,
+}
+
+impl<C> ConnectTimeoutConnector<C> {
+    const fn new(inner: C, timeout: Duration) -> Self {
+        Self { inner, timeout }
+    }
+}
+
+impl<C> Service<Uri> for ConnectTimeoutConnector<C>
+where
+    C: Service<Uri> + Send,
+    C::Future: Send + 'static,
+    C::Response: Send + 'static,
+    C::Error: Into<BoxError>,
+{
+    type Response = C::Response;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.inner.poll_ready(context) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let future = self.inner.call(uri);
+        let timeout = self.timeout;
+        Box::pin(async move {
+            time::timeout(timeout, future)
+                .await
+                .map_err(|_| {
+                    Box::new(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream TCP/TLS connection timed out",
+                    )) as BoxError
+                })?
+                .map_err(Into::into)
+        })
+    }
+}
+
+type UpstreamConnector = ConnectTimeoutConnector<hyper_rustls::HttpsConnector<HttpConnector>>;
+type UpstreamClient = Client<UpstreamConnector, ProxyBody>;
+
+struct AttachedResponseDeadlineCleanup {
+    cleanup: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl AttachedResponseDeadlineCleanup {
+    fn release(&self) {
+        let cleanup = self
+            .cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(cleanup) = cleanup {
+            cleanup();
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResponseDeadlineCleanupState {
+    released: bool,
+    values: Vec<Arc<AttachedResponseDeadlineCleanup>>,
+}
+
+struct ResponseDeadlineInner {
+    elapsed: AtomicBool,
+    cleanup: Mutex<ResponseDeadlineCleanupState>,
+}
+
+/// Shared cleanup boundary for one committed response deadline.
+///
+/// The response body owns the timer. Runtime wrappers outside that body may
+/// attach guards to this handle so the same terminal transition releases all
+/// request-owned state even when downstream flow control prevents another
+/// body poll.
+#[derive(Clone)]
+pub struct ResponseDeadline {
+    inner: Arc<ResponseDeadlineInner>,
+}
+
+impl std::fmt::Debug for ResponseDeadline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResponseDeadline")
+            .field("elapsed", &self.is_elapsed())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResponseDeadline {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(ResponseDeadlineInner {
+                elapsed: AtomicBool::new(false),
+                cleanup: Mutex::new(ResponseDeadlineCleanupState::default()),
+            }),
+        }
+    }
+
+    /// Attach cleanup that must run when this response reaches any terminal
+    /// state. Dropping the returned handle runs it earlier.
+    #[must_use]
+    pub fn attach_cleanup<F>(&self, cleanup: F) -> ResponseDeadlineCleanupGuard
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let value = Arc::new(AttachedResponseDeadlineCleanup {
+            cleanup: Mutex::new(Some(Box::new(cleanup))),
+        });
+        let mut cleanup = self
+            .inner
+            .cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cleanup.released {
+            drop(cleanup);
+            value.release();
+        } else {
+            cleanup.values.push(Arc::clone(&value));
+        }
+        ResponseDeadlineCleanupGuard { value }
+    }
+
+    fn is_elapsed(&self) -> bool {
+        self.inner.elapsed.load(Ordering::Acquire)
+    }
+
+    fn expire(&self) {
+        self.inner.elapsed.store(true, Ordering::Release);
+        self.release();
+    }
+
+    fn finish(&self) {
+        self.release();
+    }
+
+    fn release(&self) {
+        let values = {
+            let mut cleanup = self
+                .inner
+                .cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cleanup.released {
+                return;
+            }
+            cleanup.released = true;
+            std::mem::take(&mut cleanup.values)
+        };
+        for value in values {
+            value.release();
+        }
+    }
+}
+
+/// Idempotent ownership of cleanup attached to a response deadline.
+pub struct ResponseDeadlineCleanupGuard {
+    value: Arc<AttachedResponseDeadlineCleanup>,
+}
+
+impl std::fmt::Debug for ResponseDeadlineCleanupGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResponseDeadlineCleanupGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ResponseDeadlineCleanupGuard {
+    fn drop(&mut self) {
+        self.value.release();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeadlineBodyPhase {
+    Streaming,
+    TimedOut { error_emitted: bool },
+    Complete,
+}
+
+struct DeadlineBodyState<B> {
+    inner: Option<Pin<Box<B>>>,
+    phase: DeadlineBodyPhase,
+    downstream_waker: Option<Waker>,
+}
 
 struct DeadlineBody<B> {
-    inner: Pin<Box<B>>,
-    timeout: Pin<Box<Sleep>>,
-    timed_out: bool,
+    state: Arc<Mutex<DeadlineBodyState<B>>>,
+    deadline: Instant,
+    cleanup: ResponseDeadline,
+    timer: tokio::task::JoinHandle<()>,
+}
+
+fn expire_deadline_state<B>(
+    state: &Mutex<DeadlineBodyState<B>>,
+    cleanup: &ResponseDeadline,
+) -> Option<Waker> {
+    let (inner, downstream_waker) = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.phase != DeadlineBodyPhase::Streaming {
+            return None;
+        }
+        state.phase = DeadlineBodyPhase::TimedOut {
+            error_emitted: false,
+        };
+        (state.inner.take(), state.downstream_waker.take())
+    };
+    // Publish the cause before dropping ObservedBody so committed truncation
+    // is recorded as an incomplete stream, not as caller cancellation.
+    cleanup.expire();
+    drop(inner);
+    downstream_waker
+}
+
+impl<B> DeadlineBody<B>
+where
+    B: Send + 'static,
+{
+    fn new(
+        inner: B,
+        deadline: Instant,
+        cleanup: ResponseDeadline,
+        resources: RuntimeResources,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(DeadlineBodyState {
+            inner: Some(Box::pin(inner)),
+            phase: DeadlineBodyPhase::Streaming,
+            downstream_waker: None,
+        }));
+        let timer_state = Arc::clone(&state);
+        let timer_cleanup = cleanup.clone();
+        let task = resources.task();
+        let timer = tokio::spawn(async move {
+            let _task = task;
+            time::sleep_until(deadline).await;
+            if let Some(waker) = expire_deadline_state(timer_state.as_ref(), &timer_cleanup) {
+                waker.wake();
+            }
+        });
+        Self {
+            state,
+            deadline,
+            cleanup,
+            timer,
+        }
+    }
 }
 
 impl<B> DeadlineBody<B> {
-    fn new(inner: B, deadline: Instant) -> Self {
-        Self {
-            inner: Box::pin(inner),
-            timeout: Box::pin(time::sleep_until(deadline)),
-            timed_out: false,
+    fn expire_now(&mut self) {
+        if let Some(waker) = expire_deadline_state(self.state.as_ref(), &self.cleanup) {
+            waker.wake();
         }
+        self.timer.abort();
+    }
+
+    fn finish(&mut self) {
+        let inner = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.phase = DeadlineBodyPhase::Complete;
+            state.downstream_waker = None;
+            state.inner.take()
+        };
+        self.cleanup.finish();
+        drop(inner);
+        self.timer.abort();
     }
 }
 
 impl<B> Body for DeadlineBody<B>
 where
-    B: Body<Data = Bytes, Error = BoxError>,
+    B: Body<Data = Bytes, Error = BoxError> + Send + 'static,
 {
     type Data = Bytes;
     type Error = BoxError;
@@ -341,27 +614,100 @@ where
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        if !self.timed_out && self.timeout.as_mut().poll(context).is_ready() {
-            self.timed_out = true;
-            return Poll::Ready(Some(Err(Box::new(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "upstream response exceeded its request timeout",
-            )))));
+        let this = self.as_mut().get_mut();
+        if Instant::now() >= this.deadline {
+            this.expire_now();
         }
-        self.inner.as_mut().poll_frame(context)
+
+        let (result, terminal_inner) = {
+            let mut state = this
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &mut state.phase {
+                DeadlineBodyPhase::TimedOut { error_emitted } => {
+                    if *error_emitted {
+                        return Poll::Ready(None);
+                    }
+                    *error_emitted = true;
+                    return Poll::Ready(Some(Err(Box::new(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream response exceeded its request timeout",
+                    )))));
+                }
+                DeadlineBodyPhase::Complete => return Poll::Ready(None),
+                DeadlineBodyPhase::Streaming => {}
+            }
+
+            let result = state
+                .inner
+                .as_mut()
+                .expect("streaming deadline body retains its inner body")
+                .as_mut()
+                .poll_frame(context);
+            let terminal = match &result {
+                Poll::Ready(None) | Poll::Ready(Some(Err(_))) => true,
+                Poll::Ready(Some(Ok(_))) => state
+                    .inner
+                    .as_ref()
+                    .is_some_and(|inner| inner.is_end_stream()),
+                Poll::Pending => false,
+            };
+            if terminal {
+                state.phase = DeadlineBodyPhase::Complete;
+                state.downstream_waker = None;
+                (result, state.inner.take())
+            } else {
+                if result.is_pending() {
+                    state.downstream_waker = Some(context.waker().clone());
+                } else {
+                    state.downstream_waker = None;
+                }
+                (result, None)
+            }
+        };
+        if terminal_inner.is_some() {
+            this.cleanup.finish();
+            drop(terminal_inner);
+            this.timer.abort();
+        }
+        result
     }
 
     fn is_end_stream(&self) -> bool {
-        self.timed_out || self.inner.is_end_stream()
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.phase {
+            DeadlineBodyPhase::Streaming => state
+                .inner
+                .as_ref()
+                .is_none_or(|inner| inner.is_end_stream()),
+            DeadlineBodyPhase::TimedOut { error_emitted } => error_emitted,
+            DeadlineBodyPhase::Complete => true,
+        }
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inner
+            .as_ref()
+            .map_or_else(SizeHint::default, |inner| inner.size_hint())
+    }
+}
+
+impl<B> Drop for DeadlineBody<B> {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const DEFAULT_ERROR_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_ERROR_CONTENT_TYPE: &str = "application/json";
 
 fn external_inspector_id(component: &str) -> Option<&str> {
     component
@@ -735,8 +1081,8 @@ fn duration_to_history_millis(duration: Duration) -> u64 {
 pub struct HttpProxy<A = NoSemanticAdapter> {
     config: Arc<CompiledConfig>,
     listener: Arc<str>,
-    client: UpstreamClient,
-    h2c_client: UpstreamClient,
+    clients: BTreeMap<Duration, UpstreamClient>,
+    h2c_clients: BTreeMap<Duration, UpstreamClient>,
     drain: DrainController,
     semantic: A,
     pooling: Arc<PoolingCoordinator>,
@@ -830,34 +1176,23 @@ where
                 route: route.id().to_owned(),
             });
         }
-        let connector = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|error| ProxyError::TlsClient(error.to_string()))?
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
-        let mut client_builder = Client::builder(TokioExecutor::new());
-        client_builder.http2_adaptive_window(true);
-        let client = client_builder.build(connector);
-        let h2c_connector = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|error| ProxyError::TlsClient(error.to_string()))?
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
-        let mut h2c_builder = Client::builder(TokioExecutor::new());
-        h2c_builder.http2_only(true).http2_adaptive_window(true);
-        let h2c_client = h2c_builder.build(h2c_connector);
+        let tls_config = ClientConfig::builder()
+            .with_root_certificates(native_root_store()?)
+            .with_no_client_auth();
+        let mut clients = BTreeMap::new();
+        let mut h2c_clients = BTreeMap::new();
+        for timeout in configured_connect_timeouts(&config) {
+            clients.insert(timeout, build_upstream_client(&tls_config, timeout, false));
+            h2c_clients.insert(timeout, build_upstream_client(&tls_config, timeout, true));
+        }
         let caches = build_route_caches(&config)?;
         let price_book = config.usage_price_book().cloned().map(Arc::new);
         let resources = RuntimeResources::new();
         Ok(Self {
             config,
             listener,
-            client,
-            h2c_client,
+            clients,
+            h2c_clients,
             drain: DrainController::with_resources(resources.clone()),
             semantic,
             pooling,
@@ -942,9 +1277,10 @@ where
         ) {
             Ok(published) => published,
             Err(_) => {
-                return plain_response(
+                return openai_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "model view is unavailable",
+                    "service_unavailable",
                 );
             }
         };
@@ -986,7 +1322,11 @@ where
     /// Handle one downstream request and stream the opaque upstream response.
     pub async fn handle(&self, request: Request<Incoming>) -> Response<ProxyBody> {
         let Some(guard) = self.drain.try_acquire() else {
-            return plain_response(StatusCode::SERVICE_UNAVAILABLE, "proxy is draining");
+            return openai_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "proxy is draining",
+                "service_unavailable",
+            );
         };
 
         let route = match self.find_route(&request) {
@@ -1000,7 +1340,13 @@ where
                         StatusCode::UNSUPPORTED_MEDIA_TYPE
                     }
                 };
-                return plain_response(status, "no route matched");
+                let code = match status {
+                    StatusCode::NOT_FOUND => "route_not_found",
+                    StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
+                    _ => "invalid_request",
+                };
+                return openai_error_response(status, "no route matched", code);
             }
         };
         tracing::info!(
@@ -1046,9 +1392,10 @@ where
             drop(guard);
             let response = match error {
                 DownstreamAuthError::MissingOrInvalid => unauthorized_response(),
-                DownstreamAuthError::SecretUnavailable => plain_response(
+                DownstreamAuthError::SecretUnavailable => openai_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "authentication unavailable",
+                    "authentication_unavailable",
                 ),
             };
             lifecycle.complete(
@@ -1155,18 +1502,20 @@ where
                     .all(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
             });
             if !supported {
-                return Err(plain_response(
+                return Err(openai_error_response(
                     StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     "encoded request bodies are not supported",
+                    "unsupported_media_type",
                 ));
             }
         }
         let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
         let bytes = header_bytes(headers);
         if limits.check_headers(count, bytes).is_err() {
-            return Err(plain_response(
+            return Err(openai_error_response(
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
                 "request headers exceed configured limits",
+                "request_headers_too_large",
             ));
         }
 
@@ -1177,15 +1526,17 @@ where
                 .and_then(|value| value.parse().ok())
                 .ok_or(())
             else {
-                return Err(plain_response(
+                return Err(openai_error_response(
                     StatusCode::BAD_REQUEST,
                     "invalid content-length",
+                    "invalid_request",
                 ));
             };
             if limits.check_request_body(length).is_err() {
-                return Err(plain_response(
+                return Err(openai_error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request body exceeds configured limit",
+                    "request_too_large",
                 ));
             }
         }
@@ -1213,7 +1564,7 @@ where
         let mut headers = request.headers().clone();
         strip_hop_by_hop_headers(&mut headers);
         headers.remove(header::HOST);
-        headers.remove(header::AUTHORIZATION);
+        strip_downstream_authorization(route, &mut headers);
         headers.remove(header::CONTENT_LENGTH);
         headers.remove(header::CONTENT_TYPE);
         headers.remove("sec-websocket-key");
@@ -1308,11 +1659,14 @@ where
 
         let uri = websocket_uri(upstream, route, &downstream_uri)?;
         let upstream_key = generate_websocket_key()?;
-        let deadline = started + request_timeout(route.limits(), upstream);
+        let hard_deadline = websocket_hard_deadline(started, route.limits(), upstream);
+        let connect_deadline = StdInstant::now() + connect_timeout(route.limits(), upstream);
+        let connect_deadline =
+            hard_deadline.map_or(connect_deadline, |hard| connect_deadline.min(hard));
         let connect = connect_websocket(&uri, &headers, &upstream_key, &offered_protocols);
         let attempt_started = StdInstant::now();
         let (upstream_socket, upstream_response) = tokio::select! {
-            result = time::timeout_at(Instant::from_std(deadline), connect) => {
+            result = time::timeout_at(Instant::from_std(connect_deadline), connect) => {
                 result.map_err(|_| ProxyError::Timeout)?
                     ?
             }
@@ -1363,7 +1717,7 @@ where
                     realtime_validator,
                     guard,
                     cancellation,
-                    deadline,
+                    hard_deadline,
                     lease,
                     observation,
                     lifecycle,
@@ -1439,7 +1793,10 @@ where
         let mut headers = request.headers().clone();
         strip_hop_by_hop_headers(&mut headers);
         headers.remove(header::HOST);
-        headers.remove(header::AUTHORIZATION);
+        strip_downstream_authorization(route, &mut headers);
+        if route.ingress().mode() != BodyMode::Opaque {
+            headers.remove(header::AUTHORIZATION);
+        }
         if gemini_interaction_create {
             headers.insert(
                 header::ACCEPT_ENCODING,
@@ -1846,7 +2203,13 @@ where
                     route: route.id().to_owned(),
                     upstream: selection.upstream_id().to_owned(),
                 })?;
-            let websocket_transport = self.semantic.websocket_transport(route);
+            // A unary semantic request needs the selected HTTP upstream even
+            // when the route also declares a reusable Responses WebSocket
+            // transport. The response hint is decoded from this request, so
+            // it is the authoritative per-request transport choice.
+            let websocket_transport = (semantic_response_hint.mode != SemanticResponseMode::Json)
+                .then(|| self.semantic.websocket_transport(route))
+                .flatten();
             // Semantic Responses selection uses the REST provider identity so
             // catalog aliases and account state match the discovered target.
             // An explicit target transport binding supplies the WebSocket
@@ -1867,7 +2230,10 @@ where
             } else {
                 selected_upstream
             };
-            if route.target().transport_upstream().is_some()
+            let force_codex_unary_stream =
+                codex_unary_responses_requires_streaming(route, upstream, &semantic_response_hint);
+            if websocket_transport.is_some()
+                && route.target().transport_upstream().is_some()
                 && !matches!(upstream.transport(), "ws" | "wss")
             {
                 return Err(ProxyError::InvalidWebSocketHandshake(
@@ -1943,10 +2309,24 @@ where
                         Err(error) => Err(error),
                     }
                 }
-                _ => match prepared.body_for_attempt(route, &selection, lifecycle) {
-                    Ok(attempt_body) => self.send_attempt(attempt_request, attempt_body).await,
-                    Err(error) => Err(error),
-                },
+                _ => {
+                    let attempt_body = if force_codex_unary_stream {
+                        prepared
+                            .buffered_bytes_for_attempt(route, &selection, lifecycle)
+                            .and_then(|bytes| force_responses_streaming_request(&bytes, limits))
+                            .map(|bytes| {
+                                Full::new(bytes)
+                                    .map_err(|never: Infallible| match never {})
+                                    .boxed()
+                            })
+                    } else {
+                        prepared.body_for_attempt(route, &selection, lifecycle)
+                    };
+                    match attempt_body {
+                        Ok(attempt_body) => self.send_attempt(attempt_request, attempt_body).await,
+                        Err(error) => Err(error),
+                    }
+                }
             };
             let attempt_result = match response.as_ref() {
                 Ok(response) if response.status().is_success() => AttemptResult::Success,
@@ -2208,6 +2588,10 @@ where
             let observation = observation
                 .take()
                 .expect("request observation remains until response is ready");
+            let mut final_response_hint = semantic_response_hint;
+            if force_codex_unary_stream {
+                final_response_hint.upstream_mode = SemanticResponseMode::ServerSentEvents;
+            }
             return self
                 .finish_response(
                     route,
@@ -2219,7 +2603,7 @@ where
                         started,
                         observation,
                         request_headers: downstream_headers,
-                        semantic_response_hint,
+                        semantic_response_hint: final_response_hint,
                         cache_leader,
                         gemini_interaction_create,
                         lifecycle: lifecycle.clone(),
@@ -2293,20 +2677,23 @@ where
                 });
         *builder.headers_mut().expect("request builder headers") = headers;
         let upstream_request = builder.body(body)?;
-        let request_deadline = started + request_timeout(route.limits(), upstream);
-        let header_deadline = Instant::from_std(
-            (StdInstant::now() + connect_timeout(route.limits(), upstream)).min(request_deadline),
-        );
+        let request_deadline = started + effective_request_timeout(route.limits(), upstream);
+        let connection_timeout = connect_timeout(route.limits(), upstream);
+        let client = if upstream.http2() {
+            &self.h2c_clients
+        } else {
+            &self.clients
+        }
+        .get(&connection_timeout)
+        .ok_or_else(|| {
+            ProxyError::InvalidLimits("upstream connect timeout client is unavailable".to_owned())
+        })?;
         let response = tokio::select! {
             result = time::timeout_at(
-                header_deadline,
-                if upstream.http2() {
-                    self.h2c_client.request(upstream_request)
-                } else {
-                    self.client.request(upstream_request)
-                },
+                Instant::from_std(request_deadline),
+                client.request(upstream_request),
             ) => {
-                result.map_err(|_| ProxyError::Timeout)?.map_err(|error| ProxyError::Upstream(Box::new(error)))?
+                result.map_err(|_| ProxyError::Timeout)?.map_err(upstream_client_error)?
             }
             () = cancellation.cancelled() => {
                 return Err(ProxyError::Timeout);
@@ -2402,7 +2789,7 @@ where
             .unwrap_or_else(|| materialized_generation(self.config.generation(), &headers));
         let session = downstream_session_identity(request_headers, &body);
         let identity = ConnectionIdentity::new(profile, account, endpoint, generation, session);
-        let request_timeout = request_timeout(route.limits(), upstream);
+        let request_timeout = effective_request_timeout(route.limits(), upstream);
         let request_deadline = started + request_timeout;
         let connect_deadline =
             (StdInstant::now() + connect_timeout(route.limits(), upstream)).min(request_deadline);
@@ -2632,11 +3019,8 @@ where
         let body = LimitedBody::new(body, bounded_usize(route.limits().max_response_body_bytes))
             .map_err(box_error)
             .boxed();
-        let body = DeadlineBody::new(
-            body,
-            Instant::from_std(started + request_timeout(route.limits(), upstream)),
-        )
-        .boxed();
+        let response_deadline =
+            Instant::from_std(started + effective_request_timeout(route.limits(), upstream));
         observation.mark_headers();
         let mut body = if route.response().mode() == BodyMode::Semantic
             && parts.status.is_success()
@@ -2676,10 +3060,19 @@ where
                 leader.fail();
             } else {
                 let collected = tokio::select! {
-                    result = crate::collect_body_limited(
-                        body,
-                        expected_bytes.expect("cache response length was checked"),
-                    ) => result,
+                    result = time::timeout_at(
+                        response_deadline,
+                        crate::collect_body_limited(
+                            body,
+                            expected_bytes.expect("cache response length was checked"),
+                        ),
+                    ) => match result {
+                        Ok(result) => result,
+                        Err(_) => {
+                            leader.fail();
+                            return Err(ProxyError::Timeout);
+                        }
+                    },
                     () = cancellation.cancelled() => {
                         leader.fail();
                         return Err(ProxyError::Timeout);
@@ -2732,6 +3125,7 @@ where
         );
         lifecycle.committed(parts.status.as_u16());
         let completion = completion_class_for_status(parts.status);
+        let deadline_cleanup = ResponseDeadline::new();
         let body = ObservedBody::new_for_target(
             body,
             observation,
@@ -2739,12 +3133,21 @@ where
             usage_target,
             lifecycle,
             parts.status.as_u16(),
+            deadline_cleanup.clone(),
         );
-        let body = DrainedBody::new(body, guard).boxed();
+        let body = DrainedBody::new(body, guard);
+        let body = DeadlineBody::new(
+            body,
+            response_deadline,
+            deadline_cleanup.clone(),
+            self.resources.clone(),
+        )
+        .boxed();
         let mut response = Response::new(body);
         *response.status_mut() = parts.status;
         *response.version_mut() = parts.version;
         *response.headers_mut() = response_headers;
+        response.extensions_mut().insert(deadline_cleanup);
         Ok(response)
     }
 }
@@ -3066,6 +3469,7 @@ struct ObservedBody {
     usage_target: Option<UsageTarget>,
     usage_bytes: Vec<u8>,
     usage_overflowed: bool,
+    response_deadline: Option<ResponseDeadline>,
 }
 
 impl ObservedBody {
@@ -3079,6 +3483,7 @@ impl ObservedBody {
             usage_target: None,
             usage_bytes: Vec::new(),
             usage_overflowed: false,
+            response_deadline: None,
         }
     }
 
@@ -3098,6 +3503,7 @@ impl ObservedBody {
             usage_target: None,
             usage_bytes: Vec::new(),
             usage_overflowed: false,
+            response_deadline: None,
         }
     }
 
@@ -3108,6 +3514,7 @@ impl ObservedBody {
         usage_target: UsageTarget,
         lifecycle: RequestLifecycle,
         status: u16,
+        response_deadline: ResponseDeadline,
     ) -> Self {
         Self {
             inner: Box::pin(inner),
@@ -3118,6 +3525,7 @@ impl ObservedBody {
             usage_target: Some(usage_target),
             usage_bytes: Vec::new(),
             usage_overflowed: false,
+            response_deadline: Some(response_deadline),
         }
     }
 
@@ -3210,6 +3618,16 @@ impl Drop for ObservedBody {
         }
         let completion = if self.inner.is_end_stream() {
             self.completion.clone()
+        } else if self
+            .response_deadline
+            .as_ref()
+            .is_some_and(ResponseDeadline::is_elapsed)
+        {
+            if self.completion == CompletionClass::Success {
+                CompletionClass::IncompleteStream
+            } else {
+                self.completion.clone()
+            }
         } else {
             CompletionClass::Cancelled
         };
@@ -3465,12 +3883,68 @@ fn openai_websocket_error(error: OpenAiResponsesWebSocketError) -> ProxyError {
     )
 }
 
+fn upstream_client_error(error: hyper_util::client::legacy::Error) -> ProxyError {
+    let mut source: Option<&(dyn Error + 'static)> = Some(&error);
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+        {
+            return ProxyError::Timeout;
+        }
+        source = current.source();
+    }
+    ProxyError::Upstream(Box::new(error))
+}
+
 fn is_exact_gemini_interaction_create(method: &http::Method, path: &str) -> bool {
     method == http::Method::POST
         && matches!(
             path,
             "/v1/interactions" | "/v1beta/interactions" | "/v1beta2/interactions"
         )
+}
+
+fn codex_unary_responses_requires_streaming(
+    route: &RoutePlan,
+    upstream: &UpstreamPlan,
+    hint: &SemanticResponseHint,
+) -> bool {
+    hint.mode == SemanticResponseMode::Json
+        && route.ingress().mode() == BodyMode::Semantic
+        && route.ingress().decoder() == Some("decode.openai.responses")
+        && route.response().mode() == BodyMode::Semantic
+        && route.response().decoder() == Some("decode.openai.responses.events")
+        && route.response().encoder() == Some("encode.openai.responses.events")
+        && upstream.native().is_some_and(|native| {
+            native
+                .kind()
+                .eq_ignore_ascii_case(adapter_codex::CODEX_PROVIDER_ID)
+        })
+}
+
+fn force_responses_streaming_request(
+    bytes: &Bytes,
+    limits: &RouteLimits,
+) -> Result<Bytes, ProxyError> {
+    let mut document = PreservedJson::from_bytes(bytes.to_vec())
+        .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
+    document
+        .set_pointer_bounded(
+            "/stream",
+            serde_json::Value::Bool(true),
+            JsonPatchLimits::default(),
+        )
+        .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
+    let bytes = document.bytes().into_owned();
+    let observed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    limits
+        .check_request_body(observed)
+        .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+    limits
+        .check_frame(observed)
+        .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+    Ok(Bytes::from(bytes))
 }
 
 fn downstream_session_identity(headers: &HeaderMap, body: &[u8]) -> Option<Arc<str>> {
@@ -3766,11 +4240,8 @@ fn rewrite_native_upstream_uri(
     let mut target =
         url::Url::parse(&upstream_uri.to_string()).map_err(|_| ProxyError::InvalidUri)?;
     target.set_path(endpoint.path());
-    if let Some(query) = upstream_uri.query() {
-        target.set_query(Some(query));
-    } else {
-        target.set_query(endpoint.query());
-    }
+    let query = merge_endpoint_query(upstream_uri.query(), endpoint.query());
+    target.set_query(query.as_deref());
     target.as_str().parse().map_err(|_| ProxyError::InvalidUri)
 }
 
@@ -3803,7 +4274,7 @@ fn upstream_uri(
         path.to_owned()
     };
     url.set_path(&path);
-    url.set_query(downstream.query());
+    merge_upstream_query(&mut url, downstream.query());
     apply_upstream_query(&mut url, upstream.query());
     url.as_str().parse().map_err(|_| ProxyError::InvalidUri)
 }
@@ -3824,6 +4295,64 @@ fn apply_upstream_query(url: &mut url::Url, required: &[(Arc<str>, Arc<str>)]) {
         }
         url.query_pairs_mut().append_pair(name, value);
     }
+}
+
+/// Preserve query parameters embedded in an upstream base URL while adding
+/// the downstream request's query. The downstream query remains in the same
+/// order and encoding supplied by the caller; configured required parameters
+/// are appended separately by [`apply_upstream_query`].
+fn merge_upstream_query(url: &mut url::Url, downstream: Option<&str>) {
+    let base = url
+        .query()
+        .filter(|query| !query.is_empty())
+        .map(str::to_owned);
+    let merged = match (
+        base.as_deref(),
+        downstream.filter(|query| !query.is_empty()),
+    ) {
+        (Some(base), Some(downstream)) => Some(format!("{base}&{downstream}")),
+        (Some(base), None) => Some(base.to_owned()),
+        (None, Some(downstream)) => Some(downstream.to_owned()),
+        (None, None) => None,
+    };
+    url.set_query(merged.as_deref());
+}
+
+/// Merge provider-generated query parameters after preserving caller and base
+/// URL parameters. Provider parameters take precedence by name; this is
+/// required for Vertex streaming, whose adapter-generated `alt=sse` must not
+/// be replaced by a caller's `alt=json`.
+fn merge_endpoint_query(existing: Option<&str>, endpoint: Option<&str>) -> Option<String> {
+    let endpoint = endpoint.filter(|query| !query.is_empty());
+    let Some(endpoint) = endpoint else {
+        return existing.map(str::to_owned);
+    };
+    let endpoint_names = endpoint
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.split_once('=')
+                .map_or(part, |(name, _)| name)
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    let mut parts = existing
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter(|part| {
+            let part = *part;
+            let name = part.split_once('=').map_or(part, |(name, _)| name);
+            !part.is_empty() && !endpoint_names.iter().any(|candidate| candidate == name)
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    parts.extend(
+        endpoint
+            .split('&')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned),
+    );
+    (!parts.is_empty()).then(|| parts.join("&"))
 }
 
 fn request_is_websocket_upgrade(request: &Request<Incoming>) -> bool {
@@ -3959,7 +4488,8 @@ fn websocket_uri(
         }
     });
     url.set_path(path);
-    url.set_query(downstream.query());
+    merge_upstream_query(&mut url, downstream.query());
+    apply_upstream_query(&mut url, upstream.query());
     Ok(url.to_string())
 }
 
@@ -4515,7 +5045,7 @@ struct WebSocketTunnelContext {
     realtime_validator: Option<OpenAiRealtimeValidator>,
     guard: DrainGuard,
     cancellation: CancellationToken,
-    deadline: StdInstant,
+    hard_deadline: Option<StdInstant>,
     lease: Option<SelectionLease>,
     observation: RequestObservation,
     lifecycle: RequestLifecycle,
@@ -4531,7 +5061,7 @@ async fn run_websocket_tunnel(
         mut realtime_validator,
         guard,
         cancellation,
-        deadline,
+        hard_deadline,
         lease,
         mut observation,
         lifecycle,
@@ -4562,7 +5092,10 @@ async fn run_websocket_tunnel(
     let max_message = max_frame as u64;
     let mut downstream_state = WebSocketMessageState::default();
     let mut upstream_state = WebSocketMessageState::default();
-    let mut timeout = Box::pin(time::sleep_until(Instant::from_std(deadline)));
+    let mut timeout: Pin<Box<dyn Future<Output = ()> + Send>> = match hard_deadline {
+        Some(deadline) => Box::pin(time::sleep_until(Instant::from_std(deadline))),
+        None => Box::pin(std::future::pending()),
+    };
     let mut completion = CompletionClass::Success;
     let mut observed_usage = None;
 
@@ -4619,9 +5152,14 @@ async fn run_websocket_tunnel(
                         }
                     }
                     let close = frame.opcode == 8;
-                    if write_websocket_frame(&mut upstream, &frame.bytes, deadline, &cancellation)
-                        .await
-                        .is_err()
+                    if write_websocket_frame(
+                        &mut upstream,
+                        &frame.bytes,
+                        hard_deadline,
+                        &cancellation,
+                    )
+                    .await
+                    .is_err()
                     {
                         completion = CompletionClass::IncompleteStream;
                         break;
@@ -4704,9 +5242,14 @@ async fn run_websocket_tunnel(
                         }
                     }
                     let close = frame.opcode == 8;
-                    if write_websocket_frame(&mut downstream, &frame.bytes, deadline, &cancellation)
-                        .await
-                        .is_err()
+                    if write_websocket_frame(
+                        &mut downstream,
+                        &frame.bytes,
+                        hard_deadline,
+                        &cancellation,
+                    )
+                    .await
+                    .is_err()
                     {
                         completion = CompletionClass::IncompleteStream;
                         break;
@@ -4761,18 +5304,28 @@ async fn run_websocket_tunnel(
 async fn write_websocket_frame<S>(
     stream: &mut S,
     bytes: &[u8],
-    deadline: StdInstant,
+    hard_deadline: Option<StdInstant>,
     cancellation: &CancellationToken,
 ) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    tokio::select! {
-        result = time::timeout_at(Instant::from_std(deadline), async {
-            stream.write_all(bytes).await?;
-            stream.flush().await
-        }) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket write timed out"))?,
-        () = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "WebSocket write canceled")),
+    if let Some(deadline) = hard_deadline {
+        tokio::select! {
+            result = time::timeout_at(Instant::from_std(deadline), async {
+                stream.write_all(bytes).await?;
+                stream.flush().await
+            }) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket write timed out"))?,
+            () = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "WebSocket write canceled")),
+        }
+    } else {
+        tokio::select! {
+            result = async {
+                stream.write_all(bytes).await?;
+                stream.flush().await
+            } => result,
+            () = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "WebSocket write canceled")),
+        }
     }
 }
 
@@ -4865,6 +5418,15 @@ fn strip_caller_credentials_when_authenticating(
     }
 }
 
+/// A downstream bearer token authenticates the caller to Pooler; it is not an
+/// upstream credential. Remove it before forwarding an opaque request after
+/// [`HttpProxy::handle`] has verified it.
+fn strip_downstream_authorization(route: &RoutePlan, headers: &mut HeaderMap) {
+    if route.downstream_auth().is_some() {
+        headers.remove(header::AUTHORIZATION);
+    }
+}
+
 fn strip_provider_credential_headers(headers: &mut HeaderMap) {
     headers.remove(header::AUTHORIZATION);
     headers.remove("api-key");
@@ -4901,12 +5463,23 @@ fn bounded_usize(value: u64) -> usize {
     value.min(usize::MAX as u64) as usize
 }
 
-fn request_timeout(limits: &RouteLimits, upstream: &UpstreamPlan) -> Duration {
+fn request_timeout(limits: &RouteLimits, upstream: &UpstreamPlan) -> Option<Duration> {
     [limits.request_timeout, upstream.request_timeout()]
         .into_iter()
         .flatten()
         .min()
-        .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+}
+
+fn effective_request_timeout(limits: &RouteLimits, upstream: &UpstreamPlan) -> Duration {
+    request_timeout(limits, upstream).unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+}
+
+fn websocket_hard_deadline(
+    started: StdInstant,
+    limits: &RouteLimits,
+    upstream: &UpstreamPlan,
+) -> Option<StdInstant> {
+    request_timeout(limits, upstream).map(|timeout| started + timeout)
 }
 
 fn retry_deadline(
@@ -4915,7 +5488,7 @@ fn retry_deadline(
     upstream: &UpstreamPlan,
     policy: Option<&pooler_config::PolicyPlan>,
 ) -> Instant {
-    let request_deadline = started + request_timeout(limits, upstream);
+    let request_deadline = started + effective_request_timeout(limits, upstream);
     let retry_deadline = policy
         .and_then(|policy| policy.retry().maximum_elapsed())
         .map_or(request_deadline, |elapsed| {
@@ -4929,11 +5502,11 @@ fn patch_buffer_timeout(
     route: &RoutePlan,
     fallback: &UpstreamPlan,
 ) -> Duration {
-    let mut timeout = request_timeout(route.limits(), fallback);
+    let mut timeout = effective_request_timeout(route.limits(), fallback);
     if route.target().model_source().is_some() {
         for target in config.models().values().flat_map(|model| model.targets()) {
             if let Some(upstream) = config.upstreams().get(target.provider()) {
-                timeout = timeout.min(request_timeout(route.limits(), upstream));
+                timeout = timeout.min(effective_request_timeout(route.limits(), upstream));
             }
         }
     }
@@ -4945,7 +5518,46 @@ fn connect_timeout(limits: &RouteLimits, upstream: &UpstreamPlan) -> Duration {
         .into_iter()
         .flatten()
         .min()
-        .unwrap_or_else(|| request_timeout(limits, upstream))
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT)
+}
+
+fn configured_connect_timeouts(config: &CompiledConfig) -> BTreeSet<Duration> {
+    let mut timeouts = BTreeSet::from([DEFAULT_CONNECT_TIMEOUT]);
+    timeouts.extend(
+        config
+            .routes()
+            .iter()
+            .filter_map(|route| route.limits().connect_timeout),
+    );
+    timeouts.extend(
+        config
+            .upstreams()
+            .values()
+            .filter_map(UpstreamPlan::connect_timeout),
+    );
+    timeouts
+}
+
+fn build_upstream_client(
+    tls_config: &ClientConfig,
+    timeout: Duration,
+    http2_only: bool,
+) -> UpstreamClient {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    let connector = HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config.clone())
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http);
+    let connector = ConnectTimeoutConnector::new(connector, timeout);
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder.http2_adaptive_window(true);
+    if http2_only {
+        builder.http2_only(true);
+    }
+    builder.build(connector)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4985,8 +5597,33 @@ where
     Box::new(error)
 }
 
-fn plain_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
-    let body = Full::new(Bytes::copy_from_slice(body.as_bytes()))
+fn openai_error_response(
+    status: StatusCode,
+    message: &str,
+    code: &'static str,
+) -> Response<ProxyBody> {
+    let error_type = if status == StatusCode::UNAUTHORIZED {
+        "authentication_error"
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
+        "rate_limit_error"
+    } else if status.is_client_error() {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    };
+    let value = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": null,
+            "code": code,
+        }
+    });
+    let encoded = serde_json::to_vec(&value).unwrap_or_else(|_| {
+        br#"{"error":{"message":"internal error","type":"server_error","param":null,"code":"internal_error"}}"#
+            .to_vec()
+    });
+    let body = Full::new(Bytes::from(encoded))
         .map_err(|never: Infallible| match never {})
         .boxed();
     let mut response = Response::new(body);
@@ -4996,10 +5633,17 @@ fn plain_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
         HeaderValue::from_static(DEFAULT_ERROR_CONTENT_TYPE),
     );
     response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 fn unauthorized_response() -> Response<ProxyBody> {
-    let mut response = plain_response(StatusCode::UNAUTHORIZED, "bearer authentication required");
+    let mut response = openai_error_response(
+        StatusCode::UNAUTHORIZED,
+        "bearer authentication required",
+        "invalid_api_key",
+    );
     response
         .headers_mut()
         .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
@@ -5007,11 +5651,17 @@ fn unauthorized_response() -> Response<ProxyBody> {
 }
 
 fn error_response(error: ProxyError) -> Response<ProxyBody> {
-    let (status, message) = match error {
-        ProxyError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "upstream request failed"),
-        ProxyError::UnsupportedAuth | ProxyError::SecretUnavailable => {
-            (StatusCode::BAD_GATEWAY, "upstream request failed")
-        }
+    let (status, message, code) = match error {
+        ProxyError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream request failed",
+            "upstream_timeout",
+        ),
+        ProxyError::UnsupportedAuth | ProxyError::SecretUnavailable => (
+            StatusCode::BAD_GATEWAY,
+            "upstream request failed",
+            "upstream_error",
+        ),
         ProxyError::MissingUpstream { .. }
         | ProxyError::InvalidUri
         | ProxyError::InvalidLimits(_)
@@ -5020,29 +5670,48 @@ fn error_response(error: ProxyError) -> Response<ProxyBody> {
         | ProxyError::WebSocketHandshakeStatus(_)
         | ProxyError::Native(_)
         | ProxyError::Pool(_)
-        | ProxyError::UnsupportedBodyMode { .. } => {
-            (StatusCode::BAD_GATEWAY, "upstream request failed")
-        }
-        ProxyError::Extension(_) => (StatusCode::BAD_GATEWAY, "external extension failed"),
-        ProxyError::InvalidPatch(_) => (StatusCode::BAD_REQUEST, "invalid request"),
-        ProxyError::UnsupportedParameter { .. } => {
-            (StatusCode::BAD_REQUEST, "unsupported request parameter")
-        }
-        ProxyError::InvalidWebSocketHandshake(_) => {
-            (StatusCode::BAD_REQUEST, "invalid WebSocket handshake")
-        }
-        ProxyError::SemanticRequest(_) => (StatusCode::BAD_REQUEST, "invalid request"),
-        ProxyError::RequestBodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request too large"),
+        | ProxyError::UnsupportedBodyMode { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "upstream request failed",
+            "upstream_error",
+        ),
+        ProxyError::Extension(_) => (
+            StatusCode::BAD_GATEWAY,
+            "external extension failed",
+            "extension_error",
+        ),
+        ProxyError::InvalidPatch(_) | ProxyError::SemanticRequest(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid request",
+            "invalid_request",
+        ),
+        ProxyError::UnsupportedParameter { .. } => (
+            StatusCode::BAD_REQUEST,
+            "unsupported request parameter",
+            "unsupported_parameter",
+        ),
+        ProxyError::InvalidWebSocketHandshake(_) => (
+            StatusCode::BAD_REQUEST,
+            "invalid WebSocket handshake",
+            "invalid_websocket_handshake",
+        ),
+        ProxyError::RequestBodyTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request too large",
+            "request_too_large",
+        ),
         ProxyError::SemanticResponse(_) => (
             StatusCode::BAD_GATEWAY,
             "upstream response could not be converted",
+            "invalid_upstream_response",
         ),
         ProxyError::TlsClient(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "proxy initialization failed",
+            "internal_error",
         ),
     };
-    plain_response(status, message)
+    openai_error_response(status, message, code)
 }
 
 fn pool_error(error: PoolError) -> ProxyError {
@@ -5135,11 +5804,41 @@ fn native_error(error: NativeRuntimeError) -> ProxyError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use futures_util::stream;
     use http_body_util::StreamBody;
 
     use super::*;
     use pooler_config::compile_yaml;
+
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct DropTrackedPendingBody(Arc<AtomicUsize>);
+
+    impl Body for DropTrackedPendingBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for DropTrackedPendingBody {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 
     #[test]
     fn route_matcher_handles_exact_prefix_template_and_headers() {
@@ -5474,7 +6173,7 @@ routes: [{id: route, listen: local, target: provider}]
             r#"
 version: 1
 listeners: {local: {bind: 127.0.0.1:0}}
-upstreams: {local: {url: http://127.0.0.1:8319/base}}
+upstreams: {local: {url: http://127.0.0.1:8319/base?tenant=pooler}}
 routes:
   - id: route
     listen: local
@@ -5489,7 +6188,184 @@ routes:
             &"/request?stream=true".parse().unwrap(),
         )
         .unwrap();
-        assert_eq!(uri, "http://127.0.0.1:8319/v1/infer?stream=true");
+        assert_eq!(
+            uri,
+            "http://127.0.0.1:8319/v1/infer?tenant=pooler&stream=true"
+        );
+    }
+
+    #[test]
+    fn websocket_uri_merges_base_and_downstream_queries() {
+        let config = compile_yaml(
+            "websocket-query.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: ws://127.0.0.1:8319/base?tenant=pooler}}
+routes:
+  - id: route
+    listen: local
+    match: {path: /request, websocket: true}
+    target: {provider: local, upstream_path: /v1/socket}
+    ingress: {mode: opaque}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("WebSocket query config");
+        let uri = websocket_uri(
+            &config.upstreams()["local"],
+            &config.routes()[0],
+            &"/request?stream=true".parse().unwrap(),
+        )
+        .expect("WebSocket URI");
+        assert_eq!(
+            uri,
+            "ws://127.0.0.1:8319/v1/socket?tenant=pooler&stream=true"
+        );
+    }
+
+    #[test]
+    fn vertex_stream_rewrite_restores_provider_sse_query_after_query_merge() {
+        let config = compile_yaml(
+            "vertex-query.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  vertex:
+    url: https://vertex.example/base?key=server-key
+    native: {kind: vertex, project: test-project, location: us-central1}
+routes:
+  - id: route
+    listen: local
+    match: {method: POST, path: /v1beta/models/gemini-2.5-pro:streamGenerateContent}
+    target: vertex
+"#,
+        )
+        .expect("Vertex query config");
+        let route = &config.routes()[0];
+        let upstream = &config.upstreams()["vertex"];
+        let downstream: Uri =
+            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=json&trace=alias"
+                .parse()
+                .expect("downstream URI");
+        let uri = upstream_uri(upstream, route, &downstream).expect("upstream URI");
+        let rewritten =
+            rewrite_native_upstream_uri(upstream, &downstream, Some("gemini-2.5-pro"), uri)
+                .expect("rewritten Vertex URI");
+        assert_eq!(
+            rewritten,
+            "https://vertex.example/v1/projects/test-project/locations/us-central1/publishers/google/models/gemini-2.5-pro:streamGenerateContent?key=server-key&trace=alias&alt=sse"
+        );
+    }
+
+    #[test]
+    fn opaque_tunnels_preserve_caller_authorization_without_pooler_credentials() {
+        let config = compile_yaml(
+            "opaque-auth.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  tunnel: {url: http://127.0.0.1:8319}
+  authenticated:
+    url: http://127.0.0.1:8320
+    auth: {kind: bearer_secret, secret: env:POOLER_TEST_KEY}
+routes:
+  - id: tunnel
+    listen: local
+    match: {path: /tunnel}
+    target: tunnel
+    ingress: {mode: opaque}
+    response: {mode: opaque}
+  - id: authenticated
+    listen: local
+    match: {path: /authenticated}
+    target: authenticated
+    ingress: {mode: opaque}
+    response: {mode: opaque}
+  - id: downstream-authenticated
+    listen: local
+    match: {path: /downstream-authenticated}
+    downstream_auth: {secret: env:POOLER_DOWNSTREAM_KEY}
+    target: tunnel
+    ingress: {mode: opaque}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("opaque auth config");
+        let coordinator = PoolingCoordinator::new(&config).expect("pooling coordinator");
+        let tunnel = config.route("tunnel").expect("tunnel route");
+        let authenticated = config.route("authenticated").expect("authenticated route");
+        let downstream_authenticated = config
+            .route("downstream-authenticated")
+            .expect("downstream-authenticated route");
+        let tunnel_selection = coordinator
+            .select(
+                &config,
+                tunnel,
+                None,
+                &HeaderMap::new(),
+                1,
+                StdInstant::now(),
+            )
+            .expect("tunnel selection");
+        let authenticated_selection = coordinator
+            .select(
+                &config,
+                authenticated,
+                None,
+                &HeaderMap::new(),
+                1,
+                StdInstant::now(),
+            )
+            .expect("authenticated selection");
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-token"),
+        );
+        caller_headers.insert("x-api-key", HeaderValue::from_static("caller-api-key"));
+        caller_headers.insert(
+            "x-goog-api-key",
+            HeaderValue::from_static("caller-google-key"),
+        );
+        strip_caller_credentials_when_authenticating(
+            &mut caller_headers,
+            false,
+            &tunnel_selection,
+            &config.upstreams()[tunnel.target().upstream()],
+        );
+        assert_eq!(
+            caller_headers.get(header::AUTHORIZATION),
+            Some(&HeaderValue::from_static("Bearer caller-token"))
+        );
+        assert_eq!(
+            caller_headers.get("x-api-key"),
+            Some(&HeaderValue::from_static("caller-api-key"))
+        );
+        assert_eq!(
+            caller_headers.get("x-goog-api-key"),
+            Some(&HeaderValue::from_static("caller-google-key"))
+        );
+
+        strip_caller_credentials_when_authenticating(
+            &mut caller_headers,
+            false,
+            &authenticated_selection,
+            &config.upstreams()[authenticated.target().upstream()],
+        );
+        assert!(!caller_headers.contains_key(header::AUTHORIZATION));
+        assert!(!caller_headers.contains_key("x-api-key"));
+        assert!(!caller_headers.contains_key("x-goog-api-key"));
+
+        let mut downstream_headers = HeaderMap::new();
+        downstream_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer pooler-downstream-token"),
+        );
+        strip_downstream_authorization(downstream_authenticated, &mut downstream_headers);
+        assert!(!downstream_headers.contains_key(header::AUTHORIZATION));
     }
 
     #[test]
@@ -5562,12 +6438,90 @@ routes:
     async fn response_deadline_wakes_a_pending_body() {
         let stream = stream::pending::<Result<Frame<Bytes>, BoxError>>();
         let body = StreamBody::new(stream).boxed();
-        let mut body = DeadlineBody::new(body, Instant::now() + Duration::from_millis(1));
+        let resources = RuntimeResources::new();
+        let cleanup = ResponseDeadline::new();
+        let mut body = DeadlineBody::new(
+            body,
+            Instant::now() + Duration::from_millis(1),
+            cleanup.clone(),
+            resources.clone(),
+        );
         let frame = body.frame().await.expect("timeout frame");
         assert_eq!(
             frame.expect_err("deadline should fail").to_string(),
             "upstream response exceeded its request timeout"
         );
+        assert!(cleanup.is_elapsed());
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while resources.snapshot().tasks != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deadline timer task exits");
+    }
+
+    #[tokio::test]
+    async fn response_deadline_releases_unpolled_body_and_attached_guard_once() {
+        let body_drops = Arc::new(AtomicUsize::new(0));
+        let guard_drops = Arc::new(AtomicUsize::new(0));
+        let resources = RuntimeResources::new();
+        let cleanup = ResponseDeadline::new();
+        let _attached = cleanup.attach_cleanup({
+            let guard_drops = Arc::clone(&guard_drops);
+            move || drop(DropCounter(guard_drops))
+        });
+        let body = DeadlineBody::new(
+            DropTrackedPendingBody(Arc::clone(&body_drops)),
+            Instant::now() + Duration::from_millis(10),
+            cleanup.clone(),
+            resources.clone(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if body_drops.load(Ordering::Acquire) == 1
+                    && guard_drops.load(Ordering::Acquire) == 1
+                    && resources.snapshot().tasks == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned deadline releases without a downstream body poll");
+        assert!(cleanup.is_elapsed());
+
+        drop(body);
+        assert_eq!(body_drops.load(Ordering::Acquire), 1);
+        assert_eq!(guard_drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn response_deadline_preserves_frames_before_completion() {
+        let resources = RuntimeResources::new();
+        let cleanup = ResponseDeadline::new();
+        let body = Full::new(Bytes::from_static(b"unchanged"))
+            .map_err(|never: Infallible| match never {})
+            .boxed();
+        let body = DeadlineBody::new(
+            body,
+            Instant::now() + Duration::from_secs(1),
+            cleanup.clone(),
+            resources.clone(),
+        );
+        let bytes = body.collect().await.expect("body completes").to_bytes();
+        assert_eq!(bytes, Bytes::from_static(b"unchanged"));
+        assert!(!cleanup.is_elapsed());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while resources.snapshot().tasks != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed body aborts its deadline timer");
     }
 
     #[test]
@@ -5594,7 +6548,43 @@ routes:
         );
         assert_eq!(
             request_timeout(route.limits(), upstream),
-            Duration::from_secs(10)
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn explicitly_managed_websocket_null_timeout_has_no_hidden_hard_deadline() {
+        let config = compile_yaml(
+            "managed-websocket-timeout.yaml",
+            r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: ws://127.0.0.1:8319}}
+routes:
+  - id: route
+    listen: local
+    match: {path: /socket, websocket: true}
+    limits: {request_timeout: null, connect_timeout: null}
+    target: local
+    ingress: {mode: opaque}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("managed WebSocket timeout config");
+        let route = &config.routes()[0];
+        let upstream = &config.upstreams()["local"];
+        assert_eq!(request_timeout(route.limits(), upstream), None);
+        assert_eq!(
+            websocket_hard_deadline(StdInstant::now(), route.limits(), upstream),
+            None
+        );
+        assert_eq!(
+            connect_timeout(route.limits(), upstream),
+            DEFAULT_CONNECT_TIMEOUT
+        );
+        assert_eq!(
+            effective_request_timeout(route.limits(), upstream),
+            DEFAULT_REQUEST_TIMEOUT,
         );
     }
 
@@ -5652,5 +6642,66 @@ routes:
             completion_class_for_error(&ProxyError::Pool("state".to_owned())),
             CompletionClass::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn local_errors_use_the_openai_json_contract() {
+        let response = error_response(ProxyError::RequestBodyTooLarge);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("bounded error body")
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("OpenAI error JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "error": {
+                    "message": "request too large",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "request_too_large",
+                }
+            })
+        );
+
+        let response = unauthorized_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(header::WWW_AUTHENTICATE),
+            Some(&HeaderValue::from_static("Bearer"))
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("bounded authentication body")
+            .to_bytes();
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("OpenAI authentication error JSON");
+        assert_eq!(value["error"]["type"], "authentication_error");
+        assert_eq!(value["error"]["code"], "invalid_api_key");
+
+        let response = error_response(ProxyError::Timeout);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("bounded upstream error body")
+            .to_bytes();
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).expect("OpenAI upstream error JSON");
+        assert_eq!(value["error"]["type"], "server_error");
+        assert_eq!(value["error"]["code"], "upstream_timeout");
     }
 }

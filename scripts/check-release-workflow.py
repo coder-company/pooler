@@ -10,7 +10,10 @@ file text, so comments and similarly named jobs cannot satisfy an assertion.
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -373,12 +376,174 @@ def find_step(job: dict[str, Any], predicate: Any, context: str) -> dict[str, An
     fail(f"{context} is missing the required step")
 
 
-def validate_release(path: Path, workflows: dict[str, dict[str, Any]]) -> None:
+def release_asset_inventory(root: Path) -> list[str]:
+    """Return the regular, non-symlink assets that binary releases must carry."""
+
+    for directory_name in ("config", "deploy", "docs", "scripts"):
+        directory = root / directory_name
+        if directory.is_symlink() or not directory.is_dir():
+            fail(f"release asset directory is missing or unsafe: {directory}")
+
+    relative_assets: list[str] = []
+    config_paths = sorted((root / "config").glob("*.example.yaml"))
+    for asset in config_paths:
+        if asset.is_symlink():
+            fail(f"release config asset must not be a symlink: {asset}")
+        if asset.is_file():
+            relative_assets.append(asset.relative_to(root).as_posix())
+    if not relative_assets:
+        fail(f"no example configurations found under {root / 'config'}")
+
+    deployment_assets = sorted(
+        {
+            *((root / "deploy").glob("*.example.yaml")),
+            *((root / "deploy").glob("*.service")),
+        }
+    )
+    deployment_count = 0
+    for asset in deployment_assets:
+        if asset.is_symlink():
+            fail(f"release deployment asset must not be a symlink: {asset}")
+        if asset.is_file():
+            relative_assets.append(asset.relative_to(root).as_posix())
+            deployment_count += 1
+    if deployment_count == 0:
+        fail(f"no deployment assets found under {root / 'deploy'}")
+
+    for relative_path in ("docs/deployment.md", "scripts/check-deployment-config.py"):
+        asset = root / relative_path
+        if asset.is_symlink() or not asset.is_file():
+            fail(f"required release asset is missing or unsafe: {asset}")
+        relative_assets.append(relative_path)
+    return relative_assets
+
+
+def assert_stager_behavior(root: Path, expected_assets: list[str]) -> None:
+    """Exercise the shared stager and its symlink safety boundary."""
+
+    stager = root / "scripts" / "stage-release-assets.sh"
+    if stager.is_symlink() or not stager.is_file():
+        fail(f"shared release asset stager is missing or unsafe: {stager}")
+    if not os.access(stager, os.X_OK):
+        fail(f"shared release asset stager is not executable: {stager}")
+
+    with tempfile.TemporaryDirectory(prefix="pooler-release-assets-") as temporary:
+        stage = Path(temporary) / "stage"
+        result = subprocess.run(
+            [str(stager), str(root), str(stage)],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            fail(
+                "shared release asset stager failed for the repository: "
+                f"{result.stderr.strip()}"
+            )
+        actual_assets = {
+            candidate.relative_to(stage).as_posix()
+            for candidate in stage.rglob("*")
+            if candidate.is_file() or candidate.is_symlink()
+        }
+        if actual_assets != set(expected_assets):
+            fail(
+                "shared release asset stager inventory mismatch: "
+                f"expected {sorted(expected_assets)}, got {sorted(actual_assets)}"
+            )
+        for relative_path in expected_assets:
+            staged = stage / relative_path
+            if staged.is_symlink() or not staged.is_file() or staged.stat().st_size == 0:
+                fail(f"shared release asset stager produced an unsafe asset: {staged}")
+        for source_build_asset in ("Dockerfile", "docker-compose.example.yml"):
+            if (stage / source_build_asset).exists():
+                fail(f"source-build asset must not be staged: {stage / source_build_asset}")
+
+    with tempfile.TemporaryDirectory(prefix="pooler-release-assets-symlink-") as temporary:
+        fixture = Path(temporary) / "root"
+        for directory_name in ("config", "deploy", "docs", "scripts"):
+            (fixture / directory_name).mkdir(parents=True)
+        (fixture / "config" / "pooler.example.yaml").write_text("ok\n", encoding="utf-8")
+        (fixture / "deploy" / "pooler.service").write_text("[Unit]\n", encoding="utf-8")
+        (fixture / "docs" / "deployment.md").write_text("# Deploy\n", encoding="utf-8")
+        (fixture / "scripts" / "check-deployment-config.py").write_text(
+            "print('ok')\n", encoding="utf-8"
+        )
+        os.symlink(
+            fixture / "config" / "pooler.example.yaml",
+            fixture / "config" / "unsafe.example.yaml",
+        )
+        result = subprocess.run(
+            [str(stager), str(fixture), str(fixture / "stage")],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 or "symlink" not in result.stderr.lower():
+            fail("shared release asset stager must reject symlinked assets")
+
+
+def validate_hosted_release_assets(
+    release: dict[str, Any], root: Path, path: Path
+) -> None:
+    """Require hosted packaging to call and smoke-test the shared asset stager."""
+
+    expected_assets = release_asset_inventory(root)
+    assert_stager_behavior(root, expected_assets)
+
+    jobs = mapping(release["jobs"], f"{path}.jobs")
+    build = mapping(jobs["build"], f"{path}.jobs.build")
+    package_step = find_step(
+        build,
+        lambda step: step.get("name") == "Build, verify, and package",
+        f"{path}.jobs.build",
+    )
+    package_run = package_step.get("run")
+    if not isinstance(package_run, str):
+        fail(f"{path}.jobs.build package step must have a run script")
+    package_lines = package_run.splitlines()
+    if not any(
+        "stage-release-assets.sh" in line and "$stage" in line
+        for line in package_lines
+    ):
+        fail(
+            f"{path}.jobs.build package step must invoke scripts/stage-release-assets.sh "
+            "with the package stage"
+        )
+    smoke_paths = (
+        "config/*.example.yaml",
+        "deploy/*.example.yaml",
+        "deploy/*.service",
+        "docs/deployment.md",
+        "scripts/check-deployment-config.py",
+    )
+    if not all(path_fragment in package_run for path_fragment in smoke_paths):
+        fail(
+            f"{path}.jobs.build package step must smoke-test the shared release "
+            "asset inventory"
+        )
+    deployment_smoke = (
+        'POOLER_BIN="$packaged_binary"',
+        '"${packaged_root}/scripts/check-deployment-config.py"',
+        '"${packaged_root}/deploy/pooler.systemd.example.yaml" check',
+    )
+    if not all(fragment in package_run for fragment in deployment_smoke):
+        fail(
+            f"{path}.jobs.build package step must validate the packaged deployment "
+            "config and systemd overlay with the packaged binary"
+        )
+
+
+def validate_release(
+    path: Path, workflows: dict[str, dict[str, Any]], root: Path
+) -> None:
     release = load_workflow(path)
     jobs = mapping(release["jobs"], f"{path}.jobs")
     missing = REQUIRED_RELEASE_JOBS - set(jobs)
     if missing:
         fail(f"{path}.jobs is missing required jobs: {', '.join(sorted(missing))}")
+    validate_hosted_release_assets(release, root, path)
 
     resolve = mapping(jobs["resolve"], f"{path}.jobs.resolve")
     source_step = find_step(
@@ -574,7 +739,7 @@ def main() -> int:
     validate_runner_policy(workflows)
     validate_rust_setup(workflows, root)
     validate_sanitizer_runner(root)
-    validate_release(paths["release.yml"], reusable)
+    validate_release(paths["release.yml"], reusable, root)
     print("release workflow dependency checks passed")
     return 0
 

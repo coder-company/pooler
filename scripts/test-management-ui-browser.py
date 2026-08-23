@@ -38,6 +38,11 @@ class MockState:
         self.fail_all_reads = False
         self.slow_models = False
         self.reject_all = False
+        self.reject_oauth_device = False
+        self.reject_account_draft = False
+        self.delay_account_draft_unauthorized = False
+        self.account_draft_started = threading.Event()
+        self.release_account_draft = threading.Event()
         self.models_started = threading.Event()
         self.reload_request_id = 1
         self.reload_status = "succeeded"
@@ -512,11 +517,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_mutation(self, method: str) -> None:
         route = urlsplit(self.path).path
+        length = int(self.headers.get("Content-Length", "0"))
+        request_body = self.rfile.read(length) if length else b""
         if STATE.reject_all or self.headers.get("Authorization") != "Bearer good-token":
             self.send_bytes(401, b'{"error":"unauthorized"}', "application/json")
             return
-        length = int(self.headers.get("Content-Length", "0"))
-        STATE.post_bodies[route] = self.rfile.read(length) if length else b""
+        if route == "/management/accounts/primary/oauth-device" and STATE.reject_oauth_device:
+            self.send_bytes(401, b'{"error":"oauth authorization required"}', "application/json")
+            return
+        if route == "/management/config/accounts/draft" and (
+            STATE.reject_account_draft or STATE.delay_account_draft_unauthorized
+        ):
+            if STATE.delay_account_draft_unauthorized:
+                STATE.account_draft_started.set()
+                STATE.release_account_draft.wait(timeout=5)
+            self.send_bytes(
+                401,
+                b'{"error":"account draft authorization required"}',
+                "application/json",
+            )
+            return
+        STATE.post_bodies[route] = request_body
         STATE.post_transfer_encoding[route] = self.headers.get("Transfer-Encoding")
         STATE.mutation_headers[route] = {
             "authorization": self.headers.get("Authorization"),
@@ -606,6 +627,7 @@ def run_browser(playwright) -> None:
             page.locator("[style]").count() == 0,
             "inline style attribute rendered under strict CSP",
         )
+        page.wait_for_selector('[data-notice="auth"]')
         expect(
             page.locator('[data-notice="auth"]').count() == 1,
             "parallel 401 responses were not coalesced",
@@ -613,6 +635,14 @@ def run_browser(playwright) -> None:
         expect(
             page.locator("#session-dialog").evaluate("el => el.open"),
             "401 did not expose the session dialog",
+        )
+        expect(
+            "without the Bearer prefix" in page.locator("#session-copy").inner_text(),
+            "management session copy did not explain that the input excludes the Bearer prefix",
+        )
+        expect(
+            page.get_by_text("Management secret", exact=True).count() == 1,
+            "management session input was still labelled as a bearer token",
         )
 
         page.locator("#token-input").fill("wrong-token")
@@ -1076,6 +1106,26 @@ def run_browser(playwright) -> None:
         page.locator('[data-account-draft-field="envName"]').fill(
             "BROWSER_PROVIDER_KEY"
         )
+        STATE.reject_account_draft = True
+        page.locator('[data-account-draft-action="create"]').click()
+        page.get_by_text("Authorization required", exact=True).wait_for()
+        expect(
+            page.locator("#session-dialog").evaluate("el => el.open"),
+            "account draft 401 did not return to the management session dialog",
+        )
+        expect(
+            page.locator('[data-account-draft-action="create"]').count() == 0,
+            "account draft 401 was overwritten by the accounts renderer",
+        )
+        STATE.reject_account_draft = False
+        page.locator("#token-input").fill("good-token")
+        page.locator("#token-apply").click()
+        page.locator("#session-button", has_text="Connected").wait_for()
+        page.wait_for_selector(".view-accounts")
+        page.locator('[data-account-draft-field="id"]').fill("browser-account")
+        page.locator('[data-account-draft-field="envName"]').fill(
+            "BROWSER_PROVIDER_KEY"
+        )
         page.locator('[data-account-draft-action="create"]').click()
         page.wait_for_selector(".view-configuration")
         account_draft_body = json.loads(
@@ -1098,6 +1148,29 @@ def run_browser(playwright) -> None:
         page.get_by_text("Draft 12", exact=True).wait_for()
         page.locator('[data-route="accounts"]').click()
         page.wait_for_selector(".view-accounts")
+        STATE.account_draft_started.clear()
+        STATE.release_account_draft.clear()
+        STATE.delay_account_draft_unauthorized = True
+        page.locator('[data-account-draft-field="id"]').fill("stale-account")
+        page.locator('[data-account-draft-field="envName"]').fill(
+            "STALE_PROVIDER_KEY"
+        )
+        page.locator('[data-account-draft-action="create"]').click()
+        expect(
+            STATE.account_draft_started.wait(timeout=2),
+            "delayed account draft mutation did not start",
+        )
+        page.locator("#session-button").click()
+        page.locator("#token-input").fill("good-token")
+        page.locator("#token-apply").click()
+        STATE.release_account_draft.set()
+        page.locator("#session-button", has_text="Connected").wait_for()
+        page.wait_for_timeout(250)
+        expect(
+            page.get_by_text("Authorization required", exact=True).count() == 0,
+            "a delayed 401 from an old account-draft session invalidated the new session",
+        )
+        STATE.delay_account_draft_unauthorized = False
         page.locator('[data-account-connect="primary"]').click()
         page.wait_for_selector(".connection-panel")
         connection_text = page.locator(".connection-panel").inner_text()
@@ -1118,6 +1191,24 @@ def run_browser(playwright) -> None:
             "Brokered device OAuth" in connection_text,
             "documented device flow was not offered through the server-side broker",
         )
+        STATE.reject_oauth_device = True
+        page.locator('[data-account-oauth-device="primary"]').click()
+        page.get_by_text("Authorization required", exact=True).wait_for()
+        expect(
+            page.locator("#session-dialog").evaluate("el => el.open"),
+            "OAuth device start 401 did not return to the management session dialog",
+        )
+        expect(
+            page.locator('[data-account-oauth-device="primary"]').count() == 0,
+            "OAuth device start 401 was overwritten by the accounts renderer",
+        )
+        STATE.reject_oauth_device = False
+        page.locator("#token-input").fill("good-token")
+        page.locator("#token-apply").click()
+        page.locator("#session-button", has_text="Connected").wait_for()
+        page.wait_for_selector(".view-accounts")
+        page.locator('[data-account-connect="primary"]').click()
+        page.wait_for_selector(".connection-panel")
         page.locator('[data-account-oauth-device="primary"]').click()
         page.wait_for_timeout(3_000)
         expect(
@@ -1302,7 +1393,10 @@ def run_browser(playwright) -> None:
             "320px operations layout overflows the viewport",
         )
         page.locator('[data-route="setup"]').click()
-        page.wait_for_selector(".view-setup .setup-config")
+        page.wait_for_selector(".view-setup")
+        if page.locator(".view-setup .setup-config").count() == 0:
+            page.locator('[data-setup-action="generate"]').click()
+            page.wait_for_selector(".view-setup .setup-config")
         expect(
             page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"),
             "320px setup layout overflows the viewport",

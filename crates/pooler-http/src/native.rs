@@ -355,6 +355,7 @@ impl NativeRuntime {
                     Arc::new(ConfiguredNativeProviderBinding::new(
                         native.kind(),
                         provider,
+                        is_kimi_coding_upstream(upstream),
                     )),
                 );
             }
@@ -1005,13 +1006,15 @@ impl NativeProviderBinding for CodexNativeProviderBinding {
 struct ConfiguredNativeProviderBinding {
     kind: String,
     provider: Option<Arc<dyn OAuthRefresher>>,
+    kimi_coding: bool,
 }
 
 impl ConfiguredNativeProviderBinding {
-    fn new(kind: &str, provider: Option<Arc<dyn OAuthRefresher>>) -> Self {
+    fn new(kind: &str, provider: Option<Arc<dyn OAuthRefresher>>, kimi_coding: bool) -> Self {
         Self {
             kind: kind.to_owned(),
             provider,
+            kimi_coding,
         }
     }
 }
@@ -1036,6 +1039,9 @@ impl NativeProviderBinding for ConfiguredNativeProviderBinding {
             .map_err(|_| NativeRuntimeError::Authorization)?;
         let mut headers = HeaderMap::new();
         authorization.apply_to(&mut headers);
+        if self.kimi_coding {
+            apply_kimi_identity_headers(&mut headers);
+        }
         Ok(NativeAuthorization {
             headers,
             removals: Vec::new(),
@@ -1061,6 +1067,9 @@ impl NativeProviderBinding for ConfiguredNativeProviderBinding {
             .map_err(|_| NativeRuntimeError::Authorization)?;
         let mut headers = HeaderMap::new();
         authorization.apply_to(&mut headers);
+        if self.kimi_coding {
+            apply_kimi_identity_headers(&mut headers);
+        }
         Ok(NativeAuthorization {
             headers,
             removals: Vec::new(),
@@ -1098,6 +1107,61 @@ fn is_configured_native_kind(kind: &str) -> bool {
     CONFIGURED_NATIVE_KINDS
         .iter()
         .any(|candidate| kind.eq_ignore_ascii_case(candidate))
+}
+
+/// Kimi Code checks the same client identity headers emitted by CLIProxyAPI.
+///
+/// Device names and IDs in the reference implementation are machine-local
+/// values. Pooler intentionally uses a fixed product identity instead: it is
+/// stable across retries and accounts, contains no host or credential data,
+/// and still satisfies the provider's client contract. Compiled provider
+/// headers are applied after this delta and therefore retain operator-defined
+/// overrides.
+const KIMI_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const KIMI_DEVICE_ID: &str = "pooler";
+const KIMI_DEVICE_MODEL: &str = "pooler";
+const KIMI_DEVICE_NAME: &str = "pooler";
+
+fn apply_kimi_identity_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        http::header::USER_AGENT,
+        http::HeaderValue::from_static(concat!("CLIProxyAPI/", env!("CARGO_PKG_VERSION"))),
+    );
+    headers.insert(
+        HeaderName::from_static("x-msh-platform"),
+        http::HeaderValue::from_static("CLIProxyAPI"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-msh-version"),
+        http::HeaderValue::from_static(KIMI_CLIENT_VERSION),
+    );
+    headers.insert(
+        HeaderName::from_static("x-msh-device-name"),
+        http::HeaderValue::from_static(KIMI_DEVICE_NAME),
+    );
+    headers.insert(
+        HeaderName::from_static("x-msh-device-model"),
+        http::HeaderValue::from_static(KIMI_DEVICE_MODEL),
+    );
+    headers.insert(
+        HeaderName::from_static("x-msh-device-id"),
+        http::HeaderValue::from_static(KIMI_DEVICE_ID),
+    );
+}
+
+/// Native `kind: kimi` is also used by the public Moonshot API catalog. Only
+/// the Kimi Code surface needs CLIProxy's client identity contract; a known
+/// public-platform provider remains a regular bearer API-key binding. An
+/// operator-configured `kind: kimi` without a known provider is treated as
+/// Kimi Code, matching the documented native subscription configuration.
+fn is_kimi_coding_upstream(upstream: &UpstreamPlan) -> bool {
+    let Some(native) = upstream.native() else {
+        return false;
+    };
+    native.kind().eq_ignore_ascii_case("kimi")
+        && upstream
+            .known_provider()
+            .is_none_or(|provider| provider.eq_ignore_ascii_case("kimi-for-coding"))
 }
 
 fn resolve_secret(secret: &SecretRef) -> Result<SecretValue, NativeRuntimeError> {
@@ -1702,6 +1766,69 @@ accounts:
 
         assert!(authorization.is_refreshable());
         assert_header_value(&headers, "authorization", b"Bearer kimi-oauth-access");
+        assert_header_value(
+            &headers,
+            "user-agent",
+            concat!("CLIProxyAPI/", env!("CARGO_PKG_VERSION")).as_bytes(),
+        );
+        assert_header_value(&headers, "x-msh-platform", b"CLIProxyAPI");
+        assert_header_value(
+            &headers,
+            "x-msh-version",
+            env!("CARGO_PKG_VERSION").as_bytes(),
+        );
+        for name in ["x-msh-device-name", "x-msh-device-model", "x-msh-device-id"] {
+            assert_header_value(&headers, name, b"pooler");
+            assert!(headers.get(name).is_some_and(|value| !value.is_sensitive()));
+        }
+    }
+
+    #[tokio::test]
+    async fn known_kimi_open_platform_does_not_receive_kimi_code_identity() {
+        let api_secret = secret_file("moonshot-api-key");
+        let config = pooler_config::compile_yaml(
+            "native-kimi-open-platform-test.yaml",
+            &format!(
+                "version: 1\nupstreams:\n  moonshot:\n    known_provider: moonshotai\naccounts:\n  moonshot-key:\n    provider: moonshot\n    auth_kind: api_key\n    secret: file:{}\n",
+                api_secret.path().display()
+            ),
+        )
+        .expect("Kimi Open Platform config");
+        let upstream = &config.upstreams()["moonshot"];
+        let runtime =
+            NativeRuntime::new(&config, Arc::new(PanicOAuthStore)).expect("native runtime");
+        let credential = CredentialId::new("moonshot-key").expect("credential");
+        let authorization = runtime
+            .authorize_attempt(NativeAuthorizationRequest {
+                upstream,
+                account_auth_kind: Some(AccountAuthKind::ApiKey),
+                credential: Some(&credential),
+                account_secret: config.accounts()["moonshot-key"].secret(),
+                static_auth: upstream.auth(),
+                request_headers: &HeaderMap::new(),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("Open Platform authorization");
+        let mut headers = HeaderMap::new();
+        authorization
+            .apply_to(&mut headers)
+            .expect("authorization headers");
+
+        assert_header_value(&headers, "authorization", b"Bearer moonshot-api-key");
+        for name in [
+            "user-agent",
+            "x-msh-platform",
+            "x-msh-version",
+            "x-msh-device-name",
+            "x-msh-device-model",
+            "x-msh-device-id",
+        ] {
+            assert!(
+                !headers.contains_key(name),
+                "unexpected Kimi Code header {name}"
+            );
+        }
     }
 
     #[tokio::test]

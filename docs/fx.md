@@ -1,8 +1,8 @@
 # Vercel Labs fx
 
-Pooler's `fx` preset replaces the local `fx-cliproxy-bridge` process with a
-native, bounded Rust adapter. It is for the Vercel Labs `fx` terminal agent;
-it is not the Factory Droid client or the legacy `factory` preset.
+Pooler's `fx` preset provides a native, bounded Rust adapter for the Vercel
+Labs `fx` terminal agent. It is not the Factory Droid client or the legacy
+`factory` preset.
 
 The preset exposes:
 
@@ -35,10 +35,10 @@ FX_GATEWAY_CHAT_URL=http://127.0.0.1:18475/v3/ai/language-model \
 fx ask 'Explain this repository'
 ```
 
-The `fx` preset uses `loss_policy: degrade` for chat because the bridge-shaped
-wire intentionally omits optional OpenAI response IDs and detailed usage
-fields. Required tool-call and tool-result semantics are preserved. The model
-catalog routes use `loss_policy: reject`.
+The `fx` preset uses `loss_policy: degrade` for chat because the fx wire cannot
+represent optional OpenAI response IDs and detailed usage fields. Required
+tool-call and tool-result semantics are preserved. The model catalog routes
+use `loss_policy: reject`.
 
 The deterministic tool-loop fixture and replay instructions are in
 [`fixtures/fx/README.md`](../fixtures/fx/README.md).

@@ -18,6 +18,9 @@ allow = [
   "Unicode-3.0",
   "Zlib",
 ]
+exceptions = [
+  { allow = ["NCSA"], name = "libfuzzer-sys" },
+]
 
 [licenses.private]
 ignore = false

@@ -1,0 +1,73 @@
+services:
+  pooler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${POOLER_IMAGE:-pooler:local}
+    init: true
+    restart: unless-stopped
+    # Pooler drains requests for 30 seconds on SIGTERM. Leave a small margin
+    # for the runtime and container shim to exit cleanly.
+    stop_grace_period: 35s
+
+    # The image is deliberately non-root. Keep this value in sync with the
+    # POOLER_UID/POOLER_GID build args when using a different image build.
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+
+    ports:
+      # Keep the host-facing inference API local by default. Set
+      # POOLER_HOST_BIND=0.0.0.0 only behind an authenticated, encrypted edge.
+      - "${POOLER_HOST_BIND:-127.0.0.1}:8400:8400"
+
+    volumes:
+      # The config is immutable in the container. The example uses the
+      # built-in gateway preset and file-backed provider credentials.
+      - type: bind
+        source: ${POOLER_CONFIG_FILE:-./deploy/config/pooler.yaml}
+        target: /etc/pooler/pooler.yaml
+        read_only: true
+      # SQLite request/usage/credential state must survive container replacement.
+      - type: bind
+        source: ${POOLER_DATA_DIR:-./deploy/data}
+        target: /var/lib/pooler
+      # The directory contains upstream.key, downstream.key, and store.key.
+      # Every file is mounted read-only; do not commit it.
+      - type: bind
+        source: ${POOLER_SECRETS_DIR:-./deploy/secrets}
+        target: /run/secrets
+        read_only: true
+
+    command:
+      - --config
+      - /etc/pooler/pooler.yaml
+      - --credential-store
+      - /var/lib/pooler/credentials.sqlite3
+      - --credential-key-ref
+      - file:/run/secrets/store.key
+      - serve
+
+    # The example config enables management only on container loopback. No
+    # management port is published, so this check cannot expose the API to a
+    # host or peer container. The runtime image carries curl solely for this
+    # check.
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - --max-time
+        - "3"
+        - http://127.0.0.1:18477/health
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

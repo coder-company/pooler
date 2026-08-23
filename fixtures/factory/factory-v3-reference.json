@@ -1,13 +1,13 @@
 {
   "metadata": {
-    "id": "fx-cliproxy-bridge-v3-tools",
+    "id": "factory-v3-reference-tools",
     "equivalence": "event_semantic",
     "intentional_corrections": [
-      "The request shape and OpenAI translation baseline are sanitized from the local fx-cliproxy-bridge server.test.mjs and server.mjs.",
-      "Expected downstream events use Pooler's explicit semantic block lifecycle; the local bridge collapses tool arguments into one tool-call event and appends [DONE].",
-      "Pooler retains response identifiers and normalizes usage details that the local bridge does not emit."
+      "The request shape and OpenAI translation baseline are sanitized from the original Factory V3 reference implementation.",
+      "Expected downstream events use Pooler's explicit semantic block lifecycle; the reference translation collapses tool arguments into one tool-call event and appends [DONE].",
+      "Pooler retains response identifiers and normalizes usage details that the reference translation does not emit."
     ],
-    "notes": "Local reference bridge provenance only; this fixture is not evidence of compatibility with a current Factory client."
+    "notes": "Sanitized reference provenance only; this fixture is not evidence of compatibility with a current Factory client."
   },
   "downstream_request": {
     "method": "POST",

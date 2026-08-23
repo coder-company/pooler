@@ -1,19 +1,19 @@
 # Vercel Labs fx fixtures
 
-`fx-0.0.3-cliproxy-tool-loop.json` is a sanitized, deterministic behavior
+`fx-0.0.3-tool-loop.json` is a sanitized, deterministic behavior
 fixture for the installed Vercel Labs `fx` 0.0.3 client wire. Its event shape
-is anchored to the working local bridge at
-`/home/chaitanya/fx-cliproxy-bridge/server.mjs`; no credential, provider URL,
-workspace prompt, or live response is included.
+is anchored to the sanitized bridge used during the initial compatibility
+capture; no credential, provider URL, workspace prompt, or live response is
+included.
 
 The fixture exercises both halves of a tool loop. The first streamed response
 contains the OpenAI-compatible `reasoning` delta alias and fragmented tool
 arguments. They must become the fx reasoning lifecycle and one completed
 `tool-call` event before the `finish` event. The follow-up request contains the
 nested fx `tool-result` part and must become an OpenAI `role: tool` message with
-the exact invocation ID and result text. This deliberately improves on the
-temporary Node bridge, which stringifies the whole tool content array and can
-lose the nested invocation ID.
+the exact invocation ID and result text. This preserves information that the
+original reference translation could lose when it stringified the tool
+content array.
 
 The model-catalog case verifies that Pooler preserves provider-declared tags,
 reasoning options, and metadata but never invents those capabilities for

@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-use pooler_config::{Config, ConfigLoader};
+use pooler_config::{Config, ConfigLoader, MAX_CONFIG_FILE_BYTES};
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -21,7 +21,7 @@ use thiserror::Error;
 
 const MAX_DRAFTS: usize = 8;
 const MAX_PATCHES: usize = 128;
-const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DOCUMENT_BYTES: usize = MAX_CONFIG_FILE_BYTES as usize;
 const DRAFT_TTL: Duration = Duration::from_secs(30 * 60);
 const GENERATED_HEADER: &[u8] =
     b"# Generated and exclusively managed by Pooler. Do not edit by hand.\n";
@@ -1677,41 +1677,61 @@ pub(crate) fn abort_recovery(source: impl AsRef<Path>) -> Result<Value, ConfigMa
     if previous_managed && previous_backup {
         clear_recovery_marker(&managed)?;
     } else if target {
-        let Some(previous_managed_bytes) = backup_file.bytes.as_deref() else {
-            return Err(ConfigManagementError::RecoveryRequired);
-        };
-        if record.previous_backup_sha256.is_some()
-            && record.previous_backup_sha256.as_deref() != Some(record.target_sha256.as_str())
-        {
-            return Err(ConfigManagementError::RecoveryRequired);
-        }
-        let parent = managed
-            .parent()
-            .ok_or(ConfigManagementError::RecoveryRequired)?;
-        write_atomic(parent, &managed, previous_managed_bytes)?;
-        match record.previous_backup_sha256.as_deref() {
-            Some(previous_backup) if previous_backup == record.target_sha256 => {
-                let target_bytes = managed_file
-                    .bytes
-                    .as_deref()
-                    .ok_or(ConfigManagementError::RecoveryRequired)?;
-                write_atomic(parent, &backup, target_bytes)?;
+        if record.previous_managed_sha256.is_none() {
+            // A first managed commit has no prior managed bytes to restore:
+            // aborting it must remove the newly-created target and leave no
+            // backup sidecar behind. `safe_to_abort` only permits this branch
+            // when the recorded pre-transaction backup was also absent.
+            if record.previous_backup_sha256.is_some() || backup_file.present {
+                return Err(ConfigManagementError::RecoveryRequired);
             }
-            None => remove_file_synced(parent, &backup)?,
-            Some(_) => return Err(ConfigManagementError::RecoveryRequired),
+            let parent = managed
+                .parent()
+                .ok_or(ConfigManagementError::RecoveryRequired)?;
+            remove_file_synced(parent, &managed)?;
+            remove_file_synced(parent, &backup)?;
+            let restored = persistence_snapshot(&managed)?;
+            if restored.previous_managed.is_some() || restored.previous_backup.is_some() {
+                return Err(ConfigManagementError::RecoveryRequired);
+            }
+            clear_recovery_marker(&managed)?;
+        } else {
+            let Some(previous_managed_bytes) = backup_file.bytes.as_deref() else {
+                return Err(ConfigManagementError::RecoveryRequired);
+            };
+            if record.previous_backup_sha256.is_some()
+                && record.previous_backup_sha256.as_deref() != Some(record.target_sha256.as_str())
+            {
+                return Err(ConfigManagementError::RecoveryRequired);
+            }
+            let parent = managed
+                .parent()
+                .ok_or(ConfigManagementError::RecoveryRequired)?;
+            write_atomic(parent, &managed, previous_managed_bytes)?;
+            match record.previous_backup_sha256.as_deref() {
+                Some(previous_backup) if previous_backup == record.target_sha256 => {
+                    let target_bytes = managed_file
+                        .bytes
+                        .as_deref()
+                        .ok_or(ConfigManagementError::RecoveryRequired)?;
+                    write_atomic(parent, &backup, target_bytes)?;
+                }
+                None => remove_file_synced(parent, &backup)?,
+                Some(_) => return Err(ConfigManagementError::RecoveryRequired),
+            }
+            let restored = persistence_snapshot(&managed)?;
+            let expected_backup = record
+                .previous_backup_sha256
+                .as_ref()
+                .map(|_| managed_file.bytes.as_deref())
+                .unwrap_or(None);
+            if restored.previous_managed.as_deref() != Some(previous_managed_bytes)
+                || restored.previous_backup.as_deref() != expected_backup
+            {
+                return Err(ConfigManagementError::RecoveryRequired);
+            }
+            clear_recovery_marker(&managed)?;
         }
-        let restored = persistence_snapshot(&managed)?;
-        let expected_backup = record
-            .previous_backup_sha256
-            .as_ref()
-            .map(|_| managed_file.bytes.as_deref())
-            .unwrap_or(None);
-        if restored.previous_managed.as_deref() != Some(previous_managed_bytes)
-            || restored.previous_backup.as_deref() != expected_backup
-        {
-            return Err(ConfigManagementError::RecoveryRequired);
-        }
-        clear_recovery_marker(&managed)?;
     } else {
         return Err(ConfigManagementError::RecoveryRequired);
     }
@@ -1776,6 +1796,30 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn managed_documents_in_the_legacy_four_mib_gap_are_rejected() {
+        let padding_bytes = MAX_CONFIG_FILE_BYTES as usize + 128 * 1024;
+        let document = json!({
+            "version": 1,
+            "extensions": {
+                "oversized": {
+                    "command": "/bin/true",
+                    "capabilities": ["inspect"],
+                    "args": ["x".repeat(padding_bytes)]
+                }
+            }
+        });
+        let rendered = serde_yml::to_string(&document).expect("candidate serializes");
+        assert!(rendered.len() > MAX_CONFIG_FILE_BYTES as usize);
+        assert!(rendered.len() < 4 * 1024 * 1024);
+        compile_document(&document, 1).expect("candidate is compiler-valid");
+
+        assert!(matches!(
+            generated_document(&document),
+            Err(ConfigManagementError::TooLarge)
+        ));
     }
 
     #[test]
@@ -2252,6 +2296,55 @@ mod tests {
         let resumed = resume_recovery(&path).expect("resume");
         assert_eq!(resumed["action"], "resumed");
         assert!(!recovery_marker_path(&path.with_file_name("pooler.managed.yaml")).exists());
+    }
+
+    #[test]
+    fn structured_recovery_can_abort_first_managed_commit_without_prior_file() {
+        let (_directory, path) = source();
+        let manager = ConfigManagement::new(&path).expect("manager");
+        let created = manager.create(1).expect("draft");
+        let id = created["draft_id"].as_u64().expect("id");
+        let patched = manager
+            .apply(
+                id,
+                created["etag"].as_str().expect("etag"),
+                TypedConfigPatch::Upsert {
+                    section: "listeners".into(),
+                    id: "local".into(),
+                    value: json!({"bind": "127.0.0.1:1001"}),
+                },
+            )
+            .expect("patch");
+        let validated = manager
+            .validate(id, patched["etag"].as_str().expect("etag"))
+            .expect("validation");
+        let prepared = manager
+            .commit(
+                id,
+                patched["etag"].as_str().expect("etag"),
+                1,
+                validated["confirmation_token"].as_str().expect("token"),
+            )
+            .expect("commit");
+        let managed = prepared.managed_path;
+        let backup = backup_path(&managed);
+        let marker = recovery_marker_path(&managed);
+        assert!(managed.exists());
+        assert!(!backup.exists());
+        assert!(marker.exists());
+        drop(manager);
+
+        let status = recovery_status(&path).expect("status");
+        assert_eq!(status["safe_to_abort"], true);
+        let aborted = abort_recovery(&path).expect("abort");
+        assert_eq!(aborted["action"], "aborted");
+        assert!(!managed.exists());
+        assert!(!backup.exists());
+        assert!(!marker.exists());
+        assert_eq!(
+            serving_source(&path).expect("original source restored"),
+            path.canonicalize().expect("canonical source")
+        );
     }
 
     #[test]

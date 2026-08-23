@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use pooler_auth::MemoryOAuthTokenStore;
 use pooler_config::{Config, ConfigCandidate, ConfigWatcher};
@@ -14,6 +14,7 @@ use pooler_store::{SqliteOAuthTokenStore, SqliteStore};
 mod auth;
 mod bootstrap;
 mod catalog;
+mod config_path;
 mod config_recovery;
 mod dashboard;
 mod doctor;
@@ -29,8 +30,12 @@ pub use catalog::{CatalogCommand, VENDORED_MODEL_FACTS_PATH};
 #[command(name = "pooler", version, about = "Composable AI protocol runtime")]
 pub struct Cli {
     /// Configuration file to load.
-    #[arg(short, long, global = true, default_value = "pooler.yaml")]
-    pub config: PathBuf,
+    ///
+    /// When omitted, Pooler uses an existing `./pooler.yaml`; otherwise it
+    /// discovers the platform configuration path (normally
+    /// `$XDG_CONFIG_HOME/pooler/pooler.yaml` or `~/.config/pooler/pooler.yaml`).
+    #[arg(short, long, global = true)]
+    pub config: Option<PathBuf>,
     /// Owner-private SQLite credential store. If omitted, use the platform
     /// state directory or `POOLER_CREDENTIAL_STORE`.
     #[arg(long, global = true)]
@@ -226,7 +231,14 @@ pub enum ConfigCommand {
 
 /// Runs one CLI command.
 pub fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+    let Cli {
+        config,
+        credential_store,
+        credential_key_ref,
+        watch,
+        command,
+    } = cli;
+    match command {
         Command::Init { output, json } => {
             let report = bootstrap::init(&output)?;
             if json {
@@ -252,18 +264,21 @@ pub fn run(cli: Cli) -> Result<()> {
             interval_secs,
         } => tui::run(&endpoint, &token_ref, once, interval_secs),
         Command::Dashboard { url, no_open } => {
-            dashboard::launch(&cli.config, url.as_deref(), no_open)
+            let config = config_path::resolve(config.as_deref())?;
+            dashboard::launch(&config, url.as_deref(), no_open)
         }
         Command::Check => {
-            load(&cli.config)?;
+            let config = config_path::resolve(config.as_deref())?;
+            load(&config)?;
             println!("configuration is valid");
             Ok(())
         }
         Command::Config {
             command: ConfigCommand::Render,
         } => {
-            let rendered = pooler_config::render_path(&cli.config)?;
-            Config::from_yaml(cli.config.display().to_string(), &rendered)?.compile()?;
+            let config = config_path::resolve(config.as_deref())?;
+            let rendered = pooler_config::render_path(&config)?;
+            Config::from_yaml(config.display().to_string(), &rendered)?.compile()?;
             print!("{rendered}");
             Ok(())
         }
@@ -282,34 +297,38 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Config {
             command: ConfigCommand::Recovery { command },
-        } => config_recovery::run(&cli.config, command),
+        } => {
+            let config = config_path::resolve(config.as_deref())?;
+            config_recovery::run(&config, command)
+        }
         Command::Routes => {
-            let config = load(&cli.config)?;
+            let config_path = config_path::resolve(config.as_deref())?;
+            let config = load(&config_path)?;
             for route in config.routes() {
                 println!("{}", route.id());
             }
             Ok(())
         }
         Command::Serve => serve(
-            &cli.config,
-            cli.credential_store.as_deref(),
-            cli.credential_key_ref.as_deref(),
-            cli.watch,
+            &config_path::resolve(config.as_deref())?,
+            credential_store.as_deref(),
+            credential_key_ref.as_deref(),
+            watch,
         ),
         Command::Doctor => doctor::run(
-            &cli.config,
-            cli.credential_store.as_deref(),
-            cli.credential_key_ref.as_deref(),
+            &config_path::resolve(config.as_deref())?,
+            credential_store.as_deref(),
+            credential_key_ref.as_deref(),
         ),
         Command::Preflight => preflight::run(
-            &cli.config,
-            cli.credential_store.as_deref(),
-            cli.credential_key_ref.as_deref(),
+            &config_path::resolve(config.as_deref())?,
+            credential_store.as_deref(),
+            credential_key_ref.as_deref(),
         ),
         Command::Models { json } => models(
-            &cli.config,
-            cli.credential_store.as_deref(),
-            cli.credential_key_ref.as_deref(),
+            &config_path::resolve(config.as_deref())?,
+            credential_store.as_deref(),
+            credential_key_ref.as_deref(),
             json,
         ),
         Command::Catalog { command } => catalog::run(command),
@@ -325,9 +344,9 @@ pub fn run(cli: Cli) -> Result<()> {
         } => migrate::cliproxy(&input, dry_run, output.as_deref()),
         Command::Auth { command } => auth::run(
             command,
-            &cli.config,
-            cli.credential_store.as_deref(),
-            cli.credential_key_ref.as_deref(),
+            &config_path::resolve(config.as_deref())?,
+            credential_store.as_deref(),
+            credential_key_ref.as_deref(),
         ),
     }
 }
@@ -444,12 +463,32 @@ fn serve(
             tokio::spawn(async move { reload_loop(server, watcher, watch).await })
         };
         tokio::pin!(runner);
+        tokio::pin!(reload_runner);
         tokio::select! {
             result = &mut runner => {
-                reload_runner.abort();
+                reload_runner.as_ref().get_ref().abort();
                 result
                     .context("HTTP proxy task panicked")?
                     .map_err(anyhow::Error::from)
+            }
+            reload_result = &mut reload_runner => {
+                let shutdown_requested = server.cancellation_token().is_cancelled();
+                let reload_error = reload_task_error(reload_result, shutdown_requested);
+                if let Some(error) = &reload_error {
+                    tracing::error!(error = %error, "configuration reload task exited unexpectedly; shutting down");
+                }
+                server
+                    .drain(Duration::from_secs(30))
+                    .await
+                    .context("failed to drain HTTP proxy after configuration reload task exit")?;
+                runner
+                    .await
+                    .context("HTTP proxy task panicked")?
+                    .map_err(anyhow::Error::from)?;
+                match reload_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
             }
             signal = shutdown_signal() => {
                 signal?;
@@ -467,6 +506,20 @@ fn serve(
             }
         }
     })
+}
+
+fn reload_task_error(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    shutdown_requested: bool,
+) -> Option<anyhow::Error> {
+    match result {
+        Ok(Ok(())) if shutdown_requested => None,
+        Ok(Ok(())) => Some(anyhow!("configuration reload loop exited unexpectedly")),
+        Ok(Err(error)) => Some(error.context("configuration reload loop failed")),
+        Err(error) => {
+            Some(anyhow::Error::from(error).context("configuration reload task panicked"))
+        }
+    }
 }
 
 async fn reload_loop(
@@ -741,7 +794,7 @@ mod tests {
         let cli = Cli::try_parse_from(["pooler", "--config", "example.yaml", "check"])
             .expect("command should parse");
         assert!(matches!(cli.command, Command::Check));
-        assert_eq!(cli.config, PathBuf::from("example.yaml"));
+        assert_eq!(cli.config, Some(PathBuf::from("example.yaml")));
     }
 
     #[test]
@@ -849,8 +902,16 @@ mod tests {
 
     #[test]
     fn serve_command_is_available() {
-        let cli = Cli::try_parse_from(["pooler", "serve"]).expect("command should parse");
-        let error = run(cli).expect_err("missing default config should be reported");
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let missing = directory.path().join("missing/pooler.yaml");
+        let cli = Cli::try_parse_from([
+            "pooler",
+            "--config",
+            missing.to_str().expect("UTF-8 path"),
+            "serve",
+        ])
+        .expect("command should parse");
+        let error = run(cli).expect_err("missing explicit config should be reported");
         assert!(error.to_string().contains("failed to read configuration"));
     }
 
@@ -1116,6 +1177,27 @@ routes:
                 }
             } if input == PathBuf::from("input.json") && output == PathBuf::from("capture.json")
         ));
+    }
+
+    #[test]
+    fn reload_task_exit_is_clean_only_after_shutdown() {
+        assert!(reload_task_error(Ok(Ok(())), true).is_none());
+
+        let error = reload_task_error(Ok(Ok(())), false)
+            .expect("reload task exit without shutdown should be reported");
+        assert!(error
+            .to_string()
+            .contains("configuration reload loop exited unexpectedly"));
+    }
+
+    #[test]
+    fn reload_task_error_is_preserved_for_shutdown_diagnostics() {
+        let error = reload_task_error(Ok(Err(anyhow!("watcher failed"))), true)
+            .expect("reload task errors should not be treated as clean shutdown");
+        assert!(error
+            .to_string()
+            .contains("configuration reload loop failed"));
+        assert!(format!("{error:#}").contains("watcher failed"));
     }
 
     #[tokio::test]

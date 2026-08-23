@@ -39,7 +39,7 @@ pub use pooler_model_catalog::{
     RefreshConfig as CatalogRefreshConfig,
 };
 pub use pricing::{UsageAmounts, UsagePriceBookConfig, UsagePriceBookPlan, UsagePriceEntryConfig};
-use route_match::{prefix_matches, template_matches};
+use route_match::{canonical_authority, prefix_matches, template_matches};
 pub use route_match::{RouteMatchError, RouteRequest};
 pub use schema::{config_schema, render_config_schema, CONFIG_SCHEMA_VERSION};
 pub use watch::{
@@ -83,6 +83,10 @@ pub const MAX_ROUTE_CACHE_KEY_HEADERS: usize = 16;
 pub const DEFAULT_CATALOG_MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 /// Hard maximum bytes accepted from one provider model-list response.
 pub const MAX_CATALOG_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum bytes accepted for one source configuration, import, or overlay
+/// file.  Keeping this bound at the loader boundary prevents a malformed
+/// dependency from allocating without limit before YAML validation runs.
+pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Location of a declaration in its source document.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -179,7 +183,8 @@ impl SecretRef {
         match scheme.to_ascii_lowercase().as_str() {
             "env" if valid_env_name(payload) => Ok(Self::Env(Arc::from(payload))),
             "env" => Err(SecretRefError::InvalidEnvironmentName),
-            "file" => Ok(Self::File(Arc::from(payload))),
+            "file" if Path::new(payload).is_absolute() => Ok(Self::File(Arc::from(payload))),
+            "file" => Err(SecretRefError::InvalidFilePath),
             "keyring" => {
                 let (service, account) = payload
                     .split_once('/')
@@ -259,6 +264,9 @@ pub enum SecretRefError {
     /// Unsafe environment variable name.
     #[error("invalid environment secret name")]
     InvalidEnvironmentName,
+    /// File-backed references must point at an absolute path.
+    #[error("file secret references must use an absolute path")]
+    InvalidFilePath,
     /// Literal secret values are forbidden.
     #[error("literal secret values are not allowed; use env:, file:, or keyring:")]
     LiteralNotAllowed,
@@ -766,7 +774,7 @@ pub struct TransportConfig {
     pub kind: Option<String>,
     /// Base URL.
     pub base_url: Option<String>,
-    /// Connection timeout such as `5s`.
+    /// TCP/TLS connection timeout such as `5s`.
     pub connect_timeout: Option<String>,
     /// Request timeout such as `30m`.
     pub request_timeout: Option<String>,
@@ -901,7 +909,8 @@ pub struct RouteLimitsConfig {
         deserialize_with = "deserialize_optional_duration"
     )]
     pub request_timeout: Option<Duration>,
-    /// Upstream connection/header timeout.
+    /// Upstream TCP/TLS connection timeout. Response headers remain bounded
+    /// by `request_timeout`.
     #[serde(
         default = "default_connect_timeout",
         deserialize_with = "deserialize_optional_duration"
@@ -3075,14 +3084,16 @@ fn compile_config(
                 "response cache cannot be used with policy-based target selection",
             ));
         }
-        if matcher.websocket() == Some(true)
-            && target.model_source().is_none()
-            && !matches!(upstreams[target.upstream()].transport(), "ws" | "wss")
-        {
-            return Err(invalid(
-                &label,
-                "WebSocket routes require a ws or wss upstream transport",
-            ));
+        if matcher.websocket() == Some(true) && target.model_source().is_none() {
+            let transport_upstream = target
+                .transport_upstream()
+                .unwrap_or_else(|| target.upstream());
+            if !matches!(upstreams[transport_upstream].transport(), "ws" | "wss") {
+                return Err(invalid(
+                    &label,
+                    "WebSocket routes require a ws or wss upstream transport",
+                ));
+            }
         }
         if target.model_source().is_some()
             && !matches!(ingress.mode(), BodyMode::Patch | BodyMode::Semantic)
@@ -5117,8 +5128,11 @@ fn compile_match(
     };
     let host = declaration
         .host
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
+        .map(|value| {
+            canonical_authority(&value)
+                .ok_or_else(|| invalid(label, "route host must be a valid HTTP authority"))
+        })
+        .transpose()?
         .map(Arc::from);
     let headers = compile_headers(&declaration.headers, label)?;
     let mut content_types = Vec::new();
@@ -5419,13 +5433,13 @@ fn detect_conflicts(routes: &[RoutePlan]) -> Result<(), ConfigError> {
 
 fn routes_overlap(first: &RoutePlan, second: &RoutePlan) -> bool {
     methods_overlap(&first.matcher.methods, &second.matcher.methods)
-        && option_overlap(
+        && authorities_overlap(
             first.matcher.host.as_deref(),
             second.matcher.host.as_deref(),
         )
         && paths_overlap(&first.matcher.path, &second.matcher.path)
         && maps_overlap(&first.matcher.headers, &second.matcher.headers)
-        && lists_overlap(&first.matcher.content_types, &second.matcher.content_types)
+        && content_types_overlap(&first.matcher.content_types, &second.matcher.content_types)
         && bools_overlap(first.matcher.websocket, second.matcher.websocket)
 }
 
@@ -5433,8 +5447,17 @@ fn methods_overlap(first: &[Arc<str>], second: &[Arc<str>]) -> bool {
     first.is_empty() || second.is_empty() || first.iter().any(|method| second.contains(method))
 }
 
-fn option_overlap(first: Option<&str>, second: Option<&str>) -> bool {
-    first.is_none() || second.is_none() || first == second
+fn authorities_overlap(first: Option<&str>, second: Option<&str>) -> bool {
+    let (Some(first), Some(second)) = (first, second) else {
+        return true;
+    };
+    let Some(first) = route_match::normalize_authority(first) else {
+        return false;
+    };
+    let Some(second) = route_match::normalize_authority(second) else {
+        return false;
+    };
+    first.0 == second.0 && (first.1.is_none() || second.1.is_none() || first.1 == second.1)
 }
 
 fn bools_overlap(first: Option<bool>, second: Option<bool>) -> bool {
@@ -5453,8 +5476,34 @@ fn maps_overlap(
             .all(|(key, value)| first.get(key).is_none_or(|other| other == value))
 }
 
-fn lists_overlap(first: &[Arc<str>], second: &[Arc<str>]) -> bool {
-    first.is_empty() || second.is_empty() || first.iter().any(|value| second.contains(value))
+fn content_types_overlap(first: &[Arc<str>], second: &[Arc<str>]) -> bool {
+    first.is_empty()
+        || second.is_empty()
+        || first.iter().any(|first| {
+            second
+                .iter()
+                .any(|second| media_types_overlap(first, second))
+        })
+}
+
+fn media_types_overlap(first: &str, second: &str) -> bool {
+    let Some((first_type, first_subtype)) = first.split_once('/') else {
+        return false;
+    };
+    let Some((second_type, second_subtype)) = second.split_once('/') else {
+        return false;
+    };
+    if first == "*/*" || second == "*/*" {
+        return true;
+    }
+    let first_wildcard = first_subtype == "*" && first_type != "*";
+    let second_wildcard = second_subtype == "*" && second_type != "*";
+    match (first_wildcard, second_wildcard) {
+        (true, true) => first_type == second_type,
+        (true, false) => first_type == second_type,
+        (false, true) => first_type == second_type,
+        (false, false) => first == second,
+    }
 }
 
 fn paths_overlap(first: &PathPattern, second: &PathPattern) -> bool {
@@ -5698,8 +5747,31 @@ fn normalize_content_type(value: &str, label: &SourceLabel) -> Result<String, Co
         .map(str::trim)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if value.is_empty() || value.chars().any(char::is_control) || value.contains(' ') {
+    let Some((media_type, subtype)) = value.split_once('/') else {
         return Err(invalid(label, "content type must be a valid media type"));
+    };
+    if value.is_empty()
+        || value.chars().any(char::is_control)
+        || value.chars().any(char::is_whitespace)
+        || value.matches('/').count() != 1
+        || media_type.is_empty()
+        || subtype.is_empty()
+        || (media_type != "*"
+            && !media_type.chars().all(|character| {
+                character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character)
+            }))
+        || (subtype != "*"
+            && !subtype.chars().all(|character| {
+                character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character)
+            }))
+    {
+        return Err(invalid(label, "content type must be a valid media type"));
+    }
+    if media_type == "*" && subtype != "*" {
+        return Err(invalid(
+            label,
+            "content type wildcard must be */* or type/*",
+        ));
     }
     Ok(value)
 }
@@ -5907,6 +5979,145 @@ routes:
         assert!(rendered.contains("first"));
         assert!(rendered.contains("second"));
         assert!(rendered.contains("conflict.yaml"));
+    }
+
+    #[test]
+    fn websocket_validation_uses_explicit_transport_upstream() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams:
+  model: {url: http://127.0.0.1:8319}
+  socket: {url: ws://127.0.0.1:8320}
+routes:
+  - id: socket
+    listen: local
+    match: {method: GET, path: /socket, websocket: true}
+    target: {provider: model, transport_upstream: socket}
+"#;
+        let compiled = compile_yaml("websocket-transport.yaml", text).expect("WebSocket route");
+        assert_eq!(
+            compiled
+                .route("socket")
+                .expect("socket route")
+                .target()
+                .transport_upstream(),
+            Some("socket")
+        );
+
+        let without_transport = text.replace(", transport_upstream: socket", "");
+        let error = compile_yaml("websocket-http.yaml", &without_transport)
+            .expect_err("HTTP target cannot serve a WebSocket route");
+        assert!(error.to_string().contains("ws or wss"));
+    }
+
+    #[test]
+    fn wildcard_content_types_conflict_when_their_runtime_sets_overlap() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: broad
+    listen: local
+    match: {method: POST, path: /content, content_types: ['application/*']}
+    target: local
+  - id: narrow
+    listen: local
+    match: {method: POST, path: /content, content_types: [application/json]}
+    target: local
+"#;
+        assert!(compile_yaml("wildcard-conflict.yaml", text).is_err());
+
+        let disjoint = text.replace("application/json", "text/plain");
+        compile_yaml("wildcard-disjoint.yaml", &disjoint)
+            .expect("disjoint content type routes do not conflict");
+    }
+
+    #[test]
+    fn parser_preserves_supported_content_type_wildcards() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: wildcard
+    listen: local
+    match: {method: POST, path: /content, content_types: ['application/*', '*/*']}
+    target: local
+"#;
+        let config = parse_yaml("wildcards.yaml", text).expect("wildcard declarations parse");
+        assert_eq!(
+            config.routes[0]
+                .route_match
+                .as_ref()
+                .expect("route matcher")
+                .content_types,
+            ["application/*", "*/*"]
+        );
+    }
+
+    #[test]
+    fn content_type_tokens_accept_all_rfc_tchar_punctuation() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: token
+    listen: local
+    match: {method: POST, path: /token, content_types: ["a!#$%&'*+-.^_`|~/b!#$%&'*+-.^_`|~"]}
+    target: local
+"#;
+        compile_yaml("rfc-token.yaml", text).expect("RFC media-type token punctuation");
+    }
+
+    #[test]
+    fn rejects_wildcards_with_a_specific_subtype() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: invalid-wildcard
+    listen: local
+    match: {method: POST, path: /content, content_types: ['*/json']}
+    target: local
+"#;
+        let error = compile_yaml("invalid-wildcard.yaml", text)
+            .expect_err("a subtype-specific wildcard cannot be matched");
+        assert!(error
+            .to_string()
+            .contains("content type wildcard must be */* or type/*"));
+    }
+
+    #[test]
+    fn host_matchers_are_canonicalized_and_conflict_like_runtime_authority_matching() {
+        let text = r#"
+version: 1
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:8319}}
+routes:
+  - id: first
+    listen: local
+    match: {method: GET, path: /host, host: 'API.EXAMPLE.TEST.'}
+    target: local
+  - id: second
+    listen: local
+    match: {method: GET, path: /host, host: api.example.test:8443}
+    target: local
+"#;
+        assert!(compile_yaml("authority-conflict.yaml", text).is_err());
+
+        let single = text.replace(
+            "  - id: second\n    listen: local\n    match: {method: GET, path: /host, host: api.example.test:8443}\n    target: local\n",
+            "",
+        );
+        let compiled = compile_yaml("authority-canonical.yaml", &single).expect("host matcher");
+        assert_eq!(
+            compiled.route("first").unwrap().matcher().host(),
+            Some("api.example.test")
+        );
     }
 
     #[test]
@@ -6796,6 +7007,18 @@ catalog:
             SecretRef::parse("external:pooler/master"),
             Err(SecretRefError::UnknownScheme)
         ));
+        assert!(matches!(
+            SecretRef::parse("file:relative/token"),
+            Err(SecretRefError::InvalidFilePath)
+        ));
+        let absolute = if cfg!(windows) {
+            r"file:C:\absolute\token"
+        } else {
+            "file:/absolute/token"
+        };
+        assert!(SecretRef::parse(absolute).is_ok());
+        #[cfg(windows)]
+        assert!(SecretRef::parse(r"file:\\server\share\token").is_ok());
     }
 
     #[test]

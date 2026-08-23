@@ -15,8 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn replays_streaming_tool_call_and_follow_up() {
-    const MANIFEST_FIXTURE: &str =
-        include_str!("../../../fixtures/fx/fx-0.0.3-cliproxy-tool-loop.json");
+    const MANIFEST_FIXTURE: &str = include_str!("../../../fixtures/fx/fx-0.0.3-tool-loop.json");
     let fixture: Value = serde_json::from_str(MANIFEST_FIXTURE).expect("fx fixture JSON");
     assert_eq!(fixture["schema_version"], 1);
     assert_eq!(fixture["client"]["name"], "Vercel Labs fx");
@@ -86,8 +85,7 @@ async fn replays_streaming_tool_call_and_follow_up() {
 
 #[tokio::test]
 async fn preserves_upstream_model_metadata_without_inventing_capabilities() {
-    const MODEL_FIXTURE: &str =
-        include_str!("../../../fixtures/fx/fx-0.0.3-cliproxy-tool-loop.json");
+    const MODEL_FIXTURE: &str = include_str!("../../../fixtures/fx/fx-0.0.3-tool-loop.json");
     let fixture: Value = serde_json::from_str(MODEL_FIXTURE).expect("fx fixture JSON");
     let config = test_config();
     let route = config.route("fx-models").expect("fx models route");

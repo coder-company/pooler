@@ -75,6 +75,7 @@ impl SemanticAdapter for AnthropicSemanticAdapter {
             response_hint: SemanticResponseHint {
                 mode: response_mode,
                 requested_model: Some(decoded.request.model.clone()),
+                ..SemanticResponseHint::default()
             },
         })
     }
@@ -689,6 +690,7 @@ routes:
                 &pooler_http::SemanticResponseHint {
                     mode: SemanticResponseMode::Json,
                     requested_model: Some("claude-test".to_owned()),
+                    ..pooler_http::SemanticResponseHint::default()
                 },
                 CancellationToken::new(),
             )

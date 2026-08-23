@@ -134,7 +134,7 @@ jobs:
       - name: Install dependency policy tools
         uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20
         with:
-          tool: cargo-audit,cargo-deny
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
 
       - name: Install workflow checker dependencies
         run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
@@ -160,7 +160,10 @@ jobs:
         run: cargo audit --deny warnings --file fuzz/Cargo.lock
 
       - name: Check dependency and license policy
-        run: cargo deny check
+        run: cargo deny --locked --workspace check
+
+      - name: Check fuzz dependency and license policy
+        run: cargo deny --locked --manifest-path fuzz/Cargo.toml check
 
       - name: Verify the committed configuration schema
         run: scripts/check-config-schema.sh
@@ -195,7 +198,7 @@ jobs:
             run_smoke: true
           - target: aarch64-unknown-linux-gnu
             runner: blacksmith-2vcpu-ubuntu-2404-arm
-            run_smoke: false
+            run_smoke: true
           - target: x86_64-apple-darwin
             runner: blacksmith-6vcpu-macos-15
             run_smoke: true
@@ -307,6 +310,7 @@ jobs:
             --metadata "$metadata" \
             --version "$VERSION" \
             --epoch "$SOURCE_DATE_EPOCH" \
+            --target "$TARGET" \
             --assets-manifest third-party/dashboard-assets/manifest.json \
             --cyclonedx "$sbom_root/pooler.cdx.json" \
             --spdx "$sbom_root/pooler.spdx.json"
@@ -314,14 +318,12 @@ jobs:
           package_name="pooler-${VERSION}-${TARGET}"
           stage="${RUNNER_TEMP}/stage/${package_name}"
           artifact_dir="${RUNNER_TEMP}/release/${TARGET}"
-          mkdir -p "$stage/bin" "$stage/config" "$stage/compatibility" \
+          mkdir -p "$stage/bin" "$stage/compatibility" \
             "$stage/sbom" "$stage/schema" "$stage/third-party" "$artifact_dir"
           install -m 0755 "$first_binary" "$stage/bin/pooler"
           install -m 0644 README.md LICENSE NOTICE "$stage/"
           cp -R third-party/dashboard-assets "$stage/third-party/"
-          install -m 0644 config/pooler.example.yaml \
-            config/cursor.example.yaml \
-            config/media.example.yaml "$stage/config/"
+          scripts/stage-release-assets.sh "$source" "$stage"
           install -m 0644 schema/pooler.schema.json "$stage/schema/"
           install -m 0644 fixtures/compatibility/manifest.json \
             "$stage/compatibility/"
@@ -347,6 +349,35 @@ jobs:
           packaged_root="${smoke_root}/${package_name}"
           packaged_binary="${packaged_root}/bin/pooler"
           test -x "$packaged_binary"
+          verify_staged_asset() {
+            relative_path="$1"
+            source_asset="${source}/${relative_path}"
+            packaged_asset="${packaged_root}/${relative_path}"
+            test ! -L "$source_asset"
+            test -f "$source_asset"
+            test ! -L "$packaged_asset"
+            test -s "$packaged_asset"
+          }
+          config_count=0
+          for config_file in "$source"/config/*.example.yaml; do
+            [[ -e "$config_file" || -L "$config_file" ]] || continue
+            verify_staged_asset "config/${config_file##*/}"
+            config_count=$((config_count + 1))
+          done
+          test "$config_count" -gt 0
+          deployment_count=0
+          for deployment_asset in \
+            "$source"/deploy/*.example.yaml \
+            "$source"/deploy/*.service; do
+            [[ -e "$deployment_asset" || -L "$deployment_asset" ]] || continue
+            verify_staged_asset "deploy/${deployment_asset##*/}"
+            deployment_count=$((deployment_count + 1))
+          done
+          test "$deployment_count" -gt 0
+          verify_staged_asset docs/deployment.md
+          verify_staged_asset scripts/check-deployment-config.py
+          test ! -e "${packaged_root}/Dockerfile"
+          test ! -e "${packaged_root}/docker-compose.example.yml"
           test -s "${packaged_root}/third-party/dashboard-assets/manifest.json"
           license_root="${packaged_root}/third-party/dashboard-assets/licenses"
           test -s "${license_root}/Iconoir-MIT.txt"
@@ -357,6 +388,10 @@ jobs:
             smoke_config="${packaged_root}/config/pooler.example.yaml"
             "$packaged_binary" --version
             "$packaged_binary" --config "$smoke_config" check
+            "$packaged_binary" \
+              --config "${packaged_root}/deploy/pooler.systemd.example.yaml" check
+            POOLER_BIN="$packaged_binary" python3 \
+              "${packaged_root}/scripts/check-deployment-config.py"
           fi
 
           cat > "${artifact_dir}/build-info-${TARGET}.txt" <<EOF
@@ -471,6 +506,7 @@ jobs:
             --metadata "$metadata" \
             --version "$VERSION" \
             --epoch "$SOURCE_DATE_EPOCH" \
+            --target aggregate \
             --assets-manifest third-party/dashboard-assets/manifest.json \
             --cyclonedx "release/pooler-${VERSION}.cdx.json" \
             --spdx "release/pooler-${VERSION}.spdx.json"

@@ -1,9 +1,12 @@
 # pooler
 
-Pooler is a composable protocol runtime for AI clients and providers. It currently
-supports strict configuration, opaque HTTP proxying, bounded JSON patch routes,
-model-based routing, and composable imports and overlays. Unsupported protocol
-compatibility is not advertised.
+Pooler is a production-oriented protocol runtime for AI clients and providers.
+One binary serves composable OpenAI, Anthropic, Gemini, xAI, Factory, fx, and
+ConnectRPC routes with opaque forwarding or bounded semantic translation. It
+adds model-aware account pooling, brokered OAuth, encrypted persistence,
+commit-safe retries, hot configuration, a secured management dashboard, and
+release-ready deployment tooling. Compatibility remains explicit: unsupported
+protocol behavior is rejected rather than silently advertised or discarded.
 
 Validate the example configuration with:
 
@@ -78,6 +81,10 @@ SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) scripts/release.sh --output dist
 The archive layout and signing/provenance hooks are documented in
 [docs/release.md](docs/release.md).
 
-See the [delivery index](pooler-readgold.md), [product goal](GOAL.md), and
-[architecture plan](ARCHITECTURE_PLAN.md), [compatibility evidence](docs/compatibility-report.md),
-and [release acceptance](docs/release-acceptance.md).
+Container and systemd production deployment, owner-private state setup, and
+deployment lint/smoke checks are documented in [docs/deployment.md](docs/deployment.md).
+
+See the [gateway architecture](docs/gateway.md),
+[compatibility matrix](docs/compatibility-report.md),
+[operations guide](docs/deployment.md), and
+[release acceptance criteria](docs/release-acceptance.md).

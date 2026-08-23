@@ -91,12 +91,15 @@ fn normalize_sampling_precision(mut value: Value) -> Value {
 }
 
 #[test]
-fn replays_sanitized_fx_bridge_request_and_stream() {
+fn replays_sanitized_factory_reference_request_and_stream() {
     const MANIFEST_FIXTURE: &str =
-        include_str!("../../../fixtures/factory/fx-cliproxy-bridge-text.json");
+        include_str!("../../../fixtures/factory/factory-v3-text-reference.json");
     let fixture = load_fixture(MANIFEST_FIXTURE);
-    assert_eq!(fixture.id, "fx-cliproxy-bridge.factory.v3.text");
-    assert_eq!(fixture.source, "fx-cliproxy-bridge/server.mjs");
+    assert_eq!(fixture.id, "factory.v3.text.reference");
+    assert_eq!(
+        fixture.source,
+        "sanitized Factory V3 reference implementation"
+    );
     assert_eq!(fixture.equivalence, "json_structural");
     for correction in [
         "factory_response_metadata_preserves_response_id",

@@ -21,13 +21,15 @@ use crate::{
 };
 
 const MAX_COOLDOWNS: usize = 4_096;
-const LATEST_SCHEMA_VERSION: i64 = 5;
+const LATEST_SCHEMA_VERSION: i64 = 7;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/001_initial.sql")),
     (2, include_str!("migrations/002_health_and_cooldowns.sql")),
     (3, include_str!("migrations/003_credential_payloads.sql")),
     (4, include_str!("migrations/004_request_events.sql")),
     (5, include_str!("migrations/005_usage_ledger.sql")),
+    (6, include_str!("migrations/006_request_event_indexes.sql")),
+    (7, include_str!("migrations/007_encryption_fence.sql")),
 ];
 
 /// A transactional, WAL-backed SQLite [`Store`].
@@ -188,10 +190,13 @@ impl SqliteStore {
         updated_at: Timestamp,
     ) -> StoreResult<()> {
         non_empty("credential_id", credential_id)?;
-        let encryption = self.encryption_read()?;
-        let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
         let envelope = cipher.seal_for(payload, credential_id.as_bytes())?;
         self.with_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
             let exists = transaction
                 .query_row(
                     "SELECT 1 FROM credentials WHERE credential_id = ?1",
@@ -232,9 +237,12 @@ impl SqliteStore {
         updated_at: Timestamp,
     ) -> StoreResult<CredentialState> {
         non_empty("credential_id", credential_id)?;
-        let encryption = self.encryption_read()?;
-        let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
         self.with_immediate_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
             let current: CredentialState = transaction
                 .query_row(
                     "SELECT credential_id, provider_id, enabled, updated_at, revision
@@ -316,6 +324,7 @@ impl SqliteStore {
         let encryption = self.encryption_read()?;
         let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
         let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, cipher)?;
         let envelope = connection
             .query_row(
                 "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
@@ -340,6 +349,7 @@ impl SqliteStore {
         let encryption = self.encryption_read()?;
         let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
         let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, cipher)?;
         let row = connection
             .query_row(
                 "SELECT c.credential_id, c.provider_id, c.enabled, c.updated_at,
@@ -380,25 +390,52 @@ impl SqliteStore {
         self.credential_payload(credential_id)
     }
 
-    /// Remove one encrypted credential payload.
+    /// Remove one encrypted credential payload and advance its revision.
+    ///
+    /// Advancing the generation turns revocation into a tombstone for any
+    /// in-flight refresh that still holds the removed payload's snapshot.
     pub fn remove_credential_payload(&self, credential_id: &str) -> StoreResult<bool> {
         non_empty("credential_id", credential_id)?;
-        let encryption = self.encryption_read()?;
-        if encryption.is_none() {
+        if self.encryption_read()?.is_none() {
             return Err(StoreError::EncryptionRequired);
         }
         self.with_transaction(|transaction| {
+            let current_revision: Option<i64> = transaction
+                .query_row(
+                    "SELECT revision FROM credentials WHERE credential_id = ?1",
+                    [credential_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            let Some(current_revision) = current_revision else {
+                return Ok(false);
+            };
+            let next_revision = current_revision
+                .checked_add(1)
+                .ok_or(StoreError::CredentialRevisionConflict)?;
             let removed = transaction
                 .execute(
                     "DELETE FROM credential_payloads WHERE credential_id = ?1",
                     [credential_id],
                 )
                 .map_err(sqlite_error)?;
+            let advanced = transaction
+                .execute(
+                    "UPDATE credentials SET revision = ?1
+                     WHERE credential_id = ?2 AND revision = ?3",
+                    params![next_revision, credential_id, current_revision],
+                )
+                .map_err(sqlite_error)?;
+            if advanced != 1 {
+                return Err(StoreError::CredentialRevisionConflict);
+            }
             Ok(removed != 0)
         })
     }
 
-    /// Re-encrypt every payload in one transaction with a new master key.
+    /// Re-encrypt every encrypted record in one transaction with a new master
+    /// key.
     ///
     /// Any authentication or encryption failure aborts the transaction and
     /// leaves both the database and the active key unchanged.
@@ -411,7 +448,8 @@ impl SqliteStore {
         let next = Arc::new(CredentialCipher::new(master_key));
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(sqlite_error)?;
-        let rows = {
+        assert_cipher_current_transaction(&transaction, &current)?;
+        let credential_rows = {
             let mut statement = transaction
                 .prepare(
                     "SELECT credential_id, envelope
@@ -426,7 +464,7 @@ impl SqliteStore {
             rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
         };
         let mut rotated = 0_usize;
-        for (credential_id, envelope) in rows {
+        for (credential_id, envelope) in credential_rows {
             let payload = current.open_for(&envelope, credential_id.as_bytes())?;
             let replacement = next.seal_for(&payload, credential_id.as_bytes())?;
             transaction
@@ -436,6 +474,77 @@ impl SqliteStore {
                 )
                 .map_err(sqlite_error)?;
             rotated += 1;
+        }
+
+        // Request IDs remain encrypted inside the event envelope. Rebuild the
+        // keyed index from the authenticated plaintext as well as rotating
+        // the envelope; otherwise request_events_for would look under the new
+        // key and find no rows after a successful rotation.
+        let request_rows = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id, envelope
+                     FROM request_events ORDER BY id ASC",
+                )
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(sqlite_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+        };
+        for (id, envelope) in request_rows {
+            let event = decrypt_request_event(&current, id, &envelope)?;
+            let request_index = next.request_index(&event.request_id);
+            let replacement = encrypt_request_event(&next, &event)?;
+            transaction
+                .execute(
+                    "UPDATE request_events
+                     SET envelope = ?1, request_index = ?2, event_index = ?3
+                     WHERE id = ?4",
+                    params![replacement, request_index.as_slice(), event.event_index, id],
+                )
+                .map_err(sqlite_error)?;
+            rotated += 1;
+        }
+
+        let usage_rows = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id, envelope
+                     FROM usage_records ORDER BY id ASC",
+                )
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(sqlite_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+        };
+        for (id, envelope) in usage_rows {
+            let record = decrypt_usage_record(&current, id, &envelope)?;
+            let replacement = encrypt_usage_record(&next, &record)?;
+            transaction
+                .execute(
+                    "UPDATE usage_records SET envelope = ?1 WHERE id = ?2",
+                    params![replacement, id],
+                )
+                .map_err(sqlite_error)?;
+            rotated += 1;
+        }
+        let current_key_id = current.key_id();
+        let next_key_id = next.key_id();
+        let fenced = transaction
+            .execute(
+                "UPDATE encryption_fence SET key_id = ?1
+                 WHERE id = 1 AND key_id = ?2",
+                params![next_key_id.as_slice(), current_key_id.as_slice()],
+            )
+            .map_err(sqlite_error)?;
+        if fenced != 1 {
+            return Err(StoreError::WrongMasterKey);
         }
         transaction.commit().map_err(sqlite_error)?;
         *encryption = Some(Arc::clone(&next));
@@ -507,8 +616,10 @@ impl SqliteStore {
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> StoreResult<T>,
     ) -> StoreResult<T> {
+        let cipher = self.encryption_read()?.clone();
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(sqlite_error)?;
+        assert_mutation_authorized_transaction(&transaction, cipher.as_deref())?;
         let value = operation(&transaction)?;
         transaction.commit().map_err(sqlite_error)?;
         self.ensure_private_sidecars()?;
@@ -519,10 +630,12 @@ impl SqliteStore {
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> StoreResult<T>,
     ) -> StoreResult<T> {
+        let cipher = self.encryption_read()?.clone();
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error)?;
+        assert_mutation_authorized_transaction(&transaction, cipher.as_deref())?;
         let value = operation(&transaction)?;
         transaction.commit().map_err(sqlite_error)?;
         self.ensure_private_sidecars()?;
@@ -565,13 +678,15 @@ fn initialize_connection(
     if let Some(path) = &path {
         ensure_private_sidecars(path)?;
     }
+    let encryption = master_key.map(|key| Arc::new(CredentialCipher::new(key)));
+    if let Some(cipher) = encryption.as_ref() {
+        initialize_encryption_fence(&mut connection, cipher)?;
+    }
     Ok(SqliteStore {
         retention,
         connection: Arc::new(Mutex::new(connection)),
         path,
-        encryption: Arc::new(RwLock::new(
-            master_key.map(|key| Arc::new(CredentialCipher::new(key))),
-        )),
+        encryption: Arc::new(RwLock::new(encryption)),
     })
 }
 
@@ -602,6 +717,196 @@ fn apply_migration(
 ) -> Result<(), rusqlite::Error> {
     transaction.execute_batch(sql)?;
     transaction.pragma_update(None, "user_version", version)
+}
+
+fn initialize_encryption_fence(
+    connection: &mut Connection,
+    cipher: &CredentialCipher,
+) -> StoreResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO encryption_fence (id, key_id)
+             VALUES (1, NULL)",
+            [],
+        )
+        .map_err(sqlite_error)?;
+    let stored: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT key_id FROM encryption_fence WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let expected = cipher.key_id();
+    if stored.is_none() {
+        // A v6 database has no fence metadata yet. Authenticate every
+        // existing encrypted row before allowing this candidate key to claim
+        // the fence; otherwise a wrong-key first open could permanently lock
+        // the real key out without ever proving possession of it.
+        validate_existing_encrypted_rows(&transaction, cipher)?;
+        let key_id = cipher.key_id();
+        transaction
+            .execute(
+                "UPDATE encryption_fence SET key_id = ?1
+                 WHERE id = 1 AND key_id IS NULL",
+                [key_id.as_slice()],
+            )
+            .map_err(sqlite_error)?;
+        backfill_legacy_request_indexes(&transaction, cipher)?;
+    } else if stored.as_deref() == Some(expected.as_slice()) {
+        // Existing v6 rows are authenticated under the current key before
+        // their encrypted request identifiers become queryable metadata.
+        backfill_legacy_request_indexes(&transaction, cipher)?;
+    } else {
+        return Err(StoreError::WrongMasterKey);
+    }
+    transaction.commit().map_err(sqlite_error)
+}
+
+fn validate_existing_encrypted_rows(
+    transaction: &Transaction<'_>,
+    cipher: &CredentialCipher,
+) -> StoreResult<()> {
+    let credential_rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT credential_id, envelope
+                 FROM credential_payloads ORDER BY credential_id ASC",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    for (credential_id, envelope) in credential_rows {
+        cipher.open_for(&envelope, credential_id.as_bytes())?;
+    }
+
+    let request_rows = {
+        let mut statement = transaction
+            .prepare("SELECT id, envelope FROM request_events ORDER BY id ASC")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    for (id, envelope) in request_rows {
+        decrypt_request_event(cipher, id, &envelope)?;
+    }
+
+    let usage_rows = {
+        let mut statement = transaction
+            .prepare("SELECT id, envelope FROM usage_records ORDER BY id ASC")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    for (id, envelope) in usage_rows {
+        decrypt_usage_record(cipher, id, &envelope)?;
+    }
+    Ok(())
+}
+
+fn backfill_legacy_request_indexes(
+    transaction: &Transaction<'_>,
+    cipher: &CredentialCipher,
+) -> StoreResult<()> {
+    let rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, envelope FROM request_events
+                 WHERE request_index IS NULL ORDER BY id ASC",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    for (id, envelope) in rows {
+        let event = decrypt_request_event(cipher, id, &envelope)?;
+        let request_index = cipher.request_index(&event.request_id);
+        transaction
+            .execute(
+                "UPDATE request_events SET request_index = ?1, event_index = ?2
+                 WHERE id = ?3 AND request_index IS NULL",
+                params![request_index.as_slice(), event.event_index, id],
+            )
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn assert_cipher_current_transaction(
+    transaction: &Transaction<'_>,
+    cipher: &CredentialCipher,
+) -> StoreResult<()> {
+    assert_cipher_current_connection(transaction, cipher)
+}
+
+fn assert_cipher_current_connection(
+    connection: &Connection,
+    cipher: &CredentialCipher,
+) -> StoreResult<()> {
+    let stored = encryption_fence_key_id(connection)?;
+    let expected = cipher.key_id();
+    if stored.as_deref() == Some(expected.as_slice()) {
+        Ok(())
+    } else {
+        Err(StoreError::WrongMasterKey)
+    }
+}
+
+fn assert_mutation_authorized_transaction(
+    transaction: &Transaction<'_>,
+    cipher: Option<&CredentialCipher>,
+) -> StoreResult<()> {
+    if let Some(cipher) = cipher {
+        return assert_cipher_current_transaction(transaction, cipher);
+    }
+    if encryption_fence_key_id(transaction)?.is_some()
+        || transaction
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM credential_payloads
+                     UNION ALL SELECT 1 FROM request_events
+                     UNION ALL SELECT 1 FROM usage_records
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sqlite_error)?
+            != 0
+    {
+        Err(StoreError::EncryptionRequired)
+    } else {
+        Ok(())
+    }
+}
+
+fn encryption_fence_key_id(connection: &Connection) -> StoreResult<Option<Vec<u8>>> {
+    connection
+        .query_row(
+            "SELECT key_id FROM encryption_fence WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)
 }
 
 fn prepare_database_path(path: &Path) -> StoreResult<PathBuf> {
@@ -853,19 +1158,148 @@ fn decision_from_row(row: &Row<'_>) -> StoreResult<DecisionRecord> {
     })
 }
 
+fn delete_credential_dependents(
+    transaction: &Transaction<'_>,
+    credential_id: &str,
+) -> StoreResult<()> {
+    // `credential_health` predates the credential foreign key and therefore
+    // needs explicit cleanup. Affinities and credential-scoped cooldowns are
+    // also references to the removed account, not independent retained state.
+    transaction
+        .execute(
+            "DELETE FROM credential_health WHERE credential_id = ?1",
+            [credential_id],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM affinities WHERE credential_id = ?1",
+            [credential_id],
+        )
+        .map_err(sqlite_error)?;
+    let cooldowns = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT scope, scope_key FROM cooldowns
+                 WHERE scope IN ('credential', 'credential_model')",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    for (scope, key) in cooldowns {
+        if cooldown_belongs_to_credential(&scope, &key, credential_id) {
+            transaction
+                .execute(
+                    "DELETE FROM cooldowns WHERE scope = ?1 AND scope_key = ?2",
+                    params![scope, key],
+                )
+                .map_err(sqlite_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_credential(transaction: &Transaction<'_>, credential_id: &str) -> StoreResult<()> {
+    let exists: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM credentials WHERE credential_id = ?1",
+            [credential_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(StoreError::CredentialNotFound(credential_id.to_owned()))
+    }
+}
+
+fn decode_compound_cooldown_key(key: &str) -> Option<(String, String)> {
+    let value = key.strip_prefix("v2:")?;
+    let (left_length, value) = value.split_once(':')?;
+    let (right_length, value) = value.split_once(':')?;
+    let left_length = left_length.parse::<usize>().ok()?;
+    let right_length = right_length.parse::<usize>().ok()?;
+    let bytes = value.as_bytes();
+    let total = left_length.checked_add(right_length)?;
+    if bytes.len() != total {
+        return None;
+    }
+    Some((
+        String::from_utf8(bytes[..left_length].to_vec()).ok()?,
+        String::from_utf8(bytes[left_length..].to_vec()).ok()?,
+    ))
+}
+
+fn cooldown_credential_id(scope: &str, key: &str) -> Option<String> {
+    match scope {
+        "credential" => Some(key.to_owned()),
+        "credential_model" => decode_compound_cooldown_key(key)
+            .map(|(credential_id, _)| credential_id)
+            .or_else(|| {
+                (key.matches(':').count() == 1)
+                    .then(|| {
+                        key.split_once(':')
+                            .map(|(credential_id, _)| credential_id.to_owned())
+                    })
+                    .flatten()
+            }),
+        _ => None,
+    }
+}
+
+fn cooldown_belongs_to_credential(scope: &str, key: &str, credential_id: &str) -> bool {
+    cooldown_credential_id(scope, key).as_deref() == Some(credential_id)
+}
+
+fn require_cooldown_credential(
+    transaction: &Transaction<'_>,
+    scope: &str,
+    key: &str,
+) -> StoreResult<()> {
+    if let Some(credential_id) = cooldown_credential_id(scope, key) {
+        require_credential(transaction, &credential_id)?;
+    } else if matches!(scope, "credential" | "credential_model") {
+        return Err(StoreError::CredentialNotFound(key.to_owned()));
+    }
+    Ok(())
+}
+
 fn evict_credentials(transaction: &Transaction<'_>, limit: usize) -> StoreResult<usize> {
     let limit =
         i64::try_from(limit).map_err(|_| StoreError::Sqlite("retention overflow".to_owned()))?;
-    let removed = transaction
-        .execute(
-            "DELETE FROM credentials WHERE credential_id IN (
-                 SELECT credential_id FROM credentials
+    let candidates = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT credential_id FROM credentials
                  ORDER BY updated_at ASC, credential_id ASC
-                 LIMIT MAX((SELECT COUNT(*) FROM credentials) - ?1, 0)
-             )",
-            [limit],
-        )
-        .map_err(sqlite_error)?;
+                 LIMIT MAX((SELECT COUNT(*) FROM credentials) - ?1, 0)",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([limit], |row| row.get::<_, String>(0))
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    let mut removed = 0_usize;
+    for credential_id in candidates {
+        let deleted = transaction
+            .execute(
+                "DELETE FROM credentials WHERE credential_id = ?1",
+                [&credential_id],
+            )
+            .map_err(sqlite_error)?;
+        if deleted != 0 {
+            delete_credential_dependents(transaction, &credential_id)?;
+            removed = removed.saturating_add(deleted);
+        }
+    }
     Ok(removed)
 }
 
@@ -1034,6 +1468,92 @@ fn evict_cooldowns(transaction: &Transaction<'_>) -> StoreResult<()> {
     Ok(())
 }
 
+fn evict_request_events_for_transaction(
+    transaction: &Transaction<'_>,
+    cipher: &CredentialCipher,
+    request_id: &str,
+    request_index: &[u8],
+) -> StoreResult<()> {
+    let has_legacy_rows: i64 = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM request_events WHERE request_index IS NULL
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if has_legacy_rows == 0 {
+        transaction
+            .execute(
+                "DELETE FROM request_events
+                 WHERE request_index = ?1 AND id NOT IN (
+                     SELECT id FROM request_events
+                     WHERE request_index = ?1
+                     ORDER BY event_index DESC, id DESC LIMIT ?2
+                 )",
+                params![
+                    request_index,
+                    i64::try_from(MAX_REQUEST_EVENTS_PER_REQUEST)
+                        .map_err(|_| StoreError::InvalidRetention)?
+                ],
+            )
+            .map_err(sqlite_error)?;
+        return Ok(());
+    }
+
+    let indexed_rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, envelope FROM request_events
+                 WHERE request_index = ?1",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([request_index], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    let legacy_rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, envelope FROM request_events
+                 WHERE request_index IS NULL",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
+    };
+    let mut matching = Vec::with_capacity(indexed_rows.len() + legacy_rows.len());
+    for (id, envelope) in indexed_rows.into_iter().chain(legacy_rows) {
+        let event = decrypt_request_event(cipher, id, &envelope)?;
+        if event.request_id == request_id {
+            matching.push((id, event.event_index));
+        }
+    }
+    if matching.len() <= MAX_REQUEST_EVENTS_PER_REQUEST {
+        return Ok(());
+    }
+    let mut retained = matching.clone();
+    retained.sort_unstable_by(|left, right| (right.1, right.0).cmp(&(left.1, left.0)));
+    retained.truncate(MAX_REQUEST_EVENTS_PER_REQUEST);
+    let retained_ids = retained.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    for (id, _) in matching {
+        if !retained_ids.contains(&id) {
+            transaction
+                .execute("DELETE FROM request_events WHERE id = ?1", [id])
+                .map_err(sqlite_error)?;
+        }
+    }
+    Ok(())
+}
+
 impl Store for SqliteStore {
     fn retention(&self) -> RetentionPolicy {
         self.retention
@@ -1137,12 +1657,7 @@ impl Store for SqliteStore {
                     [credential_id],
                 )
                 .map_err(sqlite_error)?;
-            transaction
-                .execute(
-                    "DELETE FROM credential_health WHERE credential_id = ?1",
-                    [credential_id],
-                )
-                .map_err(sqlite_error)?;
+            delete_credential_dependents(transaction, credential_id)?;
             Ok(removed != 0)
         })
     }
@@ -1152,10 +1667,11 @@ impl Store for SqliteStore {
         state: CredentialHealthState,
     ) -> StoreResult<CredentialHealthState> {
         non_empty("credential_id", &state.credential_id)?;
-        let connection = self.connection()?;
-        connection
-            .execute(
-                "INSERT INTO credential_health
+        self.with_immediate_transaction(|transaction| {
+            require_credential(transaction, &state.credential_id)?;
+            transaction
+                .execute(
+                    "INSERT INTO credential_health
                  (credential_id, status, failure_count, cooldown_until, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(credential_id) DO UPDATE SET
@@ -1163,15 +1679,17 @@ impl Store for SqliteStore {
                    failure_count = excluded.failure_count,
                    cooldown_until = excluded.cooldown_until,
                    updated_at = excluded.updated_at",
-                params![
-                    &state.credential_id,
-                    state.status.as_str(),
-                    i64::try_from(state.failure_count).unwrap_or(i64::MAX),
-                    state.cooldown_until,
-                    state.updated_at,
-                ],
-            )
-            .map_err(sqlite_error)?;
+                    params![
+                        &state.credential_id,
+                        state.status.as_str(),
+                        i64::try_from(state.failure_count).unwrap_or(i64::MAX),
+                        state.cooldown_until,
+                        state.updated_at,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            Ok(())
+        })?;
         Ok(state)
     }
 
@@ -1208,6 +1726,7 @@ impl Store for SqliteStore {
         non_empty("scope", &state.scope)?;
         non_empty("key", &state.key)?;
         self.with_transaction(|transaction| {
+            require_cooldown_credential(transaction, &state.scope, &state.key)?;
             transaction
                 .execute(
                     "INSERT INTO cooldowns (scope, scope_key, until_at, reason, updated_at)
@@ -1281,14 +1800,15 @@ impl Store for SqliteStore {
     fn remove_cooldown(&self, scope: &str, key: &str) -> StoreResult<bool> {
         non_empty("scope", scope)?;
         non_empty("key", key)?;
-        let connection = self.connection()?;
-        let removed = connection
-            .execute(
-                "DELETE FROM cooldowns WHERE scope = ?1 AND scope_key = ?2",
-                params![scope, key],
-            )
-            .map_err(sqlite_error)?;
-        Ok(removed != 0)
+        self.with_transaction(|transaction| {
+            let removed = transaction
+                .execute(
+                    "DELETE FROM cooldowns WHERE scope = ?1 AND scope_key = ?2",
+                    params![scope, key],
+                )
+                .map_err(sqlite_error)?;
+            Ok(removed != 0)
+        })
     }
 
     fn upsert_session_affinity(&self, affinity: SessionAffinity) -> StoreResult<SessionAffinity> {
@@ -1297,6 +1817,7 @@ impl Store for SqliteStore {
         non_empty("credential_id", &affinity.credential_id)?;
         non_empty("upstream_model", &affinity.upstream_model)?;
         self.with_transaction(|transaction| {
+            require_credential(transaction, &affinity.credential_id)?;
             transaction
                 .execute(
                     "DELETE FROM affinities WHERE expires_at <= ?1",
@@ -1380,11 +1901,12 @@ impl Store for SqliteStore {
 
     fn remove_session_affinity(&self, key: &str) -> StoreResult<bool> {
         non_empty("key", key)?;
-        let connection = self.connection()?;
-        let removed = connection
-            .execute("DELETE FROM affinities WHERE key = ?1", [key])
-            .map_err(sqlite_error)?;
-        Ok(removed != 0)
+        self.with_transaction(|transaction| {
+            let removed = transaction
+                .execute("DELETE FROM affinities WHERE key = ?1", [key])
+                .map_err(sqlite_error)?;
+            Ok(removed != 0)
+        })
     }
 
     fn append_decision(&self, record: DecisionRecord) -> StoreResult<DecisionRecord> {
@@ -1473,11 +1995,19 @@ impl Store for SqliteStore {
             .encryption_read()?
             .clone()
             .ok_or(StoreError::EncryptionRequired)?;
+        let request_index = cipher.request_index(&event.request_id);
         self.with_immediate_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
             transaction
                 .execute(
-                    "INSERT INTO request_events (recorded_at, envelope) VALUES (?1, X'00')",
-                    [event.recorded_at],
+                    "INSERT INTO request_events
+                     (recorded_at, envelope, request_index, event_index)
+                     VALUES (?1, X'00', ?2, ?3)",
+                    params![
+                        event.recorded_at,
+                        request_index.as_slice(),
+                        event.event_index
+                    ],
                 )
                 .map_err(sqlite_error)?;
             let id = transaction.last_insert_rowid();
@@ -1502,39 +2032,18 @@ impl Store for SqliteStore {
                     [cutoff],
                 )
                 .map_err(sqlite_error)?;
-
-            let mut statement = transaction
-                .prepare("SELECT id, envelope FROM request_events ORDER BY id ASC")
-                .map_err(sqlite_error)?;
-            let encrypted = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })
-                .map_err(sqlite_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(sqlite_error)?;
-            drop(statement);
-            let mut same_request = Vec::new();
-            for (stored_id, stored_envelope) in encrypted {
-                let stored = decrypt_request_event(&cipher, stored_id, &stored_envelope)?;
-                if stored.request_id == event.request_id {
-                    same_request.push(stored_id);
-                }
-            }
-            for expired_id in same_request.iter().take(
-                same_request
-                    .len()
-                    .saturating_sub(MAX_REQUEST_EVENTS_PER_REQUEST),
-            ) {
-                transaction
-                    .execute("DELETE FROM request_events WHERE id = ?1", [expired_id])
-                    .map_err(sqlite_error)?;
-            }
+            evict_request_events_for_transaction(
+                transaction,
+                &cipher,
+                &event.request_id,
+                request_index.as_slice(),
+            )?;
             transaction
                 .execute(
-                    "DELETE FROM request_events WHERE id IN (
-                         SELECT id FROM request_events ORDER BY id ASC
-                         LIMIT MAX((SELECT COUNT(*) FROM request_events) - ?1, 0)
+                    "DELETE FROM request_events
+                     WHERE id <= (
+                         SELECT id FROM request_events
+                         ORDER BY id DESC LIMIT 1 OFFSET ?1
                      )",
                     [i64::try_from(self.retention.max_request_events)
                         .map_err(|_| StoreError::InvalidRetention)?],
@@ -1550,6 +2059,7 @@ impl Store for SqliteStore {
             .clone()
             .ok_or(StoreError::EncryptionRequired)?;
         let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, &cipher)?;
         let mut statement = connection
             .prepare("SELECT id, envelope FROM request_events ORDER BY id ASC")
             .map_err(sqlite_error)?;
@@ -1568,11 +2078,59 @@ impl Store for SqliteStore {
 
     fn request_events_for(&self, request_id: &str) -> StoreResult<Vec<RequestEvent>> {
         non_empty("request_id", request_id)?;
-        let mut events = self
-            .request_events()?
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        let request_index = cipher.request_index(request_id);
+        let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, &cipher)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, envelope FROM request_events
+                 WHERE request_index = ?1 ORDER BY event_index ASC, id ASC",
+            )
+            .map_err(sqlite_error)?;
+        let encrypted = statement
+            .query_map([request_index.as_slice()], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?;
+        drop(statement);
+        let mut events = encrypted
+            .into_iter()
+            .map(|(id, envelope)| decrypt_request_event(&cipher, id, &envelope))
+            .collect::<StoreResult<Vec<_>>>()?
             .into_iter()
             .filter(|event| event.request_id == request_id)
             .collect::<Vec<_>>();
+        // Rows written before migration 006 have no index metadata. Merge
+        // those authenticated legacy rows with indexed rows rather than
+        // replacing the indexed result with a full-table read. This keeps a
+        // timeline spanning the migration complete while preserving the
+        // indexed fast path for all-new rows.
+        let mut legacy_statement = connection
+            .prepare(
+                "SELECT id, envelope FROM request_events
+                 WHERE request_index IS NULL ORDER BY id ASC",
+            )
+            .map_err(sqlite_error)?;
+        let legacy_rows = legacy_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?;
+        drop(legacy_statement);
+        for (id, envelope) in &legacy_rows {
+            let event = decrypt_request_event(&cipher, *id, envelope)?;
+            if event.request_id == request_id {
+                events.push(event);
+            }
+        }
         events.sort_by_key(|event| (event.event_index, event.id));
         Ok(events)
     }
@@ -1584,6 +2142,7 @@ impl Store for SqliteStore {
             .clone()
             .ok_or(StoreError::EncryptionRequired)?;
         self.with_immediate_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
             transaction
                 .execute(
                     "INSERT INTO usage_records (recorded_at, envelope) VALUES (?1, X'00')",
@@ -1635,6 +2194,7 @@ impl Store for SqliteStore {
             .clone()
             .ok_or(StoreError::EncryptionRequired)?;
         let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, &cipher)?;
         let mut statement = connection
             .prepare("SELECT id, envelope FROM usage_records ORDER BY id ASC")
             .map_err(sqlite_error)?;
@@ -1707,7 +2267,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{CredentialHealthStatus, DecisionCandidate};
+    use crate::{CredentialHealthStatus, DecisionCandidate, RequestEventKind};
 
     fn policy(credentials: usize, affinities: usize, decisions: usize) -> RetentionPolicy {
         RetentionPolicy::new(credentials, affinities, decisions).expect("valid policy")
@@ -1875,10 +2435,163 @@ mod tests {
     }
 
     #[test]
+    fn credential_deletion_and_retention_remove_dependent_state() {
+        let store = SqliteStore::open_in_memory_with_retention(policy(1, 8, 8)).expect("store");
+        store
+            .upsert_credential_state(CredentialState::new("old", "provider", true, 1))
+            .expect("old credential");
+        store
+            .upsert_credential_health(CredentialHealthState::new(
+                "old",
+                CredentialHealthStatus::CoolingDown,
+                2,
+            ))
+            .expect("old health");
+        store
+            .upsert_session_affinity(SessionAffinity::new(
+                "old-session",
+                "provider",
+                "old",
+                "model",
+                1,
+                100,
+            ))
+            .expect("old affinity");
+        store
+            .upsert_cooldown(CooldownState::new("credential", "old", 100, 2))
+            .expect("old cooldown");
+        store
+            .upsert_cooldown(CooldownState::new("credential_model", "old:model", 100, 2))
+            .expect("old model cooldown");
+        store
+            .upsert_cooldown(CooldownState::new("provider", "provider", 100, 2))
+            .expect("provider cooldown");
+
+        // Credential retention uses the same dependency cleanup as explicit
+        // deletion.
+        store
+            .upsert_credential_state(CredentialState::new("new", "provider", true, 2))
+            .expect("new credential");
+        assert!(store.credential_state("old").expect("old state").is_none());
+        assert!(store
+            .credential_health("old")
+            .expect("old health")
+            .is_none());
+        assert!(store
+            .session_affinity("old-session", 2)
+            .expect("old affinity")
+            .is_none());
+        assert!(store
+            .cooldown("credential", "old", 2)
+            .expect("cooldown")
+            .is_none());
+        assert!(store
+            .cooldown("credential_model", "old:model", 2)
+            .expect("model cooldown")
+            .is_none());
+        assert!(store
+            .cooldown("provider", "provider", 2)
+            .expect("provider cooldown")
+            .is_some());
+
+        store
+            .upsert_credential_health(CredentialHealthState::new(
+                "new",
+                CredentialHealthStatus::Healthy,
+                3,
+            ))
+            .expect("new health");
+        store
+            .upsert_session_affinity(SessionAffinity::new(
+                "new-session",
+                "provider",
+                "new",
+                "model",
+                3,
+                100,
+            ))
+            .expect("new affinity");
+        store
+            .upsert_cooldown(CooldownState::new("credential", "new", 100, 3))
+            .expect("new cooldown");
+        assert!(store
+            .remove_credential_state("new")
+            .expect("remove credential"));
+        assert!(store
+            .credential_health("new")
+            .expect("new health")
+            .is_none());
+        assert!(store
+            .session_affinity("new-session", 3)
+            .expect("new affinity")
+            .is_none());
+        assert!(store
+            .cooldown("credential", "new", 3)
+            .expect("new cooldown")
+            .is_none());
+        assert_eq!(
+            store.upsert_credential_health(CredentialHealthState::new(
+                "new",
+                CredentialHealthStatus::Healthy,
+                4,
+            )),
+            Err(StoreError::CredentialNotFound("new".to_owned()))
+        );
+        assert_eq!(
+            store.upsert_cooldown(CooldownState::new("credential", "new", 100, 4)),
+            Err(StoreError::CredentialNotFound("new".to_owned()))
+        );
+        assert_eq!(
+            store.upsert_session_affinity(SessionAffinity::new(
+                "late-session",
+                "provider",
+                "new",
+                "model",
+                4,
+                100,
+            )),
+            Err(StoreError::CredentialNotFound("new".to_owned()))
+        );
+
+        let collision_store = SqliteStore::open_in_memory().expect("collision store");
+        collision_store
+            .upsert_credential_state(CredentialState::new("a", "provider", true, 1))
+            .expect("short credential");
+        collision_store
+            .upsert_credential_state(CredentialState::new("a:b", "provider", true, 1))
+            .expect("long credential");
+        collision_store
+            .upsert_cooldown(CooldownState::new(
+                "credential_model",
+                "v2:3:5:a:bmodel",
+                100,
+                1,
+            ))
+            .expect("long credential cooldown");
+        collision_store
+            .remove_credential_state("a")
+            .expect("remove short credential");
+        assert!(collision_store
+            .cooldown("credential_model", "v2:3:5:a:bmodel", 2)
+            .expect("long cooldown lookup")
+            .is_some());
+        collision_store
+            .remove_credential_state("a:b")
+            .expect("remove long credential");
+        assert!(collision_store
+            .cooldown("credential_model", "v2:3:5:a:bmodel", 2)
+            .expect("removed cooldown lookup")
+            .is_none());
+    }
+
+    #[test]
     fn sqlite_expiry_is_applied_after_restart() {
         let directory = private_tempdir();
         let path = directory.path().join("pooler.sqlite");
         let store = SqliteStore::open(&path).expect("open store");
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
         store
             .upsert_cooldown(CooldownState::new("provider", "provider", 10, 1))
             .expect("cooldown");
@@ -1964,17 +2677,443 @@ mod tests {
         );
         drop(store);
 
-        let old_store = SqliteStore::open_encrypted(&path, old_key).expect("old open");
-        assert_eq!(
-            old_store.credential_payload("credential"),
+        assert!(matches!(
+            SqliteStore::open_encrypted(&path, old_key),
             Err(StoreError::WrongMasterKey)
-        );
-        drop(old_store);
+        ));
         let new_store = SqliteStore::open_encrypted(&path, new_key).expect("new open");
         assert!(new_store
             .credential_payload("credential")
             .expect("new load")
             .is_some());
+    }
+
+    #[test]
+    fn master_key_rotation_reencrypts_all_encrypted_ledgers_and_rebuilds_indexes() {
+        let directory = private_tempdir();
+        let path = directory.path().join("all-encrypted.sqlite");
+        let old_key = MasterKey::from_bytes(b"all-ledger-old-key").expect("old key");
+        let new_key = MasterKey::from_bytes(b"all-ledger-new-key").expect("new key");
+        let store = SqliteStore::open_encrypted(&path, old_key.clone()).expect("open store");
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
+        let payload = CredentialPayload::new(b"refresh-token-value").expect("payload");
+        store
+            .upsert_credential_payload("credential", &payload, 2)
+            .expect("credential payload");
+        let event = store
+            .append_request_event(RequestEvent::new(
+                "request-before-rotation",
+                0,
+                RequestEventKind::Completion,
+                "listener",
+                "route",
+                3,
+            ))
+            .expect("request event");
+        let usage = store
+            .append_usage_record(UsageRecord::new(
+                4,
+                "request-before-rotation",
+                "route",
+                "success",
+            ))
+            .expect("usage record");
+
+        assert_eq!(store.rotate_master_key(new_key.clone()).expect("rotate"), 3);
+        assert_eq!(
+            store
+                .credential_payload("credential")
+                .expect("credential after rotation")
+                .expect("credential payload"),
+            payload
+        );
+        assert_eq!(
+            store
+                .request_events_for("request-before-rotation")
+                .expect("request timeline after rotation"),
+            vec![event.clone()]
+        );
+        assert_eq!(
+            store.usage_records().expect("usage after rotation"),
+            vec![usage.clone()]
+        );
+        drop(store);
+
+        assert!(matches!(
+            SqliteStore::open_encrypted(&path, old_key),
+            Err(StoreError::WrongMasterKey)
+        ));
+
+        let reopened = SqliteStore::open_encrypted(&path, new_key).expect("new-key reopen");
+        assert_eq!(
+            reopened
+                .request_events_for("request-before-rotation")
+                .expect("request timeline after restart"),
+            vec![event]
+        );
+        assert_eq!(
+            reopened.usage_records().expect("usage after restart"),
+            vec![usage]
+        );
+    }
+
+    #[test]
+    fn master_key_rotation_rolls_back_before_switching_active_key() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"atomic-rotation-old-key").expect("old key"),
+        )
+        .expect("store");
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
+        store
+            .upsert_credential_payload(
+                "credential",
+                &CredentialPayload::new(b"credential-token").expect("payload"),
+                1,
+            )
+            .expect("credential payload");
+        store
+            .append_request_event(RequestEvent::new(
+                "request",
+                0,
+                RequestEventKind::Attempt,
+                "listener",
+                "route",
+                1,
+            ))
+            .expect("request event");
+        store
+            .append_usage_record(UsageRecord::new(1, "request", "route", "success"))
+            .expect("usage record");
+        {
+            let connection = store.connection.lock().expect("connection");
+            connection
+                .execute("UPDATE usage_records SET envelope = X'00' WHERE id = 1", [])
+                .expect("tamper usage row");
+        }
+
+        assert_eq!(
+            store.rotate_master_key(
+                MasterKey::from_bytes(b"atomic-rotation-new-key").expect("new key")
+            ),
+            Err(StoreError::InvalidCredentialEnvelope)
+        );
+        assert_eq!(
+            store
+                .credential_payload("credential")
+                .expect("credential remains under old key")
+                .expect("payload")
+                .as_bytes(),
+            b"credential-token"
+        );
+        assert!(matches!(
+            store.request_events(),
+            Ok(events) if events.len() == 1
+        ));
+    }
+
+    #[test]
+    fn stale_sqlite_instance_is_fenced_after_rotation() {
+        let directory = private_tempdir();
+        let path = directory.path().join("rotation-fence.sqlite");
+        let old_key = MasterKey::from_bytes(b"rotation-fence-old-key").expect("old key");
+        let new_key = MasterKey::from_bytes(b"rotation-fence-new-key").expect("new key");
+        {
+            let store = SqliteStore::open_encrypted(&path, old_key.clone()).expect("store");
+            store
+                .append_request_event(RequestEvent::new(
+                    "before-rotation",
+                    0,
+                    RequestEventKind::Admission,
+                    "listener",
+                    "route",
+                    1,
+                ))
+                .expect("request event");
+            store
+                .append_usage_record(UsageRecord::new(1, "before-rotation", "route", "success"))
+                .expect("usage record");
+        }
+
+        let rotating = SqliteStore::open_encrypted(&path, old_key.clone()).expect("rotating");
+        let stale = SqliteStore::open_encrypted(&path, old_key).expect("stale");
+        rotating.rotate_master_key(new_key.clone()).expect("rotate");
+
+        assert_eq!(
+            stale.append_request_event(RequestEvent::new(
+                "after-rotation",
+                0,
+                RequestEventKind::Admission,
+                "listener",
+                "route",
+                2,
+            )),
+            Err(StoreError::WrongMasterKey)
+        );
+        assert_eq!(
+            stale.append_usage_record(UsageRecord::new(2, "after-rotation", "route", "success")),
+            Err(StoreError::WrongMasterKey)
+        );
+        assert_eq!(stale.request_events(), Err(StoreError::WrongMasterKey));
+        assert_eq!(stale.usage_records(), Err(StoreError::WrongMasterKey));
+
+        let current = SqliteStore::open_encrypted(&path, new_key).expect("current");
+        assert_eq!(current.request_events().expect("events").len(), 1);
+        assert_eq!(current.usage_records().expect("usage").len(), 1);
+    }
+
+    fn assert_mutations_are_fenced(store: &SqliteStore, expected: StoreError) {
+        assert_eq!(
+            store.upsert_credential_state(CredentialState::new(
+                "attacker-credential",
+                "provider",
+                true,
+                200,
+            )),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.set_credential_enabled("victim", false, 200),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.switch_credential("victim", &["sibling".to_owned()], 200),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.remove_credential_state("victim"),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.upsert_credential_health(CredentialHealthState::new(
+                "victim",
+                CredentialHealthStatus::Disabled,
+                200,
+            )),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.upsert_cooldown(CooldownState::new("provider", "provider", 300, 200,)),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.cooldown("provider", "provider", 200),
+            Err(expected.clone())
+        );
+        assert_eq!(store.cooldowns(200), Err(expected.clone()));
+        assert_eq!(
+            store.remove_cooldown("provider", "provider"),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.upsert_session_affinity(SessionAffinity::new(
+                "attacker-session",
+                "provider",
+                "victim",
+                "model",
+                200,
+                300,
+            )),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.session_affinity("protected-session", 200),
+            Err(expected.clone())
+        );
+        assert_eq!(store.session_affinities(200), Err(expected.clone()));
+        assert_eq!(
+            store.remove_session_affinity("protected-session"),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.append_decision(DecisionRecord::new(
+                "attacker-decision",
+                "route",
+                "model",
+                200,
+            )),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.upsert_credential_payload(
+                "victim",
+                &CredentialPayload::new(b"attacker-token").expect("payload"),
+                200,
+            ),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.compare_and_swap_credential_payload(
+                "victim",
+                1,
+                &CredentialPayload::new(b"attacker-token").expect("payload"),
+                200,
+            ),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.remove_credential_payload("victim"),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.append_request_event(RequestEvent::new(
+                "attacker-request",
+                0,
+                RequestEventKind::Admission,
+                "listener",
+                "route",
+                200,
+            )),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            store.append_usage_record(UsageRecord::new(
+                200,
+                "attacker-request",
+                "route",
+                "success",
+            )),
+            Err(expected.clone())
+        );
+        assert_eq!(store.prune(200), Err(expected.clone()));
+        assert_eq!(
+            store.rotate_master_key(
+                MasterKey::from_bytes(b"attacker-rotation-key").expect("master key")
+            ),
+            Err(expected)
+        );
+    }
+
+    #[test]
+    fn encrypted_store_fences_every_mutation_after_key_rotation() {
+        let directory = private_tempdir();
+        let path = directory.path().join("all-mutation-fence.sqlite");
+        let retention = policy(2, 1, 1)
+            .with_request_history(1, 100)
+            .expect("request retention")
+            .with_usage_history(1, 100)
+            .expect("usage retention");
+        let old_key = MasterKey::from_bytes(b"all-mutation-old-key").expect("old key");
+        let new_key = MasterKey::from_bytes(b"all-mutation-new-key").expect("new key");
+        let rotating =
+            SqliteStore::open_encrypted_with_retention(&path, retention, old_key.clone())
+                .expect("rotating store");
+        rotating
+            .upsert_credential_state(CredentialState::new("victim", "provider", true, 1))
+            .expect("victim credential");
+        rotating
+            .upsert_credential_payload(
+                "victim",
+                &CredentialPayload::new(b"protected-token").expect("payload"),
+                1,
+            )
+            .expect("victim payload");
+        rotating
+            .upsert_credential_state(CredentialState::new("sibling", "provider", false, 2))
+            .expect("sibling credential");
+        rotating
+            .upsert_credential_health(CredentialHealthState::new(
+                "victim",
+                CredentialHealthStatus::Healthy,
+                2,
+            ))
+            .expect("health");
+        rotating
+            .upsert_cooldown(CooldownState::new("provider", "provider", 100, 2))
+            .expect("cooldown");
+        rotating
+            .upsert_session_affinity(SessionAffinity::new(
+                "protected-session",
+                "provider",
+                "victim",
+                "model",
+                2,
+                100,
+            ))
+            .expect("affinity");
+        rotating
+            .append_decision(DecisionRecord::new(
+                "protected-decision",
+                "route",
+                "model",
+                2,
+            ))
+            .expect("decision");
+        rotating
+            .append_request_event(RequestEvent::new(
+                "protected-request",
+                0,
+                RequestEventKind::Admission,
+                "listener",
+                "route",
+                2,
+            ))
+            .expect("request event");
+        rotating
+            .append_usage_record(UsageRecord::new(2, "protected-request", "route", "success"))
+            .expect("usage record");
+
+        let stale = SqliteStore::open_encrypted_with_retention(&path, retention, old_key)
+            .expect("stale store");
+        let no_key = SqliteStore::open_with_retention(&path, retention).expect("no-key store");
+        rotating.rotate_master_key(new_key.clone()).expect("rotate");
+
+        assert_mutations_are_fenced(&stale, StoreError::WrongMasterKey);
+        assert_mutations_are_fenced(&no_key, StoreError::EncryptionRequired);
+        assert!(matches!(
+            SqliteStore::open_encrypted(
+                &path,
+                MasterKey::from_bytes(b"all-mutation-wrong-key").expect("wrong key"),
+            ),
+            Err(StoreError::WrongMasterKey)
+        ));
+
+        let current = SqliteStore::open_encrypted(&path, new_key).expect("current store");
+        assert_eq!(
+            current.len().expect("lengths"),
+            StoreLengths {
+                credentials: 2,
+                affinities: 1,
+                decisions: 1,
+                request_events: 1,
+                usage_records: 1,
+            }
+        );
+        assert_eq!(
+            current
+                .credential_payload("victim")
+                .expect("payload lookup")
+                .expect("payload")
+                .as_bytes(),
+            b"protected-token"
+        );
+        assert!(current
+            .credential_health("victim")
+            .expect("health lookup")
+            .is_some());
+        assert!(current
+            .cooldown("provider", "provider", 3)
+            .expect("cooldown lookup")
+            .is_some());
+        assert!(current
+            .session_affinity("protected-session", 3)
+            .expect("affinity lookup")
+            .is_some());
+        assert_eq!(
+            current.decisions().expect("decisions")[0].request_id,
+            "protected-decision"
+        );
+        assert_eq!(
+            current.request_events().expect("request events")[0].request_id,
+            "protected-request"
+        );
+        assert_eq!(
+            current.usage_records().expect("usage records")[0].request_id,
+            "protected-request"
+        );
     }
 
     #[test]
@@ -2092,7 +3231,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_master_key_cas_does_not_mutate_existing_token_or_revision() {
+    fn wrong_master_key_open_does_not_mutate_existing_token_or_revision() {
         let directory = private_tempdir();
         let path = directory.path().join("pooler.sqlite");
         let correct_key = MasterKey::from_bytes(b"correct cas key").expect("key");
@@ -2109,21 +3248,13 @@ mod tests {
                 )
                 .expect("payload");
         }
-        let wrong_store = SqliteStore::open_encrypted(
-            &path,
-            MasterKey::from_bytes(b"wrong cas key").expect("wrong key"),
-        )
-        .expect("wrong-key open");
-        assert_eq!(
-            wrong_store.compare_and_swap_credential_payload(
-                "credential",
-                1,
-                &CredentialPayload::new(b"replacement-token").expect("payload"),
-                2,
+        assert!(matches!(
+            SqliteStore::open_encrypted(
+                &path,
+                MasterKey::from_bytes(b"wrong cas key").expect("wrong key"),
             ),
             Err(StoreError::WrongMasterKey)
-        );
-        drop(wrong_store);
+        ));
 
         let store = SqliteStore::open_encrypted(&path, correct_key).expect("correct reopen");
         assert_eq!(
@@ -2279,6 +3410,172 @@ mod tests {
     }
 
     #[test]
+    fn wrong_key_first_v6_upgrade_does_not_claim_encryption_fence() {
+        let directory = private_tempdir();
+        let path = directory.path().join("v6-encrypted.sqlite");
+        let correct_key = MasterKey::from_bytes(b"v6-upgrade-correct-key").expect("key");
+        let cipher = CredentialCipher::new(correct_key.clone());
+        let connection = Connection::open(&path).expect("create database");
+        for &(version, sql) in MIGRATIONS.iter().take(6) {
+            connection
+                .execute_batch(sql)
+                .expect("apply legacy migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("set legacy version");
+        }
+        connection
+            .execute(
+                "INSERT INTO credentials
+                 (credential_id, provider_id, enabled, updated_at, revision)
+                 VALUES ('credential', 'provider', 1, 1, 1)",
+                [],
+            )
+            .expect("credential");
+        let credential_envelope = cipher
+            .seal_for(
+                &CredentialPayload::new(b"credential-token").expect("payload"),
+                b"credential",
+            )
+            .expect("credential envelope");
+        connection
+            .execute(
+                "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
+                 VALUES ('credential', ?1, 1)",
+                params![credential_envelope],
+            )
+            .expect("credential payload");
+        let mut event = RequestEvent::new(
+            "legacy-request",
+            0,
+            RequestEventKind::Completion,
+            "listener",
+            "route",
+            1,
+        );
+        event.id = 1;
+        let event_envelope = encrypt_request_event(&cipher, &event).expect("event envelope");
+        connection
+            .execute(
+                "INSERT INTO request_events (recorded_at, envelope)
+                 VALUES (1, ?1)",
+                params![event_envelope],
+            )
+            .expect("request event");
+        let mut usage = UsageRecord::new(1, "legacy-request", "route", "success");
+        usage.id = 1;
+        let usage_envelope = encrypt_usage_record(&cipher, &usage).expect("usage envelope");
+        connection
+            .execute(
+                "INSERT INTO usage_records (recorded_at, envelope)
+                 VALUES (1, ?1)",
+                params![usage_envelope],
+            )
+            .expect("usage record");
+        drop(connection);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("database permissions");
+        }
+
+        assert!(matches!(
+            SqliteStore::open_encrypted(
+                &path,
+                MasterKey::from_bytes(b"v6-upgrade-wrong-key").expect("wrong key")
+            ),
+            Err(StoreError::WrongMasterKey)
+        ));
+        let store = SqliteStore::open_encrypted(&path, correct_key).expect("correct key");
+        assert_eq!(
+            store
+                .credential_payload("credential")
+                .expect("payload")
+                .expect("credential")
+                .as_bytes(),
+            b"credential-token"
+        );
+        assert_eq!(
+            store
+                .request_events_for("legacy-request")
+                .expect("legacy timeline")
+                .len(),
+            1
+        );
+        assert_eq!(store.usage_records().expect("legacy usage").len(), 1);
+        let connection = store.connection.lock().expect("connection");
+        let indexed: (bool, bool) = connection
+            .query_row(
+                "SELECT request_index IS NOT NULL, event_index IS NOT NULL
+                 FROM request_events WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("backfilled indexes");
+        assert_eq!(indexed, (true, true));
+    }
+
+    #[test]
+    fn v5_upgrade_backfills_legacy_request_indexes() {
+        let directory = private_tempdir();
+        let path = directory.path().join("v5-request-history.sqlite");
+        let key = MasterKey::from_bytes(b"v5-upgrade-key").expect("key");
+        let cipher = CredentialCipher::new(key.clone());
+        let connection = Connection::open(&path).expect("create database");
+        for &(version, sql) in MIGRATIONS.iter().take(5) {
+            connection
+                .execute_batch(sql)
+                .expect("apply legacy migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("set legacy version");
+        }
+        let mut event = RequestEvent::new(
+            "v5-request",
+            0,
+            RequestEventKind::Completion,
+            "listener",
+            "route",
+            1,
+        );
+        event.id = 1;
+        let envelope = encrypt_request_event(&cipher, &event).expect("event envelope");
+        connection
+            .execute(
+                "INSERT INTO request_events (recorded_at, envelope) VALUES (1, ?1)",
+                params![envelope],
+            )
+            .expect("event");
+        drop(connection);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("database permissions");
+        }
+
+        let store = SqliteStore::open_encrypted(&path, key).expect("upgrade");
+        assert_eq!(
+            store
+                .request_events_for("v5-request")
+                .expect("timeline")
+                .len(),
+            1
+        );
+        let connection = store.connection.lock().expect("connection");
+        let indexed: (bool, bool) = connection
+            .query_row(
+                "SELECT request_index IS NOT NULL, event_index IS NOT NULL
+                 FROM request_events WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("backfilled indexes");
+        assert_eq!(indexed, (true, true));
+    }
+
+    #[test]
     fn request_history_is_encrypted_bounded_and_authenticated() {
         let directory = private_tempdir();
         let path = directory.path().join("requests.sqlite");
@@ -2341,6 +3638,226 @@ mod tests {
             )),
             Err(StoreError::EncryptionRequired)
         );
+    }
+
+    #[test]
+    fn request_timeline_merges_legacy_and_indexed_rows_after_migration() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"mixed-request-history-key").expect("master key"),
+        )
+        .expect("store");
+        let legacy = store
+            .append_request_event(RequestEvent::new(
+                "mixed-request",
+                0,
+                RequestEventKind::Admission,
+                "listener",
+                "route",
+                1,
+            ))
+            .expect("legacy event");
+        let indexed = store
+            .append_request_event(RequestEvent::new(
+                "mixed-request",
+                1,
+                RequestEventKind::Completion,
+                "listener",
+                "route",
+                2,
+            ))
+            .expect("indexed event");
+        {
+            let connection = store.connection.lock().expect("connection");
+            connection
+                .execute(
+                    "UPDATE request_events
+                     SET request_index = NULL, event_index = NULL WHERE id = ?1",
+                    [legacy.id],
+                )
+                .expect("mark pre-migration row");
+        }
+
+        assert_eq!(
+            store
+                .request_events_for("mixed-request")
+                .expect("mixed timeline"),
+            vec![legacy, indexed]
+        );
+    }
+
+    #[test]
+    fn request_history_cap_counts_legacy_and_indexed_rows_together() {
+        let retention = policy(4, 4, 4)
+            .with_request_history(128, 1_000_000)
+            .expect("request retention");
+        let store = SqliteStore::open_in_memory_encrypted_with_retention(
+            retention,
+            MasterKey::from_bytes(b"mixed-request-cap-key").expect("master key"),
+        )
+        .expect("encrypted store");
+        for event_index in 0..MAX_REQUEST_EVENTS_PER_REQUEST as u32 {
+            store
+                .append_request_event(RequestEvent::new(
+                    "mixed-cap",
+                    event_index,
+                    RequestEventKind::Attempt,
+                    "listener",
+                    "route",
+                    u64::from(event_index),
+                ))
+                .expect("legacy candidate");
+        }
+        {
+            let connection = store.connection.lock().expect("connection");
+            connection
+                .execute(
+                    "UPDATE request_events SET request_index = NULL, event_index = NULL",
+                    [],
+                )
+                .expect("mark legacy rows");
+        }
+        for event_index in
+            MAX_REQUEST_EVENTS_PER_REQUEST as u32..(MAX_REQUEST_EVENTS_PER_REQUEST as u32 + 5)
+        {
+            store
+                .append_request_event(RequestEvent::new(
+                    "mixed-cap",
+                    event_index,
+                    RequestEventKind::Completion,
+                    "listener",
+                    "route",
+                    u64::from(event_index),
+                ))
+                .expect("indexed candidate");
+        }
+        let events = store.request_events_for("mixed-cap").expect("timeline");
+        assert_eq!(events.len(), MAX_REQUEST_EVENTS_PER_REQUEST);
+        assert_eq!(events.first().map(|event| event.event_index), Some(5));
+        assert_eq!(events.last().map(|event| event.event_index), Some(68));
+    }
+
+    #[test]
+    fn request_history_retention_uses_event_order_without_cross_request_scans() {
+        let retention = policy(4, 4, 4)
+            .with_request_history(128, 1_000_000)
+            .expect("request retention");
+        let store = SqliteStore::open_in_memory_encrypted_with_retention(
+            retention,
+            MasterKey::from_bytes(b"request-history-index-master-key").expect("master key"),
+        )
+        .expect("encrypted store");
+
+        for event_index in 0..(MAX_REQUEST_EVENTS_PER_REQUEST as u32 + 5) {
+            store
+                .append_request_event(RequestEvent::new(
+                    "one",
+                    event_index,
+                    RequestEventKind::Attempt,
+                    "listener",
+                    "route",
+                    u64::from(event_index),
+                ))
+                .expect("request event");
+        }
+        let events = store.request_events_for("one").expect("request timeline");
+        assert_eq!(events.len(), MAX_REQUEST_EVENTS_PER_REQUEST);
+        assert_eq!(events.first().map(|event| event.event_index), Some(5));
+        assert_eq!(events.last().map(|event| event.event_index), Some(68));
+        store
+            .append_request_event(RequestEvent::new(
+                "one",
+                2,
+                RequestEventKind::Retry,
+                "listener",
+                "route",
+                69,
+            ))
+            .expect("out-of-order event");
+        assert_eq!(
+            store
+                .request_events_for("one")
+                .expect("bounded timeline")
+                .len(),
+            MAX_REQUEST_EVENTS_PER_REQUEST
+        );
+
+        store
+            .append_request_event(RequestEvent::new(
+                "two",
+                0,
+                RequestEventKind::Admission,
+                "listener",
+                "route",
+                100,
+            ))
+            .expect("unrelated request event");
+        {
+            let connection = store.connection.lock().expect("connection");
+            connection
+                .execute(
+                    "UPDATE request_events SET envelope = X'00'
+                     WHERE id = (SELECT id FROM request_events WHERE event_index = 68)",
+                    [],
+                )
+                .expect("tamper unrelated event");
+        }
+        store
+            .append_request_event(RequestEvent::new(
+                "two",
+                1,
+                RequestEventKind::Completion,
+                "listener",
+                "route",
+                101,
+            ))
+            .expect("indexed retention must not decrypt unrelated events");
+        assert_eq!(
+            store
+                .request_events_for("two")
+                .expect("unrelated timeline remains readable")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_request_history_writes_remain_bounded_and_ordered() {
+        let retention = policy(8, 8, 8)
+            .with_request_history(8, 1_000_000)
+            .expect("request retention");
+        let store = Arc::new(
+            SqliteStore::open_in_memory_encrypted_with_retention(
+                retention,
+                MasterKey::from_bytes(b"request-history-concurrency-master-key")
+                    .expect("master key"),
+            )
+            .expect("encrypted store"),
+        );
+        let mut threads = Vec::new();
+        for worker in 0..16 {
+            let store = Arc::clone(&store);
+            threads.push(thread::spawn(move || {
+                store
+                    .append_request_event(RequestEvent::new(
+                        format!("request-{worker}"),
+                        0,
+                        RequestEventKind::Admission,
+                        "listener",
+                        "route",
+                        worker,
+                    ))
+                    .expect("request event");
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("request writer");
+        }
+        let events = store.request_events().expect("request history");
+        assert_eq!(events.len(), retention.max_request_events);
+        assert!(events.windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert!(events
+            .iter()
+            .all(|event| event.request_id.starts_with("request-")));
     }
 
     #[test]
@@ -2470,7 +3987,9 @@ mod tests {
                     ))
                     .expect("credential");
                 store
-                    .upsert_session_affinity(affinity(&id, worker, 100))
+                    .upsert_session_affinity(SessionAffinity::new(
+                        &id, "provider", &id, "model", worker, 100,
+                    ))
                     .expect("affinity");
                 store
                     .append_decision(DecisionRecord::new(

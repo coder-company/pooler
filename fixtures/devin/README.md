@@ -1,11 +1,10 @@
 # Devin reference fixtures
 
 These sanitized wire fixtures are grounded in the `widevin` reference source
-at commit `6c48392052caaecca820ec41df9d87ed818dfc21`:
+at commit `6c48392052caaecca820ec41df9d87ed818dfc21`.
 
-`/home/chaitanya/devin-local-bridge-upstream/rust/fixtures`
-
-The two model-discovery fixtures are copied byte-for-byte from that snapshot.
+The two model-discovery fixtures are copied byte-for-byte from the upstream
+`rust/fixtures` directory at that snapshot.
 The Connect fixture uses the same minimal Prost schema and sanitized values as
 the snapshot's `rust/tests/chat.rs` and `rust/tests/connect.rs` tests. It keeps
 the complete encoded request and response envelopes so tests can verify wire

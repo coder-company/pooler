@@ -319,6 +319,16 @@
       state.endpointMeta = {};
       state.lastSuccessfulRefresh = null;
       state.connectionAccount = "";
+      state.accountDraft.busy = false;
+      state.oauthDevice = {
+        account: "",
+        requestId: null,
+        status: "",
+        verificationUri: "",
+        verificationUriComplete: "",
+        userCode: "",
+        busy: false,
+      };
       state.requestExplorer.route = "";
       state.requestExplorer.provider = "";
       state.requestExplorer.status = "";
@@ -389,8 +399,8 @@
     input.value = state.token;
     input.type = "password";
     visibility.innerHTML = ic("eye-empty", 16);
-    visibility.setAttribute("aria-label", "Show bearer token");
-    visibility.title = "Show bearer token";
+    visibility.setAttribute("aria-label", "Show management secret");
+    visibility.title = "Show management secret";
     if (!dialog.open) dialog.showModal();
     setTimeout(() => input.focus(), 50);
   }
@@ -1994,6 +2004,7 @@
 
   async function startOAuthDevice(account, trigger) {
     if (state.oauthDevice.busy) return;
+    const sessionGeneration = state.sessionGeneration;
     state.oauthDevice = {
       account,
       requestId: null,
@@ -2008,16 +2019,22 @@
       const result = await mutate(
         `/accounts/${encodeURIComponent(account)}/oauth-device`,
       );
+      if (sessionGeneration !== state.sessionGeneration) return;
       state.oauthDevice.requestId = result.request_id;
       if (!Number.isSafeInteger(result.request_id))
         throw new Error("server did not return a bounded OAuth request ID");
       renderAccounts($("#view"));
-      pollOAuthDevice(result.request_id, account, state.sessionGeneration);
+      pollOAuthDevice(result.request_id, account, sessionGeneration);
     } catch (error) {
+      if (sessionGeneration !== state.sessionGeneration) return;
       state.oauthDevice.busy = false;
       state.oauthDevice.status = "failed";
-      notify("error", `OAuth device authorization failed: ${error.message}`);
-      if (state.route === "accounts") renderAccounts($("#view"));
+      if (error.status === 401) {
+        authRequired();
+      } else {
+        notify("error", `OAuth device authorization failed: ${error.message}`);
+        if (state.route === "accounts") renderAccounts($("#view"));
+      }
     }
   }
 
@@ -2056,6 +2073,7 @@
   async function createAccountDraft(trigger) {
     const draft = state.accountDraft;
     if (draft.busy) return;
+    const sessionGeneration = state.sessionGeneration;
     const secret =
       draft.authKind === "oauth"
         ? undefined
@@ -2081,6 +2099,7 @@
         auth_kind: draft.authKind,
         ...(secret ? { secret } : {}),
       });
+      if (sessionGeneration !== state.sessionGeneration) return;
       state.configuration.draftId = result.draft_id;
       state.configuration.etag = result.etag;
       state.configuration.diff = result.semantic_diff || [];
@@ -2091,10 +2110,15 @@
       );
       window.location.hash = "configuration";
     } catch (error) {
-      notify("error", `Account draft failed: ${error.message}`);
+      if (sessionGeneration !== state.sessionGeneration) return;
+      if (error.status === 401) authRequired();
+      else notify("error", `Account draft failed: ${error.message}`);
     } finally {
-      draft.busy = false;
-      if (state.route === "accounts") renderAccounts($("#view"));
+      if (sessionGeneration === state.sessionGeneration) {
+        draft.busy = false;
+        if (state.route === "accounts" && state.authState !== "required")
+          renderAccounts($("#view"));
+      }
     }
   }
 
@@ -3339,7 +3363,7 @@
     $("#session-dialog [data-close]").innerHTML = ic("cancel", 16);
     $("#confirm-dialog [data-close]").innerHTML = ic("cancel", 16);
     $("#token-visibility").innerHTML = ic("eye-empty", 16);
-    $("#token-visibility").title = "Show bearer token";
+    $("#token-visibility").title = "Show management secret";
 
     $(".skip-link").addEventListener("click", (event) => {
       event.preventDefault();
@@ -3412,11 +3436,11 @@
       $("#token-visibility").innerHTML = ic(show ? "eye-off" : "eye-empty", 16);
       $("#token-visibility").setAttribute(
         "aria-label",
-        show ? "Hide bearer token" : "Show bearer token",
+        show ? "Hide management secret" : "Show management secret",
       );
       $("#token-visibility").title = show
-        ? "Hide bearer token"
-        : "Show bearer token";
+        ? "Hide management secret"
+        : "Show management secret";
       input.focus();
     });
 

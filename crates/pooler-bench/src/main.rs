@@ -1583,9 +1583,17 @@ async fn send_http_request(
 
 fn validate_factory_stream(status: u16, body: &[u8]) -> Result<()> {
     if status != 200 {
-        let diagnostic = match body {
-            b"upstream request failed" => "pooler upstream request failure",
-            b"upstream response could not be converted" => "pooler semantic response failure",
+        let code = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/error/code")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let diagnostic = match code.as_deref() {
+            Some("upstream_error" | "upstream_timeout") => "pooler upstream request failure",
+            Some("invalid_upstream_response") => "pooler semantic response failure",
             _ => "unclassified bounded response",
         };
         bail!("semantic stress request returned HTTP {status}: {diagnostic}")

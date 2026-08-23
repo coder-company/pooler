@@ -281,11 +281,7 @@ def binary_identity(path: Path, version_args: list[str]) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pooler-bin", type=Path, default=Path("target/release/pooler"))
-    parser.add_argument(
-        "--cliproxy-bin",
-        type=Path,
-        default=Path("/home/chaitanya/.local/bin/cliproxyapi-plus"),
-    )
+    parser.add_argument("--cliproxy-bin", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=240)
     parser.add_argument("--warmup", type=int, default=24)
     parser.add_argument("--concurrency", type=int, default=8)

@@ -547,7 +547,7 @@ fn built_in_endpoint_overrides_enforce_host_and_network_boundaries() {
             .endpoint_candidates(ProviderOperation::ListModels, None)
             .expect("custom endpoint")[0]
             .as_str(),
-        "https://unrelated.example.com/v1/v1/models"
+        "https://unrelated.example.com/v1/models"
     );
 
     for forbidden in [

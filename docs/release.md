@@ -9,8 +9,9 @@ The release helper produces one deterministic `tar.gz` archive for each of:
 - `aarch64-apple-darwin`
 
 Every archive contains the `pooler` executable, `README.md`, `LICENSE`,
-`NOTICE`, both example configurations, `schema/pooler.schema.json`, the
-sanitized compatibility manifest/report, and CycloneDX 1.5 and SPDX 2.3 SBOMs.
+`NOTICE`, all seven example configurations, the hardened systemd/deployment
+examples and validator, `schema/pooler.schema.json`, the sanitized
+compatibility manifest/report, and CycloneDX 1.5 and SPDX 2.3 SBOMs.
 
 ## Local build
 
@@ -23,6 +24,13 @@ rustup target add x86_64-apple-darwin
 rustup target add aarch64-apple-darwin
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) scripts/release.sh --output dist
 ```
+
+The output directory must not already contain a Pooler archive or
+`SHA256SUMS`; the helper refuses to delete or overwrite prior releases. A full
+four-target local build also needs the appropriate Linux cross linker and the
+Apple SDK/toolchain on macOS. The hosted release workflow builds every target
+on its native Linux or macOS architecture and is the supported publication
+path.
 
 The helper sets `CARGO_INCREMENTAL=0`, preserves deterministic caller flags,
 and adds a rustc `--remap-path-prefix` for the checkout. It compiles each

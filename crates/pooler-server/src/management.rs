@@ -2017,7 +2017,9 @@ impl ManagementApi {
             return ManagementResponse::asset(StatusCode::OK, content_type, body, head);
         }
         let response = match path {
-            "/health" | "/healthz" | "/" => self.health(snapshot, pooling),
+            "/health" | "/healthz" | "/ready" | "/readiness" | "/" => {
+                self.health(snapshot, pooling)
+            }
             path if is_config_request(path) => self.handle_config_request(
                 method,
                 path,
@@ -2048,7 +2050,11 @@ impl ManagementApi {
             "/metrics/prometheus" => ManagementResponse::body(
                 StatusCode::OK,
                 "text/plain; version=0.0.4; charset=utf-8",
-                self.metrics.export_prometheus().into_bytes(),
+                format_persistence_prometheus(
+                    self.metrics.export_prometheus(),
+                    &pooling.persistence_status().json(),
+                )
+                .into_bytes(),
                 head,
             ),
             "/active" | "/active-counts" => self.active(),
@@ -2222,15 +2228,23 @@ impl ManagementApi {
             .iter()
             .filter(|state| matches!(state.scope.as_str(), "provider" | "provider_model"))
             .count();
+        let persistence = pooling.persistence_status().json();
+        let ready = persistence["complete"].as_bool().unwrap_or(false);
         ManagementResponse::json(
-            StatusCode::OK,
+            if ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
             json!({
-                "status": "ok",
+                "status": if ready { "ok" } else { "degraded" },
+                "ready": ready,
                 "configuration_generation": snapshot.generation().value(),
                 "management": {"mutations": self.plan.auth().is_some()},
                 "active": self.active.total(),
                 "credential_health_entries": credentials,
                 "cooling_provider_entries": cooling_providers,
+                "persistence": persistence,
             }),
             false,
         )
@@ -2506,11 +2520,14 @@ impl ManagementApi {
                         )
                     })
                 });
+        let persistence = pooling.persistence_status().json();
+        let persistence_complete = persistence["complete"].as_bool().unwrap_or(false);
         let all_ready = provider_configured
             && account_configured
             && account_available
             && model_available
-            && discovery_verified;
+            && discovery_verified
+            && persistence_complete;
         ManagementResponse::json(
             StatusCode::OK,
             json!({
@@ -2518,6 +2535,7 @@ impl ManagementApi {
                 "configuration_generation": snapshot.generation().value(),
                 "ready": all_ready,
                 "connection": if discovery_verified {"verified"} else {"not_probed"},
+                "persistence": persistence,
                 "checks": [
                     {"id": "generated_configuration", "status": "passed", "detail": "Generated YAML passed Pooler's compiler."},
                     {"id": "provider", "status": if provider_configured {"passed"} else {"pending"}, "detail": if provider_configured {"Provider is present in the active generation."} else {"Apply the generated configuration and reload Pooler."}},
@@ -2525,6 +2543,7 @@ impl ManagementApi {
                     {"id": "model", "status": if model_available {"passed"} else {"pending"}, "detail": if model_available {"The selected model is published for this provider."} else {"Reload model discovery or apply the generated static model mapping."}},
                     {"id": "catalog_reload", "status": if reload_verified {"passed"} else {"failed"}, "detail": if reload_verified {"The correlated catalog reload succeeded for the active configuration and catalog generations."} else {"The correlated catalog reload did not succeed for the active configuration and catalog generations."}},
                     {"id": "connectivity", "status": if discovery_verified {"passed"} else {"not_run"}, "detail": if discovery_verified {"A matching model-discovery observation was recorded after the correlated reload request."} else {"No fresh matching discovery observation followed the correlated reload request; retained last-good state is not accepted. This check does not send a billable inference request."}},
+                    {"id": "persistence", "status": if persistence_complete {"passed"} else {"failed"}, "detail": if persistence_complete {"Historical request and usage writes are complete."} else {"Historical request or usage persistence is incomplete; readiness is withheld until the lost-write condition is investigated."}},
                 ],
             }),
             false,
@@ -5403,6 +5422,22 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         let prometheus = String::from_utf8(prometheus.body).expect("Prometheus text");
         assert!(prometheus.contains("pooler_persistence_complete 0"));
         assert!(prometheus.contains("pooler_persistence_lost_writes{stream=\"usage_records\"} 1"));
+
+        let prometheus = api.handle(&Method::GET, "/metrics/prometheus", &headers);
+        assert_eq!(prometheus.status, StatusCode::OK);
+        let prometheus = String::from_utf8(prometheus.body).expect("Prometheus text");
+        assert!(prometheus.contains("pooler_persistence_complete 0"));
+        assert!(prometheus.contains("pooler_persistence_lost_writes{stream=\"request_events\"} 1"));
+        assert!(prometheus.contains("pooler_persistence_lost_writes{stream=\"usage_records\"} 1"));
+
+        let health = api.handle(&Method::GET, "/health", &headers);
+        assert_eq!(health.status, StatusCode::SERVICE_UNAVAILABLE);
+        let health = response_value(health);
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["ready"], false);
+        assert_eq!(health["persistence"]["complete"], false);
+        let readiness = api.handle(&Method::GET, "/readiness", &headers);
+        assert_eq!(readiness.status, StatusCode::SERVICE_UNAVAILABLE);
 
         let detail = api.handle(&Method::GET, "/requests/missing", &headers);
         assert_eq!(detail.status, StatusCode::SERVICE_UNAVAILABLE);

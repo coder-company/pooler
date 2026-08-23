@@ -28,8 +28,8 @@ control accounts, prefixes, aliases, filters, bounds, and refresh behavior.
 Inspect the effective vendored facts without reading credentials:
 
 ```console
-pooler providers groq
-pooler providers groq --json
+pooler providers --search groq
+pooler providers --search groq --json
 ```
 
 Most entries use the conservative OpenAI-compatible defaults. Provider-specific

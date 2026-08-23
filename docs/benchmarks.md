@@ -89,8 +89,9 @@ isolated processes is directed to a closed loopback port.
 ```sh
 cargo build --locked --release -p pooler-cli
 python3 scripts/benchmark-cliproxyapi.py \
+  --cliproxy-bin /path/to/cli-proxy-api \
   --samples 240 --warmup 24 --concurrency 8 \
-  --output-dir .omo/evidence/cliproxyapi-benchmark
+  --output-dir target/benchmarks/cliproxyapi
 ```
 
 Every endpoint receives the same valid 1 MiB OpenAI Chat request and every

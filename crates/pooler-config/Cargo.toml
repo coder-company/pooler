@@ -12,12 +12,16 @@ http.workspace = true
 pooler-core = { path = "../pooler-core" }
 pooler-model-catalog = { path = "../pooler-model-catalog" }
 pooler-protocol = { path = "../pooler-protocol" }
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
 serde_yml.workspace = true
 thiserror.workspace = true
 url.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"

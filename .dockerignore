@@ -1,0 +1,33 @@
+# Keep the build context free of generated artifacts, local state, and
+# anything that could contain credentials. Secrets are mounted at runtime.
+.git
+.github
+.target
+/target
+**/target
+
+# Local state and private deployment material
+deploy/data
+deploy/secrets
+deploy/config
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.key
+*.pem
+*.p12
+*.env
+.env*
+
+# Editor and OS files
+.DS_Store
+.idea
+.vscode
+*.swp
+*.swo
+
+# Local reports/caches
+.structurely
+.ruff_cache
+__pycache__

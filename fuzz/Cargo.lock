@@ -1113,12 +1113,14 @@ dependencies = [
  "pooler-core",
  "pooler-model-catalog",
  "pooler-protocol",
+ "rustix",
  "serde",
  "serde_json",
  "serde_path_to_error",
  "serde_yaml_ng",
  "thiserror",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1199,6 +1201,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tokio-util",
+ "tower-service",
  "tracing",
  "url",
  "zeroize",

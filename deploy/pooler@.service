@@ -1,0 +1,53 @@
+[Unit]
+Description=Pooler AI protocol runtime (%i)
+Documentation=https://github.com/coder-company/pooler/blob/main/docs/deployment.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/pooler/%i/pooler.yaml
+ConditionPathExists=/etc/pooler/%i/pooler.example.yaml
+ConditionPathExists=/etc/pooler/%i/store.key
+ConditionPathExists=/etc/pooler/%i/upstream.key
+ConditionPathExists=/etc/pooler/%i/downstream.key
+
+[Service]
+Type=simple
+User=pooler
+Group=pooler
+UMask=0077
+WorkingDirectory=/var/lib/pooler/%i
+StateDirectory=pooler/%i
+StateDirectoryMode=0700
+
+ExecStartPre=/usr/local/bin/pooler --config /etc/pooler/%i/pooler.yaml check
+ExecStart=/usr/local/bin/pooler --config /etc/pooler/%i/pooler.yaml --credential-store /var/lib/pooler/%i/credentials.sqlite3 --credential-key-ref file:/etc/pooler/%i/store.key serve
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35s
+KillSignal=SIGTERM
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/pooler/%i
+BindReadOnlyPaths=/etc/pooler/%i/upstream.key:/run/secrets/upstream.key
+BindReadOnlyPaths=/etc/pooler/%i/downstream.key:/run/secrets/downstream.key
+
+[Install]
+WantedBy=multi-user.target

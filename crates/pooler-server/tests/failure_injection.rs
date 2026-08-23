@@ -1028,7 +1028,11 @@ async fn execute_truncated_connect(case: &Case, counters: LeakCounters) {
     )
     .await;
     assert_eq!(response_status(&response), 400);
-    assert_eq!(decoded_http_body(&response), b"invalid request");
+    let error: serde_json::Value = serde_json::from_slice(&decoded_http_body(&response))
+        .expect("local error is OpenAI-compatible JSON");
+    assert_eq!(error["error"]["message"], "invalid request");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "invalid_request");
     sleep(RETRY_GRACE).await;
     let attempts = upstream.stop().await;
     assert_eq!(attempts, case.expected_attempts, "{} attempts", case.id);

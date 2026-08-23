@@ -2481,16 +2481,49 @@ fn semantic_header_value(key: &str, headers: &HeaderMap) -> Option<String> {
 fn cooldown_key(scope: &CooldownScope) -> (&'static str, String) {
     match scope {
         CooldownScope::Credential(id) => ("credential", id.to_string()),
-        CooldownScope::CredentialModel { credential, model } => {
-            ("credential_model", format!("{credential}:{model}"))
-        }
+        CooldownScope::CredentialModel { credential, model } => (
+            "credential_model",
+            encode_compound_cooldown_key(credential.as_str(), model.as_str()),
+        ),
         CooldownScope::Model(model) => ("model", model.to_string()),
         CooldownScope::Provider(provider) => ("provider", provider.to_string()),
-        CooldownScope::ProviderModel { provider, model } => {
-            ("provider_model", format!("{provider}:{model}"))
-        }
+        CooldownScope::ProviderModel { provider, model } => (
+            "provider_model",
+            encode_compound_cooldown_key(provider.as_str(), model.as_str()),
+        ),
         CooldownScope::Route(route) => ("route", route.to_string()),
     }
+}
+
+fn encode_compound_cooldown_key(left: &str, right: &str) -> String {
+    format!("v2:{}:{}:{}{}", left.len(), right.len(), left, right)
+}
+
+fn decode_compound_cooldown_key(key: &str) -> Option<(String, String)> {
+    let value = key.strip_prefix("v2:")?;
+    let (left_length, value) = value.split_once(':')?;
+    let (right_length, value) = value.split_once(':')?;
+    let left_length = left_length.parse::<usize>().ok()?;
+    let right_length = right_length.parse::<usize>().ok()?;
+    let bytes = value.as_bytes();
+    let total = left_length.checked_add(right_length)?;
+    if bytes.len() != total {
+        return None;
+    }
+    let left = String::from_utf8(bytes[..left_length].to_vec()).ok()?;
+    let right = String::from_utf8(bytes[left_length..].to_vec()).ok()?;
+    Some((left, right))
+}
+
+fn parse_compound_cooldown_key(key: &str) -> Option<(String, String)> {
+    decode_compound_cooldown_key(key).or_else(|| {
+        // Legacy keys were only unambiguous when neither component contained
+        // a colon. Keep accepting that safe subset for restart compatibility.
+        (key.matches(':').count() == 1).then(|| {
+            key.split_once(':')
+                .map(|(left, right)| (left.to_owned(), right.to_owned()))
+        })?
+    })
 }
 
 fn parse_cooldown_scope(scope: &str, key: &str) -> Option<(CooldownScope, Option<String>)> {
@@ -2501,11 +2534,11 @@ fn parse_cooldown_scope(scope: &str, key: &str) -> Option<(CooldownScope, Option
             None,
         )),
         "credential_model" => {
-            let (credential, model) = key.split_once(':')?;
+            let (credential, model) = parse_compound_cooldown_key(key)?;
             Some((
                 CooldownScope::CredentialModel {
-                    credential: CredentialId::new(credential.to_owned()).ok()?,
-                    model: parse_id(model)?,
+                    credential: CredentialId::new(credential).ok()?,
+                    model: parse_id(&model)?,
                 },
                 None,
             ))
@@ -2516,11 +2549,11 @@ fn parse_cooldown_scope(scope: &str, key: &str) -> Option<(CooldownScope, Option
             None,
         )),
         "provider_model" => {
-            let (provider, model) = key.split_once(':')?;
+            let (provider, model) = parse_compound_cooldown_key(key)?;
             Some((
                 CooldownScope::ProviderModel {
-                    provider: ProviderId::new(provider.to_owned()).ok()?,
-                    model: parse_id(model)?,
+                    provider: ProviderId::new(provider).ok()?,
+                    model: parse_id(&model)?,
                 },
                 None,
             ))
@@ -2592,8 +2625,9 @@ mod tests {
     use super::*;
     use http::HeaderValue;
     use pooler_config::compile_yaml;
+    use pooler_store::SqliteStore;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{tempdir, NamedTempFile};
 
     #[test]
     fn account_secret_preserves_custom_header_placement() {
@@ -2800,6 +2834,83 @@ routes:
         assert_ne!(first_id, second_id);
         assert!(RequestId::parse(&first_id).is_ok());
         assert!(RequestId::parse(&second_id).is_ok());
+    }
+
+    #[test]
+    fn compound_cooldown_keys_round_trip_colons_without_legacy_ambiguity() {
+        let credential = CredentialId::new("a:b").expect("credential");
+        let model = ModelId::new("model:c").expect("model");
+        let (scope, key) = cooldown_key(&CooldownScope::CredentialModel {
+            credential: credential.clone(),
+            model: model.clone(),
+        });
+        assert_eq!(scope, "credential_model");
+        assert!(key.starts_with("v2:"));
+        let (parsed, registry_key) = parse_cooldown_scope(scope, &key).expect("parse key");
+        assert_eq!(registry_key, None);
+        assert_eq!(parsed, CooldownScope::CredentialModel { credential, model });
+
+        assert!(parse_cooldown_scope("credential_model", "a:b:model").is_none());
+        let (legacy, _) =
+            parse_cooldown_scope("credential_model", "a:model").expect("safe legacy key");
+        assert_eq!(
+            legacy,
+            CooldownScope::CredentialModel {
+                credential: CredentialId::new("a").expect("credential"),
+                model: ModelId::new("model").expect("model"),
+            }
+        );
+    }
+
+    #[test]
+    fn compound_cooldown_persists_restarts_and_deletes_the_exact_credential() {
+        let directory = tempdir().expect("temporary directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(directory.path())
+                .expect("temporary directory metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(directory.path(), permissions)
+                .expect("owner-private temporary directory");
+        }
+        let path = directory.path().join("cooldowns.sqlite");
+        let store = SqliteStore::open(&path).expect("store");
+        store
+            .upsert_credential_state(CredentialState::new("a", "provider", true, 1))
+            .expect("short credential");
+        store
+            .upsert_credential_state(CredentialState::new("a:b", "provider", true, 1))
+            .expect("long credential");
+        let credential = CredentialId::new("a:b").expect("credential");
+        let model = ModelId::new("model:c").expect("model");
+        let (_, key) = cooldown_key(&CooldownScope::CredentialModel { credential, model });
+        store
+            .upsert_cooldown(CooldownState::new("credential_model", key.clone(), 100, 1))
+            .expect("cooldown");
+        drop(store);
+
+        let reopened = SqliteStore::open(&path).expect("restart");
+        assert!(matches!(
+            parse_cooldown_scope("credential_model", &key),
+            Some((CooldownScope::CredentialModel { ref credential, .. }, None))
+                if credential.as_str() == "a:b"
+        ));
+        reopened
+            .remove_credential_state("a")
+            .expect("remove short credential");
+        assert!(reopened
+            .cooldown("credential_model", &key, 2)
+            .expect("long cooldown")
+            .is_some());
+        reopened
+            .remove_credential_state("a:b")
+            .expect("remove long credential");
+        assert!(reopened
+            .cooldown("credential_model", &key, 2)
+            .expect("removed cooldown")
+            .is_none());
     }
 
     #[test]
