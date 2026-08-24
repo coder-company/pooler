@@ -2,39 +2,42 @@
 
 This guide provides the complete **Agent-Native** onboarding architecture for Pooler.
 
-Instead of reading lengthy documentation and hand-crafting configurations, users give an **Initiation Prompt** to their AI coding agent (Cursor, Devin, Claude Code, Factory Droid, Codex). The agent then executes the **Autonomous Setup Protocol**, using interactive user tools to discover needs, configure subscriptions, set up presets, and start the proxy.
+When setting up Pooler from any repository or workspace, paste the **Initiation Prompt** below into your AI coding agent (Cursor, Devin, Claude Code, Factory Droid, Codex). The agent will reference the Pooler repository at [https://github.com/coder-company/pooler](https://github.com/coder-company/pooler), interactively ask for your requirements, install Pooler, and configure everything end-to-end.
 
 ---
 
 ## 1. What the User Pastes to Their Agent (Initiation Prompt)
 
-Copy and paste this prompt into your AI coding agent's chat box:
+Copy and paste this prompt into your AI coding agent's chat:
 
 ```text
-Set up and configure Pooler for this workspace:
+Set up and configure Pooler for this workspace from https://github.com/coder-company/pooler:
 1. First, ask me using your interactive question tool:
    - Which coding tool/agent I am using (Cursor, Devin, Factory Droid, Claude Code / Codex, or General SDK/Gateway).
    - What credentials/subscriptions I want to connect (ChatGPT / Codex subscription via device OAuth, Google Gemini OAuth, Anthropic Claude API key, OpenAI API key, xAI Grok, or Custom).
    - Whether I want multi-account pooling with automatic rate-limit failover.
    - What specific models or reasoning settings I want enabled (e.g. gpt-4o, claude-3-7-sonnet, gemini-2.5-pro, o3-mini with high reasoning).
-2. Read llms.txt or docs/agent-native.md to load the exact configuration recipes and ports.
-3. Initialize the starter workspace using `pooler init --output ./pooler-starter`.
-4. Apply the required preset or configuration with secure secret references (env:, file:, or keyring:).
-5. Guide me through authentication (such as running `pooler auth login openai --method device-code` for Codex subscriptions or setting environment variables).
-6. Run `pooler check` and `pooler preflight` to verify setup without billable inference.
-7. Start the server and confirm the exact local base URL for my coding tool.
+2. Fetch documentation and recipes from https://raw.githubusercontent.com/coder-company/pooler/main/llms.txt or inspect the repository at https://github.com/coder-company/pooler.
+3. Install the Pooler binary if not already present:
+   `curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | bash`
+4. Initialize the starter workspace using `pooler init --output ./pooler-starter`.
+5. Apply the required preset or configuration with secure secret references (env:, file:, or keyring:).
+6. Guide me through authentication (such as running `pooler auth login openai --method device-code` for Codex subscriptions or setting environment variables).
+7. Run `pooler check` and `pooler preflight` to verify setup without billable inference.
+8. Start the server and confirm the exact local base URL for my coding tool.
 ```
 
 ---
 
 ## 2. Agent Execution System Prompt (Instructions for Agents)
 
-When an AI agent receives the initiation prompt, it must execute the following structured protocol:
+When an AI agent receives the initiation prompt, it executes the following protocol:
 
 ```markdown
 ### Agent Protocol for Pooler Setup
 
-You are an autonomous setup agent for Pooler by Coder Company. Your objective is to configure a production-grade local proxy runtime tailored to the user's workflow.
+Repository: https://github.com/coder-company/pooler
+Agent Index: https://raw.githubusercontent.com/coder-company/pooler/main/llms.txt
 
 #### Step 1: Interactive User Inquiry (Mandatory)
 Before writing any configuration files or running long commands, interactively prompt the user (using structured selection tools like AskQuestion when available):
@@ -52,9 +55,13 @@ Before writing any configuration files or running long commands, interactively p
    - Reasoning effort (e.g., `high` for o3/gpt models)
    - Fallback order and cooldown policies
 
-#### Step 2: Context & Workspace Discovery
-1. Inspect the workspace for existing configuration files (`pooler.yaml`, `~/.codex/credentials.json`, environment variables like `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`).
-2. Read `llms.txt` and `docs/adapters-and-presets.md` to reference exact preset syntax.
+#### Step 2: Binary Installation & Context Discovery
+1. If `pooler` is not installed on PATH, install it:
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | bash
+   ```
+2. Inspect the workspace for existing configuration files (`pooler.yaml`, `~/.codex/credentials.json`, environment variables).
+3. Read `https://raw.githubusercontent.com/coder-company/pooler/main/llms.txt` to reference preset schemas.
 
 #### Step 3: Initialization & Configuration Generation
 1. If no deployment exists, run:
@@ -152,8 +159,6 @@ Ensure zero failing checks and verify DNS/TLS reachability.
 ---
 
 ## 3. Specific Action Prompts for Agents
-
-Once initial setup is complete, users can give these direct task prompts to their agents:
 
 ### Pool Multiple Subscriptions for Zero-Downtime Rate Limits
 ```text
