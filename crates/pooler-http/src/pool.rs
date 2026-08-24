@@ -15,8 +15,8 @@ use std::{
 };
 
 use adapter_codex::CodexFailureClassifier;
-use adapter_providers::AuthPlacement;
-use http::HeaderMap;
+use adapter_providers::{AuthPlacement, KimiAdapter};
+use http::{HeaderMap, Uri};
 use pooler_auth::SecretRef as AuthSecretRef;
 use pooler_config::{
     AccountAuthKind, AccountPlan, CompiledConfig, PolicyPlan, RoutePlan, SecretRef,
@@ -28,18 +28,21 @@ use pooler_core::{
 };
 use pooler_model_catalog::{CatalogService, CatalogSnapshot, RequestOverlay};
 use pooler_policy::{
-    AffinityKey, CommitmentState, CooldownScope, CredentialRegistration, CredentialRegistry,
-    FailureClassification, FailureClassifier, HealthMutation, HealthSubject, HttpFailureClassifier,
-    ObservedFailure, PersistedQuotaSnapshot, ProviderNeutralQuotaClassifier, QuotaClassification,
-    QuotaClassifier, QuotaObservation, QuotaProjectKey, QuotaScope, QuotaSignal, QuotaUnit,
-    ReplayCheck, RetryContext, RetryDecision, RetryPolicy, SelectionError, SelectionExplanation,
-    SelectionLease, SelectionRequest,
+    AffinityKey, BindingKey, CandidateFacts, CommitmentState, CooldownScope,
+    CredentialRegistration, CredentialRegistry, FailureClassification, FailureClassifier,
+    HealthMutation, HealthSubject, HttpFailureClassifier, ObservedFailure, PersistedQuotaSnapshot,
+    ProviderNeutralQuotaClassifier, QuotaClassification, QuotaClassifier, QuotaObservation,
+    QuotaProjectKey, QuotaScope, QuotaSignal, QuotaUnit, ReplayCheck, RetryContext, RetryDecision,
+    RetryPolicy, RoutingRequirements, RoutingTelemetry, SelectionError, SelectionExplanation,
+    SelectionLease, SelectionRequest, TelemetrySample,
 };
 use pooler_store::{
-    CooldownState, CredentialHealthState, CredentialHealthStatus, CredentialState,
-    DecisionCandidate, DecisionRecord, MemoryStore, SessionAffinity, Store, StoreError,
+    AffinityBindingIdentity, CooldownState, CredentialHealthState, CredentialHealthStatus,
+    CredentialState, DecisionCandidate, DecisionRecord, MemoryStore, SessionAffinity, Store,
+    StoreError,
 };
 use thiserror::Error;
+use url::Url;
 
 const TYPED_QUOTA_STORE_SCOPE: &str = "typed_quota_v1";
 const MAX_DISABLED_MODELS: usize = 4_096;
@@ -214,6 +217,8 @@ pub struct SelectionContext {
     required_capabilities: CapabilitySet,
     codec: Option<String>,
     affinity_values: BTreeMap<String, String>,
+    routing: Option<RoutingRequirements>,
+    fallback_depth: usize,
 }
 
 /// Attempt and monotonic-clock inputs for one selection operation.
@@ -337,6 +342,25 @@ impl SelectionContext {
         self.codec.as_deref()
     }
 
+    /// Compiled routing requirements attached by the config boundary.
+    /// Adapters cannot populate this from request bodies.
+    #[must_use]
+    pub fn routing(&self) -> Option<&RoutingRequirements> {
+        self.routing.as_ref()
+    }
+
+    /// Attach canonical routing requirements after request decoding.
+    #[must_use]
+    pub fn with_routing(mut self, routing: RoutingRequirements) -> Self {
+        self.routing = Some(routing);
+        self
+    }
+
+    fn with_fallback_depth(mut self, depth: usize) -> Self {
+        self.fallback_depth = depth;
+        self
+    }
+
     /// Look up a configured semantic affinity source.
     #[must_use]
     pub fn affinity_value(&self, key: &str) -> Option<&str> {
@@ -382,6 +406,45 @@ impl SelectionContext {
     }
 }
 
+/// Immutable metadata for one concrete model/target/account binding.
+///
+/// The policy registry owns eligibility and reservations; this index owns the
+/// transport/model facts needed after a lease is selected. Keeping those facts
+/// beside the composite binding prevents a later provider or route lookup from
+/// silently recovering the wrong target.
+#[derive(Clone)]
+struct RuntimeBinding {
+    binding: BindingKey,
+    model: ModelId,
+    provider: ProviderId,
+    upstream_id: Arc<str>,
+    upstream_model: Arc<str>,
+    account: Option<AccountPlan>,
+    pool_id: Option<Arc<str>>,
+    priority: u32,
+    capabilities: CapabilitySet,
+    facts: CandidateFacts,
+    wire_family: Option<Arc<str>>,
+    endpoint_family: Option<Arc<str>>,
+    profile: ModelProfile,
+    request_overlay: RequestOverlay,
+}
+
+type RegistryView = (
+    BTreeMap<String, Arc<CredentialRegistry>>,
+    BTreeMap<BindingKey, Arc<RuntimeBinding>>,
+);
+
+impl RuntimeBinding {
+    fn profile_capabilities(&self) -> CapabilitySet {
+        self.facts
+            .capabilities
+            .value()
+            .copied()
+            .unwrap_or(self.capabilities)
+    }
+}
+
 /// One selected upstream target and its short-lived account lease.
 pub struct PoolSelection {
     upstream_id: Arc<str>,
@@ -396,8 +459,22 @@ pub struct PoolSelection {
     provider: ProviderId,
     credential: Option<CredentialId>,
     affinity_key: Option<AffinityKey>,
+    binding_target: Option<Arc<RuntimeBinding>>,
+    affinity_scope: Option<AffinityBindingIdentity>,
+    affinity_scope_seed: Option<Arc<str>>,
     registry_key: Option<Arc<str>>,
     selection_request: Option<SelectionRequest>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AffinityCommit {
+    key: AffinityKey,
+    credential: CredentialId,
+    provider: ProviderId,
+    upstream_model: String,
+    registry_key: String,
+    scope: AffinityBindingIdentity,
+    ttl: Duration,
 }
 
 impl std::fmt::Debug for PoolSelection {
@@ -411,6 +488,17 @@ impl std::fmt::Debug for PoolSelection {
             .field("provider", &self.provider)
             .field("has_account", &self.account.is_some())
             .field("has_lease", &self.lease.is_some())
+            .field(
+                "binding_target",
+                &self.binding_target.as_ref().map(|target| &target.binding),
+            )
+            .field(
+                "wire_family",
+                &self
+                    .binding_target
+                    .as_ref()
+                    .and_then(|target| target.wire_family.as_deref()),
+            )
             .field("registry_key", &self.registry_key)
             .finish()
     }
@@ -421,6 +509,38 @@ impl PoolSelection {
     #[must_use]
     pub fn upstream_id(&self) -> &str {
         &self.upstream_id
+    }
+
+    /// Build the authoritative endpoint for the selected provider binding.
+    ///
+    /// The route's upstream is only an admission/selection anchor. Once a
+    /// model target has committed, its provider origin, provider path, and
+    /// required query belong to that selected binding. Callers append no
+    /// route-derived origin after this boundary.
+    pub fn upstream_uri(
+        &self,
+        config: &CompiledConfig,
+        route: &RoutePlan,
+        downstream: &Uri,
+    ) -> Result<Uri, PoolError> {
+        let upstream = config
+            .upstreams()
+            .get(self.upstream_id())
+            .ok_or(PoolError::InvalidUpstreamUri)?;
+        let requested_path = route.target().path().unwrap_or_else(|| downstream.path());
+        let endpoint_family = self
+            .binding_target
+            .as_ref()
+            .and_then(|target| target.endpoint_family.as_deref())
+            .or_else(|| route.target().endpoint_family());
+        let path = provider_endpoint_path(upstream, requested_path, endpoint_family)?;
+        let mut url = upstream.url().clone();
+        url.set_path(&path);
+        merge_downstream_query(&mut url, downstream.query());
+        apply_required_query(&mut url, upstream.query());
+        url.as_str()
+            .parse()
+            .map_err(|_| PoolError::InvalidUpstreamUri)
     }
 
     /// Model to place in an upstream semantic/JSON request, when model
@@ -469,6 +589,34 @@ impl PoolSelection {
         self.account.as_ref().map(AccountPlan::auth_kind)
     }
 
+    /// Exact target/account binding selected for this attempt.
+    #[must_use]
+    pub fn binding_key(&self) -> Option<&BindingKey> {
+        self.lease.as_ref().map(SelectionLease::binding_key)
+    }
+
+    /// Stable target-binding identifier for this attempt.
+    #[must_use]
+    pub fn target_binding_id(&self) -> Option<&str> {
+        self.binding_target
+            .as_ref()
+            .map(|target| target.binding.target_id().as_str())
+    }
+
+    /// Positive priority tier selected for this attempt.
+    #[must_use]
+    pub fn priority_tier(&self) -> Option<u32> {
+        self.binding_target.as_ref().map(|target| target.priority)
+    }
+
+    /// Homogeneous account-pool identity selected for this attempt.
+    #[must_use]
+    pub fn account_pool_id(&self) -> Option<&str> {
+        self.binding_target
+            .as_ref()
+            .and_then(|target| target.pool_id.as_deref())
+    }
+
     /// Whether this selection can participate in a retry policy.
     #[must_use]
     pub fn has_policy(&self) -> bool {
@@ -514,6 +662,129 @@ impl PoolSelection {
     #[must_use]
     pub fn affinity_key(&self) -> Option<&AffinityKey> {
         self.affinity_key.as_ref()
+    }
+
+    pub(crate) fn affinity_commit(&self) -> Option<AffinityCommit> {
+        let key = self.affinity_key.clone()?;
+        let credential = self.credential.clone()?;
+        let registry_key = self.registry_key.as_deref()?.to_owned();
+        let scope = self.affinity_scope.clone()?;
+        let ttl = self.policy()?.selection().affinity()?.ttl();
+        Some(AffinityCommit {
+            key,
+            credential,
+            provider: self.provider.clone(),
+            upstream_model: self
+                .upstream_model()
+                .unwrap_or(self.model().as_str())
+                .to_owned(),
+            registry_key,
+            scope,
+            ttl,
+        })
+    }
+}
+
+const PALANTIR_OPENAI_PROXY_PREFIX: &str = "/api/v2/llm/proxy/openai";
+const PALANTIR_ANTHROPIC_PROXY_PREFIX: &str = "/api/v2/llm/proxy/anthropic";
+
+fn provider_endpoint_path(
+    upstream: &pooler_config::UpstreamPlan,
+    requested_path: &str,
+    endpoint_family: Option<&str>,
+) -> Result<String, PoolError> {
+    let canonical = canonical_provider_path(requested_path);
+    if upstream
+        .native()
+        .is_some_and(|native| native.kind().eq_ignore_ascii_case("palantir_aip"))
+    {
+        let family = endpoint_family
+            .and_then(normalize_endpoint_family)
+            .or_else(|| path_endpoint_family(canonical))
+            .ok_or(PoolError::InvalidUpstreamUri)?;
+        let prefix = match family {
+            "messages" => PALANTIR_ANTHROPIC_PROXY_PREFIX,
+            "chat_completions" | "responses" => PALANTIR_OPENAI_PROXY_PREFIX,
+            _ => return Err(PoolError::InvalidUpstreamUri),
+        };
+        let exact_path = (family == "messages" && canonical == "/v1/messages")
+            || (family == "chat_completions" && canonical == "/v1/chat/completions")
+            || (family == "responses" && canonical == "/v1/responses");
+        if requested_path.starts_with(prefix) && exact_path {
+            return Ok(requested_path.to_owned());
+        }
+        return Ok(format!("{prefix}{canonical}"));
+    }
+
+    if upstream
+        .known_provider()
+        .is_some_and(|provider| provider.eq_ignore_ascii_case("kimi-for-coding"))
+    {
+        return KimiAdapter::coding_subscription()
+            .map_err(|_| PoolError::InvalidUpstreamUri)?
+            .openai_endpoint_path(canonical)
+            .map_err(|_| PoolError::InvalidUpstreamUri);
+    }
+
+    // A Palantir route can be reused by another target only after its
+    // enrollment prefix is removed. This is the important anti-anchor fence:
+    // a selected generic provider never receives another provider's path.
+    Ok(canonical.to_owned())
+}
+
+fn canonical_provider_path(path: &str) -> &str {
+    path.strip_prefix(PALANTIR_OPENAI_PROXY_PREFIX)
+        .or_else(|| path.strip_prefix(PALANTIR_ANTHROPIC_PROXY_PREFIX))
+        .unwrap_or(path)
+}
+
+fn normalize_endpoint_family(value: &str) -> Option<&'static str> {
+    match value {
+        "chat" | "chat_completions" | "openai_chat" => Some("chat_completions"),
+        "responses" | "openai_responses" => Some("responses"),
+        "messages" | "anthropic_messages" => Some("messages"),
+        _ => None,
+    }
+}
+
+fn path_endpoint_family(path: &str) -> Option<&'static str> {
+    if path.ends_with("/chat/completions") {
+        Some("chat_completions")
+    } else if path.ends_with("/responses") {
+        Some("responses")
+    } else if path.ends_with("/messages") {
+        Some("messages")
+    } else {
+        None
+    }
+}
+
+fn merge_downstream_query(url: &mut Url, downstream: Option<&str>) {
+    let base = url
+        .query()
+        .filter(|query| !query.is_empty())
+        .map(str::to_owned);
+    let merged = match (
+        base.as_deref(),
+        downstream.filter(|query| !query.is_empty()),
+    ) {
+        (Some(base), Some(downstream)) => Some(format!("{base}&{downstream}")),
+        (Some(base), None) => Some(base.to_owned()),
+        (None, Some(downstream)) => Some(downstream.to_owned()),
+        (None, None) => None,
+    };
+    url.set_query(merged.as_deref());
+}
+
+fn apply_required_query(url: &mut Url, required: &[(Arc<str>, Arc<str>)]) {
+    for (name, value) in required {
+        if url
+            .query_pairs()
+            .any(|(existing, _)| existing == name.as_ref())
+        {
+            continue;
+        }
+        url.query_pairs_mut().append_pair(name, value);
     }
 }
 
@@ -575,18 +846,24 @@ pub enum PoolError {
     Store,
     #[error("selection state unavailable")]
     Selection,
+    #[error("selected provider endpoint is invalid")]
+    InvalidUpstreamUri,
 }
 
 /// Shared mutable account-pooling state for one compiled configuration.
 #[derive(Clone)]
 pub struct PoolingCoordinator {
-    registries: Arc<BTreeMap<String, Arc<CredentialRegistry>>>,
+    registries: Arc<RwLock<BTreeMap<String, Arc<CredentialRegistry>>>>,
+    binding_index: Arc<RwLock<BTreeMap<BindingKey, Arc<RuntimeBinding>>>>,
     interaction_affinity_registries: Arc<BTreeMap<String, BTreeSet<String>>>,
     accounts: Arc<BTreeMap<String, AccountPlan>>,
+    config: Arc<CompiledConfig>,
     store: Arc<dyn Store>,
     catalog: Option<Arc<CatalogService>>,
+    catalog_generation: Arc<AtomicU64>,
     disabled_models: Arc<RwLock<BTreeSet<String>>>,
     persistence: PersistenceStatus,
+    telemetry: RoutingTelemetry,
 }
 
 /// Non-secret snapshot of the selected account and compatible registries used
@@ -597,14 +874,22 @@ pub(crate) struct InteractionAffinityBinding {
     provider: ProviderId,
     upstream_model: String,
     ttl: Duration,
-    registries: Vec<(String, ModelId)>,
+    registries: Vec<(String, ModelId, BindingKey)>,
+    scope: AffinityBindingIdentity,
+    scope_seed: String,
 }
 
 impl std::fmt::Debug for PoolingCoordinator {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PoolingCoordinator")
-            .field("registries", &self.registries.len())
+            .field(
+                "registries",
+                &self
+                    .registries
+                    .read()
+                    .map_or(0, |registries| registries.len()),
+            )
             .field("accounts", &self.accounts.len())
             .field(
                 "disabled_models",
@@ -635,6 +920,7 @@ impl PoolingCoordinator {
             .map(|account| (account.id().to_owned(), account.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut registries = BTreeMap::new();
+        let mut binding_index = BTreeMap::new();
 
         for model in config.models().values() {
             let registry = Arc::new(CredentialRegistry::new());
@@ -644,6 +930,8 @@ impl PoolingCoordinator {
                 model.targets(),
                 &accounts,
                 config.account_pools(),
+                config.upstreams(),
+                &mut binding_index,
             )?;
             registries.insert(model.id().to_owned(), registry);
         }
@@ -659,6 +947,8 @@ impl PoolingCoordinator {
                 route.target().upstream(),
                 route.target(),
                 &accounts,
+                config.upstreams(),
+                &mut binding_index,
             )?;
             registries.insert(key, registry);
         }
@@ -685,13 +975,17 @@ impl PoolingCoordinator {
         }
 
         let coordinator = Self {
-            registries: Arc::new(registries),
+            registries: Arc::new(RwLock::new(registries)),
+            binding_index: Arc::new(RwLock::new(binding_index)),
             interaction_affinity_registries: Arc::new(interaction_affinity_registries),
             accounts: Arc::new(accounts),
+            config: Arc::new(config.clone()),
             store,
             catalog: None,
+            catalog_generation: Arc::new(AtomicU64::new(0)),
             disabled_models: Arc::new(RwLock::new(BTreeSet::new())),
             persistence: PersistenceStatus::new(true),
+            telemetry: RoutingTelemetry::default(),
         };
         coordinator.restore_account_state(config)?;
         Ok(coordinator)
@@ -704,8 +998,12 @@ impl PoolingCoordinator {
     pub fn reconfigure(&self, config: &CompiledConfig) -> Result<Self, PoolError> {
         let mut coordinator = Self::with_store(config, Arc::clone(&self.store))?;
         coordinator.catalog.clone_from(&self.catalog);
+        if coordinator.catalog.is_some() {
+            coordinator.sync_catalog_snapshot()?;
+        }
         coordinator.disabled_models = Arc::clone(&self.disabled_models);
         coordinator.persistence = self.persistence.clone();
+        coordinator.telemetry = self.telemetry.clone();
         Ok(coordinator)
     }
 
@@ -713,6 +1011,7 @@ impl PoolingCoordinator {
     #[must_use]
     pub fn with_catalog(mut self, catalog: Arc<CatalogService>) -> Self {
         self.catalog = Some(catalog);
+        let _ = self.sync_catalog_snapshot();
         self
     }
 
@@ -720,7 +1019,88 @@ impl PoolingCoordinator {
     #[must_use]
     pub fn with_optional_catalog(mut self, catalog: Option<Arc<CatalogService>>) -> Self {
         self.catalog = catalog;
+        if self.catalog.is_some() {
+            let _ = self.sync_catalog_snapshot();
+        } else {
+            self.catalog_generation.store(0, Ordering::Release);
+        }
         self
+    }
+
+    fn sync_catalog_snapshot(&self) -> Result<(), PoolError> {
+        let Some(catalog) = self.catalog.as_ref() else {
+            return Ok(());
+        };
+        let snapshot = catalog.snapshot();
+        let generation = snapshot.generation();
+        if self.catalog_generation.load(Ordering::Acquire) == generation {
+            return Ok(());
+        }
+
+        let (registries, bindings) = self.build_registry_view(Some(snapshot.as_ref()))?;
+        *self.registries.write().map_err(|_| PoolError::Selection)? = registries;
+        *self
+            .binding_index
+            .write()
+            .map_err(|_| PoolError::Selection)? = bindings;
+        self.catalog_generation.store(generation, Ordering::Release);
+        self.restore_account_state(&self.config)
+    }
+
+    fn build_registry_view(
+        &self,
+        catalog: Option<&CatalogSnapshot>,
+    ) -> Result<RegistryView, PoolError> {
+        let mut registries = BTreeMap::new();
+        let mut binding_index = BTreeMap::new();
+        for model in self.config.models().values() {
+            let registry = Arc::new(CredentialRegistry::new());
+            register_model_accounts(
+                &registry,
+                model.id(),
+                model.targets(),
+                &self.accounts,
+                self.config.account_pools(),
+                self.config.upstreams(),
+                &mut binding_index,
+            )?;
+            registries.insert(model.id().to_owned(), registry);
+        }
+        for route in self.config.routes() {
+            if route.target().policy().is_none() || route.target().model_source().is_some() {
+                continue;
+            }
+            let key = route_registry_key(route.id());
+            let registry = Arc::new(CredentialRegistry::new());
+            register_route_accounts(
+                &registry,
+                route.id(),
+                route.target().upstream(),
+                route.target(),
+                &self.accounts,
+                self.config.upstreams(),
+                &mut binding_index,
+            )?;
+            registries.insert(key, registry);
+        }
+        if let Some(catalog) = catalog {
+            for model in catalog.models().values() {
+                let key = model.id().to_string();
+                let registry = registries
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(CredentialRegistry::new()))
+                    .clone();
+                register_catalog_model(
+                    &registry,
+                    model,
+                    &self.accounts,
+                    self.config.account_pools(),
+                    self.config.upstreams(),
+                    &mut binding_index,
+                )?;
+            }
+        }
+        Ok((registries, binding_index))
     }
 
     /// Return the mutable state store shared by this coordinator.
@@ -733,6 +1113,18 @@ impl PoolingCoordinator {
     #[must_use]
     pub fn persistence_status(&self) -> PersistenceStatus {
         self.persistence.clone()
+    }
+
+    /// Return the bounded telemetry registry used by adaptive selection.
+    #[must_use]
+    pub fn routing_telemetry(&self) -> RoutingTelemetry {
+        self.telemetry.clone()
+    }
+
+    /// Record one completed attempt for adaptive ranking. Only fixed numeric
+    /// timing fields and the composite binding identity cross this boundary.
+    pub fn record_routing_telemetry(&self, binding: BindingKey, sample: TelemetrySample) {
+        self.telemetry.record(binding, sample);
     }
 
     /// Allocate one process-unique logical request identifier. The caller owns
@@ -811,15 +1203,18 @@ impl PoolingCoordinator {
 
     /// Return deduplicated, redacted typed quota windows for management views.
     pub fn quota_states(&self) -> Result<Vec<pooler_policy::PersistedQuotaSnapshot>, PoolError> {
+        self.sync_catalog_snapshot()?;
         let now = Instant::now();
         let now_unix_ms = timestamp_now();
         let mut records = BTreeMap::new();
-        for registry in self.registries.values() {
+        let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
+        for registry in registries.values() {
             for record in registry
                 .quota_state_records(now, now_unix_ms)
                 .map_err(|_| PoolError::Selection)?
             {
-                records.insert(format!("{record:?}"), record);
+                let identity = serde_json::to_string(&record).map_err(|_| PoolError::Selection)?;
+                records.insert(identity, record);
             }
         }
         Ok(records.into_values().collect())
@@ -834,6 +1229,7 @@ impl PoolingCoordinator {
 
     /// Enable or disable one configured account in persistence and live registries.
     pub fn set_account_enabled(&self, account_id: &str, enabled: bool) -> Result<(), PoolError> {
+        self.sync_catalog_snapshot()?;
         if !self.accounts.contains_key(account_id) {
             return Err(PoolError::InvalidCredential);
         }
@@ -841,7 +1237,8 @@ impl PoolingCoordinator {
         self.store
             .set_credential_enabled(account_id, enabled, timestamp_now())
             .map_err(|_| PoolError::Store)?;
-        for registry in self.registries.values() {
+        let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
+        for registry in registries.values() {
             if enabled {
                 registry
                     .enable(&credential)
@@ -855,40 +1252,13 @@ impl PoolingCoordinator {
         Ok(())
     }
 
-    /// Atomically persist a provider account switch and publish it to live registries.
+    /// Compatibility entry point that enables one account without a
+    /// provider-wide sibling switch.
     pub fn switch_account(&self, account_id: &str) -> Result<(), PoolError> {
-        let selected = self
-            .accounts
-            .get(account_id)
-            .ok_or(PoolError::InvalidCredential)?;
-        let siblings = self
-            .accounts
-            .values()
-            .filter(|account| {
-                account.provider() == selected.provider() && account.id() != selected.id()
-            })
-            .map(|account| account.id().to_owned())
-            .collect::<Vec<_>>();
-        self.store
-            .switch_credential(account_id, &siblings, timestamp_now())
-            .map_err(|_| PoolError::Store)?;
-        let selected_id =
-            CredentialId::new(account_id).map_err(|_| PoolError::InvalidCredential)?;
-        let sibling_ids = siblings
-            .iter()
-            .map(|id| CredentialId::new(id).map_err(|_| PoolError::InvalidCredential))
-            .collect::<Result<Vec<_>, _>>()?;
-        for registry in self.registries.values() {
-            registry
-                .enable(&selected_id)
-                .map_err(|_| PoolError::Selection)?;
-            for sibling in &sibling_ids {
-                registry
-                    .disable(sibling.clone())
-                    .map_err(|_| PoolError::Selection)?;
-            }
-        }
-        Ok(())
+        // Account choice is a target/pool concern. Keep this compatibility
+        // entry point as a scoped enable operation; never disable every other
+        // account sharing the provider origin.
+        self.set_account_enabled(account_id, true)
     }
 
     /// Enable or disable one public model for new selections.
@@ -944,9 +1314,10 @@ impl PoolingCoordinator {
     pub fn published_models(
         &self,
         config: &CompiledConfig,
-        provider: &str,
+        _provider: &str,
         required: CapabilitySet,
     ) -> Result<PublishedModels, PoolError> {
+        self.sync_catalog_snapshot()?;
         let snapshot = self.catalog.as_ref().map(|catalog| catalog.snapshot());
         let now = timestamp_now();
         let cooling: BTreeSet<String> = self
@@ -956,10 +1327,12 @@ impl PoolingCoordinator {
             .map(|cooldown| cooldown.key)
             .collect();
         let mut provider_credentials = BTreeMap::<String, bool>::new();
+        let mut account_enabled = BTreeMap::<String, bool>::new();
         for state in self.credential_states()? {
             if !self.accounts.contains_key(&state.credential_id) {
                 continue;
             }
+            account_enabled.insert(state.credential_id.clone(), state.enabled);
             provider_credentials
                 .entry(state.provider_id)
                 .and_modify(|enabled| *enabled |= state.enabled)
@@ -974,15 +1347,40 @@ impl PoolingCoordinator {
                 && provider_credentials.get(provider).copied().unwrap_or(true)
         };
 
+        let binding_index = self
+            .binding_index
+            .read()
+            .map_err(|_| PoolError::Selection)?;
+        let binding_is_usable =
+            |model: &str, target_id: &str, target_provider: &str, capabilities: CapabilitySet| {
+                binding_index.values().any(|binding| {
+                    binding.model.as_str() == model
+                        && binding.binding.target_id().as_str() == target_id
+                        && binding.provider.as_str() == target_provider
+                        && binding.profile_capabilities().contains_all(required)
+                        && binding.profile_capabilities().contains_all(capabilities)
+                        && provider_is_usable(target_provider)
+                        && binding
+                            .account
+                            .as_ref()
+                            .and_then(|account| account_enabled.get(account.id()))
+                            .copied()
+                            .unwrap_or(true)
+                })
+            };
+
         let mut published = BTreeSet::new();
         for (id, model) in config.models() {
             if !self.model_enabled(id)? {
                 continue;
             }
             if model.targets().iter().any(|target| {
-                target.provider() == provider
-                    && target.capabilities().contains_all(required)
-                    && provider_is_usable(target.provider())
+                binding_is_usable(
+                    id,
+                    &target.binding_id().as_str(),
+                    target.provider(),
+                    target.capabilities(),
+                )
             }) {
                 published.insert(id.to_string());
             }
@@ -994,9 +1392,12 @@ impl PoolingCoordinator {
                     continue;
                 }
                 if model.targets().iter().any(|target| {
-                    target.provider().as_str() == provider
-                        && target.capabilities().contains_all(required)
-                        && provider_is_usable(target.provider().as_str())
+                    binding_is_usable(
+                        id,
+                        target.binding_id(),
+                        target.provider().as_str(),
+                        target.capabilities(),
+                    )
                 }) {
                     published.insert(id.to_owned());
                 }
@@ -1040,6 +1441,7 @@ impl PoolingCoordinator {
         context: &SelectionContext,
         timing: SelectionTiming,
     ) -> Result<PoolSelection, PoolError> {
+        self.sync_catalog_snapshot()?;
         let policy = route
             .target()
             .policy()
@@ -1090,7 +1492,13 @@ impl PoolingCoordinator {
             }
         });
         let (logical_model, static_upstream, static_model) =
-            resolve_static_target(config, route, requested_model, catalog.as_deref())?;
+            resolve_with_configured_model_fallback(
+                config,
+                route,
+                requested_model,
+                policy.as_ref(),
+                catalog.as_deref(),
+            )?;
         if !self.model_enabled(&logical_model)? {
             return Err(PoolError::ModelDisabled {
                 model: logical_model,
@@ -1113,25 +1521,56 @@ impl PoolingCoordinator {
                 ProviderId::new(static_upstream.clone()).map_err(|_| PoolError::InvalidProvider)?;
             let model_id =
                 ModelId::new(logical_model.to_owned()).map_err(|_| PoolError::InvalidModel)?;
-            let profile = resolve_target_profile(
-                catalog.as_deref(),
-                &logical_model,
-                &static_upstream,
-                static_model.as_deref(),
-            );
+            let binding_target = self
+                .binding_index
+                .read()
+                .map_err(|_| PoolError::Selection)?
+                .values()
+                .filter(|target| {
+                    target.model.as_str() == logical_model
+                        && target.provider.as_str() == static_upstream
+                        && static_model
+                            .as_deref()
+                            .is_none_or(|model| target.upstream_model.as_ref() == model)
+                })
+                .min_by_key(|target| target.priority)
+                .cloned();
+            let profile = binding_target
+                .as_ref()
+                .map_or(ModelProfile::DEFAULT, |target| target.profile);
+            let request_overlay = binding_target
+                .as_ref()
+                .map_or_else(RequestOverlay::default, |target| {
+                    target.request_overlay.clone()
+                });
+            let account = binding_target
+                .as_ref()
+                .and_then(|target| target.account.clone());
+            let credential = account.as_ref().map(|account| {
+                CredentialId::new(account.id().to_owned())
+                    .expect("compiled account IDs remain valid")
+            });
             return Ok(PoolSelection {
-                upstream_id: Arc::from(static_upstream),
+                upstream_id: Arc::from(
+                    route
+                        .target()
+                        .transport_upstream()
+                        .unwrap_or(&static_upstream),
+                ),
                 upstream_model: static_model.map(Arc::from),
                 profile,
-                request_overlay: resolve_request_overlay(catalog.as_deref(), &logical_model),
-                account: None,
+                request_overlay,
+                account,
                 lease: None,
                 policy: None,
                 explanation: None,
                 model: model_id,
                 provider,
-                credential: None,
+                credential,
                 affinity_key: None,
+                binding_target,
+                affinity_scope: None,
+                affinity_scope_seed: None,
                 registry_key: None,
                 selection_request: None,
             });
@@ -1144,7 +1583,25 @@ impl PoolingCoordinator {
         };
         let model_id =
             ModelId::new(logical_model.to_owned()).map_err(|_| PoolError::InvalidModel)?;
-        let Some(registry) = self.registries.get(&registry_key) else {
+        let registry = self
+            .registries
+            .read()
+            .map_err(|_| PoolError::Selection)?
+            .get(&registry_key)
+            .cloned();
+        let Some(registry) = registry else {
+            if let Some(fallback) = next_model_fallback(&policy, requested_model, context) {
+                return self.select_with_context(
+                    config,
+                    route,
+                    Some(fallback),
+                    headers,
+                    &context
+                        .clone()
+                        .with_fallback_depth(context.fallback_depth + 1),
+                    timing,
+                );
+            }
             self.record_no_eligible(
                 route,
                 model_id.as_str(),
@@ -1170,6 +1627,13 @@ impl PoolingCoordinator {
             // Eligibility must use the current instant. A request-admission
             // timestamp can predate a concurrent zero-delay quota recovery.
             .at(Instant::now());
+        let mut routing = routing_requirements(&policy);
+        if routing.target_order.is_empty() {
+            routing.target_order = model_target_order(config, &logical_model);
+        }
+        request = request
+            .with_routing(routing)
+            .with_telemetry(self.telemetry.snapshot(), timestamp_now());
         if let Some(codec) = required_codec_for_selection(route, requested_model, context) {
             request = request
                 .with_codec(codec)
@@ -1182,12 +1646,14 @@ impl PoolingCoordinator {
                 .collect::<Vec<_>>();
             request = request.with_allowed_credentials(ids);
         }
+        let affinity_scope_seed =
+            affinity_scope_seed(config, catalog.as_deref(), route, &logical_model);
         let affinity_key = affinity_value(&policy, headers, context)
-            .and_then(|value| AffinityKey::new(value.as_bytes()).ok());
+            .and_then(|value| scoped_affinity_key(&affinity_scope_seed, &value));
         if let Some(affinity) = policy.selection().affinity() {
             request = request.with_affinity_rebind(affinity.rebind());
             if let Some(value) = affinity_value(&policy, headers, context) {
-                if let Ok(key) = AffinityKey::new(value.as_bytes()) {
+                if let Some(key) = scoped_affinity_key(&affinity_scope_seed, &value) {
                     request = request
                         .with_hashed_affinity_key(key.clone(), affinity.ttl())
                         .map_err(|_| PoolError::Selection)?;
@@ -1199,6 +1665,18 @@ impl PoolingCoordinator {
         let lease = match registry.select(request) {
             Ok(lease) => lease,
             Err(SelectionError::NoEligible { explanation, .. }) => {
+                if let Some(fallback) = next_model_fallback(&policy, requested_model, context) {
+                    return self.select_with_context(
+                        config,
+                        route,
+                        Some(fallback),
+                        headers,
+                        &context
+                            .clone()
+                            .with_fallback_depth(context.fallback_depth + 1),
+                        timing,
+                    );
+                }
                 self.record_no_eligible(
                     route,
                     model_id.as_str(),
@@ -1217,26 +1695,18 @@ impl PoolingCoordinator {
         let explanation = lease.explanation().clone();
         let provider = registration.provider().clone();
         let account_id = registration.credential().clone();
-        let account = self.accounts.get(account_id.as_str()).cloned();
-        let selected_model = config
-            .models()
-            .get(logical_model.as_str())
-            .and_then(|plan| {
-                plan.targets()
-                    .iter()
-                    .find(|target| {
-                        target.provider() == provider.as_str()
-                            && target_bound_accounts(target, config.account_pools())
-                                .contains(&account_id.as_str())
-                    })
-                    .or_else(|| {
-                        plan.targets()
-                            .iter()
-                            .find(|target| target.provider() == provider.as_str())
-                    })
-            })
-            .map(|target| target.upstream_model().to_owned())
-            .or(static_model);
+        let binding_target = self
+            .binding_index
+            .read()
+            .map_err(|_| PoolError::Selection)?
+            .get(lease.binding_key())
+            .cloned()
+            .ok_or(PoolError::Selection)?;
+        let account = binding_target
+            .account
+            .clone()
+            .or_else(|| self.accounts.get(account_id.as_str()).cloned());
+        let selected_model = Some(binding_target.upstream_model.as_ref().to_owned());
         self.record_selection(
             route,
             &logical_model,
@@ -1245,25 +1715,34 @@ impl PoolingCoordinator {
             &lease,
             selected_model.as_deref(),
         );
-        let profile = resolve_target_profile(
-            catalog.as_deref(),
-            &logical_model,
-            provider.as_str(),
-            selected_model.as_deref(),
-        );
+        let profile = binding_target.profile;
         Ok(PoolSelection {
-            upstream_id: Arc::from(provider.as_str()),
-            upstream_model: selected_model.map(Arc::from),
+            upstream_id: Arc::from(
+                route
+                    .target()
+                    .transport_upstream()
+                    .unwrap_or(binding_target.upstream_id.as_ref()),
+            ),
+            upstream_model: Some(binding_target.upstream_model.clone()),
             profile,
-            request_overlay: resolve_request_overlay(catalog.as_deref(), &logical_model),
+            request_overlay: binding_target.request_overlay.clone(),
             account,
             lease: Some(lease),
-            policy: Some(policy),
+            policy: Some(policy.clone()),
             explanation: Some(explanation),
             model: ModelId::new(logical_model.to_owned()).map_err(|_| PoolError::InvalidModel)?,
             provider,
             credential: Some(account_id),
             affinity_key,
+            binding_target: Some(binding_target.clone()),
+            affinity_scope: Some(affinity_scope_for_selection(
+                route,
+                &policy,
+                &logical_model,
+                &binding_target,
+                &affinity_scope_seed,
+            )),
+            affinity_scope_seed: Some(Arc::from(affinity_scope_seed)),
             registry_key: Some(Arc::from(registry_key)),
             selection_request: Some(selection_request),
         })
@@ -1319,8 +1798,9 @@ impl PoolingCoordinator {
             model: Some(selection.model().clone()),
             provider: Some(selection.provider().clone()),
             route: RouteId::new(route.id()).ok(),
+            binding: selection.binding_key().cloned(),
         };
-        let registry = self.registry_for(route, selection.model());
+        let registry = self.registry_for(selection);
         let policy = selection.policy().cloned();
         let retry_policy = policy.as_ref().map(configured_retry_policy);
         let retry_context = RetryContext::new(attempt, commitment, replay)
@@ -1448,26 +1928,14 @@ impl PoolingCoordinator {
         let explanation = lease.explanation().clone();
         let provider = registration.provider().clone();
         let credential = registration.credential().clone();
-        let upstream_model = config
-            .models()
-            .get(registration.model().as_str())
-            .and_then(|model| {
-                model
-                    .targets()
-                    .iter()
-                    .find(|target| {
-                        target.provider() == provider.as_str()
-                            && target_bound_accounts(target, config.account_pools())
-                                .contains(&credential.as_str())
-                    })
-                    .or_else(|| {
-                        model
-                            .targets()
-                            .iter()
-                            .find(|target| target.provider() == provider.as_str())
-                    })
-            })
-            .map(|target| Arc::from(target.upstream_model()))
+        let binding_target = self
+            .binding_index
+            .read()
+            .ok()
+            .and_then(|bindings| bindings.get(lease.binding_key()).cloned());
+        let upstream_model = binding_target
+            .as_ref()
+            .map(|target| target.upstream_model.clone())
             .or_else(|| {
                 (&provider == failed.provider())
                     .then(|| failed.upstream_model().map(Arc::from))
@@ -1481,27 +1949,32 @@ impl PoolingCoordinator {
             &lease,
             upstream_model.as_deref(),
         );
-        let profile = resolve_target_profile(
-            self.catalog
-                .as_ref()
-                .map(|catalog| catalog.snapshot())
-                .as_deref(),
-            registration.model().as_str(),
-            provider.as_str(),
-            upstream_model.as_deref(),
-        );
+        let profile = binding_target
+            .as_ref()
+            .map_or(ModelProfile::DEFAULT, |target| target.profile);
+        let affinity_scope = failed.affinity_scope.clone().map(|mut scope| {
+            if let Some(target) = binding_target.as_ref() {
+                scope.target_binding_id = target.binding.target_id().as_str().to_owned();
+            }
+            scope
+        });
         PoolSelection {
-            upstream_id: Arc::from(provider.as_str()),
+            upstream_id: Arc::from(route.target().transport_upstream().unwrap_or_else(|| {
+                binding_target
+                    .as_ref()
+                    .map_or(provider.as_str(), |target| target.upstream_id.as_ref())
+            })),
             upstream_model,
             profile,
-            request_overlay: resolve_request_overlay(
-                self.catalog
-                    .as_ref()
-                    .map(|catalog| catalog.snapshot())
-                    .as_deref(),
-                registration.model().as_str(),
-            ),
-            account: self.accounts.get(credential.as_str()).cloned(),
+            request_overlay: binding_target
+                .as_ref()
+                .map_or_else(RequestOverlay::default, |target| {
+                    target.request_overlay.clone()
+                }),
+            account: binding_target
+                .as_ref()
+                .and_then(|target| target.account.clone())
+                .or_else(|| self.accounts.get(credential.as_str()).cloned()),
             lease: Some(lease),
             policy: failed.policy.clone(),
             explanation: Some(explanation),
@@ -1509,6 +1982,9 @@ impl PoolingCoordinator {
             provider,
             credential: Some(credential),
             affinity_key: failed.affinity_key.clone(),
+            binding_target,
+            affinity_scope,
+            affinity_scope_seed: failed.affinity_scope_seed.clone(),
             registry_key: failed.registry_key.clone(),
             selection_request: Some(request),
         }
@@ -1523,7 +1999,10 @@ impl PoolingCoordinator {
     ) {
         self.propagate_shared_quota(failed, classification, current);
         let now_wall = timestamp_now();
-        for registry in self.registries.values() {
+        let Ok(registries) = self.registries.read() else {
+            return;
+        };
+        for registry in registries.values() {
             let Ok(records) = registry.quota_state_records(now, now_wall) else {
                 continue;
             };
@@ -1562,22 +2041,24 @@ impl PoolingCoordinator {
             .as_ref()
             .and_then(|account| account.quota_project())
             .and_then(|project| QuotaProjectKey::new(project).ok());
-        for registry in self.registries.values() {
+        let Ok(registries) = self.registries.read() else {
+            return;
+        };
+        for registry in registries.values() {
             if Arc::ptr_eq(registry, current) {
                 continue;
             }
             let Ok(registrations) = registry.registrations() else {
                 continue;
             };
-            let matching = registrations.into_iter().find(|registration| {
+            for registration in registrations.into_iter().filter(|registration| {
                 quota_registration_matches(
                     registration,
                     failed,
                     classification.snapshot.scope,
                     quota_project.as_ref(),
                 )
-            });
-            if let Some(registration) = matching {
+            }) {
                 let _ =
                     registry.set_quota_snapshot(registration.credential(), classification.snapshot);
             }
@@ -1603,21 +2084,33 @@ impl PoolingCoordinator {
             .cloned()
             .unwrap_or_default();
         registry_keys.insert(selection.registry_key.as_deref()?.to_owned());
+        let registries_by_key = self.registries.read().ok()?;
         let registries = registry_keys
             .into_iter()
             .filter_map(|registry_key| {
-                let registry = self.registries.get(&registry_key)?;
+                let registry = registries_by_key.get(&registry_key)?;
+                let desired_target = registry_key
+                    .strip_prefix("route:")
+                    .map(route_registry_key)
+                    .or_else(|| selection.target_binding_id().map(str::to_owned));
                 let model = registry
                     .registrations()
                     .ok()?
                     .into_iter()
-                    .find(|registration| {
+                    .filter(|registration| {
                         registration.credential() == &credential
                             && registration.provider() == &provider
-                    })?
-                    .model()
+                            && desired_target
+                                .as_deref()
+                                .is_none_or(|target| registration.target_id().as_str() == target)
+                    })
+                    .min_by(|left, right| left.target_id().cmp(right.target_id()))?
                     .clone();
-                Some((registry_key, model))
+                Some((
+                    registry_key,
+                    model.model().clone(),
+                    model.binding_key().clone(),
+                ))
             })
             .collect::<Vec<_>>();
         if registries.is_empty() {
@@ -1631,19 +2124,24 @@ impl PoolingCoordinator {
                 .unwrap_or(selection.model().as_str())
                 .to_owned(),
             ttl: affinity.ttl(),
+            scope: selection.affinity_scope.clone()?,
+            scope_seed: selection.affinity_scope_seed.as_deref()?.to_owned(),
             registries,
         })
     }
 
-    /// Bind one hashed provider-returned Gemini Interaction ID to the exact
-    /// account selected for its create request. Only the redacted key is
-    /// installed in memory and persistence.
+    /// Bind one provider-returned Gemini Interaction ID after a clean response
+    /// terminal to the exact account selected for its create request. Only the
+    /// scoped redacted key is installed in memory and persistence.
     pub(crate) fn bind_interaction_affinity(
         &self,
         binding: &InteractionAffinityBinding,
-        key: AffinityKey,
+        interaction_id: String,
         now: Timestamp,
     ) {
+        let Some(key) = scoped_affinity_key(&binding.scope_seed, &interaction_id) else {
+            return;
+        };
         let Some(expires_at) =
             now.checked_add(u64::try_from(binding.ttl.as_millis()).unwrap_or(u64::MAX))
         else {
@@ -1651,13 +2149,16 @@ impl PoolingCoordinator {
         };
         let now_instant = Instant::now();
         let expires_instant = now_instant.checked_add(binding.ttl).unwrap_or(now_instant);
-        for (registry_key, model) in &binding.registries {
-            let Some(registry) = self.registries.get(registry_key) else {
+        let Ok(registries) = self.registries.read() else {
+            return;
+        };
+        for (registry_key, model, target_binding) in &binding.registries {
+            let Some(registry) = registries.get(registry_key) else {
                 continue;
             };
-            let evicted = match registry.restore_affinity(
+            let evicted = match registry.restore_affinity_binding(
                 key.clone(),
-                binding.credential.clone(),
+                target_binding.clone(),
                 binding.provider.clone(),
                 model.clone(),
                 now_instant,
@@ -1667,15 +2168,31 @@ impl PoolingCoordinator {
                 Err(_) => continue,
             };
             if let Some(evicted) = evicted {
-                let _ = self
-                    .store
-                    .remove_session_affinity(&format!("{registry_key}|{}", evicted.as_str()));
+                let _ = self.store.remove_session_affinity(&affinity_storage_key(
+                    registry_key,
+                    target_binding.target_id().as_str(),
+                    evicted.as_str(),
+                ));
             }
-            let persisted = SessionAffinity::new(
-                format!("{registry_key}|{}", key.as_str()),
+            let scope = AffinityBindingIdentity::new(
+                registry_key
+                    .strip_prefix("route:")
+                    .unwrap_or(binding.scope.route_id.as_str()),
+                binding.scope.policy_id.clone(),
+                model.as_str(),
+                binding.scope.account_pool_id.clone(),
+                target_binding.target_id().as_str(),
+            );
+            let persisted = SessionAffinity::new_scoped(
+                affinity_storage_key(
+                    registry_key,
+                    target_binding.target_id().as_str(),
+                    key.as_str(),
+                ),
                 binding.provider.as_str(),
                 binding.credential.as_str(),
                 &binding.upstream_model,
+                scope,
                 now,
                 expires_at,
             );
@@ -1685,31 +2202,26 @@ impl PoolingCoordinator {
 
     /// Persist a newly selected affinity binding without storing raw keys.
     pub fn persist_affinity(&self, selection: &PoolSelection, now: Timestamp) {
-        let Some(key) = selection.affinity_key() else {
+        let Some(commit) = selection.affinity_commit() else {
             return;
         };
-        let Some(credential) = selection.credential() else {
+        self.persist_affinity_commit(commit, now);
+    }
+
+    pub(crate) fn persist_affinity_commit(&self, commit: AffinityCommit, now: Timestamp) {
+        let Some(expires_at) = now.checked_add(commit.ttl.as_millis() as u64) else {
             return;
         };
-        let Some(affinity) = selection
-            .policy()
-            .and_then(|policy| policy.selection().affinity())
-        else {
-            return;
-        };
-        let Some(registry_key) = selection.registry_key.as_deref() else {
-            return;
-        };
-        let Some(expires_at) = now.checked_add(affinity.ttl().as_millis() as u64) else {
-            return;
-        };
-        let binding = SessionAffinity::new(
-            format!("{registry_key}|{}", key.as_str()),
-            selection.provider().as_str(),
-            credential.as_str(),
-            selection
-                .upstream_model()
-                .unwrap_or(selection.model().as_str()),
+        let binding = SessionAffinity::new_scoped(
+            affinity_storage_key(
+                &commit.registry_key,
+                &commit.scope.target_binding_id,
+                commit.key.as_str(),
+            ),
+            commit.provider.as_str(),
+            commit.credential.as_str(),
+            commit.upstream_model,
+            commit.scope,
             now,
             expires_at,
         );
@@ -1717,6 +2229,7 @@ impl PoolingCoordinator {
     }
 
     fn restore_account_state(&self, _config: &CompiledConfig) -> Result<(), PoolError> {
+        let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
         for account in self.accounts.values() {
             let current = self
                 .store
@@ -1735,7 +2248,7 @@ impl PoolingCoordinator {
                     ))
                     .map_err(|_| PoolError::Store)?;
             }
-            for registry in self.registries.values() {
+            for registry in registries.values() {
                 let id =
                     CredentialId::new(account.id()).map_err(|_| PoolError::InvalidCredential)?;
                 registry
@@ -1761,6 +2274,7 @@ impl PoolingCoordinator {
     fn restore_cooldowns(&self) -> Result<(), PoolError> {
         let now_wall = timestamp_now();
         let now_instant = Instant::now();
+        let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
         for cooldown in self
             .store
             .cooldowns(now_wall)
@@ -1777,7 +2291,7 @@ impl PoolingCoordinator {
             else {
                 continue;
             };
-            for (key, registry) in self.registries.iter() {
+            for (key, registry) in registries.iter() {
                 if registry_key
                     .as_deref()
                     .is_some_and(|expected| expected != key.as_str())
@@ -1795,6 +2309,7 @@ impl PoolingCoordinator {
     fn restore_quota_states(&self) -> Result<(), PoolError> {
         let now_wall = timestamp_now();
         let now = Instant::now();
+        let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
         for cooldown in self
             .store
             .cooldowns(now_wall)
@@ -1808,7 +2323,7 @@ impl PoolingCoordinator {
             if record.reset_at_unix_ms() != Some(cooldown.until) {
                 return Err(PoolError::Store);
             }
-            for registry in self.registries.values() {
+            for registry in registries.values() {
                 registry
                     .restore_quota_state(&record, now, now_wall)
                     .map_err(|_| PoolError::Selection)?;
@@ -1820,14 +2335,29 @@ impl PoolingCoordinator {
     fn restore_affinities(&self) -> Result<(), PoolError> {
         let now_wall = timestamp_now();
         let now_instant = Instant::now();
+        let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
+        let bindings = self
+            .binding_index
+            .read()
+            .map_err(|_| PoolError::Selection)?;
         for affinity in self
             .store
             .session_affinities(now_wall)
             .map_err(|_| PoolError::Store)?
         {
-            let Some((registry_key, redacted_key)) = affinity.key.split_once('|') else {
+            let Some((registry_key, target_id, redacted_key)) =
+                parse_affinity_storage_key(&affinity.key)
+            else {
                 continue;
             };
+            if affinity.route_id.is_empty()
+                || affinity.policy_id.is_empty()
+                || affinity.logical_model.is_empty()
+                || affinity.account_pool_id.is_empty()
+                || affinity.target_binding_id != target_id
+            {
+                continue;
+            }
             let remaining = affinity.expires_at.saturating_sub(now_wall);
             if remaining == 0 {
                 continue;
@@ -1838,20 +2368,13 @@ impl PoolingCoordinator {
                 .map_err(|_| PoolError::InvalidCredential)?;
             let provider =
                 ProviderId::new(affinity.provider_id).map_err(|_| PoolError::InvalidProvider)?;
-            let model = self
-                .registries
-                .get(registry_key)
-                .and_then(|registry| registry.registrations().ok())
-                .and_then(|registrations| {
-                    registrations
-                        .into_iter()
-                        .find(|registration| {
-                            registration.credential() == &credential
-                                && registration.provider() == &provider
-                        })
-                        .map(|registration| registration.model().clone())
-                });
-            let Some(model) = model else {
+            let Some(binding) = bindings.values().find(|binding| {
+                binding.binding.target_id().as_str() == target_id
+                    && binding.binding.account_id() == &credential
+                    && binding.provider == provider
+                    && binding.model.as_str() == affinity.logical_model
+                    && binding.upstream_model.as_ref() == affinity.upstream_model.as_str()
+            }) else {
                 continue;
             };
             let last_used = now_instant
@@ -1862,22 +2385,25 @@ impl PoolingCoordinator {
             let expires = now_instant
                 .checked_add(Duration::from_millis(remaining))
                 .unwrap_or(now_instant);
-            if let Some(registry) = self.registries.get(registry_key) {
+            if let Some(registry) = registries.get(registry_key) {
                 registry
-                    .restore_affinity(key, credential, provider, model, last_used, expires)
+                    .restore_affinity_binding(
+                        key,
+                        binding.binding.clone(),
+                        provider,
+                        binding.model.clone(),
+                        last_used,
+                        expires,
+                    )
                     .map_err(|_| PoolError::Selection)?;
             }
         }
         Ok(())
     }
 
-    fn registry_for(&self, route: &RoutePlan, model: &ModelId) -> Option<Arc<CredentialRegistry>> {
-        let key = if route.target().model_source().is_some() {
-            model.as_str().to_owned()
-        } else {
-            route_registry_key(route.id())
-        };
-        self.registries.get(&key).cloned()
+    fn registry_for(&self, selection: &PoolSelection) -> Option<Arc<CredentialRegistry>> {
+        let key = selection.registry_key.as_deref()?;
+        self.registries.read().ok()?.get(key).cloned()
     }
 
     fn record_selection(
@@ -1901,6 +2427,12 @@ impl PoolingCoordinator {
                 .map_or_else(|| "redacted".to_owned(), |value| value.as_str().to_owned()),
         );
         record.upstream_model = upstream_model.map(str::to_owned);
+        if let Ok(bindings) = self.binding_index.read() {
+            if let Some(binding) = bindings.get(lease.binding_key()) {
+                record.target_binding_id = Some(binding.binding.target_id().as_str().to_owned());
+                record.priority_tier = Some(binding.priority);
+            }
+        }
         record.candidates = lease
             .explanation()
             .candidates
@@ -2154,6 +2686,8 @@ fn register_model_accounts(
     targets: &[pooler_config::ModelTargetPlan],
     accounts: &BTreeMap<String, AccountPlan>,
     account_pools: &BTreeMap<Arc<str>, pooler_config::AccountPoolPlan>,
+    upstreams: &BTreeMap<Arc<str>, pooler_config::UpstreamPlan>,
+    binding_index: &mut BTreeMap<BindingKey, Arc<RuntimeBinding>>,
 ) -> Result<(), PoolError> {
     let model = ModelId::new(model.to_owned()).map_err(|_| PoolError::InvalidModel)?;
     for target in targets {
@@ -2165,18 +2699,67 @@ fn register_model_accounts(
             if account.provider() != target.provider() {
                 continue;
             }
-            let registration = CredentialRegistration::from_strings(
-                account.id(),
-                account.provider(),
-                model.as_str(),
+            let fingerprint = upstreams
+                .get(account.provider())
+                .map(|upstream| {
+                    crate::account_configuration_fingerprint(
+                        upstream,
+                        account.id(),
+                        account.auth_kind(),
+                    )
+                    .map_err(|_| PoolError::Selection)
+                })
+                .transpose()?
+                .unwrap_or_else(|| format!("{}:{}", account.provider(), account.id()));
+            let binding = BindingKey::new(target.binding_id().as_str(), account.id(), fingerprint)
+                .map_err(|_| PoolError::Selection)?;
+            let binding_target = Arc::new(RuntimeBinding {
+                binding: binding.clone(),
+                model: model.clone(),
+                provider: ProviderId::new(target.provider().to_owned())
+                    .map_err(|_| PoolError::InvalidProvider)?,
+                upstream_id: Arc::from(target.provider()),
+                upstream_model: Arc::from(target.upstream_model()),
+                account: Some(account.clone()),
+                pool_id: Some(Arc::from(
+                    target
+                        .account_pool()
+                        .or(target.account())
+                        .unwrap_or(target.id().as_str()),
+                )),
+                priority: target.priority(),
+                capabilities: target.capabilities(),
+                facts: target_routing_facts(target),
+                wire_family: Some(Arc::from(target.wire_family())),
+                endpoint_family: None,
+                profile: ModelProfile::DEFAULT,
+                request_overlay: RequestOverlay::default(),
+            });
+            let registration = CredentialRegistration::with_binding(
+                binding.clone(),
+                ProviderId::new(account.provider().to_owned())
+                    .map_err(|_| PoolError::InvalidProvider)?,
+                model.clone(),
                 target.capabilities(),
             )
             .map_err(|_| PoolError::Selection)?
             .with_weight(account.weight())
             .map_err(|_| PoolError::Selection)?;
             let registration = registration
+                .with_target_weight(target.weight())
+                .map_err(|_| PoolError::Selection)?
+                .with_priority(target.priority())
+                .map_err(|_| PoolError::Selection)?
+                .with_pool_id(
+                    target
+                        .account_pool()
+                        .or(target.account())
+                        .unwrap_or(target.id().as_str()),
+                )
+                .map_err(|_| PoolError::Selection)?
                 .with_codecs(target.codecs().iter().map(AsRef::as_ref))
                 .map_err(|_| PoolError::Selection)?;
+            let registration = registration.with_facts(target_routing_facts(target));
             let registration = with_account_quota_project(registration, account)?;
             let registration = match account.max_concurrency() {
                 Some(max) => registration
@@ -2187,6 +2770,7 @@ fn register_model_accounts(
             registry
                 .register(registration)
                 .map_err(|_| PoolError::Selection)?;
+            binding_index.insert(binding, binding_target);
         }
     }
     Ok(())
@@ -2198,24 +2782,67 @@ fn register_route_accounts(
     upstream: &str,
     target: &pooler_config::TargetPlan,
     accounts: &BTreeMap<String, AccountPlan>,
+    upstreams: &BTreeMap<Arc<str>, pooler_config::UpstreamPlan>,
+    binding_index: &mut BTreeMap<BindingKey, Arc<RuntimeBinding>>,
 ) -> Result<(), PoolError> {
     let model = ModelId::new(route_key.to_owned()).map_err(|_| PoolError::InvalidModel)?;
     for account in accounts
         .values()
         .filter(|account| account.provider() == upstream)
     {
-        let registration = CredentialRegistration::from_strings(
-            account.id(),
-            account.provider(),
-            model.as_str(),
+        let fingerprint = upstreams
+            .get(account.provider())
+            .map(|upstream| {
+                crate::account_configuration_fingerprint(
+                    upstream,
+                    account.id(),
+                    account.auth_kind(),
+                )
+                .map_err(|_| PoolError::Selection)
+            })
+            .transpose()?
+            .unwrap_or_else(|| format!("{}:{}", account.provider(), account.id()));
+        let target_id = route_registry_key(route_key);
+        let binding = BindingKey::new(&target_id, account.id(), fingerprint)
+            .map_err(|_| PoolError::Selection)?;
+        let binding_target = Arc::new(RuntimeBinding {
+            binding: binding.clone(),
+            model: model.clone(),
+            provider: ProviderId::new(account.provider().to_owned())
+                .map_err(|_| PoolError::InvalidProvider)?,
+            upstream_id: Arc::from(account.provider()),
+            upstream_model: Arc::from(route_key),
+            account: Some(account.clone()),
+            pool_id: Some(Arc::from(route_key)),
+            priority: 1,
+            capabilities: target.capabilities(),
+            facts: CandidateFacts::operator_capabilities(target.capabilities()),
+            wire_family: None,
+            endpoint_family: target.endpoint_family().map(Arc::from),
+            profile: ModelProfile::DEFAULT,
+            request_overlay: RequestOverlay::default(),
+        });
+        let registration = CredentialRegistration::with_binding(
+            binding.clone(),
+            ProviderId::new(account.provider().to_owned())
+                .map_err(|_| PoolError::InvalidProvider)?,
+            model.clone(),
             target.capabilities(),
         )
         .map_err(|_| PoolError::Selection)?
         .with_weight(account.weight())
         .map_err(|_| PoolError::Selection)?;
         let registration = registration
+            .with_target_weight(1)
+            .map_err(|_| PoolError::Selection)?
+            .with_priority(1)
+            .map_err(|_| PoolError::Selection)?
+            .with_pool_id(route_key)
+            .map_err(|_| PoolError::Selection)?
             .with_codecs(target.codecs().iter().map(AsRef::as_ref))
             .map_err(|_| PoolError::Selection)?;
+        let registration =
+            registration.with_facts(CandidateFacts::operator_capabilities(target.capabilities()));
         let registration = with_account_quota_project(registration, account)?;
         let registration = match account.max_concurrency() {
             Some(max) => registration
@@ -2226,8 +2853,185 @@ fn register_route_accounts(
         registry
             .register(registration)
             .map_err(|_| PoolError::Selection)?;
+        binding_index.insert(binding, binding_target);
     }
     Ok(())
+}
+
+fn register_catalog_model(
+    registry: &CredentialRegistry,
+    model: &pooler_model_catalog::CatalogModel,
+    accounts: &BTreeMap<String, AccountPlan>,
+    account_pools: &BTreeMap<Arc<str>, pooler_config::AccountPoolPlan>,
+    upstreams: &BTreeMap<Arc<str>, pooler_config::UpstreamPlan>,
+    binding_index: &mut BTreeMap<BindingKey, Arc<RuntimeBinding>>,
+) -> Result<(), PoolError> {
+    for target in model.targets() {
+        let account_ids = target
+            .account()
+            .map(|account| vec![account.to_owned()])
+            .or_else(|| {
+                target.account_pool().and_then(|pool| {
+                    account_pools
+                        .get(pool)
+                        .map(|pool| pool.accounts().iter().map(ToString::to_string).collect())
+                })
+            })
+            .unwrap_or_default();
+        let Some(upstream) = upstreams.get(target.provider().as_str()) else {
+            continue;
+        };
+        if account_ids.is_empty() {
+            let binding = BindingKey::new(
+                target.binding_id(),
+                "catalog-static",
+                target.provider().as_str(),
+            )
+            .map_err(|_| PoolError::Selection)?;
+            binding_index.insert(
+                binding.clone(),
+                Arc::new(RuntimeBinding {
+                    binding,
+                    model: model.id().clone(),
+                    provider: target.provider().clone(),
+                    upstream_id: Arc::from(target.provider().as_str()),
+                    upstream_model: Arc::from(target.upstream_model().as_str()),
+                    account: None,
+                    pool_id: None,
+                    priority: target.priority(),
+                    capabilities: target.capabilities(),
+                    facts: CandidateFacts::operator_capabilities(target.capabilities()),
+                    wire_family: catalog_wire_family(target.profile()),
+                    endpoint_family: catalog_endpoint_family(target.profile()),
+                    profile: target.profile(),
+                    request_overlay: model.request_overlay().clone(),
+                }),
+            );
+            continue;
+        }
+        for account_id in account_ids {
+            let Some(account) = accounts.get(&account_id) else {
+                continue;
+            };
+            if account.provider() != target.provider().as_str() {
+                continue;
+            }
+            let fingerprint = crate::account_configuration_fingerprint(
+                upstream,
+                account.id(),
+                account.auth_kind(),
+            )
+            .map_err(|_| PoolError::Selection)?;
+            let binding = BindingKey::new(target.binding_id(), account.id(), fingerprint)
+                .map_err(|_| PoolError::Selection)?;
+            let binding_target = Arc::new(RuntimeBinding {
+                binding: binding.clone(),
+                model: model.id().clone(),
+                provider: target.provider().clone(),
+                upstream_id: Arc::from(target.provider().as_str()),
+                upstream_model: Arc::from(target.upstream_model().as_str()),
+                account: Some(account.clone()),
+                pool_id: target.account_pool().or(target.account()).map(Arc::from),
+                priority: target.priority(),
+                capabilities: target.capabilities(),
+                facts: CandidateFacts::operator_capabilities(target.capabilities()),
+                wire_family: catalog_wire_family(target.profile()),
+                endpoint_family: catalog_endpoint_family(target.profile()),
+                profile: target.profile(),
+                request_overlay: model.request_overlay().clone(),
+            });
+            let registration = CredentialRegistration::with_binding(
+                binding.clone(),
+                target.provider().clone(),
+                model.id().clone(),
+                target.capabilities(),
+            )
+            .map_err(|_| PoolError::Selection)?
+            .with_weight(account.weight())
+            .map_err(|_| PoolError::Selection)?
+            .with_priority(target.priority())
+            .map_err(|_| PoolError::Selection)?
+            .with_pool_id(
+                target
+                    .account_pool()
+                    .or(target.account())
+                    .unwrap_or(target.binding_id()),
+            )
+            .map_err(|_| PoolError::Selection)?;
+            let registration = registration
+                .with_facts(CandidateFacts::operator_capabilities(target.capabilities()));
+            let registration = with_account_quota_project(registration, account)?;
+            let registration = match account.max_concurrency() {
+                Some(max) => registration
+                    .with_max_in_flight(max)
+                    .map_err(|_| PoolError::Selection)?,
+                None => registration,
+            };
+            registry
+                .register(registration)
+                .map_err(|_| PoolError::Selection)?;
+            binding_index.insert(binding, binding_target);
+        }
+    }
+    Ok(())
+}
+
+fn catalog_wire_family(profile: ModelProfile) -> Option<Arc<str>> {
+    let family = match profile.request_transform {
+        pooler_core::ModelRequestTransform::AnthropicMessages => "anthropic",
+        pooler_core::ModelRequestTransform::GeminiGenerateContent => "gemini",
+        pooler_core::ModelRequestTransform::XaiChat => "xai",
+        pooler_core::ModelRequestTransform::KimiChat => "kimi",
+        pooler_core::ModelRequestTransform::OpenAiChat
+        | pooler_core::ModelRequestTransform::ProtocolDefault => "openai",
+    };
+    Some(Arc::from(family))
+}
+
+fn catalog_endpoint_family(profile: ModelProfile) -> Option<Arc<str>> {
+    let variants = profile.endpoint_variants;
+    if variants.responses {
+        Some(Arc::from("responses"))
+    } else if variants.chat_completions {
+        Some(Arc::from("chat_completions"))
+    } else if variants.messages {
+        Some(Arc::from("messages"))
+    } else if variants.generate_content {
+        Some(Arc::from("generate_content"))
+    } else if variants.realtime {
+        Some(Arc::from("realtime"))
+    } else {
+        None
+    }
+}
+
+fn target_routing_facts(target: &pooler_config::ModelTargetPlan) -> CandidateFacts {
+    let mut facts = CandidateFacts::operator_capabilities(target.capabilities());
+    if !target.parameters().is_empty() {
+        facts = facts.with_parameters(target.parameters().iter().map(ToString::to_string));
+    }
+    if let Some(context_window) = target.context_window() {
+        facts = facts.with_context_window(context_window);
+    }
+    if !target.quantization().is_empty() {
+        facts = facts.with_quantization(target.quantization().iter().map(ToString::to_string));
+    }
+    if let Some(privacy) = target.privacy() {
+        facts = facts.with_privacy(privacy);
+    }
+    if let Some(zdr) = target.zdr() {
+        facts = facts.with_zdr(zdr);
+    }
+    if let Some(data_policy) = target.data_policy() {
+        facts = facts.with_data_policy(data_policy);
+    }
+    if let Some(region) = target.region() {
+        facts = facts.with_region(region);
+    }
+    if let Some(price) = target.price() {
+        facts = facts.with_price(price);
+    }
+    facts
 }
 
 fn with_account_quota_project(
@@ -2253,8 +3057,19 @@ fn resolve_static_target(
             let target = plan
                 .targets()
                 .iter()
-                .find(|target| target.provider() == route.target().upstream())
-                .or_else(|| plan.targets().first())
+                .filter(|target| target.provider() == route.target().upstream())
+                .min_by(|left, right| {
+                    left.priority()
+                        .cmp(&right.priority())
+                        .then_with(|| left.binding_id().cmp(right.binding_id()))
+                })
+                .or_else(|| {
+                    plan.targets().iter().min_by(|left, right| {
+                        left.priority()
+                            .cmp(&right.priority())
+                            .then_with(|| left.binding_id().cmp(right.binding_id()))
+                    })
+                })
                 .ok_or(PoolError::UnknownModel {
                     model: model.to_owned(),
                 })?;
@@ -2270,8 +3085,19 @@ fn resolve_static_target(
                 model
                     .targets()
                     .iter()
-                    .find(|target| target.provider().as_str() == route.target().upstream())
-                    .or_else(|| model.targets().first())
+                    .filter(|target| target.provider().as_str() == route.target().upstream())
+                    .min_by(|left, right| {
+                        left.priority()
+                            .cmp(&right.priority())
+                            .then_with(|| left.binding_id().cmp(right.binding_id()))
+                    })
+                    .or_else(|| {
+                        model.targets().iter().min_by(|left, right| {
+                            left.priority()
+                                .cmp(&right.priority())
+                                .then_with(|| left.binding_id().cmp(right.binding_id()))
+                        })
+                    })
             })
         {
             return Ok((
@@ -2295,42 +3121,55 @@ fn resolve_static_target(
     ))
 }
 
-/// Resolve the dialect of the target the pool actually committed to.
-///
-/// A public model may map to several provider targets, and account failover can
-/// commit to any of them, so the dialect is matched on the selected provider and
-/// upstream model rather than taken from the first candidate. Statically
-/// configured models carry no discovered facts and keep the protocol default.
-fn resolve_target_profile(
+fn resolve_with_configured_model_fallback(
+    config: &CompiledConfig,
+    route: &RoutePlan,
+    requested_model: Option<&str>,
+    policy: Option<&PolicyPlan>,
     catalog: Option<&CatalogSnapshot>,
-    model: &str,
-    provider: &str,
-    upstream_model: Option<&str>,
-) -> ModelProfile {
-    let Some(upstream_model) = upstream_model else {
-        return ModelProfile::DEFAULT;
+) -> Result<(String, String, Option<String>), PoolError> {
+    let Some(requested_model) = requested_model else {
+        return resolve_static_target(config, route, None, catalog);
     };
-    catalog
-        .and_then(|catalog| catalog.get(model))
-        .and_then(|model| {
-            model.targets().iter().find(|target| {
-                target.provider().as_str() == provider
-                    && target.upstream_model().as_str() == upstream_model
-            })
-        })
-        .map_or(ModelProfile::DEFAULT, |target| target.profile())
+    match resolve_static_target(config, route, Some(requested_model), catalog) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let Some(policy) = policy else {
+                return Err(error);
+            };
+            if !policy.routing().allow_fallbacks() {
+                return Err(error);
+            }
+            for fallback in policy.routing().fallback_models() {
+                if fallback.as_ref() == requested_model {
+                    continue;
+                }
+                if let Ok(value) = resolve_static_target(config, route, Some(fallback), catalog) {
+                    return Ok(value);
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
-/// Resolve the request-body fields an operator pinned for a public model.
-///
-/// The overlay belongs to the public model rather than to one target, because
-/// an operator pins it for the model their clients name. A statically
-/// configured model carries no catalog entry and so pins nothing.
-fn resolve_request_overlay(catalog: Option<&CatalogSnapshot>, model: &str) -> RequestOverlay {
-    catalog
-        .and_then(|catalog| catalog.get(model))
-        .map(|model| model.request_overlay().clone())
-        .unwrap_or_default()
+fn next_model_fallback<'a>(
+    policy: &'a PolicyPlan,
+    requested_model: Option<&str>,
+    context: &SelectionContext,
+) -> Option<&'a str> {
+    if !policy.routing().allow_fallbacks() {
+        return None;
+    }
+    let index = context.fallback_depth;
+    let requested_model = requested_model.unwrap_or_default();
+    policy
+        .routing()
+        .fallback_models()
+        .iter()
+        .filter(|model| model.as_ref() != requested_model)
+        .nth(index)
+        .map(|model| model.as_ref())
 }
 
 fn selection_contract_is_declared(route: &RoutePlan, model: Option<&str>) -> bool {
@@ -2378,8 +3217,19 @@ fn target_satisfies_context(
             let Some(target) = plan
                 .targets()
                 .iter()
-                .find(|target| target.provider() == static_upstream)
-                .or_else(|| plan.targets().first())
+                .filter(|target| target.provider() == static_upstream)
+                .min_by(|left, right| {
+                    left.priority()
+                        .cmp(&right.priority())
+                        .then_with(|| left.binding_id().cmp(right.binding_id()))
+                })
+                .or_else(|| {
+                    plan.targets().iter().min_by(|left, right| {
+                        left.priority()
+                            .cmp(&right.priority())
+                            .then_with(|| left.binding_id().cmp(right.binding_id()))
+                    })
+                })
             else {
                 return false;
             };
@@ -2396,8 +3246,19 @@ fn target_satisfies_context(
                     model
                         .targets()
                         .iter()
-                        .find(|target| target.provider().as_str() == static_upstream)
-                        .or_else(|| model.targets().first())
+                        .filter(|target| target.provider().as_str() == static_upstream)
+                        .min_by(|left, right| {
+                            left.priority()
+                                .cmp(&right.priority())
+                                .then_with(|| left.binding_id().cmp(right.binding_id()))
+                        })
+                        .or_else(|| {
+                            model.targets().iter().min_by(|left, right| {
+                                left.priority()
+                                    .cmp(&right.priority())
+                                    .then_with(|| left.binding_id().cmp(right.binding_id()))
+                            })
+                        })
                 })
             else {
                 return false;
@@ -2441,6 +3302,119 @@ fn route_registry_key(route: &str) -> String {
     format!("route:{route}")
 }
 
+fn scoped_affinity_key(scope: &str, value: &str) -> Option<AffinityKey> {
+    if value.is_empty() {
+        return None;
+    }
+    AffinityKey::new(format!("{scope}|{value}").as_bytes()).ok()
+}
+
+fn affinity_scope_seed(
+    config: &CompiledConfig,
+    catalog: Option<&CatalogSnapshot>,
+    route: &RoutePlan,
+    logical_model: &str,
+) -> String {
+    let policy = route.target().policy().unwrap_or("direct");
+    let interaction_scope = config
+        .policies()
+        .get(policy)
+        .and_then(|policy| policy.selection().affinity())
+        .is_some_and(|affinity| affinity.key() == "gemini.interaction_id");
+    let mut bindings = BTreeSet::new();
+    let configured_models = if interaction_scope {
+        config.models().values().collect::<Vec<_>>()
+    } else {
+        config.models().get(logical_model).into_iter().collect()
+    };
+    for model in configured_models {
+        for target in model.targets() {
+            bindings.insert(format!(
+                "{}:{}:{}",
+                target.binding_id(),
+                target.provider(),
+                target
+                    .account_pool()
+                    .or(target.account())
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    let catalog_models = catalog
+        .map(|catalog| {
+            if interaction_scope {
+                catalog.models().values().collect::<Vec<_>>()
+            } else {
+                catalog.get(logical_model).into_iter().collect()
+            }
+        })
+        .unwrap_or_default();
+    for model in catalog_models {
+        for target in model.targets() {
+            bindings.insert(format!(
+                "{}:{}:{}",
+                target.binding_id(),
+                target.provider(),
+                target
+                    .account_pool()
+                    .or(target.account())
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    if interaction_scope {
+        let routes = config
+            .routes()
+            .iter()
+            .filter(|candidate| candidate.target().policy() == Some(policy))
+            .map(|candidate| candidate.id())
+            .collect::<Vec<_>>()
+            .join(",");
+        return format!(
+            "v2|interaction-routes:{routes}|policy:{policy}|bindings:{}",
+            bindings.into_iter().collect::<Vec<_>>().join(",")
+        );
+    }
+    format!(
+        "v2|route:{}|policy:{}|model:{}|bindings:{}",
+        route.id(),
+        policy,
+        logical_model,
+        bindings.into_iter().collect::<Vec<_>>().join(",")
+    )
+}
+
+fn affinity_scope_for_selection(
+    route: &RoutePlan,
+    policy: &PolicyPlan,
+    logical_model: &str,
+    target: &RuntimeBinding,
+    _scope_seed: &str,
+) -> AffinityBindingIdentity {
+    AffinityBindingIdentity::new(
+        route.id(),
+        policy.id(),
+        logical_model,
+        target
+            .pool_id
+            .as_deref()
+            .unwrap_or(target.binding.account_id().as_str()),
+        target.binding.target_id().as_str(),
+    )
+}
+
+fn affinity_storage_key(registry_key: &str, target_id: &str, redacted_key: &str) -> String {
+    format!("v2|{registry_key}|{target_id}|{redacted_key}")
+}
+
+fn parse_affinity_storage_key(key: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = key.splitn(4, '|');
+    if parts.next() != Some("v2") {
+        return None;
+    }
+    Some((parts.next()?, parts.next()?, parts.next()?))
+}
+
 fn config_strategy(strategy: ConfigSelectionStrategy) -> pooler_policy::SelectionStrategy {
     match strategy {
         ConfigSelectionStrategy::RoundRobin => pooler_policy::SelectionStrategy::RoundRobin,
@@ -2456,15 +3430,81 @@ fn config_strategy(strategy: ConfigSelectionStrategy) -> pooler_policy::Selectio
     }
 }
 
+fn routing_requirements(policy: &PolicyPlan) -> RoutingRequirements {
+    let routing = policy.routing();
+    RoutingRequirements {
+        provider_order: routing.order().iter().map(ToString::to_string).collect(),
+        provider_allow: routing.allow().iter().map(ToString::to_string).collect(),
+        provider_deny: routing.deny().iter().map(ToString::to_string).collect(),
+        target_order: routing
+            .target_order()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        target_allow: routing
+            .target_allow()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        target_deny: routing
+            .target_deny()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        allow_fallbacks: routing.allow_fallbacks(),
+        required_parameters: routing
+            .required_parameters()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        required_capabilities: routing.required_capabilities(),
+        minimum_context: routing.minimum_context(),
+        quantization: routing
+            .quantization()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        privacy: routing.privacy().map(str::to_owned),
+        require_zdr: routing.require_zdr(),
+        data_policy: routing.data_policy().map(str::to_owned),
+        region: routing.region().map(str::to_owned),
+        max_price: routing.max_price(),
+        prefer_price: routing.preference().price(),
+        prefer_latency: routing.preference().latency(),
+        prefer_throughput: routing.preference().throughput(),
+        max_latency_ms: routing.preference().max_latency_ms(),
+        min_throughput: routing.preference().min_throughput(),
+        min_samples: routing.preference().min_samples(),
+        stale_after_ms: routing.preference().stale_after_ms(),
+    }
+}
+
+fn model_target_order(config: &CompiledConfig, model: &str) -> Vec<String> {
+    config
+        .models()
+        .get(model)
+        .map(|model| {
+            model
+                .targets()
+                .iter()
+                .map(|target| target.id().as_str().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn model_account_allow_list(config: &CompiledConfig, model: &str) -> Option<Vec<String>> {
     let targets = config.models().get(model)?.targets();
-    let mut accounts = BTreeSet::new();
+    let mut accounts = Vec::new();
+    let mut seen = BTreeSet::new();
     for target in targets {
         for account in target_bound_accounts(target, config.account_pools()) {
-            accounts.insert(account.to_owned());
+            if seen.insert(account) {
+                accounts.push(account.to_owned());
+            }
         }
     }
-    Some(accounts.into_iter().collect())
+    Some(accounts)
 }
 
 fn target_bound_accounts<'a>(
@@ -2532,6 +3572,17 @@ fn cooldown_key(scope: &CooldownScope) -> (&'static str, String) {
             "credential_model",
             encode_compound_cooldown_key(credential.as_str(), model.as_str()),
         ),
+        CooldownScope::Binding(binding) => (
+            "binding",
+            serde_json::to_string(binding).expect("binding identity serializes"),
+        ),
+        CooldownScope::BindingModel { binding, model } => (
+            "binding_model",
+            encode_compound_cooldown_key(
+                &serde_json::to_string(binding).expect("binding identity serializes"),
+                model.as_str(),
+            ),
+        ),
         CooldownScope::Model(model) => ("model", model.to_string()),
         CooldownScope::Provider(provider) => ("provider", provider.to_string()),
         CooldownScope::ProviderModel { provider, model } => (
@@ -2585,6 +3636,20 @@ fn parse_cooldown_scope(scope: &str, key: &str) -> Option<(CooldownScope, Option
             Some((
                 CooldownScope::CredentialModel {
                     credential: CredentialId::new(credential).ok()?,
+                    model: parse_id(&model)?,
+                },
+                None,
+            ))
+        }
+        "binding" => Some((
+            CooldownScope::Binding(serde_json::from_str(key).ok()?),
+            None,
+        )),
+        "binding_model" => {
+            let (binding, model) = parse_compound_cooldown_key(key)?;
+            Some((
+                CooldownScope::BindingModel {
+                    binding: serde_json::from_str(&binding).ok()?,
                     model: parse_id(&model)?,
                 },
                 None,
@@ -2766,7 +3831,7 @@ upstreams:
     }
 
     #[test]
-    fn published_models_stay_provider_scoped_with_a_disabled_sibling_account() {
+    fn published_models_use_any_eligible_target_without_stale_accounts() {
         let config = compile_yaml(
             "published-model-scope.yaml",
             r#"
@@ -2806,7 +3871,10 @@ models:
             .published_models(&config, "first", CapabilitySet::new())
             .expect("published models");
 
-        assert_eq!(published.models(), &["first-model".to_owned()]);
+        assert_eq!(
+            published.models(),
+            &["first-model".to_owned(), "second-model".to_owned()]
+        );
 
         coordinator
             .set_account_enabled("first-selected", false)
@@ -2814,10 +3882,7 @@ models:
         let published = coordinator
             .published_models(&config, "first", CapabilitySet::new())
             .expect("published models without an eligible current account");
-        assert!(
-            published.models().is_empty(),
-            "a removed enabled account must not keep the provider visible"
-        );
+        assert_eq!(published.models(), &["second-model".to_owned()]);
     }
 
     fn project_quota_config() -> CompiledConfig {
@@ -3223,11 +4288,7 @@ routes:
             .interaction_affinity_binding(&create)
             .expect("configured interaction binding");
         let now = timestamp_now();
-        coordinator.bind_interaction_affinity(
-            &binding,
-            AffinityKey::new("int_returned_123").expect("hashed interaction ID"),
-            now,
-        );
+        coordinator.bind_interaction_affinity(&binding, "int_returned_123".to_owned(), now);
         drop(create);
 
         let persisted = store.session_affinities(now).expect("persisted affinities");
@@ -3637,9 +4698,7 @@ routes:
                 .map(CredentialId::as_str),
             Some("third")
         );
-        let registry = coordinator
-            .registry_for(route, failed.model())
-            .expect("route registry");
+        let registry = coordinator.registry_for(&failed).expect("route registry");
         let mut snapshots = registry
             .quota_snapshots(&failed_credential, Instant::now())
             .expect("typed quota snapshots");
@@ -3774,7 +4833,10 @@ routes:
             .expect("disable fallback");
         let registry = coordinator
             .registries
+            .read()
+            .expect("registry map")
             .get(&route_registry_key("pooled"))
+            .cloned()
             .expect("route registry");
         let credential = CredentialId::new("first").expect("credential");
         let reset_at = Instant::now();

@@ -15,6 +15,8 @@ pub const CLI_PROXY_API_REFERENCE_REVISION: &str = "2e6b1d83f6c304a102aa33c1faf0
 pub const MAX_PROVIDER_METADATA_ITEMS: usize = 64;
 /// Maximum length of a provider metadata currency code.
 pub const MAX_PROVIDER_METADATA_CURRENCY_BYTES: usize = 16;
+/// Maximum length of a provider metadata region label.
+pub const MAX_PROVIDER_METADATA_REGION_BYTES: usize = 64;
 /// Maximum number of bytes accepted for a Palantir enrollment origin.
 pub const MAX_PALANTIR_ENROLLMENT_BYTES: usize = 512;
 
@@ -22,6 +24,12 @@ pub const MAX_PALANTIR_ENROLLMENT_BYTES: usize = 512;
 pub const PALANTIR_OAUTH_AUTHORIZATION_PATH: &str = "/multipass/api/oauth2/authorize";
 /// Foundry OAuth token endpoint relative to an enrollment origin.
 pub const PALANTIR_OAUTH_TOKEN_PATH: &str = "/multipass/api/oauth2/token";
+/// Palantir's OpenAI-compatible proxy path prefix.
+pub const PALANTIR_OPENAI_PROXY_PATH_PREFIX: &str = "/api/v2/llm/proxy/openai";
+/// Palantir's Anthropic-compatible proxy path prefix.
+pub const PALANTIR_ANTHROPIC_PROXY_PATH_PREFIX: &str = "/api/v2/llm/proxy/anthropic";
+/// Prefix required for an explicit Palantir language-model resource RID.
+pub const PALANTIR_MODEL_RID_PREFIX: &str = "ri.language-model-service..language-model.";
 
 /// Provider family understood by the integration helpers.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -416,6 +424,8 @@ pub struct ProviderMetadata {
     pub privacy: ProviderFact<ProviderPrivacy>,
     pub zdr: ProviderFact<bool>,
     pub data_policy: ProviderFact<ProviderDataPolicy>,
+    #[serde(default)]
+    pub region: ProviderFact<String>,
     pub pricing: ProviderFact<ProviderPricing>,
 }
 
@@ -526,6 +536,13 @@ impl ProviderMetadata {
                 return Err(ProviderMetadataError::InvalidCurrency);
             }
         }
+        if self.region.value.as_ref().is_some_and(|region| {
+            region.is_empty()
+                || region.len() > MAX_PROVIDER_METADATA_REGION_BYTES
+                || region.chars().any(char::is_whitespace)
+        }) {
+            return Err(ProviderMetadataError::InvalidRegion);
+        }
         macro_rules! check_provenance {
             ($($fact:expr),+ $(,)?) => {
                 $(if $fact.value.is_none()
@@ -546,6 +563,7 @@ impl ProviderMetadata {
             &self.privacy,
             &self.zdr,
             &self.data_policy,
+            &self.region,
             &self.pricing,
         );
         Ok(())
@@ -561,6 +579,9 @@ pub enum ProviderMetadataError {
     /// A pricing currency is not a short ASCII code.
     #[error("provider metadata pricing currency is invalid")]
     InvalidCurrency,
+    /// A region label is empty, too long, or contains whitespace.
+    #[error("provider metadata region is invalid")]
+    InvalidRegion,
     /// A value/provenance pair was manually assembled inconsistently.
     #[error("provider metadata contains inconsistent provenance")]
     InconsistentProvenance,

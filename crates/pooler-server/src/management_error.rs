@@ -24,6 +24,7 @@ pub enum ManagementErrorCode {
     ConfigDraftEtagMismatch,
     ConfigGenerationConflict,
     OperationInProgress,
+    ResourceConflict,
     OAuthTokenGenerationConflict,
     ConfirmationInvalid,
     DraftExpired,
@@ -64,6 +65,7 @@ impl ManagementErrorCode {
             Self::ConfigDraftEtagMismatch => "config_draft_etag_mismatch",
             Self::ConfigGenerationConflict => "config_generation_conflict",
             Self::OperationInProgress => "operation_in_progress",
+            Self::ResourceConflict => "resource_conflict",
             Self::OAuthTokenGenerationConflict => "oauth_token_generation_conflict",
             Self::ConfirmationInvalid => "confirmation_invalid",
             Self::DraftExpired => "draft_expired",
@@ -101,10 +103,12 @@ impl ManagementErrorCode {
     #[must_use]
     pub const fn status(self) -> StatusCode {
         match self {
-            Self::ConfigDraftEtagMismatch
-            | Self::ConfigGenerationConflict => StatusCode::PRECONDITION_FAILED,
+            Self::ConfigDraftEtagMismatch | Self::ConfigGenerationConflict => {
+                StatusCode::PRECONDITION_FAILED
+            }
             Self::PreconditionRequired => StatusCode::PRECONDITION_REQUIRED,
             Self::OperationInProgress
+            | Self::ResourceConflict
             | Self::OAuthTokenGenerationConflict
             | Self::ConfirmationInvalid
             | Self::OAuthUnsupported
@@ -118,9 +122,9 @@ impl ManagementErrorCode {
             | Self::DependencyUnavailable
             | Self::RequestHistoryIncomplete => StatusCode::SERVICE_UNAVAILABLE,
             Self::AuthenticationRequired => StatusCode::UNAUTHORIZED,
-            Self::AuthenticationNotConfigured
-            | Self::ForbiddenHost
-            | Self::ForbiddenOrigin => StatusCode::FORBIDDEN,
+            Self::AuthenticationNotConfigured | Self::ForbiddenHost | Self::ForbiddenOrigin => {
+                StatusCode::FORBIDDEN
+            }
             Self::NotFound
             | Self::AccountNotFound
             | Self::ModelNotFound
@@ -431,7 +435,10 @@ mod tests {
             assert_eq!(error.status(), status);
             assert_eq!(value["schema_version"], SCHEMA_VERSION);
             assert_eq!(value["error"]["code"], wire_code);
-            assert!(value["error"].get("message").and_then(Value::as_str).is_some());
+            assert!(value["error"]
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some());
             assert!(value["error"].get("retryable").is_some());
             assert!(value["error"].get("details").is_some_and(Value::is_object));
             assert!(value["error"].get("current_generation").is_some());

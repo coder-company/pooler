@@ -7,8 +7,8 @@ use std::time::Duration;
 use pooler_core::{Capability, CapabilitySet, ModelId};
 use pooler_model_catalog::{
     CatalogError, CatalogService, CatalogSourceConfig, DiscoveredModel, DiscoveryFailure,
-    DiscoveryFailureKind, DiscoveryFuture, DiscoveryResponse, ModelDiscovery, RefreshConfig,
-    RegisteredSource,
+    DiscoveryFailureKind, DiscoveryFuture, DiscoveryResponse, ModelDiscovery, ModelSelectionAction,
+    RefreshConfig, RegisteredSource,
 };
 
 fn model(id: &str) -> DiscoveredModel {
@@ -236,4 +236,119 @@ async fn complete_deadline_covers_high_work_merge_and_publication() {
         .expect_err("merge must share the complete refresh deadline");
     assert_eq!(error, CatalogError::RefreshTimedOut { timeout_ms: 1 });
     assert_eq!(service.snapshot().generation(), 0);
+}
+
+#[test]
+fn account_bound_targets_and_signed_priorities_are_stable() {
+    let make_source = |id: &str, account: Option<&str>, pool: Option<&str>, priority| {
+        CatalogSourceConfig {
+            id: id.to_owned(),
+            provider: "shared-provider".to_owned(),
+            account: account.map(str::to_owned),
+            account_pool: pool.map(str::to_owned),
+            priority,
+            ..CatalogSourceConfig::default()
+        }
+        .compile()
+        .expect("valid account-bound source")
+    };
+    let first = pooler_model_catalog::CatalogInput::new(
+        make_source("shared.a", Some("account-a"), None, 20),
+        DiscoveryResponse::new(vec![model("shared-model")]),
+    );
+    let second = pooler_model_catalog::CatalogInput::new(
+        make_source("shared.b", Some("account-b"), None, 20),
+        DiscoveryResponse::new(vec![model("shared-model")]),
+    );
+    let pooled = pooler_model_catalog::CatalogInput::new(
+        make_source("shared.pool", None, Some("pool-a"), -5),
+        DiscoveryResponse::new(vec![model("shared-model")]),
+    );
+    let merged = pooler_model_catalog::merge_discoveries(
+        1,
+        100,
+        vec![first.clone(), second.clone(), pooled.clone()],
+        RefreshConfig::default().compile().expect("limits"),
+        &pooler_model_catalog::ModelOverrides::default(),
+    )
+    .expect("account-bound catalog merges");
+    let targets = &merged.get("shared-model").expect("model").targets();
+    assert_eq!(
+        targets.len(),
+        3,
+        "authorized accounts and pools stay distinct"
+    );
+    assert_eq!(targets[0].priority(), 1);
+    assert_eq!(targets[1].priority(), 1);
+    assert_eq!(targets[2].priority(), 2);
+    assert_eq!(targets[0].signed_priority(), 20);
+    assert_eq!(targets[2].signed_priority(), -5);
+    assert_eq!(targets[0].account(), Some("account-a"));
+    assert_eq!(targets[1].account(), Some("account-b"));
+    assert_eq!(targets[2].account_pool(), Some("pool-a"));
+    assert_ne!(
+        targets[0].binding().binding_id(),
+        targets[1].binding().binding_id()
+    );
+    assert_eq!(targets[0].provenance()[0].account(), Some("account-a"));
+    assert_eq!(targets[2].provenance()[0].account_pool(), Some("pool-a"));
+
+    let repeat = pooler_model_catalog::merge_discoveries(
+        1,
+        100,
+        vec![pooled, second, first],
+        RefreshConfig::default().compile().expect("limits"),
+        &pooler_model_catalog::ModelOverrides::default(),
+    )
+    .expect("repeat merge");
+    assert_eq!(
+        merged, repeat,
+        "source order cannot change binding identity"
+    );
+}
+
+#[tokio::test]
+async fn typed_bulk_selection_preserves_explicit_exclusions_across_refresh() {
+    let discovery = Arc::new(SequenceDiscovery::new([
+        Ok(DiscoveryResponse::new(vec![model("keep"), model("remove")])),
+        Ok(DiscoveryResponse::new(vec![model("keep"), model("remove")])),
+        Ok(DiscoveryResponse::new(vec![model("keep"), model("remove")])),
+    ]));
+    let limits = RefreshConfig::default().compile().expect("limits");
+    let service = CatalogService::new(
+        vec![RegisteredSource::new(
+            source("provider.selection", "provider"),
+            discovery,
+        )],
+        limits,
+    )
+    .expect("service");
+
+    service
+        .exclude_model("provider.selection", "remove")
+        .expect("explicit exclusion");
+    service.refresh(1).await.expect("initial selection refresh");
+    assert!(service.snapshot().get("keep").is_some());
+    assert!(service.snapshot().get("remove").is_none());
+
+    service
+        .apply_selection("provider.selection", ModelSelectionAction::SelectNone)
+        .expect("select none");
+    service.refresh(2).await.expect("select none refresh");
+    assert!(service.snapshot().models().is_empty());
+
+    service
+        .apply_selection("provider.selection", ModelSelectionAction::SelectAll)
+        .expect("select all");
+    service.refresh(3).await.expect("select all refresh");
+    assert!(service.snapshot().get("keep").is_some());
+    assert!(service.snapshot().get("remove").is_none());
+    let state = service
+        .selection_state("provider.selection")
+        .expect("selection state");
+    assert_eq!(state.action(), ModelSelectionAction::SelectAll);
+    assert_eq!(
+        state.explicit_exclusions(),
+        &[pooler_core::ModelId::new("remove").expect("id")]
+    );
 }

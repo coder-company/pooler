@@ -21,6 +21,10 @@ use crate::{StoreError, StoreResult};
 
 const ENVELOPE_MAGIC: &[u8; 4] = b"PLCP";
 const ENVELOPE_VERSION: u8 = 1;
+/// Version of the credential identity carried in payload AAD. This is
+/// independent from the envelope format so identity migrations can reject
+/// stale account/configuration bindings without accepting old ciphertext.
+pub(crate) const CREDENTIAL_IDENTITY_AAD_VERSION: u8 = 2;
 const ENVELOPE_ALGORITHM_AES_256_GCM: u8 = 1;
 const KEY_ID_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;

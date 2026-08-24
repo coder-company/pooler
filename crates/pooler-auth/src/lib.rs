@@ -960,7 +960,13 @@ impl RefreshEntry {
 }
 
 struct CoordinatorState {
-    entries: Mutex<HashMap<CredentialId, Arc<RefreshEntry>>>,
+    entries: Mutex<HashMap<RefreshKey, Arc<RefreshEntry>>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RefreshKey {
+    credential: CredentialId,
+    fingerprint: String,
 }
 
 /// Coordinates at most one OAuth refresh operation per credential.
@@ -1008,13 +1014,49 @@ impl RefreshCoordinator {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<OAuthTokens, RefreshError>>,
     {
+        self.refresh_for_fingerprint(credential, "", operation)
+            .await
+    }
+
+    /// Run one refresh operation keyed by the credential and its immutable
+    /// configuration fingerprint. A token refresh must never be shared
+    /// between two configurations that happen to reuse an account ID.
+    pub async fn refresh_for_fingerprint<F, Fut>(
+        &self,
+        credential: CredentialId,
+        fingerprint: impl Into<String>,
+        operation: F,
+    ) -> Result<OAuthTokens, RefreshError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<OAuthTokens, RefreshError>>,
+    {
+        self.refresh_key(
+            RefreshKey {
+                credential,
+                fingerprint: fingerprint.into(),
+            },
+            operation,
+        )
+        .await
+    }
+
+    async fn refresh_key<F, Fut>(
+        &self,
+        key: RefreshKey,
+        operation: F,
+    ) -> Result<OAuthTokens, RefreshError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<OAuthTokens, RefreshError>>,
+    {
         let (entry, leader) = {
             let mut entries = lock_unpoisoned(&self.state.entries);
-            if let Some(entry) = entries.get(&credential) {
+            if let Some(entry) = entries.get(&key) {
                 (Arc::clone(entry), false)
             } else {
                 let entry = Arc::new(RefreshEntry::new());
-                entries.insert(credential.clone(), Arc::clone(&entry));
+                entries.insert(key.clone(), Arc::clone(&entry));
                 (entry, true)
             }
         };
@@ -1025,7 +1067,7 @@ impl RefreshCoordinator {
 
         let mut guard = LeaderGuard {
             coordinator: self.clone(),
-            credential,
+            key,
             entry: Arc::clone(&entry),
             completed: false,
         };
@@ -1048,13 +1090,35 @@ impl RefreshCoordinator {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<OAuthTokens, RefreshError>>,
     {
+        self.refresh_cancellable_for_fingerprint(credential, "", cancellation, operation)
+            .await
+    }
+
+    /// Cancellation-aware refresh keyed by account and configuration
+    /// fingerprint. Waiters for another fingerprint keep an independent
+    /// provider operation even when the account ID is identical.
+    pub async fn refresh_cancellable_for_fingerprint<F, Fut>(
+        &self,
+        credential: CredentialId,
+        fingerprint: impl Into<String>,
+        cancellation: CancellationToken,
+        operation: F,
+    ) -> Result<OAuthTokens, RefreshError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<OAuthTokens, RefreshError>>,
+    {
+        let key = RefreshKey {
+            credential,
+            fingerprint: fingerprint.into(),
+        };
         let (entry, leader) = {
             let mut entries = lock_unpoisoned(&self.state.entries);
-            if let Some(entry) = entries.get(&credential) {
+            if let Some(entry) = entries.get(&key) {
                 (Arc::clone(entry), false)
             } else {
                 let entry = Arc::new(RefreshEntry::new());
-                entries.insert(credential.clone(), Arc::clone(&entry));
+                entries.insert(key.clone(), Arc::clone(&entry));
                 (entry, true)
             }
         };
@@ -1068,7 +1132,7 @@ impl RefreshCoordinator {
 
         let mut guard = LeaderGuard {
             coordinator: self.clone(),
-            credential,
+            key,
             entry: Arc::clone(&entry),
             completed: false,
         };
@@ -1107,7 +1171,7 @@ async fn wait_for_refresh(entry: &RefreshEntry) -> Result<OAuthTokens, RefreshEr
 
 struct LeaderGuard {
     coordinator: RefreshCoordinator,
-    credential: CredentialId,
+    key: RefreshKey,
     entry: Arc<RefreshEntry>,
     completed: bool,
 }
@@ -1115,11 +1179,7 @@ struct LeaderGuard {
 impl LeaderGuard {
     fn complete(&mut self, result: Result<OAuthTokens, RefreshError>) {
         *lock_unpoisoned(&self.entry.result) = Some(result);
-        remove_entry(
-            &self.coordinator.state.entries,
-            &self.credential,
-            &self.entry,
-        );
+        remove_entry(&self.coordinator.state.entries, &self.key, &self.entry);
         self.entry.complete.notify_waiters();
         self.completed = true;
     }
@@ -1131,26 +1191,22 @@ impl Drop for LeaderGuard {
             return;
         }
         *lock_unpoisoned(&self.entry.result) = Some(Err(RefreshError::Cancelled));
-        remove_entry(
-            &self.coordinator.state.entries,
-            &self.credential,
-            &self.entry,
-        );
+        remove_entry(&self.coordinator.state.entries, &self.key, &self.entry);
         self.entry.complete.notify_waiters();
     }
 }
 
 fn remove_entry(
-    entries: &Mutex<HashMap<CredentialId, Arc<RefreshEntry>>>,
-    credential: &CredentialId,
+    entries: &Mutex<HashMap<RefreshKey, Arc<RefreshEntry>>>,
+    key: &RefreshKey,
     expected: &Arc<RefreshEntry>,
 ) {
     let mut entries = lock_unpoisoned(entries);
     let should_remove = entries
-        .get(credential)
+        .get(key)
         .is_some_and(|current| Arc::ptr_eq(current, expected));
     if should_remove {
-        entries.remove(credential);
+        entries.remove(key);
     }
 }
 
@@ -1326,6 +1382,27 @@ mod tests {
         assert_eq!(first_result.access_token().expose_secret(), "access");
         assert_eq!(second_result.access_token().expose_secret(), "access");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(coordinator.active_leases(), 0);
+    }
+
+    #[tokio::test]
+    async fn refreshes_with_distinct_fingerprints_do_not_share_a_lease() {
+        let coordinator = RefreshCoordinator::new();
+        let credential = CredentialId::new("shared-account").expect("valid credential ID");
+        let first = coordinator
+            .refresh_for_fingerprint(credential.clone(), "fingerprint-a", || async {
+                Ok(OAuthTokens::bearer("access-a", None::<String>, None))
+            })
+            .await
+            .expect("first refresh");
+        let second = coordinator
+            .refresh_for_fingerprint(credential, "fingerprint-b", || async {
+                Ok(OAuthTokens::bearer("access-b", None::<String>, None))
+            })
+            .await
+            .expect("second refresh");
+        assert_eq!(first.access_token().expose_secret(), "access-a");
+        assert_eq!(second.access_token().expose_secret(), "access-b");
         assert_eq!(coordinator.active_leases(), 0);
     }
 

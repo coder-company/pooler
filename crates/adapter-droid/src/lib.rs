@@ -1317,7 +1317,7 @@ mod tests {
             .map(|value| format!("    limits: {{max_response_body_bytes: {value}}}\n"))
             .unwrap_or_default();
         let source = format!(
-            "version: 1\nlisteners: {{droid: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://127.0.0.1:9}}}}\nroutes:\n  - id: droid\n    listen: droid\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: {ingress}}}\n    target: {{provider: local, path: /v1/responses}}\n{limits}    response: {{mode: semantic, decoder: {decoder}, encoder: {encoder}}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{droid: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://127.0.0.1:9}}}}\nroutes:\n  - id: droid\n    listen: droid\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: {ingress}}}\n    target: {{provider: local, path: /v1/responses}}\n{limits}    response: {{mode: semantic, decoder: {decoder}, encoder: {encoder}}}\n    loss_policy: reject\n"
         );
         Config::from_yaml("droid.yaml", &source)
             .expect("config parses")
@@ -1334,7 +1334,7 @@ mod tests {
         encoder: &str,
     ) -> pooler_config::RoutePlan {
         let source = format!(
-            "version: 1\nlisteners: {{droid: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://127.0.0.1:9}}}}\nroutes:\n  - id: droid\n    listen: droid\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: {ingress}, encoder: {request_encoder}}}\n    target: {{provider: local, path: /v1/responses}}\n    response: {{mode: semantic, decoder: {decoder}, encoder: {encoder}}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{droid: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://127.0.0.1:9}}}}\nroutes:\n  - id: droid\n    listen: droid\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: {ingress}, encoder: {request_encoder}}}\n    target: {{provider: local, path: /v1/responses}}\n    response: {{mode: semantic, decoder: {decoder}, encoder: {encoder}}}\n    loss_policy: reject\n"
         );
         Config::from_yaml("droid-request-encoder.yaml", &source)
             .expect("config parses")

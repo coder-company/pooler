@@ -370,12 +370,19 @@ jobs:
             "$source"/deploy/*.example.yaml \
             "$source"/deploy/*.service; do
             [[ -e "$deployment_asset" || -L "$deployment_asset" ]] || continue
+            [[ "${deployment_asset##*/}" == "pooler@.service" ]] && continue
             verify_staged_asset "deploy/${deployment_asset##*/}"
             deployment_count=$((deployment_count + 1))
           done
           test "$deployment_count" -gt 0
           verify_staged_asset docs/deployment.md
           verify_staged_asset scripts/check-deployment-config.py
+          verify_staged_asset scripts/install-system-pooler.sh
+          verify_staged_asset scripts/test-system-install.sh
+          verify_staged_asset scripts/check-staged-secrets.sh
+          verify_staged_asset scripts/release.sh
+          verify_staged_asset schema/pooler.schema.json
+          test ! -e "${packaged_root}/deploy/pooler@.service"
           test ! -e "${packaged_root}/Dockerfile"
           test ! -e "${packaged_root}/docker-compose.example.yml"
           test -s "${packaged_root}/third-party/dashboard-assets/manifest.json"
@@ -391,7 +398,16 @@ jobs:
             "$packaged_binary" \
               --config "${packaged_root}/deploy/pooler.systemd.example.yaml" check
             POOLER_BIN="$packaged_binary" python3 \
-              "${packaged_root}/scripts/check-deployment-config.py"
+              "${packaged_root}/scripts/check-deployment-config.py" \
+              "${packaged_root}/deploy/pooler.systemd.example.yaml" check
+            bash "${packaged_root}/scripts/release.sh" --check
+            "$packaged_binary" migrate --help >/dev/null
+            "$packaged_binary" config schema --output \
+              "${RUNNER_TEMP}/pooler-${TARGET}.schema.json"
+            cmp -- "${RUNNER_TEMP}/pooler-${TARGET}.schema.json" \
+              "${packaged_root}/schema/pooler.schema.json"
+            bash "${packaged_root}/scripts/test-system-install.sh" --sandbox \
+              --binary "$packaged_binary"
           fi
 
           cat > "${artifact_dir}/build-info-${TARGET}.txt" <<EOF

@@ -1,23 +1,31 @@
-//! Bounded typed configuration drafts and durable managed-file persistence.
+//! Bounded typed drafts and one canonical configuration-file transaction.
+//!
+//! File preparation and runtime publication are deliberately separate. This
+//! module validates a candidate, durably stages it, and hands the staged
+//! candidate to the runtime owner. The configured path remains the only live
+//! configuration path.
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-use pooler_config::{Config, ConfigLoader, MAX_CONFIG_FILE_BYTES};
+use pooler_config::{CompiledConfig, Config, ConfigLoader, MAX_CONFIG_FILE_BYTES};
 use ring::digest::{digest, SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
+
+use crate::ManagementState;
+use pooler_store::DraftRecord;
 
 const MAX_DRAFTS: usize = 8;
 const MAX_PATCHES: usize = 128;
@@ -25,18 +33,19 @@ const MAX_DOCUMENT_BYTES: usize = MAX_CONFIG_FILE_BYTES as usize;
 const DRAFT_TTL: Duration = Duration::from_secs(30 * 60);
 const GENERATED_HEADER: &[u8] =
     b"# Generated and exclusively managed by Pooler. Do not edit by hand.\n";
-const RECOVERY_MARKER: &[u8] = b"pooler-managed-config-transaction-v1\n";
+const RECOVERY_MARKER: &[u8] = b"pooler-config-transaction-v2\n";
 const RECOVERY_MARKER_MAX_BYTES: usize = 64 * 1024;
-const RECOVERY_RECORD_VERSION: u8 = 1;
+const RECOVERY_RECORD_VERSION: u8 = 2;
 
 #[cfg(test)]
 thread_local! {
-    static FAIL_WRITE_AFTER_RENAME: Cell<bool> = const { Cell::new(false) };
+    static FAILURE_HOOK: Cell<Option<FileTransactionStage>> = const { Cell::new(None) };
 }
 
-/// A section-scoped mutation. Arbitrary JSON pointers and unrestricted YAML are
-/// deliberately unsupported; the compiler remains the final type authority.
-#[derive(Deserialize)]
+/// A section-scoped mutation. Arbitrary JSON pointers and unrestricted YAML
+/// are deliberately unsupported; the compiler remains the final type
+/// authority.
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TypedConfigPatch {
     Upsert {
@@ -65,33 +74,32 @@ struct Draft {
     confirmation: Option<String>,
 }
 
-struct PendingCommit {
-    request_id: u64,
-    managed_path: PathBuf,
-    persistence: PersistenceState,
-    previous_source: PathBuf,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DurableDraftPayload {
+    base: Value,
+    document: Value,
+    patches: usize,
+    confirmation: Option<String>,
 }
 
-struct PersistenceState {
-    previous_managed: Option<Vec<u8>>,
-    previous_backup: Option<Vec<u8>>,
+struct PendingActivation {
+    request_id: u64,
+    activation: PreparedActivation,
 }
 
 struct State {
-    active_source: PathBuf,
     drafts: VecDeque<Draft>,
-    pending: BTreeMap<u64, PendingCommit>,
+    pending: BTreeMap<u64, PendingActivation>,
     commit_in_progress: bool,
-    unmanaged_reload_in_progress: bool,
+    external_reload_in_progress: bool,
 }
 
-/// Process-local draft coordinator. Persisted output is always an explicitly
-/// named generated sidecar; operator-authored source is never rewritten.
+/// Process-local draft coordinator for the canonical configuration path.
 pub(crate) struct ConfigManagement {
-    source_path: PathBuf,
-    managed_path: PathBuf,
+    canonical_path: PathBuf,
     next_id: AtomicU64,
     state: Mutex<State>,
+    durable: Option<std::sync::Arc<ManagementState>>,
 }
 
 #[derive(Debug, Error)]
@@ -122,54 +130,77 @@ pub enum ConfigManagementError {
 struct RecoveryRecord {
     version: u8,
     operation: String,
-    source: String,
-    managed: String,
+    canonical: String,
+    staged: String,
     backup: String,
+    rollback: String,
     generation: u64,
-    target_sha256: String,
-    previous_managed_sha256: Option<String>,
-    previous_backup_sha256: Option<String>,
+    prior_sha256: String,
+    next_sha256: String,
+    prior_backup_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 enum RecoveryMarker {
     Legacy,
-    Record(RecoveryRecord),
+    Record(Box<RecoveryRecord>),
 }
 
-pub(crate) fn serving_source(source: impl AsRef<Path>) -> Result<PathBuf, ConfigManagementError> {
-    let (original, managed) = managed_paths(source.as_ref())?;
-    ensure_no_recovery_marker(&managed)?;
-    if validate_existing_managed(&managed)? {
-        Ok(managed)
-    } else {
-        Ok(original)
-    }
+/// Return the one configured path after regular-file and marker validation.
+///
+/// The caller must load this exact path. No alternate generated path is
+/// selected when a recovery marker or an unsafe file is present.
+pub(crate) fn configured_source(
+    source: impl AsRef<Path>,
+) -> Result<PathBuf, ConfigManagementError> {
+    let canonical = canonical_config_path(source.as_ref())?;
+    ensure_no_recovery_marker(&canonical)?;
+    Ok(canonical)
 }
 
 impl ConfigManagement {
     pub(crate) fn new(source: impl AsRef<Path>) -> Result<Self, ConfigManagementError> {
-        let (original_source, managed_path) = managed_paths(source.as_ref())?;
-        ensure_no_recovery_marker(&managed_path)?;
-        let active_source = if validate_existing_managed(&managed_path)? {
-            managed_path.clone()
-        } else {
-            original_source.clone()
-        };
+        let canonical_path = canonical_config_path(source.as_ref())?;
+        ensure_no_recovery_marker(&canonical_path)?;
         Ok(Self {
-            source_path: original_source,
-            managed_path,
+            canonical_path,
             next_id: AtomicU64::new(0),
             state: Mutex::new(State {
-                active_source,
                 drafts: VecDeque::new(),
                 pending: BTreeMap::new(),
                 commit_in_progress: false,
-                unmanaged_reload_in_progress: false,
+                external_reload_in_progress: false,
             }),
+            durable: None,
         })
     }
 
+    pub(crate) fn new_with_state(
+        source: impl AsRef<Path>,
+        durable: std::sync::Arc<ManagementState>,
+    ) -> Result<Self, ConfigManagementError> {
+        let mut manager = Self::new(source)?;
+        manager.durable = Some(durable);
+        Ok(manager)
+    }
+
+    fn render_document(&self) -> Result<Value, ConfigManagementError> {
+        let rendered = ConfigLoader::default()
+            .render(&self.canonical_path)
+            .map_err(|error| ConfigManagementError::Invalid(error.to_string()))?;
+        if rendered.len() > MAX_DOCUMENT_BYTES {
+            return Err(ConfigManagementError::TooLarge);
+        }
+        let yaml: serde_yml::Value = serde_yml::from_str(&rendered)
+            .map_err(|error| ConfigManagementError::Invalid(error.to_string()))?;
+        serde_json::to_value(yaml)
+            .map_err(|_| ConfigManagementError::Invalid("candidate is not JSON-shaped".into()))
+    }
+
+    /// Serialize an external watcher with a prepared canonical activation.
+    ///
+    /// The method name remains a narrow compatibility seam for the current
+    /// management caller; it does not select or serve another file.
     pub(crate) fn try_begin_unmanaged_reload(&self) -> bool {
         let mut state = self
             .state
@@ -177,11 +208,11 @@ impl ConfigManagement {
             .expect("configuration draft lock poisoned");
         if state.commit_in_progress
             || !state.pending.is_empty()
-            || state.unmanaged_reload_in_progress
+            || state.external_reload_in_progress
         {
             return false;
         }
-        state.unmanaged_reload_in_progress = true;
+        state.external_reload_in_progress = true;
         true
     }
 
@@ -189,7 +220,7 @@ impl ConfigManagement {
         self.state
             .lock()
             .expect("configuration draft lock poisoned")
-            .unmanaged_reload_in_progress = false;
+            .external_reload_in_progress = false;
     }
 
     pub(crate) fn create(&self, base_generation: u64) -> Result<Value, ConfigManagementError> {
@@ -202,7 +233,7 @@ impl ConfigManagement {
             state.drafts.pop_front();
         }
         let rendered = ConfigLoader::default()
-            .render(&state.active_source)
+            .render(&self.canonical_path)
             .map_err(|error| ConfigManagementError::Invalid(error.to_string()))?;
         if rendered.len() > MAX_DOCUMENT_BYTES {
             return Err(ConfigManagementError::TooLarge);
@@ -235,6 +266,35 @@ impl ConfigManagement {
         }))
     }
 
+    pub(crate) fn create_owned(
+        &self,
+        owner_id: &str,
+        base_generation: u64,
+    ) -> Result<Value, ConfigManagementError> {
+        let Some(durable) = self.durable.as_ref() else {
+            return self.create(base_generation);
+        };
+        let document = self.render_document()?;
+        let payload = DurableDraftPayload {
+            base: document.clone(),
+            document,
+            patches: 0,
+            confirmation: None,
+        };
+        let now = management_timestamp_ms();
+        let record = durable
+            .create_draft(DraftRecord::new(
+                owner_id,
+                "configuration",
+                base_generation,
+                encode_durable_draft(&payload)?,
+                now,
+                now.saturating_add(u64::try_from(DRAFT_TTL.as_millis()).unwrap_or(u64::MAX)),
+            ))
+            .map_err(map_store_error)?;
+        durable_draft_view(&record, &payload)
+    }
+
     pub(crate) fn view(&self, id: u64) -> Result<Value, ConfigManagementError> {
         let mut state = self
             .state
@@ -242,6 +302,22 @@ impl ConfigManagement {
             .expect("configuration draft lock poisoned");
         let draft = draft_mut(&mut state.drafts, id)?;
         Ok(draft_view(draft))
+    }
+
+    pub(crate) fn view_owned(
+        &self,
+        owner_id: &str,
+        id: u64,
+    ) -> Result<Value, ConfigManagementError> {
+        let Some(durable) = self.durable.as_ref() else {
+            return self.view(id);
+        };
+        let record = durable
+            .draft(id, owner_id, management_timestamp_ms())
+            .map_err(map_store_error)?
+            .ok_or(ConfigManagementError::NotFound)?;
+        let payload = decode_durable_draft(&record.payload)?;
+        durable_draft_view(&record, &payload)
     }
 
     pub(crate) fn apply(
@@ -276,6 +352,52 @@ impl ConfigManagement {
         Ok(draft_view(draft))
     }
 
+    pub(crate) fn apply_owned(
+        &self,
+        owner_id: &str,
+        id: u64,
+        if_match: &str,
+        patch: TypedConfigPatch,
+    ) -> Result<Value, ConfigManagementError> {
+        let Some(durable) = self.durable.as_ref() else {
+            return self.apply(id, if_match, patch);
+        };
+        let record = durable
+            .draft(id, owner_id, management_timestamp_ms())
+            .map_err(map_store_error)?
+            .ok_or(ConfigManagementError::NotFound)?;
+        let mut payload = decode_durable_draft(&record.payload)?;
+        if document_etag(&payload.document)? != if_match.trim_matches('"') {
+            return Err(ConfigManagementError::Precondition);
+        }
+        if payload.patches >= MAX_PATCHES {
+            return Err(ConfigManagementError::PatchLimit);
+        }
+        let mut candidate = payload.document.clone();
+        apply_patch(&mut candidate, patch)?;
+        if serde_json::to_vec(&candidate)
+            .map_err(|_| ConfigManagementError::UnsupportedPatch)?
+            .len()
+            > MAX_DOCUMENT_BYTES
+        {
+            return Err(ConfigManagementError::TooLarge);
+        }
+        payload.document = candidate;
+        payload.patches += 1;
+        payload.confirmation = None;
+        let next = durable
+            .update_draft(
+                id,
+                owner_id,
+                record.revision,
+                &record.etag,
+                encode_durable_draft(&payload)?,
+                management_timestamp_ms(),
+            )
+            .map_err(map_store_error)?;
+        durable_draft_view(&next, &payload)
+    }
+
     pub(crate) fn validate(&self, id: u64, if_match: &str) -> Result<Value, ConfigManagementError> {
         let mut state = self
             .state
@@ -297,6 +419,52 @@ impl ConfigManagement {
         }))
     }
 
+    pub(crate) fn validate_owned(
+        &self,
+        owner_id: &str,
+        id: u64,
+        if_match: &str,
+    ) -> Result<Value, ConfigManagementError> {
+        let Some(durable) = self.durable.as_ref() else {
+            return self.validate(id, if_match);
+        };
+        let record = durable
+            .draft(id, owner_id, management_timestamp_ms())
+            .map_err(map_store_error)?
+            .ok_or(ConfigManagementError::NotFound)?;
+        let mut payload = decode_durable_draft(&record.payload)?;
+        if document_etag(&payload.document)? != if_match.trim_matches('"') {
+            return Err(ConfigManagementError::Precondition);
+        }
+        compile_document(&payload.document, record.base_generation.saturating_add(1))?;
+        let changes = semantic_diff(&payload.base, &payload.document);
+        let confirmation = confirmation_token_for(
+            record.draft_id,
+            record.base_generation,
+            if_match.trim_matches('"'),
+            &changes,
+        )?;
+        payload.confirmation = Some(confirmation.clone());
+        let next = durable
+            .update_draft(
+                id,
+                owner_id,
+                record.revision,
+                &record.etag,
+                encode_durable_draft(&payload)?,
+                management_timestamp_ms(),
+            )
+            .map_err(map_store_error)?;
+        Ok(json!({
+            "draft_id": next.draft_id,
+            "base_generation": next.base_generation,
+            "etag": document_etag(&payload.document)?,
+            "valid": true,
+            "semantic_diff": changes,
+            "confirmation_token": confirmation
+        }))
+    }
+
     pub(crate) fn diff(&self, id: u64) -> Result<Value, ConfigManagementError> {
         let mut state = self
             .state
@@ -311,20 +479,37 @@ impl ConfigManagement {
         }))
     }
 
+    pub(crate) fn diff_owned(
+        &self,
+        owner_id: &str,
+        id: u64,
+    ) -> Result<Value, ConfigManagementError> {
+        let Some(durable) = self.durable.as_ref() else {
+            return self.diff(id);
+        };
+        let record = durable
+            .draft(id, owner_id, management_timestamp_ms())
+            .map_err(map_store_error)?
+            .ok_or(ConfigManagementError::NotFound)?;
+        let payload = decode_durable_draft(&record.payload)?;
+        durable_draft_diff(&record, &payload)
+    }
+
+    /// Validate and stage a candidate without claiming runtime activation.
     pub(crate) fn commit(
         &self,
         id: u64,
         if_match: &str,
         active_generation: u64,
         confirmation: &str,
-    ) -> Result<PreparedCommit, ConfigManagementError> {
+    ) -> Result<PreparedActivation, ConfigManagementError> {
         let mut state = self
             .state
             .lock()
             .expect("configuration draft lock poisoned");
         if state.commit_in_progress
             || !state.pending.is_empty()
-            || state.unmanaged_reload_in_progress
+            || state.external_reload_in_progress
         {
             return Err(ConfigManagementError::Precondition);
         }
@@ -342,34 +527,104 @@ impl ConfigManagement {
         if draft.confirmation.as_deref() != Some(confirmation) {
             return Err(ConfigManagementError::Confirmation);
         }
-        compile_document(&draft.document, active_generation.saturating_add(1))?;
+        let target_generation = active_generation.saturating_add(1);
+        let compiled = compile_document(&draft.document, target_generation)?;
         let encoded = generated_document(&draft.document)?;
-        let previous_source = state.active_source.clone();
-        let persistence = match persist_atomic(
-            &self.managed_path,
-            &encoded,
-            active_generation.saturating_add(1),
+        let activation = match prepare_activation(
+            &self.canonical_path,
+            encoded,
+            compiled,
+            active_generation,
+            target_generation,
             "commit",
-            &self.source_path,
         ) {
-            Ok(persistence) => persistence,
+            Ok(activation) => activation,
             Err(error) => {
-                state.commit_in_progress = matches!(error, ConfigManagementError::RecoveryRequired);
+                state.commit_in_progress =
+                    matches!(&error, ConfigManagementError::RecoveryRequired);
                 return Err(error);
             }
         };
-        state.active_source = self.managed_path.clone();
         state.drafts.remove(position);
         state.commit_in_progress = true;
-        Ok(PreparedCommit {
-            base_generation: active_generation,
-            managed_path: self.managed_path.clone(),
-            persistence,
-            previous_source,
-        })
+        Ok(activation)
     }
 
-    pub(crate) fn register_commit(&self, request_id: u64, commit: PreparedCommit) {
+    pub(crate) fn commit_owned(
+        &self,
+        owner_id: &str,
+        id: u64,
+        if_match: &str,
+        active_generation: u64,
+        confirmation: &str,
+    ) -> Result<PreparedActivation, ConfigManagementError> {
+        let Some(durable) = self.durable.as_ref() else {
+            return self.commit(id, if_match, active_generation, confirmation);
+        };
+        {
+            let state = self
+                .state
+                .lock()
+                .expect("configuration draft lock poisoned");
+            if state.commit_in_progress
+                || !state.pending.is_empty()
+                || state.external_reload_in_progress
+            {
+                return Err(ConfigManagementError::Precondition);
+            }
+        }
+        let record = durable
+            .draft(id, owner_id, management_timestamp_ms())
+            .map_err(map_store_error)?
+            .ok_or(ConfigManagementError::NotFound)?;
+        let payload = decode_durable_draft(&record.payload)?;
+        if document_etag(&payload.document)? != if_match.trim_matches('"') {
+            return Err(ConfigManagementError::Precondition);
+        }
+        if record.base_generation != active_generation {
+            return Err(ConfigManagementError::Precondition);
+        }
+        if payload.confirmation.as_deref() != Some(confirmation) {
+            return Err(ConfigManagementError::Confirmation);
+        }
+        let target_generation = active_generation.saturating_add(1);
+        let compiled = compile_document(&payload.document, target_generation)?;
+        let encoded = generated_document(&payload.document)?;
+        let activation = match prepare_activation(
+            &self.canonical_path,
+            encoded,
+            compiled,
+            active_generation,
+            target_generation,
+            "commit",
+        ) {
+            Ok(activation) => activation,
+            Err(error) => {
+                self.state
+                    .lock()
+                    .expect("configuration draft lock poisoned")
+                    .commit_in_progress = matches!(&error, ConfigManagementError::RecoveryRequired);
+                return Err(error);
+            }
+        };
+        match durable.remove_draft(id, owner_id) {
+            Ok(true) => {
+                self.state
+                    .lock()
+                    .expect("configuration draft lock poisoned")
+                    .commit_in_progress = true;
+                Ok(activation)
+            }
+            Ok(false) | Err(_) => {
+                let mut activation = activation;
+                let _ = rollback_activation(&mut activation);
+                Err(ConfigManagementError::Persistence)
+            }
+        }
+    }
+
+    /// Register the handoff before the runtime starts its off-path work.
+    pub(crate) fn register_commit(&self, request_id: u64, activation: PreparedActivation) {
         let mut state = self
             .state
             .lock()
@@ -377,13 +632,69 @@ impl ConfigManagement {
         state.commit_in_progress = false;
         state.pending.insert(
             request_id,
-            PendingCommit {
+            PendingActivation {
                 request_id,
-                managed_path: commit.managed_path,
-                persistence: commit.persistence,
-                previous_source: commit.previous_source,
+                activation,
             },
         );
+    }
+
+    /// Promote a prepared candidate after the runtime has accepted it.
+    #[cfg(test)]
+    pub(crate) fn promote_file(
+        &self,
+        activation: &mut PreparedActivation,
+    ) -> Result<(), ConfigManagementError> {
+        if activation.candidate.canonical_path != self.canonical_path
+            || !activation.rollback_guard.active
+        {
+            return Err(ConfigManagementError::Precondition);
+        }
+        let result = promote_staged(&activation.candidate);
+        if let Err(error) = result {
+            return match rollback_activation(activation) {
+                Ok(()) => Err(error),
+                Err(_) => Err(ConfigManagementError::RecoveryRequired),
+            };
+        }
+        activation.promoted = true;
+        Ok(())
+    }
+
+    /// Promote one registered handoff after runtime preparation succeeds.
+    pub(crate) fn promote_commit(&self, request_id: u64) -> Result<(), ConfigManagementError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("configuration draft lock poisoned");
+        let pending = state
+            .pending
+            .get_mut(&request_id)
+            .ok_or(ConfigManagementError::NotFound)?;
+        if pending.activation.candidate.canonical_path != self.canonical_path
+            || !pending.activation.rollback_guard.active
+        {
+            return Err(ConfigManagementError::Precondition);
+        }
+        let result = promote_staged(&pending.activation.candidate);
+        if let Err(error) = result {
+            return match rollback_activation(&mut pending.activation) {
+                Ok(()) => Err(error),
+                Err(_) => Err(ConfigManagementError::RecoveryRequired),
+            };
+        }
+        pending.activation.promoted = true;
+        Ok(())
+    }
+
+    /// Complete or roll back a registered file handoff.
+    #[cfg(test)]
+    pub(crate) fn complete(
+        &self,
+        request_id: u64,
+        succeeded: bool,
+    ) -> Result<(), ConfigManagementError> {
+        self.complete_commit(request_id, succeeded)
     }
 
     pub(crate) fn complete_commit(
@@ -395,87 +706,132 @@ impl ConfigManagement {
             .state
             .lock()
             .expect("configuration draft lock poisoned");
-        let Some(pending) = state.pending.remove(&request_id) else {
+        let Some(mut pending) = state.pending.remove(&request_id) else {
             return Ok(());
         };
         debug_assert_eq!(pending.request_id, request_id);
         let completion = if succeeded {
-            clear_recovery_marker(&pending.managed_path)
+            complete_activation(&mut pending.activation)
         } else {
-            restore_persistence(&pending.managed_path, &pending.persistence)
-                .and_then(|()| verify_persistence(&pending.managed_path, &pending.persistence))
-                .and_then(|()| clear_recovery_marker(&pending.managed_path))
+            rollback_activation(&mut pending.activation)
         };
-        if completion.is_err() {
+        if let Err(error) = completion {
             state.pending.insert(request_id, pending);
-            return Err(ConfigManagementError::RecoveryRequired);
-        }
-        if !succeeded {
-            state.active_source = pending.previous_source;
+            return Err(error);
         }
         Ok(())
     }
 
+    /// Cancel an unregistered handoff and restore the exact prior file state.
+    #[cfg(test)]
+    pub(crate) fn cancel_activation(
+        &self,
+        mut activation: PreparedActivation,
+    ) -> Result<(), ConfigManagementError> {
+        let handoff_failure = fail_hook(FileTransactionStage::HandoffCancellation);
+        let rollback_result = rollback_activation(&mut activation);
+        let rollback_ok = rollback_result.is_ok();
+        let result = match (handoff_failure, rollback_result) {
+            (Ok(()), result) => result,
+            (Err(error), Ok(())) => Err(error),
+            (Err(_), Err(_)) => Err(ConfigManagementError::RecoveryRequired),
+        };
+        if rollback_ok {
+            self.state
+                .lock()
+                .expect("configuration draft lock poisoned")
+                .commit_in_progress = false;
+        }
+        result
+    }
+
+    /// Stage the prior canonical revision as an explicit rollback activation.
     pub(crate) fn rollback(
         &self,
         active_generation: u64,
-    ) -> Result<PreparedCommit, ConfigManagementError> {
+    ) -> Result<PreparedActivation, ConfigManagementError> {
         let mut state = self
             .state
             .lock()
             .expect("configuration draft lock poisoned");
         if state.commit_in_progress
             || !state.pending.is_empty()
-            || state.unmanaged_reload_in_progress
+            || state.external_reload_in_progress
         {
             return Err(ConfigManagementError::Precondition);
         }
-        if let Err(error) = ensure_no_recovery_marker(&self.managed_path) {
-            state.commit_in_progress = matches!(error, ConfigManagementError::RecoveryRequired);
-            return Err(error);
-        }
-        let backup = backup_path(&self.managed_path);
-        let prepared = (|| {
-            let prior = read_existing_managed(&backup)?.ok_or(ConfigManagementError::NotFound)?;
-            let prior_text = std::str::from_utf8(&prior)
-                .map_err(|_| ConfigManagementError::Invalid("rollback is not UTF-8".into()))?;
-            Config::from_yaml(backup.display().to_string(), prior_text)
-                .and_then(|config| {
-                    config.compile_with_generation(active_generation.saturating_add(1))
-                })
-                .map_err(|error| ConfigManagementError::Invalid(error.to_string()))?;
-            Ok(prior)
-        })();
-        let prior = prepared?;
-        let previous_source = state.active_source.clone();
-        let persistence = match persist_atomic(
-            &self.managed_path,
-            &prior,
+        ensure_no_recovery_marker(&self.canonical_path)?;
+        let backup = backup_path(&self.canonical_path);
+        let prior = read_existing_file(&backup, true)?.ok_or(ConfigManagementError::NotFound)?;
+        let compiled =
+            compile_generated_bytes(&backup, &prior, active_generation.saturating_add(1))?;
+        let activation = match prepare_activation(
+            &self.canonical_path,
+            prior,
+            compiled,
+            active_generation,
             active_generation.saturating_add(1),
             "rollback",
-            &self.source_path,
         ) {
-            Ok(persistence) => persistence,
+            Ok(activation) => activation,
             Err(error) => {
-                state.commit_in_progress = matches!(error, ConfigManagementError::RecoveryRequired);
+                state.commit_in_progress =
+                    matches!(&error, ConfigManagementError::RecoveryRequired);
                 return Err(error);
             }
         };
         state.commit_in_progress = true;
-        Ok(PreparedCommit {
-            base_generation: active_generation,
-            managed_path: self.managed_path.clone(),
-            persistence,
-            previous_source,
-        })
+        Ok(activation)
+    }
+
+    /// Redacted file state for management/status consumers.
+    #[allow(dead_code)] // Exposed by the structured control-plane graph in Task 14.
+    pub(crate) fn active_status(&self, generation: u64) -> Result<Value, ConfigManagementError> {
+        let bytes = read_existing_file(&self.canonical_path, false)?
+            .ok_or(ConfigManagementError::Persistence)?;
+        Ok(json!({
+            "path": self.canonical_path,
+            "sha256": bytes_digest(&bytes),
+            "generation": generation,
+        }))
     }
 }
 
-pub(crate) struct PreparedCommit {
+/// The immutable candidate passed from file management to runtime activation.
+#[derive(Clone)]
+pub(crate) struct ActivationCandidate {
     pub(crate) base_generation: u64,
-    pub(crate) managed_path: PathBuf,
+    pub(crate) target_generation: u64,
+    pub(crate) compiled: CompiledConfig,
+    pub(crate) canonical_path: PathBuf,
+    pub(crate) staged_path: PathBuf,
+    pub(crate) backup_path: PathBuf,
+    pub(crate) rollback_path: PathBuf,
+    #[allow(dead_code)] // Surfaced by the structured activation graph in Task 14.
+    pub(crate) prior_digest: String,
+    pub(crate) next_digest: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// A prepared candidate with an exact-file rollback guard.
+pub(crate) struct PreparedActivation {
+    pub(crate) candidate: ActivationCandidate,
+    rollback_guard: RollbackGuard,
+    promoted: bool,
+}
+
+struct RollbackGuard {
     persistence: PersistenceState,
-    previous_source: PathBuf,
+    active: bool,
+}
+
+/// Compatibility type name for the current management caller. The value is
+/// already a prepared activation and no file is promoted by this alias.
+pub(crate) type PreparedCommit = PreparedActivation;
+
+struct PersistenceState {
+    previous_canonical: Vec<u8>,
+    previous_backup: Option<Vec<u8>>,
 }
 
 fn draft_view(draft: &Draft) -> Value {
@@ -486,6 +842,76 @@ fn draft_view(draft: &Draft) -> Value {
         "patch_count": draft.patches,
         "status": if draft.confirmation.is_some() { "validated" } else { "draft" }
     })
+}
+
+fn management_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn encode_durable_draft(payload: &DurableDraftPayload) -> Result<Vec<u8>, ConfigManagementError> {
+    serde_json::to_vec(payload).map_err(|_| ConfigManagementError::Persistence)
+}
+
+fn decode_durable_draft(bytes: &[u8]) -> Result<DurableDraftPayload, ConfigManagementError> {
+    serde_json::from_slice(bytes).map_err(|_| ConfigManagementError::Persistence)
+}
+
+fn durable_draft_view(
+    record: &DraftRecord,
+    payload: &DurableDraftPayload,
+) -> Result<Value, ConfigManagementError> {
+    Ok(json!({
+        "draft_id": record.draft_id,
+        "base_generation": record.base_generation,
+        "etag": document_etag(&payload.document)?,
+        "patch_count": payload.patches,
+        "status": if payload.confirmation.is_some() { "validated" } else { "draft" }
+    }))
+}
+
+fn durable_draft_diff(
+    record: &DraftRecord,
+    payload: &DurableDraftPayload,
+) -> Result<Value, ConfigManagementError> {
+    Ok(json!({
+        "draft_id": record.draft_id,
+        "base_generation": record.base_generation,
+        "etag": document_etag(&payload.document)?,
+        "semantic_diff": semantic_diff(&payload.base, &payload.document)
+    }))
+}
+
+fn confirmation_token_for(
+    draft_id: u64,
+    base_generation: u64,
+    etag: &str,
+    changes: &Value,
+) -> Result<String, ConfigManagementError> {
+    let encoded = serde_json::to_vec(&json!({
+        "draft": draft_id,
+        "generation": base_generation,
+        "etag": etag,
+        "diff": changes
+    }))
+    .map_err(|_| ConfigManagementError::Confirmation)?;
+    Ok(hex(digest(&SHA256, &encoded).as_ref()))
+}
+
+fn map_store_error(error: pooler_store::StoreError) -> ConfigManagementError {
+    match error {
+        pooler_store::StoreError::OwnerMismatch
+        | pooler_store::StoreError::ManagementRevisionConflict => {
+            ConfigManagementError::Precondition
+        }
+        pooler_store::StoreError::RecordExpired => ConfigManagementError::Expired,
+        pooler_store::StoreError::ManagementCapacity => ConfigManagementError::PatchLimit,
+        _ => ConfigManagementError::Persistence,
+    }
 }
 
 fn draft_mut(drafts: &mut VecDeque<Draft>, id: u64) -> Result<&mut Draft, ConfigManagementError> {
@@ -521,9 +947,11 @@ fn apply_patch(document: &mut Value, patch: TypedConfigPatch) -> Result<(), Conf
     match patch {
         TypedConfigPatch::Upsert { section, id, value } => {
             validate_id(&id)?;
+            if matches!(section.as_str(), "accounts" | "upstreams") {
+                reject_external_secret_references(&value)?;
+            }
             if map_section(&section) {
-                let map = section_object_mut(document, &section)?;
-                map.insert(id, value);
+                section_object_mut(document, &section)?.insert(id, value);
                 Ok(())
             } else if list_section(&section) {
                 let list = section_array_mut(document, &section)?;
@@ -575,21 +1003,44 @@ fn apply_patch(document: &mut Value, patch: TypedConfigPatch) -> Result<(), Conf
     }
 }
 
+fn reject_external_secret_references(value: &Value) -> Result<(), ConfigManagementError> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    for (key, child) in object {
+        if matches!(
+            key.as_str(),
+            "secret" | "client_secret" | "secret_value" | "access_token" | "refresh_token"
+        ) {
+            let Some(reference) = child.as_str() else {
+                return Err(ConfigManagementError::UnsupportedPatch);
+            };
+            if !reference.starts_with("managed:") {
+                return Err(ConfigManagementError::UnsupportedPatch);
+            }
+        }
+        if child.is_object() {
+            reject_external_secret_references(child)?;
+        } else if let Some(values) = child.as_array() {
+            for value in values {
+                if value.is_object() {
+                    reject_external_secret_references(value)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn map_section(section: &str) -> bool {
     matches!(
         section,
-        "listeners"
-            | "upstreams"
-            | "accounts"
-            | "credentials"
-            | "account_pools"
-            | "policies"
-            | "extensions"
+        "listeners" | "upstreams" | "accounts" | "account_pools" | "policies" | "extensions"
     )
 }
 
 fn list_section(section: &str) -> bool {
-    matches!(section, "models" | "routes")
+    section == "models" || section == "routes"
 }
 
 fn validate_id(id: &str) -> Result<(), ConfigManagementError> {
@@ -631,12 +1082,27 @@ fn section_array_mut<'a>(
         .ok_or(ConfigManagementError::UnsupportedPatch)
 }
 
-fn compile_document(document: &Value, generation: u64) -> Result<(), ConfigManagementError> {
+fn compile_document(
+    document: &Value,
+    generation: u64,
+) -> Result<CompiledConfig, ConfigManagementError> {
     let encoded = serde_json::to_string(document)
         .map_err(|_| ConfigManagementError::Invalid("candidate serialization failed".into()))?;
-    Config::from_yaml("<managed-config-draft>", &encoded)
+    Config::from_yaml("<canonical-config-draft>", &encoded)
         .and_then(|config| config.compile_with_generation(generation))
-        .map(|_| ())
+        .map_err(|error| ConfigManagementError::Invalid(error.to_string()))
+}
+
+fn compile_generated_bytes(
+    path: &Path,
+    bytes: &[u8],
+    generation: u64,
+) -> Result<CompiledConfig, ConfigManagementError> {
+    let body = bytes.strip_prefix(GENERATED_HEADER).unwrap_or(bytes);
+    let text = std::str::from_utf8(body)
+        .map_err(|_| ConfigManagementError::Invalid("configuration is not UTF-8".into()))?;
+    Config::from_yaml(path.display().to_string(), text)
+        .and_then(|config| config.compile_with_generation(generation))
         .map_err(|error| ConfigManagementError::Invalid(error.to_string()))
 }
 
@@ -676,14 +1142,13 @@ fn semantic_diff(base: &Value, candidate: &Value) -> Value {
         "listeners",
         "upstreams",
         "accounts",
-        "credentials",
         "account_pools",
         "policies",
         "extensions",
     ] {
         let before = base.get(section).and_then(Value::as_object);
         let after = candidate.get(section).and_then(Value::as_object);
-        let mut ids = std::collections::BTreeSet::new();
+        let mut ids = BTreeSet::new();
         ids.extend(before.into_iter().flat_map(|map| map.keys().cloned()));
         ids.extend(after.into_iter().flat_map(|map| map.keys().cloned()));
         for id in ids {
@@ -718,7 +1183,7 @@ fn semantic_diff(base: &Value, candidate: &Value) -> Value {
         };
         let before = indexed(base.get(section));
         let after = indexed(candidate.get(section));
-        let mut ids = std::collections::BTreeSet::new();
+        let mut ids = BTreeSet::new();
         ids.extend(before.keys().cloned());
         ids.extend(after.keys().cloned());
         for id in ids {
@@ -756,8 +1221,29 @@ fn generated_document(document: &Value) -> Result<Vec<u8>, ConfigManagementError
     Ok(output)
 }
 
+fn canonical_config_path(path: &Path) -> Result<PathBuf, ConfigManagementError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| ConfigManagementError::Persistence)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(ConfigManagementError::Persistence);
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| ConfigManagementError::Persistence)?;
+    validate_source_file(&canonical)?;
+    validate_parent_directory(
+        canonical
+            .parent()
+            .ok_or(ConfigManagementError::Persistence)?,
+    )?;
+    Ok(canonical)
+}
+
 fn backup_path(path: &Path) -> PathBuf {
     path.with_extension("backup.yaml")
+}
+
+fn rollback_path(path: &Path) -> PathBuf {
+    path.with_extension("rollback.yaml")
 }
 
 fn recovery_marker_path(path: &Path) -> PathBuf {
@@ -768,9 +1254,22 @@ fn completed_recovery_marker_path(path: &Path) -> PathBuf {
     path.with_extension("recovery-completed")
 }
 
+fn staged_path(path: &Path) -> PathBuf {
+    let parent = path.parent().expect("canonical path has a parent");
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    parent.join(format!(".{name}.{}.{}.stage", std::process::id(), nonce))
+}
+
 fn ensure_no_recovery_marker(path: &Path) -> Result<(), ConfigManagementError> {
     cleanup_completed_recovery_marker(path)?;
-    if validate_existing_recovery_marker(&recovery_marker_path(path))? {
+    if read_recovery_marker(&recovery_marker_path(path))?.is_some() {
         Err(ConfigManagementError::RecoveryRequired)
     } else {
         Ok(())
@@ -779,15 +1278,19 @@ fn ensure_no_recovery_marker(path: &Path) -> Result<(), ConfigManagementError> {
 
 fn cleanup_completed_recovery_marker(path: &Path) -> Result<(), ConfigManagementError> {
     let completed = completed_recovery_marker_path(path);
-    if !validate_existing_recovery_marker(&completed)? {
+    if !path_exists(&completed)? {
         return Ok(());
     }
     let parent = path.parent().ok_or(ConfigManagementError::Persistence)?;
     remove_file_synced(parent, &completed)
 }
 
-fn validate_existing_recovery_marker(path: &Path) -> Result<bool, ConfigManagementError> {
-    Ok(read_recovery_marker(path)?.is_some())
+fn path_exists(path: &Path) -> Result<bool, ConfigManagementError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(ConfigManagementError::Persistence),
+    }
 }
 
 fn read_recovery_marker(path: &Path) -> Result<Option<RecoveryMarker>, ConfigManagementError> {
@@ -815,51 +1318,50 @@ fn read_recovery_marker(path: &Path) -> Result<Option<RecoveryMarker>, ConfigMan
     if record.version != RECOVERY_RECORD_VERSION {
         return Err(ConfigManagementError::RecoveryRequired);
     }
-    Ok(Some(RecoveryMarker::Record(record)))
+    Ok(Some(RecoveryMarker::Record(Box::new(record))))
 }
 
 fn acquire_recovery_marker(path: &Path) -> Result<(), ConfigManagementError> {
     ensure_no_recovery_marker(path)?;
     let parent = path.parent().ok_or(ConfigManagementError::Persistence)?;
     let marker = recovery_marker_path(path);
-    for _ in 0..3 {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let mut file = match options.open(&marker) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if validate_existing_recovery_marker(&marker)? {
-                    return Err(ConfigManagementError::RecoveryRequired);
-                }
-                continue;
-            }
-            Err(_) => return Err(ConfigManagementError::Persistence),
-        };
-        let result = (|| -> io::Result<()> {
-            let metadata = file.metadata()?;
-            if !metadata.file_type().is_file() {
-                return Err(io::Error::other("recovery marker is not a regular file"));
-            }
-            #[cfg(unix)]
-            if metadata.uid() != rustix::process::geteuid().as_raw()
-                || metadata.mode() & 0o077 != 0
-                || metadata.nlink() != 1
-            {
-                return Err(io::Error::other("recovery marker is not owner-private"));
-            }
-            file.write_all(RECOVERY_MARKER)?;
-            file.sync_all()?;
-            File::open(parent)?.sync_all()
-        })();
-        return result.map_err(|_| ConfigManagementError::RecoveryRequired);
+    fail_hook(FileTransactionStage::MarkerCreate)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    Err(ConfigManagementError::Persistence)
+    let mut file = options
+        .open(&marker)
+        .map_err(|_| ConfigManagementError::Persistence)?;
+    let result = (|| -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other("transaction marker is not a regular file"));
+        }
+        #[cfg(unix)]
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o077 != 0
+            || metadata.nlink() != 1
+        {
+            return Err(io::Error::other("transaction marker is not owner-private"));
+        }
+        file.write_all(RECOVERY_MARKER)?;
+        file.sync_all()?;
+        sync_directory(parent)
+            .map_err(|_| io::Error::other("transaction marker directory sync"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(&marker);
+        let _ = sync_directory_io(parent);
+        return Err(ConfigManagementError::Persistence);
+    }
+    Ok(())
 }
 
 fn write_recovery_record(
@@ -881,196 +1383,348 @@ fn write_recovery_record(
     let mut file = options
         .open(&marker)
         .map_err(|_| ConfigManagementError::RecoveryRequired)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| ConfigManagementError::RecoveryRequired)?;
-    #[cfg(unix)]
-    if metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.mode() & 0o077 != 0
-        || metadata.nlink() != 1
-    {
-        return Err(ConfigManagementError::RecoveryRequired);
-    }
     file.set_len(0)
         .and_then(|_| file.write_all(&bytes))
         .and_then(|_| file.sync_all())
-        .and_then(|_| File::open(parent)?.sync_all())
+        .and_then(|_| sync_directory_io(parent))
         .map_err(|_| ConfigManagementError::RecoveryRequired)
 }
 
 fn clear_recovery_marker(path: &Path) -> Result<(), ConfigManagementError> {
-    cleanup_completed_recovery_marker(path)?;
     let parent = path.parent().ok_or(ConfigManagementError::Persistence)?;
     let marker = recovery_marker_path(path);
     let completed = completed_recovery_marker_path(path);
-    if !validate_existing_recovery_marker(&marker)? {
+    if !path_exists(&marker)? {
         return Err(ConfigManagementError::Persistence);
     }
+    fail_hook(FileTransactionStage::CompletionMarkerWrite)?;
     fs::rename(&marker, &completed).map_err(|_| ConfigManagementError::Persistence)?;
-    if File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .is_err()
-    {
+    if sync_directory(parent).is_err() {
         let _ = fs::rename(&completed, &marker);
-        let _ = File::open(parent).and_then(|directory| directory.sync_all());
+        let _ = sync_directory_io(parent);
         return Err(ConfigManagementError::RecoveryRequired);
     }
-    // The durable rename records completed recovery. Removing that completion
-    // marker is only cleanup: either its presence or absence is safe at restart.
     let _ = remove_file_synced(parent, &completed);
     Ok(())
 }
 
-fn clear_marker_or_recovery_required(
+fn clear_recovery_marker_if_present(path: &Path) -> Result<(), ConfigManagementError> {
+    if path_exists(&recovery_marker_path(path))? {
+        clear_recovery_marker(path)
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Every path/digest component is part of the durable record.
+fn recovery_record(
     path: &Path,
+    staged: &Path,
+    backup: &Path,
+    rollback: &Path,
+    bytes: &[u8],
+    generation: u64,
+    operation: &str,
+    persistence: &PersistenceState,
+) -> RecoveryRecord {
+    RecoveryRecord {
+        version: RECOVERY_RECORD_VERSION,
+        operation: operation.to_owned(),
+        canonical: path.display().to_string(),
+        staged: staged.display().to_string(),
+        backup: backup.display().to_string(),
+        rollback: rollback.display().to_string(),
+        generation,
+        prior_sha256: bytes_digest(&persistence.previous_canonical),
+        next_sha256: bytes_digest(bytes),
+        prior_backup_sha256: persistence.previous_backup.as_deref().map(bytes_digest),
+    }
+}
+
+fn prepare_activation(
+    canonical: &Path,
+    bytes: Vec<u8>,
+    compiled: CompiledConfig,
+    base_generation: u64,
+    target_generation: u64,
+    operation: &str,
+) -> Result<PreparedActivation, ConfigManagementError> {
+    acquire_recovery_marker(canonical)?;
+    let backup = backup_path(canonical);
+    let rollback = rollback_path(canonical);
+    let staged = staged_path(canonical);
+    let persistence = match persistence_snapshot(canonical) {
+        Ok(persistence) => persistence,
+        Err(error) => {
+            return Err(abort_preparation(
+                canonical, &backup, &staged, &rollback, None, error,
+            ))
+        }
+    };
+    let record = recovery_record(
+        canonical,
+        &staged,
+        &backup,
+        &rollback,
+        &bytes,
+        target_generation,
+        operation,
+        &persistence,
+    );
+    let preparation = (|| {
+        write_recovery_record(canonical, &record)?;
+        if let Some(previous_backup) = persistence.previous_backup.as_deref() {
+            write_atomic(
+                canonical
+                    .parent()
+                    .ok_or(ConfigManagementError::Persistence)?,
+                &rollback,
+                previous_backup,
+                AtomicWriteKind::Backup,
+            )?;
+        }
+        write_atomic(
+            canonical
+                .parent()
+                .ok_or(ConfigManagementError::Persistence)?,
+            &backup,
+            &persistence.previous_canonical,
+            AtomicWriteKind::Backup,
+        )?;
+        write_atomic(
+            canonical
+                .parent()
+                .ok_or(ConfigManagementError::Persistence)?,
+            &staged,
+            &bytes,
+            AtomicWriteKind::Staged,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = preparation {
+        return Err(abort_preparation(
+            canonical,
+            &backup,
+            &staged,
+            &rollback,
+            Some(&persistence),
+            error,
+        ));
+    }
+    let prior_digest = bytes_digest(&persistence.previous_canonical);
+    let next_digest = bytes_digest(&bytes);
+    Ok(PreparedActivation {
+        candidate: ActivationCandidate {
+            base_generation,
+            target_generation,
+            compiled,
+            canonical_path: canonical.to_owned(),
+            staged_path: staged,
+            backup_path: backup,
+            rollback_path: rollback,
+            prior_digest,
+            next_digest,
+            bytes,
+        },
+        rollback_guard: RollbackGuard {
+            persistence,
+            active: true,
+        },
+        promoted: false,
+    })
+}
+
+fn abort_preparation(
+    canonical: &Path,
+    backup: &Path,
+    staged: &Path,
+    rollback: &Path,
+    persistence: Option<&PersistenceState>,
     original: ConfigManagementError,
 ) -> ConfigManagementError {
-    if clear_recovery_marker(path).is_ok() {
+    let restored = (if let Some(persistence) = persistence {
+        restore_preparation_state(canonical, backup, staged, rollback, persistence)
+    } else {
+        Ok(())
+    })
+    .and_then(|_| clear_recovery_marker_if_present(canonical));
+    if restored.is_ok() {
         original
     } else {
         ConfigManagementError::RecoveryRequired
     }
 }
 
-fn persist_atomic(
-    path: &Path,
-    bytes: &[u8],
-    generation: u64,
-    operation: &str,
-    source: &Path,
-) -> Result<PersistenceState, ConfigManagementError> {
-    acquire_recovery_marker(path)?;
-    let persistence = match persistence_snapshot(path) {
-        Ok(persistence) => persistence,
-        Err(error) => return Err(clear_marker_or_recovery_required(path, error)),
-    };
-    let record = recovery_record(path, source, bytes, generation, operation, &persistence)?;
-    write_recovery_record(path, &record)?;
-    persist_atomic_marked(path, bytes, persistence)
-}
-
-fn persist_atomic_marked(
-    path: &Path,
-    bytes: &[u8],
-    persistence: PersistenceState,
-) -> Result<PersistenceState, ConfigManagementError> {
-    let parent = match path.parent().and_then(|parent| parent.canonicalize().ok()) {
-        Some(parent) => parent,
-        None => {
-            return Err(clear_marker_or_recovery_required(
-                path,
-                ConfigManagementError::Persistence,
-            ));
-        }
-    };
-    let backup = backup_path(path);
-
-    let mutation = (|| {
-        if let Some(previous) = persistence.previous_managed.as_deref() {
-            write_atomic(&parent, &backup, previous)?;
-        }
-        write_atomic(&parent, path, bytes)
-    })();
-    if mutation.is_err() {
-        return match restore_persistence(path, &persistence)
-            .and_then(|()| verify_persistence(path, &persistence))
-            .and_then(|()| clear_recovery_marker(path))
-        {
-            Ok(()) => Err(ConfigManagementError::Persistence),
-            Err(_) => Err(ConfigManagementError::RecoveryRequired),
-        };
+fn restore_preparation_state(
+    canonical: &Path,
+    backup: &Path,
+    staged: &Path,
+    rollback: &Path,
+    persistence: &PersistenceState,
+) -> Result<(), ConfigManagementError> {
+    let parent = canonical
+        .parent()
+        .ok_or(ConfigManagementError::Persistence)?;
+    if let Some(previous_backup) = persistence.previous_backup.as_deref() {
+        write_atomic(parent, backup, previous_backup, AtomicWriteKind::Rollback)?;
+    } else {
+        remove_file_synced(parent, backup)?;
     }
-    Ok(persistence)
+    remove_file_synced(parent, staged)?;
+    remove_file_synced(parent, rollback)?;
+    Ok(())
 }
 
 fn persistence_snapshot(path: &Path) -> Result<PersistenceState, ConfigManagementError> {
-    let _parent = path
-        .parent()
-        .and_then(|parent| parent.canonicalize().ok())
-        .ok_or(ConfigManagementError::Persistence)?;
+    let previous_canonical =
+        read_existing_file(path, false)?.ok_or(ConfigManagementError::Persistence)?;
     let backup = backup_path(path);
-    let previous_managed = read_optional_managed(path)?;
-    let previous_backup = read_optional_managed(&backup)?;
+    let previous_backup = read_existing_file(&backup, true)?;
+    let rollback = rollback_path(path);
+    if path_exists(&rollback)? {
+        return Err(ConfigManagementError::RecoveryRequired);
+    }
     Ok(PersistenceState {
-        previous_managed,
+        previous_canonical,
         previous_backup,
     })
 }
 
-fn recovery_record(
-    path: &Path,
-    source: &Path,
-    bytes: &[u8],
-    generation: u64,
-    operation: &str,
+fn restore_file_state(
+    canonical: &Path,
+    backup: &Path,
+    staged: &Path,
+    rollback: &Path,
     persistence: &PersistenceState,
-) -> Result<RecoveryRecord, ConfigManagementError> {
-    let source = source
-        .canonicalize()
+) -> Result<(), ConfigManagementError> {
+    let parent = canonical
+        .parent()
+        .ok_or(ConfigManagementError::Persistence)?;
+    write_atomic(
+        parent,
+        canonical,
+        &persistence.previous_canonical,
+        AtomicWriteKind::Rollback,
+    )?;
+    if let Some(previous_backup) = persistence.previous_backup.as_deref() {
+        write_atomic(parent, backup, previous_backup, AtomicWriteKind::Rollback)?;
+    } else {
+        remove_file_synced(parent, backup)?;
+    }
+    remove_file_synced(parent, staged)?;
+    remove_file_synced(parent, rollback)?;
+    fail_hook(FileTransactionStage::RollbackFsync)?;
+    sync_directory(parent)
+}
+
+fn restore_exact(
+    candidate: &ActivationCandidate,
+    persistence: &PersistenceState,
+) -> Result<(), ConfigManagementError> {
+    restore_file_state(
+        &candidate.canonical_path,
+        &candidate.backup_path,
+        &candidate.staged_path,
+        &candidate.rollback_path,
+        persistence,
+    )
+}
+
+fn rollback_activation(activation: &mut PreparedActivation) -> Result<(), ConfigManagementError> {
+    if !activation.rollback_guard.active {
+        return Ok(());
+    }
+    restore_exact(
+        &activation.candidate,
+        &activation.rollback_guard.persistence,
+    )?;
+    clear_recovery_marker(&activation.candidate.canonical_path)?;
+    activation.rollback_guard.active = false;
+    activation.promoted = false;
+    Ok(())
+}
+
+fn promote_staged(candidate: &ActivationCandidate) -> Result<(), ConfigManagementError> {
+    let staged = read_existing_file(&candidate.staged_path, true)?
+        .ok_or(ConfigManagementError::Persistence)?;
+    if bytes_digest(&staged) != candidate.next_digest {
+        return Err(ConfigManagementError::RecoveryRequired);
+    }
+    let parent = candidate
+        .canonical_path
+        .parent()
+        .ok_or(ConfigManagementError::Persistence)?;
+    fail_hook(FileTransactionStage::Rename)?;
+    fs::rename(&candidate.staged_path, &candidate.canonical_path)
         .map_err(|_| ConfigManagementError::Persistence)?;
-    let managed = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let backup = backup_path(path);
-    let backup = backup.canonicalize().unwrap_or(backup);
-    Ok(RecoveryRecord {
-        version: RECOVERY_RECORD_VERSION,
-        operation: operation.to_owned(),
-        source: source.display().to_string(),
-        managed: managed.display().to_string(),
-        backup: backup.display().to_string(),
-        generation,
-        target_sha256: bytes_digest(bytes),
-        previous_managed_sha256: persistence.previous_managed.as_deref().map(bytes_digest),
-        previous_backup_sha256: persistence.previous_backup.as_deref().map(bytes_digest),
-    })
+    sync_directory(parent)?;
+    Ok(())
 }
 
-fn read_optional_managed(path: &Path) -> Result<Option<Vec<u8>>, ConfigManagementError> {
-    read_existing_managed(path)
+fn complete_activation(activation: &mut PreparedActivation) -> Result<(), ConfigManagementError> {
+    if !activation.rollback_guard.active || !activation.promoted {
+        return Err(ConfigManagementError::Precondition);
+    }
+    let parent = activation
+        .candidate
+        .canonical_path
+        .parent()
+        .ok_or(ConfigManagementError::Persistence)?;
+    remove_file_synced(parent, &activation.candidate.staged_path)?;
+    remove_file_synced(parent, &activation.candidate.rollback_path)?;
+    clear_recovery_marker(&activation.candidate.canonical_path)?;
+    activation.rollback_guard.active = false;
+    Ok(())
 }
 
-fn restore_persistence(
-    path: &Path,
-    persistence: &PersistenceState,
-) -> Result<(), ConfigManagementError> {
-    let parent = path.parent().ok_or(ConfigManagementError::Persistence)?;
-    if let Some(previous) = persistence.previous_managed.as_deref() {
-        write_atomic(parent, path, previous)?;
-    } else {
-        remove_file_synced(parent, path)?;
-    }
-
-    let backup = backup_path(path);
-    if let Some(previous) = persistence.previous_backup.as_deref() {
-        write_atomic(parent, &backup, previous)
-    } else {
-        remove_file_synced(parent, &backup)
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AtomicWriteKind {
+    Backup,
+    Staged,
+    Rollback,
 }
 
-fn verify_persistence(
-    path: &Path,
-    persistence: &PersistenceState,
-) -> Result<(), ConfigManagementError> {
-    if read_optional_managed(path)? != persistence.previous_managed {
-        return Err(ConfigManagementError::Persistence);
-    }
-    if read_optional_managed(&backup_path(path))? != persistence.previous_backup {
-        return Err(ConfigManagementError::Persistence);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileTransactionStage {
+    MarkerCreate,
+    BackupWrite,
+    BackupFsync,
+    TempWrite,
+    TempFsync,
+    Rename,
+    DirectoryFsync,
+    #[cfg(test)]
+    HandoffCancellation,
+    CompletionMarkerWrite,
+    RollbackFsync,
+}
+
+fn fail_hook(_stage: FileTransactionStage) -> Result<(), ConfigManagementError> {
+    #[cfg(test)]
+    {
+        if FAILURE_HOOK.with(|hook| hook.get() == Some(_stage)) {
+            FAILURE_HOOK.with(|hook| hook.set(None));
+            return Err(ConfigManagementError::Persistence);
+        }
     }
     Ok(())
 }
 
-fn remove_file_synced(parent: &Path, path: &Path) -> Result<(), ConfigManagementError> {
-    match fs::remove_file(path) {
-        Ok(()) => File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| ConfigManagementError::Persistence),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(ConfigManagementError::Persistence),
-    }
+fn sync_directory(path: &Path) -> Result<(), ConfigManagementError> {
+    fail_hook(FileTransactionStage::DirectoryFsync)?;
+    sync_directory_io(path).map_err(|_| ConfigManagementError::Persistence)
 }
 
-fn write_atomic(parent: &Path, path: &Path, bytes: &[u8]) -> Result<(), ConfigManagementError> {
+fn sync_directory_io(path: &Path) -> io::Result<()> {
+    File::open(path).and_then(|directory| directory.sync_all())
+}
+
+fn write_atomic(
+    parent: &Path,
+    path: &Path,
+    bytes: &[u8],
+    kind: AtomicWriteKind,
+) -> Result<(), ConfigManagementError> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1080,6 +1734,15 @@ fn write_atomic(parent: &Path, path: &Path, bytes: &[u8]) -> Result<(), ConfigMa
         .unwrap_or_default()
         .as_nanos();
     let temporary = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), nonce));
+    let write_stage = match kind {
+        AtomicWriteKind::Backup => FileTransactionStage::BackupWrite,
+        AtomicWriteKind::Staged | AtomicWriteKind::Rollback => FileTransactionStage::TempWrite,
+    };
+    let sync_stage = match kind {
+        AtomicWriteKind::Backup => FileTransactionStage::BackupFsync,
+        AtomicWriteKind::Staged | AtomicWriteKind::Rollback => FileTransactionStage::TempFsync,
+    };
+    fail_hook(write_stage)?;
     let result = (|| -> io::Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -1091,15 +1754,16 @@ fn write_atomic(parent: &Path, path: &Path, bytes: &[u8]) -> Result<(), ConfigMa
         }
         let mut file = options.open(&temporary)?;
         file.write_all(bytes)?;
+        fail_hook(sync_stage).map_err(|_| io::Error::other("transaction sync hook"))?;
         file.sync_all()?;
+        fail_hook(FileTransactionStage::Rename)
+            .map_err(|_| io::Error::other("transaction rename hook"))?;
         fs::rename(&temporary, path)?;
-        #[cfg(test)]
-        if FAIL_WRITE_AFTER_RENAME.replace(false) {
-            return Err(io::Error::other("injected failure after atomic rename"));
-        }
         #[cfg(unix)]
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        File::open(parent)?.sync_all()?;
+        fail_hook(FileTransactionStage::DirectoryFsync)
+            .map_err(|_| io::Error::other("transaction directory sync hook"))?;
+        sync_directory_io(parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -1109,27 +1773,12 @@ fn write_atomic(parent: &Path, path: &Path, bytes: &[u8]) -> Result<(), ConfigMa
     Ok(())
 }
 
-fn managed_paths(source: &Path) -> Result<(PathBuf, PathBuf), ConfigManagementError> {
-    let source_metadata =
-        fs::symlink_metadata(source).map_err(|_| ConfigManagementError::Persistence)?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.file_type().is_file() {
-        return Err(ConfigManagementError::Persistence);
+fn remove_file_synced(parent: &Path, path: &Path) -> Result<(), ConfigManagementError> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_directory(parent),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ConfigManagementError::Persistence),
     }
-    let original = source
-        .canonicalize()
-        .map_err(|_| ConfigManagementError::Persistence)?;
-    validate_source_file(&original)?;
-    validate_parent_directory(
-        original
-            .parent()
-            .ok_or(ConfigManagementError::Persistence)?,
-    )?;
-    let file_name = original
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .ok_or(ConfigManagementError::Persistence)?;
-    let managed = original.with_file_name(format!("{file_name}.managed.yaml"));
-    Ok((original, managed))
 }
 
 fn validate_source_file(path: &Path) -> Result<(), ConfigManagementError> {
@@ -1138,12 +1787,11 @@ fn validate_source_file(path: &Path) -> Result<(), ConfigManagementError> {
         .ok_or(ConfigManagementError::Persistence)
 }
 
-fn validate_existing_managed(path: &Path) -> Result<bool, ConfigManagementError> {
-    Ok(read_existing_managed(path)?.is_some())
-}
-
-fn read_existing_managed(path: &Path) -> Result<Option<Vec<u8>>, ConfigManagementError> {
-    let Some(mut file) = open_validated_file(path, true)? else {
+fn read_existing_file(
+    path: &Path,
+    owner_private: bool,
+) -> Result<Option<Vec<u8>>, ConfigManagementError> {
+    let Some(mut file) = open_validated_file(path, owner_private)? else {
         return Ok(None);
     };
     if file
@@ -1159,8 +1807,8 @@ fn read_existing_managed(path: &Path) -> Result<Option<Vec<u8>>, ConfigManagemen
         .take(MAX_DOCUMENT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| ConfigManagementError::Persistence)?;
-    if bytes.len() > MAX_DOCUMENT_BYTES || !bytes.starts_with(GENERATED_HEADER) {
-        return Err(ConfigManagementError::Persistence);
+    if bytes.len() > MAX_DOCUMENT_BYTES {
+        return Err(ConfigManagementError::TooLarge);
     }
     Ok(Some(bytes))
 }
@@ -1233,7 +1881,6 @@ struct RecoveryFileInspection {
     present: bool,
     regular: bool,
     owner_private: bool,
-    single_link: bool,
     bytes: Option<Vec<u8>>,
     digest: Option<String>,
     generated: bool,
@@ -1249,7 +1896,12 @@ struct RecoveryMarkerInspection {
     error: Option<String>,
 }
 
-fn inspect_recovery_file(path: &Path, generation: Option<u64>) -> RecoveryFileInspection {
+fn inspect_recovery_file(
+    path: &Path,
+    generation: u64,
+    require_generated: bool,
+    owner_private: bool,
+) -> RecoveryFileInspection {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1270,8 +1922,15 @@ fn inspect_recovery_file(path: &Path, generation: Option<u64>) -> RecoveryFileIn
             ..RecoveryFileInspection::default()
         };
     }
-    let Some(mut file) = (match open_validated_file(path, true) {
-        Ok(file) => file,
+    let bytes = match read_existing_file(path, owner_private) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return RecoveryFileInspection {
+                present: true,
+                error: Some("file disappeared during inspection".into()),
+                ..RecoveryFileInspection::default()
+            }
+        }
         Err(error) => {
             return RecoveryFileInspection {
                 present: true,
@@ -1280,51 +1939,23 @@ fn inspect_recovery_file(path: &Path, generation: Option<u64>) -> RecoveryFileIn
                 ..RecoveryFileInspection::default()
             }
         }
-    }) else {
-        return RecoveryFileInspection {
-            present: true,
-            regular: true,
-            error: Some("file disappeared during inspection".into()),
-            ..RecoveryFileInspection::default()
-        };
     };
-    let mut bytes = Vec::new();
-    if Read::by_ref(&mut file)
-        .take(MAX_DOCUMENT_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return RecoveryFileInspection {
-            present: true,
-            regular: true,
-            owner_private: true,
-            single_link: true,
-            error: Some("file could not be read".into()),
-            ..RecoveryFileInspection::default()
-        };
-    }
-    if bytes.len() > MAX_DOCUMENT_BYTES {
-        return RecoveryFileInspection {
-            present: true,
-            regular: true,
-            owner_private: true,
-            single_link: true,
-            error: Some("file exceeds the managed document limit".into()),
-            ..RecoveryFileInspection::default()
-        };
-    }
     let digest = bytes_digest(&bytes);
     let generated = bytes.starts_with(GENERATED_HEADER);
-    let (config_valid, error) = if !generated {
+    let config_bytes = if generated {
+        &bytes[GENERATED_HEADER.len()..]
+    } else {
+        &bytes[..]
+    };
+    let (config_valid, error) = if require_generated && !generated {
         (
             false,
             Some("file is missing Pooler's generated-file marker".into()),
         )
     } else {
-        let body = &bytes[GENERATED_HEADER.len()..];
-        match std::str::from_utf8(body) {
+        match std::str::from_utf8(config_bytes) {
             Ok(body) => match Config::from_yaml(path.display().to_string(), body)
-                .and_then(|config| config.compile_with_generation(generation.unwrap_or(1)))
+                .and_then(|config| config.compile_with_generation(generation))
             {
                 Ok(_) => (true, None),
                 Err(error) => (false, Some(error.to_string())),
@@ -1335,13 +1966,30 @@ fn inspect_recovery_file(path: &Path, generation: Option<u64>) -> RecoveryFileIn
     RecoveryFileInspection {
         present: true,
         regular: true,
-        owner_private: true,
-        single_link: true,
+        owner_private: !owner_private || is_owner_private(path),
         bytes: Some(bytes),
         digest: Some(digest),
         generated,
         config_valid,
         error,
+    }
+}
+
+fn is_owner_private(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        fs::metadata(path)
+            .map(|metadata| {
+                metadata.uid() == rustix::process::geteuid().as_raw()
+                    && metadata.nlink() == 1
+                    && metadata.mode() & 0o077 == 0
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
     }
 }
 
@@ -1373,11 +2021,11 @@ fn inspect_recovery_marker(path: &Path) -> RecoveryMarkerInspection {
             valid: false,
             digest: None,
             marker: None,
-            error: Some("recovery marker is not a regular file".into()),
+            error: Some("transaction marker is not a regular file".into()),
         };
     }
-    let Some(mut file) = (match open_validated_file(path, true) {
-        Ok(file) => file,
+    let Some(bytes) = (match read_existing_file(path, true) {
+        Ok(bytes) => bytes,
         Err(error) => {
             return RecoveryMarkerInspection {
                 present: true,
@@ -1393,23 +2041,9 @@ fn inspect_recovery_marker(path: &Path) -> RecoveryMarkerInspection {
             valid: false,
             digest: None,
             marker: None,
-            error: Some("recovery marker disappeared during inspection".into()),
+            error: Some("transaction marker disappeared during inspection".into()),
         };
     };
-    let mut bytes = Vec::new();
-    if Read::by_ref(&mut file)
-        .take(RECOVERY_MARKER_MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return RecoveryMarkerInspection {
-            present: true,
-            valid: false,
-            digest: None,
-            marker: None,
-            error: Some("recovery marker could not be read".into()),
-        };
-    }
     let digest = Some(bytes_digest(&bytes));
     if bytes.len() > RECOVERY_MARKER_MAX_BYTES {
         return RecoveryMarkerInspection {
@@ -1417,7 +2051,7 @@ fn inspect_recovery_marker(path: &Path) -> RecoveryMarkerInspection {
             valid: false,
             digest,
             marker: None,
-            error: Some("recovery marker is too large".into()),
+            error: Some("transaction marker is too large".into()),
         };
     }
     if bytes == RECOVERY_MARKER {
@@ -1435,7 +2069,7 @@ fn inspect_recovery_marker(path: &Path) -> RecoveryMarkerInspection {
             valid: false,
             digest,
             marker: None,
-            error: Some("recovery marker has an unknown format".into()),
+            error: Some("transaction marker has an unknown format".into()),
         };
     };
     let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
@@ -1447,11 +2081,11 @@ fn inspect_recovery_marker(path: &Path) -> RecoveryMarkerInspection {
         present: true,
         valid,
         digest,
-        marker: record.map(RecoveryMarker::Record),
+        marker: record.map(|record| RecoveryMarker::Record(Box::new(record))),
         error: if valid {
             None
         } else {
-            Some("recovery marker record is invalid".into())
+            Some("transaction marker record is invalid".into())
         },
     }
 }
@@ -1461,7 +2095,6 @@ fn recovery_file_value(file: &RecoveryFileInspection) -> Value {
         "present": file.present,
         "regular": file.regular,
         "owner_private": file.owner_private,
-        "single_link": file.single_link,
         "bytes": file.bytes.as_ref().map(Vec::len),
         "sha256": file.digest,
         "generated": file.generated,
@@ -1473,7 +2106,7 @@ fn recovery_file_value(file: &RecoveryFileInspection) -> Value {
 fn recovery_marker_value(marker: &RecoveryMarkerInspection) -> Value {
     let (format, record) = match marker.marker.as_ref() {
         Some(RecoveryMarker::Legacy) => (Some("legacy"), None),
-        Some(RecoveryMarker::Record(record)) => (Some("v1"), Some(record)),
+        Some(RecoveryMarker::Record(record)) => (Some("v2"), Some(record)),
         None => (None, None),
     };
     json!({
@@ -1484,13 +2117,14 @@ fn recovery_marker_value(marker: &RecoveryMarkerInspection) -> Value {
         "record": record.map(|record| json!({
             "version": record.version,
             "operation": record.operation,
-            "source": record.source,
-            "managed": record.managed,
+            "canonical": record.canonical,
+            "staged": record.staged,
             "backup": record.backup,
+            "rollback": record.rollback,
             "generation": record.generation,
-            "target_sha256": record.target_sha256,
-            "previous_managed_sha256": record.previous_managed_sha256,
-            "previous_backup_sha256": record.previous_backup_sha256,
+            "prior_sha256": record.prior_sha256,
+            "next_sha256": record.next_sha256,
+            "prior_backup_sha256": record.prior_backup_sha256,
         })),
         "error": marker.error,
     })
@@ -1509,90 +2143,95 @@ fn optional_digest_matches(file: &RecoveryFileInspection, expected: Option<&str>
 
 fn record_path_matches(
     record: &RecoveryRecord,
-    source: &Path,
-    managed: &Path,
+    canonical: &Path,
+    staged: &Path,
     backup: &Path,
+    rollback: &Path,
 ) -> bool {
     record.version == RECOVERY_RECORD_VERSION
         && !record.operation.is_empty()
-        && source.display().to_string() == record.source
-        && managed.display().to_string() == record.managed
+        && canonical.display().to_string() == record.canonical
+        && staged.display().to_string() == record.staged
         && backup.display().to_string() == record.backup
+        && rollback.display().to_string() == record.rollback
         && record.generation > 0
-        && valid_digest(&record.target_sha256)
+        && valid_digest(&record.prior_sha256)
+        && valid_digest(&record.next_sha256)
         && record
-            .previous_managed_sha256
-            .as_deref()
-            .is_none_or(valid_digest)
-        && record
-            .previous_backup_sha256
+            .prior_backup_sha256
             .as_deref()
             .is_none_or(valid_digest)
 }
 
 fn inspect_recovery(source: impl AsRef<Path>) -> Result<Value, ConfigManagementError> {
-    let (source, managed) = managed_paths(source.as_ref())?;
-    let backup = backup_path(&managed);
-    let marker_path = recovery_marker_path(&managed);
+    let canonical = canonical_config_path(source.as_ref())?;
+    let backup = backup_path(&canonical);
+    let rollback = rollback_path(&canonical);
+    let marker_path = recovery_marker_path(&canonical);
     let marker = inspect_recovery_marker(&marker_path);
     let generation = marker.marker.as_ref().and_then(|marker| match marker {
         RecoveryMarker::Legacy => None,
         RecoveryMarker::Record(record) => Some(record.generation),
     });
-    let managed_file = inspect_recovery_file(&managed, generation);
-    let backup_file = inspect_recovery_file(&backup, generation);
-    let mut verified = !marker.present
-        && marker.valid
-        && (!managed_file.present || (managed_file.owner_private && managed_file.config_valid))
-        && (!backup_file.present || (backup_file.owner_private && backup_file.config_valid));
+    let generation_for_compile = generation.unwrap_or(1);
+    let canonical_file = inspect_recovery_file(&canonical, generation_for_compile, false, false);
+    let staged_path = marker
+        .marker
+        .as_ref()
+        .and_then(|marker| match marker {
+            RecoveryMarker::Record(record) => Some(PathBuf::from(&record.staged)),
+            RecoveryMarker::Legacy => None,
+        })
+        .unwrap_or_else(|| canonical.with_file_name(".pooler-config-stage"));
+    let staged_file = inspect_recovery_file(&staged_path, generation_for_compile, true, true);
+    let backup_file = inspect_recovery_file(&backup, generation_for_compile, false, true);
+    let rollback_file = inspect_recovery_file(&rollback, generation_for_compile, false, true);
+    let mut verified = !marker.present && canonical_file.config_valid;
     let mut can_resume = false;
     let mut can_abort = false;
     let mut state = if marker.present { "blocked" } else { "clear" };
     let mut reason = marker.error.clone();
     if let Some(RecoveryMarker::Record(record)) = marker.marker.as_ref() {
-        let paths_match = record_path_matches(record, &source, &managed, &backup);
-        let files_safe = (!managed_file.present
-            || (managed_file.owner_private && managed_file.config_valid))
-            && (!backup_file.present || (backup_file.owner_private && backup_file.config_valid));
-        let target = managed_file.digest.as_deref() == Some(record.target_sha256.as_str());
-        let previous_managed =
-            optional_digest_matches(&managed_file, record.previous_managed_sha256.as_deref());
-        let previous_backup =
-            optional_digest_matches(&backup_file, record.previous_backup_sha256.as_deref());
-        let backup_previous_managed =
-            optional_digest_matches(&backup_file, record.previous_managed_sha256.as_deref());
-        let complete = target && backup_previous_managed;
-        let untouched = previous_managed && previous_backup;
-        let intermediate = previous_managed && backup_previous_managed;
-        verified = paths_match && files_safe && (complete || untouched || intermediate);
-        can_resume = verified && (complete || untouched);
-        can_abort = verified
-            && (untouched
-                || (complete
-                    && (record.previous_backup_sha256.is_none()
-                        || record.previous_backup_sha256.as_deref()
-                            == Some(record.target_sha256.as_str()))));
+        let paths_match = record_path_matches(record, &canonical, &staged_path, &backup, &rollback);
+        let files_safe = canonical_file.config_valid
+            && (!staged_file.present || (staged_file.owner_private && staged_file.config_valid))
+            && (!backup_file.present || (backup_file.owner_private && backup_file.config_valid))
+            && (!rollback_file.present
+                || (rollback_file.owner_private && rollback_file.config_valid));
+        let prior_canonical =
+            canonical_file.digest.as_deref() == Some(record.prior_sha256.as_str());
+        let next_canonical = canonical_file.digest.as_deref() == Some(record.next_sha256.as_str());
+        let staged_next = staged_file.digest.as_deref() == Some(record.next_sha256.as_str());
+        let backup_prior = backup_file.digest.as_deref() == Some(record.prior_sha256.as_str());
+        let prior_backup =
+            optional_digest_matches(&rollback_file, record.prior_backup_sha256.as_deref());
+        let prepared = prior_canonical && staged_next && backup_prior && prior_backup;
+        let promoted = next_canonical && !staged_file.present && backup_prior && prior_backup;
+        let untouched = prior_canonical
+            && !staged_file.present
+            && optional_digest_matches(&backup_file, record.prior_backup_sha256.as_deref());
+        verified = paths_match && files_safe && (prepared || promoted || untouched);
+        can_resume = verified && (prepared || promoted);
+        can_abort = verified && (prepared || promoted);
         if !paths_match {
-            reason = Some("recovery marker paths, generation, or digests are invalid".into());
+            reason = Some("transaction marker paths, generation, or digests are invalid".into());
         } else if !files_safe {
-            reason = Some(
-                "managed or backup file failed identity, permission, or compiler checks".into(),
-            );
-        } else if complete {
-            state = "ready-to-resume";
+            reason = Some("canonical transaction file failed identity or compiler checks".into());
+        } else if promoted {
+            state = "ready-to-complete";
+        } else if prepared {
+            state = "ready-to-promote";
         } else if untouched {
             state = "no-op-recovery";
-        } else if intermediate {
-            state = "requires-operator";
-            reason = Some("transaction stopped between backup and managed-file replacement".into());
         } else {
-            reason =
-                Some("managed and backup digests do not describe a known transaction state".into());
+            state = "requires-operator";
+            reason = Some("transaction files do not describe a known state".into());
         }
     } else if matches!(marker.marker, Some(RecoveryMarker::Legacy)) {
         state = "legacy-marker";
         reason = Some(
-            "legacy marker has no durable file digests or generation; refusing mutation".into(),
+            "legacy transaction marker has no durable file digests or generation; refusing mutation"
+                .into(),
         );
     }
     Ok(json!({
@@ -1601,15 +2240,23 @@ fn inspect_recovery(source: impl AsRef<Path>) -> Result<Value, ConfigManagementE
         "safe_to_resume": can_resume,
         "safe_to_abort": can_abort,
         "generation": generation,
-        "source": source,
+        "active": {
+            "path": canonical,
+            "sha256": canonical_file.digest,
+            "generation": generation,
+        },
         "paths": {
-            "managed": managed,
+            "canonical": canonical,
+            "staged": staged_path,
             "backup": backup,
+            "rollback": rollback,
             "recovery_marker": marker_path,
         },
         "marker": recovery_marker_value(&marker),
-        "managed": recovery_file_value(&managed_file),
+        "canonical_file": recovery_file_value(&canonical_file),
+        "staged_file": recovery_file_value(&staged_file),
         "backup": recovery_file_value(&backup_file),
+        "rollback": recovery_file_value(&rollback_file),
         "reason": reason,
     }))
 }
@@ -1638,11 +2285,35 @@ pub(crate) fn resume_recovery(source: impl AsRef<Path>) -> Result<Value, ConfigM
     if status.get("safe_to_resume").and_then(Value::as_bool) != Some(true) {
         return Err(ConfigManagementError::RecoveryRequired);
     }
-    let managed = status["paths"]["managed"]
+    let canonical = status["paths"]["canonical"]
         .as_str()
         .map(PathBuf::from)
         .ok_or(ConfigManagementError::RecoveryRequired)?;
-    clear_recovery_marker(&managed)?;
+    let staged = status["paths"]["staged"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or(ConfigManagementError::RecoveryRequired)?;
+    let marker = inspect_recovery_marker(&recovery_marker_path(&canonical));
+    if let Some(RecoveryMarker::Record(record)) = marker.marker {
+        let canonical_file = inspect_recovery_file(&canonical, record.generation, false, false);
+        if canonical_file.digest.as_deref() != Some(record.next_sha256.as_str()) {
+            let staged_bytes = read_existing_file(&staged, true)?
+                .ok_or(ConfigManagementError::RecoveryRequired)?;
+            if bytes_digest(&staged_bytes) != record.next_sha256 {
+                return Err(ConfigManagementError::RecoveryRequired);
+            }
+            fail_hook(FileTransactionStage::Rename)?;
+            fs::rename(&staged, &canonical).map_err(|_| ConfigManagementError::RecoveryRequired)?;
+            sync_directory(
+                canonical
+                    .parent()
+                    .ok_or(ConfigManagementError::RecoveryRequired)?,
+            )?;
+        }
+        clear_recovery_marker(&canonical)?;
+    } else {
+        return Err(ConfigManagementError::RecoveryRequired);
+    }
     let mut resumed = inspect_recovery(source)?;
     resumed["action"] = Value::String("resumed".into());
     Ok(resumed)
@@ -1654,87 +2325,50 @@ pub(crate) fn abort_recovery(source: impl AsRef<Path>) -> Result<Value, ConfigMa
     if status.get("safe_to_abort").and_then(Value::as_bool) != Some(true) {
         return Err(ConfigManagementError::RecoveryRequired);
     }
-    let (source, managed) = managed_paths(source)?;
-    let backup = backup_path(&managed);
-    let marker_path = recovery_marker_path(&managed);
-    let marker = inspect_recovery_marker(&marker_path);
+    let canonical = status["paths"]["canonical"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or(ConfigManagementError::RecoveryRequired)?;
+    let staged = status["paths"]["staged"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or(ConfigManagementError::RecoveryRequired)?;
+    let backup = status["paths"]["backup"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or(ConfigManagementError::RecoveryRequired)?;
+    let rollback = status["paths"]["rollback"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or(ConfigManagementError::RecoveryRequired)?;
+    let marker = inspect_recovery_marker(&recovery_marker_path(&canonical));
     let Some(RecoveryMarker::Record(record)) = marker.marker else {
         return Err(ConfigManagementError::RecoveryRequired);
     };
-    let managed_file = inspect_recovery_file(&managed, Some(record.generation));
-    let backup_file = inspect_recovery_file(&backup, Some(record.generation));
-    if !record_path_matches(&record, &source, &managed, &backup)
-        || (managed_file.present && (!managed_file.owner_private || !managed_file.config_valid))
-        || (backup_file.present && (!backup_file.owner_private || !backup_file.config_valid))
-    {
+    let backup_bytes =
+        read_existing_file(&backup, true)?.ok_or(ConfigManagementError::RecoveryRequired)?;
+    if bytes_digest(&backup_bytes) != record.prior_sha256 {
         return Err(ConfigManagementError::RecoveryRequired);
     }
-    let target = managed_file.digest.as_deref() == Some(record.target_sha256.as_str());
-    let previous_managed =
-        optional_digest_matches(&managed_file, record.previous_managed_sha256.as_deref());
-    let previous_backup =
-        optional_digest_matches(&backup_file, record.previous_backup_sha256.as_deref());
-    if previous_managed && previous_backup {
-        clear_recovery_marker(&managed)?;
-    } else if target {
-        if record.previous_managed_sha256.is_none() {
-            // A first managed commit has no prior managed bytes to restore:
-            // aborting it must remove the newly-created target and leave no
-            // backup sidecar behind. `safe_to_abort` only permits this branch
-            // when the recorded pre-transaction backup was also absent.
-            if record.previous_backup_sha256.is_some() || backup_file.present {
-                return Err(ConfigManagementError::RecoveryRequired);
-            }
-            let parent = managed
-                .parent()
-                .ok_or(ConfigManagementError::RecoveryRequired)?;
-            remove_file_synced(parent, &managed)?;
-            remove_file_synced(parent, &backup)?;
-            let restored = persistence_snapshot(&managed)?;
-            if restored.previous_managed.is_some() || restored.previous_backup.is_some() {
-                return Err(ConfigManagementError::RecoveryRequired);
-            }
-            clear_recovery_marker(&managed)?;
-        } else {
-            let Some(previous_managed_bytes) = backup_file.bytes.as_deref() else {
-                return Err(ConfigManagementError::RecoveryRequired);
-            };
-            if record.previous_backup_sha256.is_some()
-                && record.previous_backup_sha256.as_deref() != Some(record.target_sha256.as_str())
-            {
-                return Err(ConfigManagementError::RecoveryRequired);
-            }
-            let parent = managed
-                .parent()
-                .ok_or(ConfigManagementError::RecoveryRequired)?;
-            write_atomic(parent, &managed, previous_managed_bytes)?;
-            match record.previous_backup_sha256.as_deref() {
-                Some(previous_backup) if previous_backup == record.target_sha256 => {
-                    let target_bytes = managed_file
-                        .bytes
-                        .as_deref()
-                        .ok_or(ConfigManagementError::RecoveryRequired)?;
-                    write_atomic(parent, &backup, target_bytes)?;
-                }
-                None => remove_file_synced(parent, &backup)?,
-                Some(_) => return Err(ConfigManagementError::RecoveryRequired),
-            }
-            let restored = persistence_snapshot(&managed)?;
-            let expected_backup = record
-                .previous_backup_sha256
-                .as_ref()
-                .map(|_| managed_file.bytes.as_deref())
-                .unwrap_or(None);
-            if restored.previous_managed.as_deref() != Some(previous_managed_bytes)
-                || restored.previous_backup.as_deref() != expected_backup
-            {
-                return Err(ConfigManagementError::RecoveryRequired);
-            }
-            clear_recovery_marker(&managed)?;
+    let parent = canonical
+        .parent()
+        .ok_or(ConfigManagementError::RecoveryRequired)?;
+    write_atomic(parent, &canonical, &backup_bytes, AtomicWriteKind::Rollback)?;
+    if let Some(previous_backup) = record.prior_backup_sha256.as_deref() {
+        let previous =
+            read_existing_file(&rollback, true)?.ok_or(ConfigManagementError::RecoveryRequired)?;
+        if bytes_digest(&previous) != previous_backup {
+            return Err(ConfigManagementError::RecoveryRequired);
         }
+        write_atomic(parent, &backup, &previous, AtomicWriteKind::Rollback)?;
     } else {
-        return Err(ConfigManagementError::RecoveryRequired);
+        remove_file_synced(parent, &backup)?;
     }
+    remove_file_synced(parent, &staged)?;
+    remove_file_synced(parent, &rollback)?;
+    fail_hook(FileTransactionStage::RollbackFsync)?;
+    sync_directory(parent)?;
+    clear_recovery_marker(&canonical)?;
     let mut aborted = inspect_recovery(source)?;
     aborted["action"] = Value::String("aborted".into());
     Ok(aborted)
@@ -1762,453 +2396,160 @@ mod tests {
         (directory, path)
     }
 
+    fn candidate(manager: &ConfigManagement, generation: u64, bind: &str) -> PreparedActivation {
+        let created = manager.create(generation).expect("draft");
+        let id = created["draft_id"].as_u64().expect("id");
+        let patched = manager
+            .apply(
+                id,
+                created["etag"].as_str().expect("etag"),
+                TypedConfigPatch::Upsert {
+                    section: "listeners".into(),
+                    id: "local".into(),
+                    value: json!({"bind": bind}),
+                },
+            )
+            .expect("patch");
+        let validated = manager
+            .validate(id, patched["etag"].as_str().expect("etag"))
+            .expect("validate");
+        manager
+            .commit(
+                id,
+                patched["etag"].as_str().expect("etag"),
+                generation,
+                validated["confirmation_token"].as_str().expect("token"),
+            )
+            .expect("prepare")
+    }
+
     #[test]
-    fn draft_patch_validation_diff_and_atomic_persistence_are_bounded() {
+    fn canonical_config_transaction_activates_exact_candidate() {
+        let (_directory, path) = source();
+        let canonical = path.canonicalize().expect("canonical path");
+        let prior = fs::read(&canonical).expect("prior bytes");
+        let manager = ConfigManagement::new(&path).expect("manager");
+        let mut activation = candidate(&manager, 1, "127.0.0.1:1001");
+
+        assert_eq!(activation.candidate.canonical_path, canonical);
+        assert_eq!(activation.candidate.base_generation, 1);
+        assert_eq!(activation.candidate.target_generation, 2);
+        assert_eq!(
+            bytes_digest(&activation.candidate.bytes),
+            activation.candidate.next_digest
+        );
+        assert_eq!(
+            fs::read(&canonical).expect("canonical remains prior"),
+            prior
+        );
+        assert_eq!(
+            fs::read(&activation.candidate.backup_path).expect("backup"),
+            prior
+        );
+        assert!(activation.candidate.staged_path.is_file());
+
+        manager
+            .promote_file(&mut activation)
+            .expect("promote candidate");
+        assert_eq!(
+            fs::read(&canonical).expect("promoted canonical"),
+            activation.candidate.bytes
+        );
+        assert!(!activation.candidate.staged_path.exists());
+        manager.register_commit(9, activation);
+        manager.complete(9, true).expect("complete");
+        assert!(!recovery_marker_path(&canonical).exists());
+        assert!(!rollback_path(&canonical).exists());
+        assert_eq!(
+            configured_source(&path).expect("configured path"),
+            canonical
+        );
+    }
+
+    #[test]
+    fn canonical_config_transaction_rolls_back_file_hooks() {
+        let stages = [
+            FileTransactionStage::MarkerCreate,
+            FileTransactionStage::BackupWrite,
+            FileTransactionStage::BackupFsync,
+            FileTransactionStage::TempWrite,
+            FileTransactionStage::TempFsync,
+            FileTransactionStage::Rename,
+            FileTransactionStage::DirectoryFsync,
+        ];
+        for stage in stages {
+            let (_directory, path) = source();
+            let canonical = path.canonicalize().expect("canonical path");
+            let prior = fs::read(&canonical).expect("prior bytes");
+            let manager = ConfigManagement::new(&path).expect("manager");
+            FAILURE_HOOK.with(|hook| hook.set(Some(stage)));
+            let result = {
+                let created = manager.create(1).expect("draft");
+                let id = created["draft_id"].as_u64().expect("id");
+                let patched = manager
+                    .apply(
+                        id,
+                        created["etag"].as_str().expect("etag"),
+                        TypedConfigPatch::Upsert {
+                            section: "listeners".into(),
+                            id: "local".into(),
+                            value: json!({"bind": "127.0.0.1:1001"}),
+                        },
+                    )
+                    .expect("patch");
+                let validated = manager
+                    .validate(id, patched["etag"].as_str().expect("etag"))
+                    .expect("validate");
+                manager.commit(
+                    id,
+                    patched["etag"].as_str().expect("etag"),
+                    1,
+                    validated["confirmation_token"].as_str().expect("token"),
+                )
+            };
+            assert!(result.is_err(), "hook should fail: {stage:?}");
+            assert_eq!(fs::read(&canonical).expect("prior restored"), prior);
+            assert!(
+                !recovery_marker_path(&canonical).exists(),
+                "recovery marker remains after {stage:?}"
+            );
+            assert!(!rollback_path(&canonical).exists());
+        }
+
+        let (_directory, path) = source();
+        let canonical = path.canonicalize().expect("canonical path");
+        let prior = fs::read(&canonical).expect("prior bytes");
+        let manager = ConfigManagement::new(&path).expect("manager");
+        let activation = candidate(&manager, 1, "127.0.0.1:1001");
+        FAILURE_HOOK.with(|hook| hook.set(Some(FileTransactionStage::HandoffCancellation)));
+        assert!(manager.cancel_activation(activation).is_err());
+        assert_eq!(
+            fs::read(&canonical).expect("prior after cancellation"),
+            prior
+        );
+        FAILURE_HOOK.with(|hook| hook.set(None));
+        let mut activation = candidate(&manager, 1, "127.0.0.1:1002");
+        manager.promote_file(&mut activation).expect("promote");
+        manager.register_commit(11, activation);
+        FAILURE_HOOK.with(|hook| hook.set(Some(FileTransactionStage::CompletionMarkerWrite)));
+        assert!(manager.complete(11, true).is_err());
+        FAILURE_HOOK.with(|hook| hook.set(None));
+        manager.complete(11, true).expect("retry complete");
+
+        let mut activation = candidate(&manager, 2, "127.0.0.1:1003");
+        manager.promote_file(&mut activation).expect("promote");
+        manager.register_commit(12, activation);
+        FAILURE_HOOK.with(|hook| hook.set(Some(FileTransactionStage::RollbackFsync)));
+        assert!(manager.complete(12, false).is_err());
+        FAILURE_HOOK.with(|hook| hook.set(None));
+        manager.complete(12, false).expect("retry rollback");
+    }
+
+    #[test]
+    fn canonical_config_transaction_preserves_etag_and_generation_guards() {
         let (_directory, path) = source();
         let manager = ConfigManagement::new(&path).expect("manager");
         let created = manager.create(7).expect("draft");
-        let id = created["draft_id"].as_u64().expect("id");
-        let etag = created["etag"].as_str().expect("etag");
-        let patched = manager
-            .apply(
-                id,
-                etag,
-                TypedConfigPatch::Upsert {
-                    section: "listeners".into(),
-                    id: "local".into(),
-                    value: json!({"bind": "127.0.0.1:0"}),
-                },
-            )
-            .expect("patch");
-        let etag = patched["etag"].as_str().expect("etag");
-        let validated = manager.validate(id, etag).expect("validate");
-        assert_eq!(validated["valid"], true);
-        assert_eq!(validated["semantic_diff"][0]["id"], "local");
-        let token = validated["confirmation_token"].as_str().expect("token");
-        let commit = manager.commit(id, etag, 7, token).expect("commit");
-        assert!(commit.managed_path.is_file());
-        #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(&commit.managed_path)
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-
-    #[test]
-    fn managed_documents_in_the_legacy_four_mib_gap_are_rejected() {
-        let padding_bytes = MAX_CONFIG_FILE_BYTES as usize + 128 * 1024;
-        let document = json!({
-            "version": 1,
-            "extensions": {
-                "oversized": {
-                    "command": "/bin/true",
-                    "capabilities": ["inspect"],
-                    "args": ["x".repeat(padding_bytes)]
-                }
-            }
-        });
-        let rendered = serde_yml::to_string(&document).expect("candidate serializes");
-        assert!(rendered.len() > MAX_CONFIG_FILE_BYTES as usize);
-        assert!(rendered.len() < 4 * 1024 * 1024);
-        compile_document(&document, 1).expect("candidate is compiler-valid");
-
-        assert!(matches!(
-            generated_document(&document),
-            Err(ConfigManagementError::TooLarge)
-        ));
-    }
-
-    #[test]
-    fn successful_commits_create_a_reversible_owner_private_backup() {
-        let (_directory, path) = source();
-        assert_eq!(
-            serving_source(&path).expect("original selected"),
-            path.canonicalize().expect("canonical source")
-        );
-        let manager = ConfigManagement::new(&path).expect("manager");
-
-        let commit_listener = |generation: u64, bind: &str| {
-            let created = manager.create(generation).expect("draft");
-            let id = created["draft_id"].as_u64().expect("id");
-            let patched = manager
-                .apply(
-                    id,
-                    created["etag"].as_str().expect("etag"),
-                    TypedConfigPatch::Upsert {
-                        section: "listeners".into(),
-                        id: "local".into(),
-                        value: json!({"bind": bind}),
-                    },
-                )
-                .expect("patch");
-            let etag = patched["etag"].as_str().expect("patched etag");
-            let validated = manager.validate(id, etag).expect("validate");
-            manager
-                .commit(
-                    id,
-                    etag,
-                    generation,
-                    validated["confirmation_token"]
-                        .as_str()
-                        .expect("confirmation"),
-                )
-                .expect("commit")
-        };
-
-        let first = commit_listener(1, "127.0.0.1:1001");
-        let managed = first.managed_path.clone();
-        let marker = recovery_marker_path(&managed);
-        manager.register_commit(1, first);
-        assert!(marker.is_file());
-        assert!(matches!(
-            serving_source(&path),
-            Err(ConfigManagementError::RecoveryRequired)
-        ));
-        assert!(matches!(
-            ConfigManagement::new(&path),
-            Err(ConfigManagementError::RecoveryRequired)
-        ));
-        manager.complete_commit(1, true).expect("first completion");
-        assert!(!marker.exists());
-        assert_eq!(
-            serving_source(&path).expect("managed source selected after restart"),
-            managed
-        );
-        assert!(fs::read_to_string(&managed)
-            .expect("first managed file")
-            .contains("1001"));
-
-        let second = commit_listener(2, "127.0.0.1:1002");
-        manager.register_commit(2, second);
-        manager.complete_commit(2, true).expect("second completion");
-        assert!(fs::read_to_string(&managed)
-            .expect("second managed file")
-            .contains("1002"));
-        let backup = backup_path(&managed);
-        assert!(fs::read_to_string(&backup)
-            .expect("first backup")
-            .contains("1001"));
-
-        let rollback = manager.rollback(3).expect("rollback");
-        manager.register_commit(3, rollback);
-        manager
-            .complete_commit(3, true)
-            .expect("rollback completion");
-        assert!(fs::read_to_string(&managed)
-            .expect("rolled back managed file")
-            .contains("1001"));
-        assert!(fs::read_to_string(&backup)
-            .expect("reversible backup")
-            .contains("1002"));
-        let failed = commit_listener(4, "127.0.0.1:1003");
-        manager.register_commit(4, failed);
-        manager
-            .complete_commit(4, false)
-            .expect("failed commit restoration");
-        assert!(!marker.exists());
-        assert_eq!(
-            manager.state.lock().expect("state lock").active_source,
-            managed
-        );
-        assert!(fs::read_to_string(&managed)
-            .expect("restored managed file")
-            .contains("1001"));
-        assert!(fs::read_to_string(&backup)
-            .expect("restored rollback backup")
-            .contains("1002"));
-
-        let failed_rollback = manager.rollback(5).expect("failed rollback candidate");
-        manager.register_commit(5, failed_rollback);
-        manager
-            .complete_commit(5, false)
-            .expect("failed rollback restoration");
-        assert!(fs::read_to_string(&managed)
-            .expect("managed file after failed rollback")
-            .contains("1001"));
-        assert!(fs::read_to_string(&backup)
-            .expect("backup after failed rollback")
-            .contains("1002"));
-
-        let injected = manager.create(6).expect("injected draft");
-        let injected_id = injected["draft_id"].as_u64().expect("injected id");
-        let injected_patch = manager
-            .apply(
-                injected_id,
-                injected["etag"].as_str().expect("injected etag"),
-                TypedConfigPatch::Upsert {
-                    section: "listeners".into(),
-                    id: "local".into(),
-                    value: json!({"bind": "127.0.0.1:1004"}),
-                },
-            )
-            .expect("injected patch");
-        let injected_etag = injected_patch["etag"]
-            .as_str()
-            .expect("injected patched etag");
-        let injected_validation = manager
-            .validate(injected_id, injected_etag)
-            .expect("injected validation");
-        FAIL_WRITE_AFTER_RENAME.set(true);
-        assert!(matches!(
-            manager.commit(
-                injected_id,
-                injected_etag,
-                6,
-                injected_validation["confirmation_token"]
-                    .as_str()
-                    .expect("injected confirmation"),
-            ),
-            Err(ConfigManagementError::Persistence)
-        ));
-        assert!(!manager.state.lock().expect("state lock").commit_in_progress);
-        assert!(fs::read_to_string(&managed)
-            .expect("managed file after injected commit failure")
-            .contains("1001"));
-        assert!(fs::read_to_string(&backup)
-            .expect("backup after injected commit failure")
-            .contains("1002"));
-
-        assert!(matches!(
-            manager.commit(injected_id, injected_etag, 6, "wrong-confirmation"),
-            Err(ConfigManagementError::Confirmation)
-        ));
-        FAIL_WRITE_AFTER_RENAME.set(true);
-        assert!(matches!(
-            manager.rollback(7),
-            Err(ConfigManagementError::Persistence)
-        ));
-        assert!(fs::read_to_string(&managed)
-            .expect("managed file after injected rollback failure")
-            .contains("1001"));
-        assert!(fs::read_to_string(&backup)
-            .expect("backup after injected rollback failure")
-            .contains("1002"));
-
-        #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(&backup)
-                .expect("backup metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-
-    #[test]
-    fn unmanaged_reload_lease_blocks_managed_commit_until_released() {
-        let (_directory, path) = source();
-        let manager = ConfigManagement::new(&path).expect("manager");
-        let created = manager.create(1).expect("draft");
-        let id = created["draft_id"].as_u64().expect("id");
-        let patched = manager
-            .apply(
-                id,
-                created["etag"].as_str().expect("etag"),
-                TypedConfigPatch::Upsert {
-                    section: "listeners".into(),
-                    id: "local".into(),
-                    value: json!({"bind": "127.0.0.1:1001"}),
-                },
-            )
-            .expect("patch");
-        let etag = patched["etag"].as_str().expect("patched etag");
-        let validated = manager.validate(id, etag).expect("validate");
-        let token = validated["confirmation_token"]
-            .as_str()
-            .expect("confirmation");
-        assert!(manager.try_begin_unmanaged_reload());
-        assert!(matches!(
-            manager.commit(id, etag, 1, token),
-            Err(ConfigManagementError::Precondition)
-        ));
-        manager.finish_unmanaged_reload();
-        let commit = manager
-            .commit(id, etag, 1, token)
-            .expect("commit after lease release");
-        manager.register_commit(1, commit);
-        manager
-            .complete_commit(1, false)
-            .expect("leased commit restoration");
-    }
-
-    #[test]
-    fn rollback_recovery_marker_blocks_all_reload_classes() {
-        let (_directory, path) = source();
-        let manager = ConfigManagement::new(&path).expect("manager");
-        let marker = recovery_marker_path(&manager.managed_path);
-        fs::write(&marker, RECOVERY_MARKER).expect("recovery marker");
-        #[cfg(unix)]
-        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
-            .expect("private recovery marker");
-
-        assert!(matches!(
-            manager.rollback(1),
-            Err(ConfigManagementError::RecoveryRequired)
-        ));
-        assert!(!manager.try_begin_unmanaged_reload());
-    }
-
-    #[test]
-    fn rollback_without_a_backup_does_not_create_a_recovery_lock() {
-        let (_directory, path) = source();
-        let manager = ConfigManagement::new(&path).expect("manager");
-
-        assert!(matches!(
-            manager.rollback(1),
-            Err(ConfigManagementError::NotFound)
-        ));
-        assert!(!recovery_marker_path(&manager.managed_path).exists());
-        assert!(manager.try_begin_unmanaged_reload());
-        manager.finish_unmanaged_reload();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn source_and_managed_destination_symlinks_fail_closed() {
-        use std::os::unix::fs::symlink;
-
-        let (_directory, path) = source();
-        let linked_source = path.with_file_name("linked.yaml");
-        symlink(&path, &linked_source).expect("source symlink");
-        assert!(matches!(
-            ConfigManagement::new(&linked_source),
-            Err(ConfigManagementError::Persistence)
-        ));
-
-        let managed = path.with_file_name("pooler.managed.yaml");
-        symlink(&path, &managed).expect("managed destination symlink");
-        assert!(matches!(
-            ConfigManagement::new(&path),
-            Err(ConfigManagementError::Persistence)
-        ));
-        fs::remove_file(&managed).expect("managed symlink removed");
-        fs::write(&managed, b"version: 1\n").expect("unmarked managed file");
-        fs::set_permissions(&managed, fs::Permissions::from_mode(0o600))
-            .expect("unmarked file made private");
-        assert!(matches!(
-            serving_source(&path),
-            Err(ConfigManagementError::Persistence)
-        ));
-        fs::remove_file(&managed).expect("unmarked managed file removed");
-
-        let marker = recovery_marker_path(&managed);
-        let completed = completed_recovery_marker_path(&managed);
-        fs::write(&completed, RECOVERY_MARKER).expect("completed marker written");
-        fs::set_permissions(&completed, fs::Permissions::from_mode(0o600))
-            .expect("completed marker made private");
-        assert_eq!(
-            serving_source(&path).expect("completed transaction marker is safe"),
-            path.canonicalize().expect("canonical source")
-        );
-        assert!(!completed.exists());
-
-        symlink(&path, &marker).expect("recovery marker symlink");
-        assert!(matches!(
-            serving_source(&path),
-            Err(ConfigManagementError::Persistence)
-        ));
-        fs::remove_file(&marker).expect("marker symlink removed");
-        fs::write(&marker, RECOVERY_MARKER).expect("recovery marker written");
-        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644))
-            .expect("marker permissions changed");
-        assert!(matches!(
-            ConfigManagement::new(&path),
-            Err(ConfigManagementError::Persistence)
-        ));
-        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
-            .expect("marker made private");
-        let marked = ConfigManagement::new(&path);
-        assert!(
-            matches!(marked, Err(ConfigManagementError::RecoveryRequired)),
-            "unexpected marked-source result: {:?}",
-            marked.err()
-        );
-        fs::remove_file(&marker).expect("valid marker removed");
-        let linked_marker = marker.with_extension("linked");
-        fs::write(&linked_marker, RECOVERY_MARKER).expect("hard-link source written");
-        fs::set_permissions(&linked_marker, fs::Permissions::from_mode(0o600))
-            .expect("hard-link source made private");
-        fs::hard_link(&linked_marker, &marker).expect("marker hard link");
-        assert!(matches!(
-            serving_source(&path),
-            Err(ConfigManagementError::Persistence)
-        ));
-
-        let (_writable_source_directory, writable_source) = source();
-        fs::set_permissions(&writable_source, fs::Permissions::from_mode(0o666))
-            .expect("source made writable");
-        assert!(matches!(
-            ConfigManagement::new(&writable_source),
-            Err(ConfigManagementError::Persistence)
-        ));
-
-        let (writable_directory, writable_source) = source();
-        fs::set_permissions(writable_directory.path(), fs::Permissions::from_mode(0o777))
-            .expect("source parent made writable");
-        assert!(matches!(
-            ConfigManagement::new(&writable_source),
-            Err(ConfigManagementError::Persistence)
-        ));
-    }
-
-    #[test]
-    fn versioned_usage_price_book_is_a_compiler_validated_typed_section() {
-        let (_directory, path) = source();
-        let manager = ConfigManagement::new(&path).expect("manager");
-        let created = manager.create(1).expect("draft");
-        let id = created["draft_id"].as_u64().expect("id");
-        let patched = manager
-            .apply(
-                id,
-                created["etag"].as_str().expect("etag"),
-                TypedConfigPatch::Upsert {
-                    section: "upstreams".into(),
-                    id: "provider".into(),
-                    value: json!({"url": "http://127.0.0.1:1"}),
-                },
-            )
-            .expect("provider patch");
-        let patched = manager
-            .apply(
-                id,
-                patched["etag"].as_str().expect("etag"),
-                TypedConfigPatch::Replace {
-                    section: "usage_price_book".into(),
-                    value: json!({
-                        "version": "operator-v1",
-                        "entries": [{
-                            "provider": "provider",
-                            "model": "model",
-                            "input_per_million_usd_ticks": 1
-                        }]
-                    }),
-                },
-            )
-            .expect("price book patch");
-        let validated = manager
-            .validate(id, patched["etag"].as_str().expect("etag"))
-            .expect("compiled price book draft");
-        assert!(
-            validated["semantic_diff"]
-                .as_array()
-                .expect("diff")
-                .iter()
-                .any(|change| change["section"] == "usage_price_book"
-                    && change["change"] == "changed")
-        );
-        assert!(!validated.to_string().contains("operator-v1"));
-    }
-
-    #[test]
-    fn stale_etags_and_literal_secrets_fail_closed() {
-        let (_directory, path) = source();
-        let manager = ConfigManagement::new(&path).expect("manager");
-        let created = manager.create(1).expect("draft");
         let id = created["draft_id"].as_u64().expect("id");
         assert!(matches!(
             manager.apply(
@@ -2221,89 +2562,6 @@ mod tests {
             ),
             Err(ConfigManagementError::Precondition)
         ));
-
-        let etag = created["etag"].as_str().expect("etag");
-        let before = manager.view(id).expect("draft before oversized patch");
-        assert!(matches!(
-            manager.apply(
-                id,
-                etag,
-                TypedConfigPatch::Replace {
-                    section: "management".into(),
-                    value: json!({"padding": "x".repeat(MAX_DOCUMENT_BYTES)}),
-                },
-            ),
-            Err(ConfigManagementError::TooLarge)
-        ));
-        let after = manager.view(id).expect("draft after oversized patch");
-        assert_eq!(after["etag"], before["etag"]);
-        assert_eq!(after["patch_count"], before["patch_count"]);
-
-        let patched = manager
-            .apply(
-                id,
-                etag,
-                TypedConfigPatch::Upsert {
-                    section: "upstreams".into(),
-                    id: "bad".into(),
-                    value: json!({
-                        "base_url": "https://example.invalid",
-                        "auth": {"kind": "bearer", "secret": "literal-secret"}
-                    }),
-                },
-            )
-            .expect("structural patch");
-        let etag = patched["etag"].as_str().expect("etag");
-        assert!(matches!(
-            manager.validate(id, etag),
-            Err(ConfigManagementError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn structured_recovery_can_verify_and_resume_a_persisted_commit() {
-        let (_directory, path) = source();
-        let manager = ConfigManagement::new(&path).expect("manager");
-        let created = manager.create(1).expect("draft");
-        let id = created["draft_id"].as_u64().expect("id");
-        let patched = manager
-            .apply(
-                id,
-                created["etag"].as_str().expect("etag"),
-                TypedConfigPatch::Upsert {
-                    section: "listeners".into(),
-                    id: "local".into(),
-                    value: json!({"bind": "127.0.0.1:1001"}),
-                },
-            )
-            .expect("patch");
-        let etag = patched["etag"].as_str().expect("etag");
-        let validated = manager.validate(id, etag).expect("validation");
-        manager
-            .commit(
-                id,
-                etag,
-                1,
-                validated["confirmation_token"].as_str().expect("token"),
-            )
-            .expect("commit");
-
-        let status = recovery_status(&path).expect("status");
-        assert_eq!(status["marker"]["format"], "v1");
-        assert_eq!(status["verified"], true);
-        assert_eq!(status["safe_to_resume"], true);
-        verify_recovery(&path).expect("verify");
-        let resumed = resume_recovery(&path).expect("resume");
-        assert_eq!(resumed["action"], "resumed");
-        assert!(!recovery_marker_path(&path.with_file_name("pooler.managed.yaml")).exists());
-    }
-
-    #[test]
-    fn structured_recovery_can_abort_first_managed_commit_without_prior_file() {
-        let (_directory, path) = source();
-        let manager = ConfigManagement::new(&path).expect("manager");
-        let created = manager.create(1).expect("draft");
-        let id = created["draft_id"].as_u64().expect("id");
         let patched = manager
             .apply(
                 id,
@@ -2317,105 +2575,57 @@ mod tests {
             .expect("patch");
         let validated = manager
             .validate(id, patched["etag"].as_str().expect("etag"))
-            .expect("validation");
-        let prepared = manager
-            .commit(
+            .expect("validate");
+        assert!(matches!(
+            manager.commit(
                 id,
                 patched["etag"].as_str().expect("etag"),
-                1,
-                validated["confirmation_token"].as_str().expect("token"),
-            )
-            .expect("commit");
-        let managed = prepared.managed_path;
-        let backup = backup_path(&managed);
-        let marker = recovery_marker_path(&managed);
-        assert!(managed.exists());
-        assert!(!backup.exists());
-        assert!(marker.exists());
-        drop(manager);
-
-        let status = recovery_status(&path).expect("status");
-        assert_eq!(status["safe_to_abort"], true);
-        let aborted = abort_recovery(&path).expect("abort");
-        assert_eq!(aborted["action"], "aborted");
-        assert!(!managed.exists());
-        assert!(!backup.exists());
-        assert!(!marker.exists());
-        assert_eq!(
-            serving_source(&path).expect("original source restored"),
-            path.canonicalize().expect("canonical source")
-        );
+                8,
+                validated["confirmation_token"].as_str().expect("token")
+            ),
+            Err(ConfigManagementError::Precondition)
+        ));
     }
 
     #[test]
-    fn structured_recovery_can_abort_when_previous_backup_is_recoverable() {
+    fn recovery_status_exposes_only_canonical_transaction_paths() {
         let (_directory, path) = source();
         let manager = ConfigManagement::new(&path).expect("manager");
-        let commit_listener = |generation: u64, bind: &str, complete: bool| {
-            let created = manager.create(generation).expect("draft");
-            let id = created["draft_id"].as_u64().expect("id");
-            let patched = manager
-                .apply(
-                    id,
-                    created["etag"].as_str().expect("etag"),
-                    TypedConfigPatch::Upsert {
-                        section: "listeners".into(),
-                        id: "local".into(),
-                        value: json!({"bind": bind}),
-                    },
-                )
-                .expect("patch");
-            let etag = patched["etag"].as_str().expect("etag");
-            let validated = manager.validate(id, etag).expect("validation");
-            let commit = manager
-                .commit(
-                    id,
-                    etag,
-                    generation,
-                    validated["confirmation_token"].as_str().expect("token"),
-                )
-                .expect("commit");
-            manager.register_commit(generation, commit);
-            if complete {
-                manager.complete_commit(generation, true).expect("complete");
-            }
-        };
-        commit_listener(1, "127.0.0.1:1001", true);
-        let managed = path.with_file_name("pooler.managed.yaml");
-        commit_listener(2, "127.0.0.1:1002", false);
-
+        let activation = candidate(&manager, 1, "127.0.0.1:1001");
         let status = recovery_status(&path).expect("status");
-        assert_eq!(status["safe_to_abort"], true);
-        let aborted = abort_recovery(&path).expect("abort");
-        assert_eq!(aborted["action"], "aborted");
-        assert!(fs::read_to_string(&managed)
-            .expect("restored managed file")
-            .contains("1001"));
-        assert!(!backup_path(&managed).exists());
-        assert!(!recovery_marker_path(&managed).exists());
+        assert_eq!(status["state"], "ready-to-promote");
+        assert_eq!(
+            status["paths"]["canonical"],
+            path.canonicalize()
+                .expect("canonical")
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert!(status["paths"].get("staged").is_some());
+        assert!(status["paths"].get("backup").is_some());
+        assert!(status["paths"].get("rollback").is_some());
+        manager.cancel_activation(activation).expect("cancel");
+        assert_eq!(recovery_status(&path).expect("clear")["state"], "clear");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn legacy_recovery_markers_are_inspectable_but_never_mutated() {
-        let (_directory, path) = source();
-        let managed = path.with_file_name("pooler.managed.yaml");
-        fs::write(&managed, GENERATED_HEADER).expect("managed marker");
-        fs::set_permissions(&managed, fs::Permissions::from_mode(0o600))
-            .expect("managed permissions");
-        fs::write(recovery_marker_path(&managed), RECOVERY_MARKER).expect("legacy marker");
-        fs::set_permissions(
-            recovery_marker_path(&managed),
-            fs::Permissions::from_mode(0o600),
-        )
-        .expect("marker permissions");
+    fn canonical_config_rejects_symlink_and_shared_writable_paths() {
+        use std::os::unix::fs::symlink;
 
-        let status = recovery_status(&path).expect("status");
-        assert_eq!(status["state"], "legacy-marker");
-        assert_eq!(status["safe_to_resume"], false);
+        let (_directory, path) = source();
+        let linked = path.with_file_name("linked.yaml");
+        symlink(&path, &linked).expect("symlink");
         assert!(matches!(
-            resume_recovery(&path),
-            Err(ConfigManagementError::RecoveryRequired)
+            ConfigManagement::new(&linked),
+            Err(ConfigManagementError::Persistence)
         ));
-        assert!(recovery_marker_path(&managed).exists());
+        let (writable_directory, writable_source) = source();
+        fs::set_permissions(writable_directory.path(), fs::Permissions::from_mode(0o777))
+            .expect("writable directory");
+        assert!(matches!(
+            ConfigManagement::new(&writable_source),
+            Err(ConfigManagementError::Persistence)
+        ));
     }
 }

@@ -23,6 +23,17 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  system-deployment:
+    name: System deployment sandbox
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout-ref || github.sha }}
+          persist-credentials: false
+      - name: Verify the canonical service topology without starting a host unit
+        run: bash scripts/test-system-install.sh --sandbox
+
   failure-and-security:
     name: Failure injection and security boundaries
     runs-on: blacksmith-2vcpu-ubuntu-2404

@@ -3,13 +3,14 @@
 
 Run from the repository root:
 
-    python3 scripts/test-management-ui-browser.py
+    python3 scripts/test-management-ui-browser.py --scenario all
 
 The test starts a loopback mock management listener and uses Python Playwright.
 If Playwright (or its Chromium browser) is not installed, the default is an
 explicit SKIP with exit status 0 so local asset generation remains usable.
 Install with ``python3 -m pip install playwright && playwright install chromium``.
-CI can pass ``--require-playwright`` to turn a missing dependency into failure.
+CI can pass ``--require-playwright`` to turn a missing dependency into failure;
+``--evidence-dir`` writes redacted request evidence for a named scenario.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -123,6 +125,82 @@ def payload(path: str) -> dict:
                 {"id": "factory", "name": "Factory protocol", "description": "Factory"},
                 {"id": "devin", "name": "Devin protocol", "description": "Devin"},
             ],
+        },
+        "/management/control-plane": {
+            **generation,
+            "schema_version": 2,
+            "configuration": {"generation": 7},
+            "providers": [
+                {
+                    "id": "openai-upstream",
+                    "instance_id": "openai-upstream",
+                    "origin": "https://api.example.com",
+                    "base_url": "https://api.example.com/v1",
+                    "accounts": 1,
+                    "pools": 0,
+                    "auth": {"required": True, "kind": "bearer", "header": "authorization"},
+                }
+            ],
+            "accounts": [
+                {
+                    "id": "primary",
+                    "provider": "openai-upstream",
+                    "auth_kind": "oauth",
+                    "enabled": True,
+                    "health": {"status": "available", "failure_count": 0, "cooldown_until": None},
+                    "secret": {"configured": True, "opaque": True},
+                }
+            ],
+            "pools": [],
+            "models": [
+                {
+                    "id": "gpt-test",
+                    "enabled": True,
+                    "targets": [
+                        {"binding_id": "gpt-test-primary", "provider": "openai-upstream", "account": "primary", "priority": 1, "upstream_model": "gpt-test", "capabilities": ["text", "streaming"]},
+                        {"binding_id": "gpt-test-fallback", "provider": "openai-upstream", "account": "primary", "priority": 2, "upstream_model": "gpt-test-fallback", "capabilities": ["text"]},
+                    ],
+                }
+            ],
+            "effective_order": [{"model": "gpt-test", "candidates": [{"position": 1, "binding_id": "gpt-test-primary", "provider": "openai-upstream", "account": "primary", "priority": 1}, {"position": 2, "binding_id": "gpt-test-fallback", "provider": "openai-upstream", "account": "primary", "priority": 2}]}],
+            "policies": [{"id": "default", "selection": {"strategy": "ordered_fallback"}, "routing": {"allow": [], "deny": [], "allow_fallbacks": True, "required_parameters": [], "required_capabilities": [], "quantization": []}}],
+            "health": {"credentials": [{"account": "primary", "status": "available", "failure_count": 0}], "cooldowns": []},
+            "discovery": {"configured": True, "catalog_generation": 2, "refreshed_at_unix_ms": 2, "sources": [{"id": "openai-models"}], "models": []},
+            "quota": [],
+        },
+        "/management/control-plane/endpoints": {
+            "schema_version": 2,
+            "client_agnostic": True,
+            "listeners": [
+                {
+                    "id": "main",
+                    "bind": "127.0.0.1:8080",
+                    "base_urls": ["http://127.0.0.1:8080"],
+                    "routes": [{"id": "chat", "methods": ["POST"], "path": "/v1/chat/completions", "protocol": "semantic", "downstream_auth": {"required": False}}],
+                }
+            ],
+            "management": {"base_urls": ["http://127.0.0.1:18400"], "paths": ["/management/control-plane", "/management/endpoints"], "auth": {"required": True, "scheme": "Bearer"}},
+            "downstream_clients": ["Factory", "Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"],
+            "connect_tools": {"optional": True, "routing_effect": "none", "requires_confirmation_for_route_draft": True},
+        },
+        "/management/accounts/primary/oauth-capabilities": {
+            "schema_version": 1,
+            "account": "primary",
+            "methods": [
+                {"method": "browser_pkce", "status": "supported", "note": "Browser authorization"},
+                {"method": "device_code", "status": "supported", "note": "Device authorization"},
+                {"method": "client_credentials", "status": "supported", "note": "Service authentication"},
+            ],
+        },
+        "/management/oauth/status/77": {
+            "schema_version": 1,
+            "request_id": 77,
+            "account": "primary",
+            "method": "device_code",
+            "status": "authorization_required",
+            "verification_uri": "https://provider.example/device",
+            "user_code": "BROWSER-CODE",
+            "expires_at_ms": 600000,
         },
         "/management/setup/config": {
             "schema_version": 1,
@@ -547,6 +625,37 @@ class Handler(BaseHTTPRequestHandler):
         }
         STATE.posts[route] = STATE.posts.get(route, 0) + 1
         time.sleep(0.05 if route.startswith("/management/config/") else 0.25)
+        if route == "/management/control-plane/drafts":
+            self.send_bytes(
+                201,
+                b'{"draft_id":11,"base_generation":7,"etag":"draft-a","status":"draft"}',
+                "application/json",
+            )
+            return
+        elif route.startswith("/management/control-plane/drafts/11/"):
+            self.send_bytes(
+                200,
+                b'{"draft_id":11,"base_generation":7,"etag":"draft-b","status":"draft","semantic_diff":[]}',
+                "application/json",
+            )
+            return
+        elif route == "/management/control-plane/secrets":
+            self.send_bytes(
+                201,
+                b'{"managed_secret":{"reference":"managed:secret-1","kind":"api_key","revision":1}}',
+                "application/json",
+            )
+            return
+        elif route == "/management/oauth/start":
+            self.send_bytes(
+                202,
+                b'{"request_id":77,"status":"authorization_required","method":"device_code","verification_uri":"https://provider.example/device","user_code":"BROWSER-CODE","expires_at_ms":600000}',
+                "application/json",
+            )
+            return
+        elif route == "/management/oauth/cancel/77":
+            self.send_bytes(200, b'{"request_id":77,"status":"cancelled"}', "application/json")
+            return
         if route in {"/management/reload", "/management/models/reload"}:
             STATE.reload_request_id += 1
             STATE.reload_status = STATE.reload_outcome
@@ -605,7 +714,7 @@ def expect(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def run_browser(playwright) -> None:
+def run_legacy_browser(playwright) -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1478,6 +1587,163 @@ def run_browser(playwright) -> None:
         thread.join(timeout=2)
 
 
+def redact_evidence(value: object) -> object:
+    """Keep browser evidence useful without retaining bearer or secret material."""
+    if isinstance(value, dict):
+        redacted: dict[object, object] = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if any(marker in key_text for marker in ("authorization", "secret", "token", "code")):
+                redacted[key] = "[REDACTED]"
+            else:
+                redacted[key] = redact_evidence(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_evidence(item) for item in value]
+    if isinstance(value, str):
+        return re.sub(r"(?i)bearer\s+[^\s,;]+", "Bearer [REDACTED]", value)
+    return value
+
+
+def write_evidence(evidence_dir: Path | None, scenario: str, page, errors: list[str]) -> None:
+    if evidence_dir is None:
+        return
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "scenario": scenario,
+        "page_errors": errors,
+        "requests": STATE.get_targets,
+        "authorization": STATE.get_authorization,
+        "mutations": STATE.posts,
+    }
+    (evidence_dir / f"management-ui-{scenario}.json").write_text(
+        json.dumps(redact_evidence(payload), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = None) -> None:
+    """Run the existing browser harness against the structured dashboard surface."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f"http://127.0.0.1:{server.server_port}"
+    browser = playwright.chromium.launch(headless=True)
+    page = browser.new_page(viewport={"width": 1280, "height": 800}, accept_downloads=True)
+    errors: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    try:
+        response = page.goto(f"{origin}/management/ui/", wait_until="networkidle")
+        expect(response is not None and response.headers.get("content-security-policy") == CSP, "strict CSP header missing")
+        expect(page.locator("[style]").count() == 0, "inline style attribute rendered under strict CSP")
+        page.wait_for_selector('[data-notice="auth"]')
+        page.locator("#token-input").fill("good-token")
+        page.locator("#token-apply").click()
+        page.locator("#session-button", has_text="Connected").wait_for()
+        expect(page.locator('[data-route="setup"]').count() == 0, "legacy Setup navigation remains visible")
+        expect(page.locator('.brand-mark').first.get_attribute("width") == "64" and page.locator('.brand-mark').first.get_attribute("height") == "56", "brand intrinsic dimensions changed")
+        if scenario == "baseline":
+            page.set_viewport_size({"width": 390, "height": 780})
+            expect(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "baseline mobile layout overflows viewport")
+            expect(page.locator("[style]").count() == 0, "baseline rendered inline styles under CSP")
+            print("PASS: management dashboard browser QA (baseline)")
+            return
+
+        page.locator('[data-route="providers"]').click()
+        page.wait_for_selector(".view-providers")
+        expect("provider instance" in page.locator(".view-providers").inner_text().lower() or "Configured instances" in page.locator(".view-providers").inner_text(), "provider control surface missing")
+        page.locator('[data-provider-action="show-form"]').click()
+        page.locator('[data-provider-field="id"]').fill("same-origin-second")
+        page.locator('[data-provider-field="origin"]').fill("https://api.example.com")
+        page.locator('[data-provider-action="create"]').click()
+        page.wait_for_selector('[data-account-new-field="id"]')
+        expect("client" not in page.locator(".onboarding-panel").inner_text().lower() and "sidecar" not in page.locator(".onboarding-panel").inner_text().lower(), "provider onboarding exposed client or sidecar jargon")
+        page.locator('[data-account-new-field="id"]').fill("second-account")
+        page.locator('[data-account-new-field="secret"]').fill("one-time-provider-secret")
+        page.locator('[data-account-new-action="create"]').click()
+        page.wait_for_selector('[data-onboarding-action="discover"]')
+        page.locator('[data-onboarding-action="discover"]').click()
+        page.get_by_role("button", name="Select all", exact=True).wait_for()
+        expect(page.get_by_role("button", name="Select all", exact=True).count() > 0 and page.get_by_role("button", name="Select none", exact=True).count() > 0, "model exposure select-all/select-none controls missing")
+        page.get_by_role("button", name="Select none", exact=True).click()
+        expect(page.locator('[data-model-selection-id]:checked').count() == 0, "Select none left models exposed")
+        page.get_by_role("button", name="Select all", exact=True).click()
+        expect(page.locator('[data-model-selection-id]:checked').count() > 0, "Select all did not expose verified models")
+
+        page.locator('[data-route="accounts"]').click()
+        page.wait_for_selector(".view-accounts")
+        expect(page.locator('[data-account-action="switch"]').count() == 0, "account Switch action remains")
+        page.locator('[data-account-new-field="id"]').fill("one-time-account")
+        page.locator('[data-account-new-field="authKind"]').select_option("api_key")
+        page.locator('[data-account-new-field="secret"]').fill("provider-secret-value")
+        page.locator('[data-account-new-action="create"]').click()
+        page.wait_for_timeout(150)
+        expect(page.locator('[data-account-new-field="secret"]').input_value() == "", "one-time account secret was not cleared")
+        page.locator('[data-account-connect="primary"]').click()
+        page.wait_for_selector('[data-oauth-start="device_code"]')
+        page.locator('[data-oauth-start="device_code"]').click()
+        # The mocked start request is intentionally delayed by 250 ms; allow
+        # that response plus the dashboard's two-second polling interval.
+        page.wait_for_timeout(2_600)
+        expect(STATE.get_authorization.get("/management/oauth/status/77") == "Bearer good-token", "OAuth status did not use the management authorization")
+        expect("BROWSER-CODE" in page.locator(".oauth-panel").inner_text(), "device URL/code was not rendered")
+
+        page.locator('[data-route="models"]').click()
+        page.wait_for_selector(".target-row")
+        expect(page.locator(".target-row").count() == 2, "semantic model target rows were not rendered")
+        expect(page.locator("[data-target-priority]").count() == 2, "dense numeric priority controls are missing")
+        expect(page.locator("[data-target-move]").count() >= 8, "keyboard and move controls are incomplete")
+        page.locator('[data-target-move="down"]').first.click()
+        expect("moved to priority" in page.locator("#target-announcement").inner_text(), "target move did not announce the new priority")
+        page.locator("[data-target-row]").first.drag_to(page.locator("[data-target-row]").last)
+        expect("moved to priority" in page.locator("#target-announcement").inner_text(), "pointer target drag did not reorder or announce")
+        page.locator("[data-target-row]").first.focus()
+        page.locator("[data-target-row]").first.press("Alt+End")
+        expect(page.locator("#target-announcement").inner_text() != "", "Alt+End target move had no live announcement")
+        priority = page.locator("[data-target-priority]").first
+        priority.fill("7")
+        priority.press("Tab")
+        expect("priority set to 7" in page.locator("#target-announcement").inner_text(), "numeric priority edit was not applied")
+        expect(page.locator("[data-target-combine]").count() > 0, "explicit combine-tier action is missing")
+        expect(page.locator("[data-policy-field=allow]").count() == 1 and page.locator("[data-policy-field=deny]").count() == 1, "policy allow/deny controls are missing")
+        expect(page.locator("[data-policy-field=ranking]").count() == 1, "adaptive ranking preference control is missing")
+        page.locator("[data-policy-field=allow]").fill("openai-upstream")
+        page.locator("[data-policy-field=ranking]").select_option("adaptive")
+        expect("adaptive" in page.locator(".policy-preview").inner_text().lower(), "effective adaptive policy preview is missing")
+        page.emulate_media(color_scheme="dark", reduced_motion="reduce")
+        expect(page.locator("[style]").count() == 0, "theme/reduced-motion scenario introduced inline styles")
+        for width in (320, 720, 1280):
+            page.set_viewport_size({"width": width, "height": 780})
+            expect(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), f"model controls overflow at {width}px")
+
+        page.locator('[data-route="pools"]').click()
+        page.wait_for_selector(".view-pools")
+        expect("optional pool" in page.locator(".view-pools").inner_text().lower(), "optional pool surface missing")
+        page.locator('[data-route="endpoints"]').click()
+        page.wait_for_selector(".view-endpoints")
+        endpoint_text = page.locator(".view-endpoints").inner_text()
+        for label in ("Factory", "Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"):
+            expect(label in endpoint_text, f"optional Connect tools omitted {label}")
+        expect("routing effect none" in endpoint_text.lower() and "client-agnostic" in endpoint_text.lower(), "endpoint inventory did not declare client-agnostic optional tools")
+        expect(page.locator(".endpoint-json").count() == 1, "machine-readable endpoint inventory missing")
+
+        page.set_viewport_size({"width": 320, "height": 700})
+        page.locator('[data-route="operations"]').click()
+        page.wait_for_selector(".view-operations")
+        expect(page.locator('.nav-link[aria-current="page"]').evaluate("link => link.offsetLeft >= link.parentElement.scrollLeft && link.offsetLeft + link.offsetWidth <= link.parentElement.scrollLeft + link.parentElement.clientWidth"), "active mobile navigation item was not scrolled into view")
+        expect(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "mobile dashboard overflows viewport")
+        expect(not errors, f"browser page errors: {errors}")
+        redacted = json.dumps(redact_evidence({"authorization": STATE.get_authorization, "mutations": STATE.posts}))
+        expect("Bearer good-token" not in redacted and "provider-secret-value" not in redacted, "browser evidence redaction leaked credential material")
+        print(f"PASS: management dashboard browser QA ({scenario})")
+    finally:
+        write_evidence(evidence_dir, scenario, page, errors)
+        browser.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -1493,6 +1759,17 @@ def parse_args() -> argparse.Namespace:
         "--require-playwright",
         action="store_true",
         help="fail when Python Playwright or Chromium is unavailable",
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=("all", "full", "baseline", "control-plane"),
+        default="all",
+        help="select the existing dashboard scenario set (default: all)",
+    )
+    parser.add_argument(
+        "--evidence-dir",
+        type=Path,
+        help="write redacted JSON browser evidence to this directory",
     )
     return parser.parse_args()
 
@@ -1515,7 +1792,7 @@ def main() -> int:
         return 1 if args.require_playwright else 0
     try:
         with sync_playwright() as playwright:
-            run_browser(playwright)
+            run_browser(playwright, args.scenario, args.evidence_dir)
     except Exception as error:
         message = str(error)
         if missing_playwright_browser(message):

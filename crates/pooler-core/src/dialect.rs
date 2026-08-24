@@ -207,9 +207,11 @@ pub enum ModelRequestTransform {
     /// Let the configured protocol adapter select its normal behavior.
     #[default]
     ProtocolDefault,
+    #[serde(rename = "openai_chat")]
     OpenAiChat,
     AnthropicMessages,
     GeminiGenerateContent,
+    #[serde(rename = "xai_chat")]
     XaiChat,
     KimiChat,
 }

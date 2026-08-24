@@ -18,9 +18,11 @@ use std::{
     time::{Duration, Instant as StdInstant},
 };
 
+#[cfg(test)]
+use adapter_providers::KimiAdapter;
 use adapter_providers::{
-    AuthPlacement, KimiAdapter, ProviderAdapter, ProviderKind, ProviderOperation,
-    ProviderResponseClassifier, VertexAdapter,
+    AuthPlacement, ProviderAdapter, ProviderKind, ProviderOperation, ProviderResponseClassifier,
+    VertexAdapter,
 };
 use base64::Engine;
 use bytes::Bytes;
@@ -42,10 +44,12 @@ use pooler_core::{BodyMode, ErrorClass, RouteLimits};
 use pooler_extension::{ExtensionInput, ExtensionRegistry};
 use pooler_observe::{
     AttemptRecord, AttemptResult, CompletionClass, CooldownRecord, DecisionRecord, MetricsRegistry,
-    QuotaRecord, RequestObservation, RetryRecord, TraceRecord, TraceRecorder, TraceStage,
-    Usage as ObservedUsage,
+    QuotaRecord, RequestObservation, RetryRecord, RoutingTelemetryRecord, TraceRecord,
+    TraceRecorder, TraceStage, Usage as ObservedUsage,
 };
-use pooler_policy::{AffinityKey, CommitmentState, QuotaObservation, ReplayCheck, SelectionLease};
+use pooler_policy::{
+    CommitmentState, QuotaObservation, ReplayCheck, SelectionLease, TelemetrySample,
+};
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
 use pooler_store::{CostProvenance, RequestEvent, RequestEventKind, Store, UsageRecord};
 use ring::rand::SecureRandom;
@@ -800,6 +804,8 @@ struct RequestLifecycleState {
     upstream_model: Option<String>,
     provider: Option<String>,
     account_pseudonym: Option<String>,
+    target_binding_id: Option<String>,
+    priority_tier: Option<u32>,
     attempt: Option<u32>,
     ttft_ms: Option<u64>,
     semantic_losses: Vec<String>,
@@ -849,6 +855,8 @@ impl RequestLifecycle {
                 upstream_model: None,
                 provider: None,
                 account_pseudonym: None,
+                target_binding_id: None,
+                priority_tier: None,
                 attempt: None,
                 ttft_ms: None,
                 semantic_losses: Vec::new(),
@@ -875,6 +883,8 @@ impl RequestLifecycle {
         event.upstream_model = state.upstream_model.clone();
         event.provider = state.provider.clone();
         event.account_pseudonym = state.account_pseudonym.clone();
+        event.target_binding_id = state.target_binding_id.clone();
+        event.priority_tier = state.priority_tier;
         event.attempt = state.attempt;
         event.ttft_ms = state.ttft_ms;
         event.semantic_losses = state.semantic_losses.clone();
@@ -907,6 +917,8 @@ impl RequestLifecycle {
                 .explanation()
                 .and_then(|value| value.selected_credential_pseudonym())
                 .map(|value| value.as_str().to_owned());
+            state.target_binding_id = selection.target_binding_id().map(str::to_owned);
+            state.priority_tier = selection.priority_tier();
             state.attempt = Some(attempt);
         }
         self.record(RequestEventKind::Selection, |event| {
@@ -1562,8 +1574,10 @@ where
         let cancellation = guard.cancellation_token();
         let downstream_uri = request.uri().clone();
         let mut headers = request.headers().clone();
+        let routing_metadata_requested = routing_metadata_opt_in(&headers);
         strip_hop_by_hop_headers(&mut headers);
         headers.remove(header::HOST);
+        headers.remove("x-pooler-routing-metadata");
         strip_downstream_authorization(route, &mut headers);
         headers.remove(header::CONTENT_LENGTH);
         headers.remove(header::CONTENT_TYPE);
@@ -1646,18 +1660,41 @@ where
         );
         if let Some(native_auth) = native_auth {
             native_auth.apply_once(&mut headers).map_err(native_error)?;
-        } else if selection.account_secret().is_some() {
-            crate::pool::apply_configured_account_auth(
-                &mut headers,
-                selection.account_secret(),
-                upstream.auth(),
-            )
-            .map_err(pool_error)?;
+        } else if let Some(account_secret) = selection.account_secret() {
+            if !self
+                .native
+                .apply_managed_account_auth(
+                    &mut headers,
+                    account_secret,
+                    upstream.auth(),
+                    upstream,
+                    selection.credential(),
+                )
+                .map_err(native_error)?
+            {
+                crate::pool::apply_configured_account_auth(
+                    &mut headers,
+                    Some(account_secret),
+                    upstream.auth(),
+                )
+                .map_err(pool_error)?;
+            }
+        } else if let Some(auth) = upstream.auth() {
+            if !self
+                .native
+                .apply_managed_account_auth(&mut headers, auth.secret(), Some(auth), upstream, None)
+                .map_err(native_error)?
+            {
+                apply_configured_upstream_auth(&mut headers, upstream)?;
+            }
         } else {
             apply_configured_upstream_auth(&mut headers, upstream)?;
         }
 
-        let uri = websocket_uri(upstream, route, &downstream_uri)?;
+        let uri = selection
+            .upstream_uri(&self.config, route, &downstream_uri)
+            .map_err(pool_error)?
+            .to_string();
         let upstream_key = generate_websocket_key()?;
         let hard_deadline = websocket_hard_deadline(started, route.limits(), upstream);
         let connect_deadline = StdInstant::now() + connect_timeout(route.limits(), upstream);
@@ -1696,13 +1733,17 @@ where
         if let Some(protocol) = upstream_response.protocol {
             response_headers.insert("sec-websocket-protocol", protocol);
         }
+        if routing_metadata_requested {
+            add_routing_metadata_headers(response_headers, &selection, 1);
+        }
 
         let mut observation = observation
             .take()
             .expect("request observation remains until response is ready");
         observation.mark_headers();
-        self.pooling
-            .persist_affinity(&selection, crate::pool::timestamp_now());
+        let affinity_commit = selection
+            .affinity_commit()
+            .map(|commit| (Arc::clone(&self.pooling), commit));
         let lease = selection.take_lease();
         let max_frame_bytes = route.limits().max_frame_bytes;
         let task = self.resources.task();
@@ -1721,6 +1762,7 @@ where
                     lease,
                     observation,
                     lifecycle,
+                    affinity_commit,
                 },
             )
             .await;
@@ -1791,8 +1833,10 @@ where
             .get(route.id())
             .is_none_or(|cache| safe_request_for_cache(request.headers(), cache.policy()));
         let mut headers = request.headers().clone();
+        let routing_metadata_requested = routing_metadata_opt_in(&headers);
         strip_hop_by_hop_headers(&mut headers);
         headers.remove(header::HOST);
+        headers.remove("x-pooler-routing-metadata");
         strip_downstream_authorization(route, &mut headers);
         if route.ingress().mode() != BodyMode::Opaque {
             headers.remove(header::AUTHORIZATION);
@@ -1807,12 +1851,234 @@ where
         let idempotency_key_present = headers.contains_key("idempotency-key");
         let method_safe_for_cache = safe_method_for_cache(method.as_str(), idempotency_key_present);
         let replay = ReplayCheck::for_http_method(method.as_str(), idempotency_key_present);
-        let (mut prepared, selected_model, selection_context, semantic_response_hint) = match route
-            .ingress()
-            .mode()
-        {
-            BodyMode::Opaque => {
-                if route.cache().is_some_and(|cache| cache.enabled()) && method_safe_for_cache {
+        let (mut prepared, selected_model, mut selection_context, semantic_response_hint) =
+            match route.ingress().mode() {
+                BodyMode::Opaque => {
+                    if route.cache().is_some_and(|cache| cache.enabled()) && method_safe_for_cache {
+                        let incoming =
+                            FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
+                        let bytes = tokio::select! {
+                            result = time::timeout_at(
+                                buffer_deadline,
+                                crate::collect_body_limited(
+                                    incoming,
+                                    bounded_usize(limits.max_request_body_bytes),
+                                ),
+                            ) => result
+                                .map_err(|_| ProxyError::Timeout)?
+                                .map_err(|error| match error {
+                                    crate::BodyLimitError::TooLarge { .. }
+                                    | crate::BodyLimitError::Upstream(crate::BodyLimitError::TooLarge { .. }) => {
+                                        ProxyError::RequestBodyTooLarge
+                                    }
+                                    other => ProxyError::Upstream(Box::new(other)),
+                                })?,
+                            () = cancellation.cancelled() => {
+                                return Err(ProxyError::Timeout);
+                            }
+                        };
+                        (
+                            PreparedBody::Buffered {
+                                bytes,
+                                patch_model: false,
+                            },
+                            None,
+                            SelectionContext::default(),
+                            SemanticResponseHint::default(),
+                        )
+                    } else {
+                        let body = LimitedBody::new(
+                            incoming,
+                            bounded_usize(limits.max_request_body_bytes),
+                        )
+                        .map_err(box_error)
+                        .boxed();
+                        (
+                            PreparedBody::Streaming(Some(body)),
+                            None,
+                            SelectionContext::default(),
+                            SemanticResponseHint::default(),
+                        )
+                    }
+                }
+                BodyMode::Patch => {
+                    let incoming =
+                        FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
+                    let bytes = tokio::select! {
+                        result = time::timeout_at(
+                            buffer_deadline,
+                            crate::collect_body_limited(
+                                incoming,
+                                bounded_usize(limits.max_request_body_bytes),
+                            ),
+                        ) => result
+                            .map_err(|_| ProxyError::Timeout)?
+                            .map_err(|error| match error {
+                                crate::BodyLimitError::TooLarge { .. } => {
+                                    ProxyError::RequestBodyTooLarge
+                                }
+                                crate::BodyLimitError::Upstream(
+                                    crate::BodyLimitError::TooLarge { .. },
+                                ) => ProxyError::RequestBodyTooLarge,
+                                other => ProxyError::InvalidPatch(other.to_string()),
+                            })?,
+                        () = cancellation.cancelled() => {
+                            return Err(ProxyError::Timeout);
+                        }
+                    };
+                    let mut document = PreservedJson::from_bytes(bytes.to_vec())
+                        .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+                    let external_metadata = self
+                        .run_external_inspectors(
+                            route,
+                            content_type_for_extension(&headers),
+                            document.bytes().as_ref(),
+                            cancellation.clone(),
+                        )
+                        .await?;
+                    let inspected_model =
+                        if route.target().model_source() == Some(ModelSource::Inspected) {
+                            let body_model = document
+                                .extract_model()
+                                .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?
+                                .map(str::to_owned);
+                            body_model.or_else(|| external_metadata.get("model").cloned())
+                        } else {
+                            None
+                        };
+                    for transform in route.request_steps() {
+                        match transform {
+                            RequestTransform::JsonSet { pointer, value } => {
+                                document
+                                    .set_pointer_bounded(
+                                        pointer,
+                                        value.clone(),
+                                        JsonPatchLimits::default(),
+                                    )
+                                    .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+                            }
+                            RequestTransform::JsonSetWhenModelPrefix {
+                                prefix,
+                                pointer,
+                                value,
+                            } => {
+                                document
+                                    .set_pointer_when_model_prefix(
+                                        prefix,
+                                        pointer,
+                                        value.clone(),
+                                        JsonPatchLimits::default(),
+                                    )
+                                    .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+                            }
+                        }
+                    }
+                    for extension in route.external_transforms() {
+                        let transformed = self
+                            .extensions
+                            .transform(
+                                extension,
+                                ExtensionInput {
+                                    media_type: content_type_for_extension(&headers),
+                                    body: document.bytes().into_owned(),
+                                    metadata: extension_metadata(route),
+                                },
+                                cancellation.clone(),
+                            )
+                            .await
+                            .map_err(|error| ProxyError::Extension(error.to_string()))?;
+                        document = PreservedJson::from_bytes(transformed)
+                            .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+                    }
+                    let bytes = document.bytes().into_owned();
+                    limits
+                        .check_request_body(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                        .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                    limits
+                        .check_frame(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                        .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                    headers.remove(header::CONTENT_LENGTH);
+                    let selected_model = match route.target().model_source() {
+                        Some(ModelSource::Request) => Some(
+                            document
+                                .require_model()
+                                .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?
+                                .to_owned(),
+                        ),
+                        Some(ModelSource::Inspected) => Some(inspected_model.ok_or_else(|| {
+                            ProxyError::InvalidPatch("request model is missing".to_owned())
+                        })?),
+                        None => None,
+                    };
+                    (
+                        PreparedBody::Buffered {
+                            bytes: Bytes::from(bytes),
+                            patch_model: selected_model.is_some(),
+                        },
+                        selected_model,
+                        SelectionContext::default(),
+                        SemanticResponseHint::default(),
+                    )
+                }
+                BodyMode::Semantic => {
+                    strip_provider_credential_headers(&mut headers);
+                    let incoming =
+                        FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
+                    let bytes = tokio::select! {
+                        result = time::timeout_at(
+                            buffer_deadline,
+                            crate::collect_body_limited(
+                                incoming,
+                                bounded_usize(limits.max_request_body_bytes),
+                            ),
+                        ) => result
+                            .map_err(|_| ProxyError::Timeout)?
+                            .map_err(|error| match error {
+                                crate::BodyLimitError::TooLarge { .. } => {
+                                    ProxyError::RequestBodyTooLarge
+                                }
+                                crate::BodyLimitError::Upstream(
+                                    crate::BodyLimitError::TooLarge { .. },
+                                ) => ProxyError::RequestBodyTooLarge,
+                                other => ProxyError::SemanticRequest(other.to_string()),
+                            })?,
+                        () = cancellation.cancelled() => {
+                            return Err(ProxyError::Timeout);
+                        }
+                    };
+                    let selection_context = self
+                        .semantic
+                        .selection_context_with_uri(route, &downstream_uri, &headers, &bytes)
+                        .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
+                    let prepared = self
+                        .semantic
+                        .encode_request_with_uri(route, &downstream_uri, &headers, &bytes)
+                        .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
+                    limits
+                        .check_request_body(u64::try_from(prepared.body.len()).unwrap_or(u64::MAX))
+                        .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                    limits
+                        .check_frame(u64::try_from(prepared.body.len()).unwrap_or(u64::MAX))
+                        .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                    headers.insert(header::CONTENT_TYPE, prepared.content_type);
+                    self.semantic.sanitize_request_headers(&mut headers);
+                    headers.insert(
+                        header::ACCEPT_ENCODING,
+                        HeaderValue::from_static("identity"),
+                    );
+                    headers.remove(header::CONTENT_LENGTH);
+                    let response_hint = prepared.response_hint;
+                    (
+                        PreparedBody::Buffered {
+                            bytes: Bytes::from(prepared.body),
+                            patch_model: self.semantic.model_in_request_body(route),
+                        },
+                        None,
+                        selection_context,
+                        response_hint,
+                    )
+                }
+                BodyMode::Inspect => {
                     let incoming =
                         FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
                     let bytes = tokio::select! {
@@ -1829,12 +2095,24 @@ where
                                 | crate::BodyLimitError::Upstream(crate::BodyLimitError::TooLarge { .. }) => {
                                     ProxyError::RequestBodyTooLarge
                                 }
-                                other => ProxyError::Upstream(Box::new(other)),
+                                other => ProxyError::InvalidPatch(other.to_string()),
                             })?,
                         () = cancellation.cancelled() => {
                             return Err(ProxyError::Timeout);
                         }
                     };
+                    let _external_metadata = self
+                        .run_external_inspectors(
+                            route,
+                            content_type_for_extension(&headers),
+                            &bytes,
+                            cancellation.clone(),
+                        )
+                        .await?;
+                    limits
+                        .check_request_body(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                        .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                    headers.remove(header::CONTENT_LENGTH);
                     (
                         PreparedBody::Buffered {
                             bytes,
@@ -1844,242 +2122,11 @@ where
                         SelectionContext::default(),
                         SemanticResponseHint::default(),
                     )
-                } else {
-                    let body =
-                        LimitedBody::new(incoming, bounded_usize(limits.max_request_body_bytes))
-                            .map_err(box_error)
-                            .boxed();
-                    (
-                        PreparedBody::Streaming(Some(body)),
-                        None,
-                        SelectionContext::default(),
-                        SemanticResponseHint::default(),
-                    )
                 }
-            }
-            BodyMode::Patch => {
-                let incoming =
-                    FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
-                let bytes = tokio::select! {
-                    result = time::timeout_at(
-                        buffer_deadline,
-                        crate::collect_body_limited(
-                            incoming,
-                            bounded_usize(limits.max_request_body_bytes),
-                        ),
-                    ) => result
-                        .map_err(|_| ProxyError::Timeout)?
-                        .map_err(|error| match error {
-                            crate::BodyLimitError::TooLarge { .. } => {
-                                ProxyError::RequestBodyTooLarge
-                            }
-                            crate::BodyLimitError::Upstream(
-                                crate::BodyLimitError::TooLarge { .. },
-                            ) => ProxyError::RequestBodyTooLarge,
-                            other => ProxyError::InvalidPatch(other.to_string()),
-                        })?,
-                    () = cancellation.cancelled() => {
-                        return Err(ProxyError::Timeout);
-                    }
-                };
-                let mut document = PreservedJson::from_bytes(bytes.to_vec())
-                    .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
-                let external_metadata = self
-                    .run_external_inspectors(
-                        route,
-                        content_type_for_extension(&headers),
-                        document.bytes().as_ref(),
-                        cancellation.clone(),
-                    )
-                    .await?;
-                let inspected_model =
-                    if route.target().model_source() == Some(ModelSource::Inspected) {
-                        let body_model = document
-                            .extract_model()
-                            .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?
-                            .map(str::to_owned);
-                        body_model.or_else(|| external_metadata.get("model").cloned())
-                    } else {
-                        None
-                    };
-                for transform in route.request_steps() {
-                    match transform {
-                        RequestTransform::JsonSet { pointer, value } => {
-                            document
-                                .set_pointer_bounded(
-                                    pointer,
-                                    value.clone(),
-                                    JsonPatchLimits::default(),
-                                )
-                                .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
-                        }
-                        RequestTransform::JsonSetWhenModelPrefix {
-                            prefix,
-                            pointer,
-                            value,
-                        } => {
-                            document
-                                .set_pointer_when_model_prefix(
-                                    prefix,
-                                    pointer,
-                                    value.clone(),
-                                    JsonPatchLimits::default(),
-                                )
-                                .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
-                        }
-                    }
-                }
-                for extension in route.external_transforms() {
-                    let transformed = self
-                        .extensions
-                        .transform(
-                            extension,
-                            ExtensionInput {
-                                media_type: content_type_for_extension(&headers),
-                                body: document.bytes().into_owned(),
-                                metadata: extension_metadata(route),
-                            },
-                            cancellation.clone(),
-                        )
-                        .await
-                        .map_err(|error| ProxyError::Extension(error.to_string()))?;
-                    document = PreservedJson::from_bytes(transformed)
-                        .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
-                }
-                let bytes = document.bytes().into_owned();
-                limits
-                    .check_request_body(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-                    .map_err(|_| ProxyError::RequestBodyTooLarge)?;
-                limits
-                    .check_frame(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-                    .map_err(|_| ProxyError::RequestBodyTooLarge)?;
-                headers.remove(header::CONTENT_LENGTH);
-                let selected_model = match route.target().model_source() {
-                    Some(ModelSource::Request) => Some(
-                        document
-                            .require_model()
-                            .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?
-                            .to_owned(),
-                    ),
-                    Some(ModelSource::Inspected) => Some(inspected_model.ok_or_else(|| {
-                        ProxyError::InvalidPatch("request model is missing".to_owned())
-                    })?),
-                    None => None,
-                };
-                (
-                    PreparedBody::Buffered {
-                        bytes: Bytes::from(bytes),
-                        patch_model: selected_model.is_some(),
-                    },
-                    selected_model,
-                    SelectionContext::default(),
-                    SemanticResponseHint::default(),
-                )
-            }
-            BodyMode::Semantic => {
-                strip_provider_credential_headers(&mut headers);
-                let incoming =
-                    FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
-                let bytes = tokio::select! {
-                    result = time::timeout_at(
-                        buffer_deadline,
-                        crate::collect_body_limited(
-                            incoming,
-                            bounded_usize(limits.max_request_body_bytes),
-                        ),
-                    ) => result
-                        .map_err(|_| ProxyError::Timeout)?
-                        .map_err(|error| match error {
-                            crate::BodyLimitError::TooLarge { .. } => {
-                                ProxyError::RequestBodyTooLarge
-                            }
-                            crate::BodyLimitError::Upstream(
-                                crate::BodyLimitError::TooLarge { .. },
-                            ) => ProxyError::RequestBodyTooLarge,
-                            other => ProxyError::SemanticRequest(other.to_string()),
-                        })?,
-                    () = cancellation.cancelled() => {
-                        return Err(ProxyError::Timeout);
-                    }
-                };
-                let selection_context = self
-                    .semantic
-                    .selection_context_with_uri(route, &downstream_uri, &headers, &bytes)
-                    .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
-                let prepared = self
-                    .semantic
-                    .encode_request_with_uri(route, &downstream_uri, &headers, &bytes)
-                    .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?;
-                limits
-                    .check_request_body(u64::try_from(prepared.body.len()).unwrap_or(u64::MAX))
-                    .map_err(|_| ProxyError::RequestBodyTooLarge)?;
-                limits
-                    .check_frame(u64::try_from(prepared.body.len()).unwrap_or(u64::MAX))
-                    .map_err(|_| ProxyError::RequestBodyTooLarge)?;
-                headers.insert(header::CONTENT_TYPE, prepared.content_type);
-                self.semantic.sanitize_request_headers(&mut headers);
-                headers.insert(
-                    header::ACCEPT_ENCODING,
-                    HeaderValue::from_static("identity"),
-                );
-                headers.remove(header::CONTENT_LENGTH);
-                let response_hint = prepared.response_hint;
-                (
-                    PreparedBody::Buffered {
-                        bytes: Bytes::from(prepared.body),
-                        patch_model: self.semantic.model_in_request_body(route),
-                    },
-                    None,
-                    selection_context,
-                    response_hint,
-                )
-            }
-            BodyMode::Inspect => {
-                let incoming =
-                    FrameLimitedBody::new(incoming, bounded_usize(limits.max_frame_bytes));
-                let bytes = tokio::select! {
-                    result = time::timeout_at(
-                        buffer_deadline,
-                        crate::collect_body_limited(
-                            incoming,
-                            bounded_usize(limits.max_request_body_bytes),
-                        ),
-                    ) => result
-                        .map_err(|_| ProxyError::Timeout)?
-                        .map_err(|error| match error {
-                            crate::BodyLimitError::TooLarge { .. }
-                            | crate::BodyLimitError::Upstream(crate::BodyLimitError::TooLarge { .. }) => {
-                                ProxyError::RequestBodyTooLarge
-                            }
-                            other => ProxyError::InvalidPatch(other.to_string()),
-                        })?,
-                    () = cancellation.cancelled() => {
-                        return Err(ProxyError::Timeout);
-                    }
-                };
-                let _external_metadata = self
-                    .run_external_inspectors(
-                        route,
-                        content_type_for_extension(&headers),
-                        &bytes,
-                        cancellation.clone(),
-                    )
-                    .await?;
-                limits
-                    .check_request_body(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-                    .map_err(|_| ProxyError::RequestBodyTooLarge)?;
-                headers.remove(header::CONTENT_LENGTH);
-                (
-                    PreparedBody::Buffered {
-                        bytes,
-                        patch_model: false,
-                    },
-                    None,
-                    SelectionContext::default(),
-                    SemanticResponseHint::default(),
-                )
-            }
-        };
+            };
+        if let Some(interaction_id) = gemini_interaction_id_from_path(downstream_uri.path()) {
+            selection_context.with_affinity_value("gemini.interaction_id", interaction_id);
+        }
         let is_buffered = matches!(prepared, PreparedBody::Buffered { .. });
         let mut cache_leader = None;
         if is_buffered && cache_identity_safe && method_safe_for_cache {
@@ -2277,6 +2324,9 @@ where
                     )
                 }
             });
+            let selected_upstream_uri = selection
+                .upstream_uri(&self.config, route, &downstream_uri)
+                .map_err(pool_error)?;
             let attempt_started = StdInstant::now();
             let attempt_request = AttemptRequest {
                 route,
@@ -2285,6 +2335,7 @@ where
                 version,
                 headers: &headers,
                 upstream,
+                upstream_uri: selected_upstream_uri,
                 selection: &selection,
                 native_auth,
                 native_profile,
@@ -2336,6 +2387,36 @@ where
             };
             let attempt_duration = attempt_started.elapsed();
             lifecycle.attempt(attempt, attempt_result, attempt_duration);
+            if let Some(binding) = selection.binding_key().cloned() {
+                let latency_ms = duration_to_history_millis(attempt_duration);
+                self.pooling.record_routing_telemetry(
+                    binding,
+                    TelemetrySample {
+                        observed_at_ms: request_timestamp_now(),
+                        sample_count: 1,
+                        rolling_window_ms: 5 * 60 * 1_000,
+                        stale_after_ms: 5 * 60 * 1_000,
+                        latency_ms: Some(latency_ms),
+                        ttft_ms: None,
+                        throughput_per_second: None,
+                    },
+                );
+                if let Some(target) = selection.target_binding_id() {
+                    self.observability
+                        .record_routing_telemetry(RoutingTelemetryRecord {
+                            route: route.id().to_owned(),
+                            provider: selection.provider().as_str().to_owned(),
+                            binding: target.to_owned(),
+                            observed_at_ms: request_timestamp_now(),
+                            sample_count: 1,
+                            rolling_window_ms: 5 * 60 * 1_000,
+                            stale_after_ms: 5 * 60 * 1_000,
+                            latency_ms: Some(latency_ms),
+                            ttft_ms: None,
+                            throughput_per_second: None,
+                        });
+                }
+            }
             self.observability.record_attempt(
                 AttemptRecord::new(route.id(), selection.provider().as_str(), attempt_result)
                     .duration(attempt_duration),
@@ -2603,6 +2684,8 @@ where
                         started,
                         observation,
                         request_headers: downstream_headers,
+                        routing_metadata_requested,
+                        attempt,
                         semantic_response_hint: final_response_hint,
                         cache_leader,
                         gemini_interaction_create,
@@ -2625,6 +2708,7 @@ where
             version: _downstream_version,
             headers: request_headers,
             upstream,
+            upstream_uri,
             selection,
             native_auth,
             native_profile: _,
@@ -2641,20 +2725,40 @@ where
         );
         if let Some(native_auth) = native_auth {
             native_auth.apply_once(&mut headers).map_err(native_error)?;
-        } else if selection.account_secret().is_some() {
-            let _ = crate::pool::apply_configured_account_auth(
-                &mut headers,
-                selection.account_secret(),
-                upstream.auth(),
-            )
-            .map_err(pool_error)?;
+        } else if let Some(account_secret) = selection.account_secret() {
+            if !self
+                .native
+                .apply_managed_account_auth(
+                    &mut headers,
+                    account_secret,
+                    upstream.auth(),
+                    upstream,
+                    selection.credential(),
+                )
+                .map_err(native_error)?
+            {
+                let _ = crate::pool::apply_configured_account_auth(
+                    &mut headers,
+                    Some(account_secret),
+                    upstream.auth(),
+                )
+                .map_err(pool_error)?;
+            }
+        } else if let Some(auth) = upstream.auth() {
+            if !self
+                .native
+                .apply_managed_account_auth(&mut headers, auth.secret(), Some(auth), upstream, None)
+                .map_err(native_error)?
+            {
+                apply_configured_upstream_auth(&mut headers, upstream)?;
+            }
         } else {
             apply_configured_upstream_auth(&mut headers, upstream)?;
         }
         let body = FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
             .map_err(box_error)
             .boxed();
-        let uri = upstream_uri(upstream, route, downstream_uri)?;
+        let uri = upstream_uri;
         let uri = self
             .semantic
             .rewrite_upstream_uri(route, downstream_uri, selection.upstream_model(), uri)
@@ -2733,10 +2837,11 @@ where
         let AttemptRequest {
             route,
             method: _,
-            downstream_uri,
+            downstream_uri: _,
             version: _,
             headers: request_headers,
             upstream,
+            upstream_uri,
             selection,
             native_auth,
             native_profile,
@@ -2753,13 +2858,33 @@ where
         );
         if let Some(native_auth) = native_auth {
             native_auth.apply_once(&mut headers).map_err(native_error)?;
-        } else if selection.account_secret().is_some() {
-            crate::pool::apply_configured_account_auth(
-                &mut headers,
-                selection.account_secret(),
-                upstream.auth(),
-            )
-            .map_err(pool_error)?;
+        } else if let Some(account_secret) = selection.account_secret() {
+            if !self
+                .native
+                .apply_managed_account_auth(
+                    &mut headers,
+                    account_secret,
+                    upstream.auth(),
+                    upstream,
+                    selection.credential(),
+                )
+                .map_err(native_error)?
+            {
+                crate::pool::apply_configured_account_auth(
+                    &mut headers,
+                    Some(account_secret),
+                    upstream.auth(),
+                )
+                .map_err(pool_error)?;
+            }
+        } else if let Some(auth) = upstream.auth() {
+            if !self
+                .native
+                .apply_managed_account_auth(&mut headers, auth.secret(), Some(auth), upstream, None)
+                .map_err(native_error)?
+            {
+                apply_configured_upstream_auth(&mut headers, upstream)?;
+            }
         } else {
             apply_configured_upstream_auth(&mut headers, upstream)?;
         }
@@ -2776,7 +2901,7 @@ where
                 header_bytes(&headers),
             )
             .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
-        let endpoint = websocket_uri(upstream, route, downstream_uri)?;
+        let endpoint = upstream_uri.to_string();
         let profile = match transport {
             SemanticWebSocketTransport::OpenAiResponses if native_profile => "codex_subscription",
             SemanticWebSocketTransport::OpenAiResponses => "openai_api_key",
@@ -2978,7 +3103,9 @@ where
             started,
             mut observation,
             request_headers,
+            routing_metadata_requested,
             semantic_response_hint,
+            attempt,
             mut cache_leader,
             gemini_interaction_create,
             lifecycle,
@@ -2990,6 +3117,9 @@ where
             .is_some();
         let mut response_headers = parts.headers;
         strip_hop_by_hop_headers(&mut response_headers);
+        if routing_metadata_requested {
+            add_routing_metadata_headers(&mut response_headers, &selection, attempt);
+        }
         if gemini_interaction_create
             && parts.status.is_success()
             && response_headers
@@ -3091,8 +3221,9 @@ where
                     .boxed();
             }
         }
-        self.pooling
-            .persist_affinity(&selection, crate::pool::timestamp_now());
+        let affinity_commit = selection
+            .affinity_commit()
+            .map(|commit| (Arc::clone(&self.pooling), commit));
         if gemini_interaction_create && parts.status.is_success() {
             if let Some(binding) = self.pooling.interaction_affinity_binding(&selection) {
                 let is_sse = response_headers
@@ -3134,6 +3265,7 @@ where
             lifecycle,
             parts.status.as_u16(),
             deadline_cleanup.clone(),
+            affinity_commit,
         );
         let body = DrainedBody::new(body, guard);
         let body = DeadlineBody::new(
@@ -3164,6 +3296,7 @@ struct AttemptRequest<'a> {
     version: http::Version,
     headers: &'a HeaderMap,
     upstream: &'a UpstreamPlan,
+    upstream_uri: Uri,
     selection: &'a PoolSelection,
     native_auth: Option<NativeAuthorization>,
     native_profile: bool,
@@ -3178,6 +3311,8 @@ struct FinishResponseContext {
     started: StdInstant,
     observation: RequestObservation,
     request_headers: HeaderMap,
+    routing_metadata_requested: bool,
+    attempt: u32,
     semantic_response_hint: SemanticResponseHint,
     cache_leader: Option<CacheLeader>,
     gemini_interaction_create: bool,
@@ -3249,6 +3384,7 @@ struct GeminiInteractionAffinityBody {
     pooling: Arc<PoolingCoordinator>,
     binding: crate::pool::InteractionAffinityBinding,
     observation: InteractionIdObservation,
+    pending_interaction_id: Option<String>,
 }
 
 enum InteractionIdObservation {
@@ -3277,14 +3413,21 @@ impl GeminiInteractionAffinityBody {
             pooling,
             binding,
             observation,
+            pending_interaction_id: None,
         }
     }
 
     fn observe(&mut self, bytes: &[u8], end_stream: bool) {
-        if let Some(key) = self.observation.observe(bytes, end_stream) {
+        if let Some(interaction_id) = self.observation.observe(bytes, end_stream) {
+            self.pending_interaction_id = Some(interaction_id);
+        }
+    }
+
+    fn finish_success(&mut self) {
+        if let Some(interaction_id) = self.pending_interaction_id.take() {
             self.pooling.bind_interaction_affinity(
                 &self.binding,
-                key,
+                interaction_id,
                 crate::pool::timestamp_now(),
             );
         }
@@ -3306,7 +3449,7 @@ impl InteractionIdObservation {
         }
     }
 
-    fn observe(&mut self, bytes: &[u8], end_stream: bool) -> Option<AffinityKey> {
+    fn observe(&mut self, bytes: &[u8], end_stream: bool) -> Option<String> {
         let interaction_id = match self {
             Self::Json(buffer) => {
                 if buffer.len().saturating_add(bytes.len())
@@ -3321,10 +3464,7 @@ impl InteractionIdObservation {
                 }
                 serde_json::from_slice::<serde_json::Value>(buffer)
                     .ok()
-                    .and_then(|value| {
-                        interaction_id_from_json(&value)
-                            .and_then(|id| AffinityKey::new(id.as_bytes()).ok())
-                    })
+                    .and_then(|value| interaction_id_from_json(&value).map(str::to_owned))
             }
             Self::Sse {
                 parser,
@@ -3338,10 +3478,7 @@ impl InteractionIdObservation {
                     Ok(events) => events.into_iter().find_map(|event| {
                         serde_json::from_str::<serde_json::Value>(&event.data)
                             .ok()
-                            .and_then(|value| {
-                                interaction_id_from_json(&value)
-                                    .and_then(|id| AffinityKey::new(id.as_bytes()).ok())
-                            })
+                            .and_then(|value| interaction_id_from_json(&value).map(str::to_owned))
                     }),
                     Err(_) => {
                         *self = Self::Done;
@@ -3380,9 +3517,15 @@ impl Body for GeminiInteractionAffinityBody {
                 if let Some(data) = frame.data_ref() {
                     let end_stream = self.inner.is_end_stream();
                     self.observe(data, end_stream);
+                    if end_stream {
+                        self.finish_success();
+                    }
                 }
             }
-            Poll::Ready(None) => self.observe(&[], true),
+            Poll::Ready(None) => {
+                self.observe(&[], true);
+                self.finish_success();
+            }
             Poll::Ready(Some(Err(_))) | Poll::Pending => {}
         }
         result
@@ -3410,6 +3553,17 @@ fn interaction_id_from_json(value: &serde_json::Value) -> Option<&str> {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         })
+}
+
+fn gemini_interaction_id_from_path(path: &str) -> Option<&str> {
+    let suffix = path.strip_prefix("/v1beta/interactions/")?;
+    let interaction_id = suffix.strip_suffix("/cancel").unwrap_or(suffix);
+    (!interaction_id.is_empty()
+        && !interaction_id.contains('/')
+        && interaction_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    .then_some(interaction_id)
 }
 
 struct SelectionLeaseBody {
@@ -3470,6 +3624,7 @@ struct ObservedBody {
     usage_bytes: Vec<u8>,
     usage_overflowed: bool,
     response_deadline: Option<ResponseDeadline>,
+    affinity_commit: Option<(Arc<PoolingCoordinator>, crate::pool::AffinityCommit)>,
 }
 
 impl ObservedBody {
@@ -3484,6 +3639,7 @@ impl ObservedBody {
             usage_bytes: Vec::new(),
             usage_overflowed: false,
             response_deadline: None,
+            affinity_commit: None,
         }
     }
 
@@ -3504,9 +3660,11 @@ impl ObservedBody {
             usage_bytes: Vec::new(),
             usage_overflowed: false,
             response_deadline: None,
+            affinity_commit: None,
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Body lifecycle ownership stays explicit at commitment.
     fn new_for_target(
         inner: ProxyBody,
         observation: RequestObservation,
@@ -3515,6 +3673,7 @@ impl ObservedBody {
         lifecycle: RequestLifecycle,
         status: u16,
         response_deadline: ResponseDeadline,
+        affinity_commit: Option<(Arc<PoolingCoordinator>, crate::pool::AffinityCommit)>,
     ) -> Self {
         Self {
             inner: Box::pin(inner),
@@ -3526,6 +3685,7 @@ impl ObservedBody {
             usage_bytes: Vec::new(),
             usage_overflowed: false,
             response_deadline: Some(response_deadline),
+            affinity_commit,
         }
     }
 
@@ -3536,6 +3696,15 @@ impl ObservedBody {
         let usage = (!self.usage_overflowed)
             .then(|| extract_observed_usage(&self.usage_bytes))
             .flatten();
+        if matches!(completion, CompletionClass::Success)
+            && self
+                .status
+                .is_some_and(|status| (200..300).contains(&status))
+        {
+            if let Some((pooling, commit)) = self.affinity_commit.take() {
+                pooling.persist_affinity_commit(commit, crate::pool::timestamp_now());
+            }
+        }
         if let Some(lifecycle) = self.lifecycle.as_ref() {
             lifecycle.complete_with_usage(completion.clone(), self.status, usage.as_ref());
         }
@@ -4205,6 +4374,17 @@ fn rewrite_native_upstream_uri(
     let Some(native) = upstream.native() else {
         return Ok(upstream_uri);
     };
+    if native.kind().eq_ignore_ascii_case("codex") {
+        let path = match downstream.path() {
+            "/v1/responses" => adapter_codex::CODEX_RESPONSES_PATH,
+            "/v1/models" => adapter_codex::CODEX_MODELS_PATH,
+            _ => return Ok(upstream_uri),
+        };
+        let mut target =
+            url::Url::parse(&upstream_uri.to_string()).map_err(|_| ProxyError::InvalidUri)?;
+        target.set_path(path);
+        return target.as_str().parse().map_err(|_| ProxyError::InvalidUri);
+    }
     if !native.kind().eq_ignore_ascii_case("vertex") {
         return Ok(upstream_uri);
     }
@@ -4245,6 +4425,7 @@ fn rewrite_native_upstream_uri(
     target.as_str().parse().map_err(|_| ProxyError::InvalidUri)
 }
 
+#[cfg(test)]
 fn upstream_uri(
     upstream: &UpstreamPlan,
     route: &RoutePlan,
@@ -4285,6 +4466,7 @@ fn upstream_uri(
 /// reason to know about, such as Azure OpenAI's `api-version`. A caller that
 /// did send the parameter chose a value deliberately, so configuration fills
 /// the gap rather than replacing the choice.
+#[cfg(test)]
 fn apply_upstream_query(url: &mut url::Url, required: &[(Arc<str>, Arc<str>)]) {
     for (name, value) in required {
         if url
@@ -4301,6 +4483,7 @@ fn apply_upstream_query(url: &mut url::Url, required: &[(Arc<str>, Arc<str>)]) {
 /// the downstream request's query. The downstream query remains in the same
 /// order and encoding supplied by the caller; configured required parameters
 /// are appended separately by [`apply_upstream_query`].
+#[cfg(test)]
 fn merge_upstream_query(url: &mut url::Url, downstream: Option<&str>) {
     let base = url
         .query()
@@ -4465,6 +4648,7 @@ fn websocket_protocols(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn websocket_uri(
     upstream: &UpstreamPlan,
     route: &RoutePlan,
@@ -5049,6 +5233,7 @@ struct WebSocketTunnelContext {
     lease: Option<SelectionLease>,
     observation: RequestObservation,
     lifecycle: RequestLifecycle,
+    affinity_commit: Option<(Arc<PoolingCoordinator>, crate::pool::AffinityCommit)>,
 }
 
 async fn run_websocket_tunnel(
@@ -5065,6 +5250,7 @@ async fn run_websocket_tunnel(
         lease,
         mut observation,
         lifecycle,
+        affinity_commit,
     } = context;
     let upgraded = tokio::select! {
         result = downstream_upgrade => match result {
@@ -5294,10 +5480,15 @@ async fn run_websocket_tunnel(
     let _ = upstream.shutdown().await;
     observation.complete(completion.clone(), None);
     lifecycle.complete_with_usage(
-        completion,
+        completion.clone(),
         Some(StatusCode::SWITCHING_PROTOCOLS.as_u16()),
         observed_usage.as_ref(),
     );
+    if matches!(completion, CompletionClass::Success) {
+        if let Some((pooling, commit)) = affinity_commit {
+            pooling.persist_affinity_commit(commit, crate::pool::timestamp_now());
+        }
+    }
     drop(lease);
     drop(guard);
 }
@@ -5424,6 +5615,38 @@ fn strip_caller_credentials_when_authenticating(
 fn strip_downstream_authorization(route: &RoutePlan, headers: &mut HeaderMap) {
     if route.downstream_auth().is_some() {
         headers.remove(header::AUTHORIZATION);
+    }
+}
+
+fn routing_metadata_opt_in(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-pooler-routing-metadata")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
+}
+
+fn add_routing_metadata_headers(headers: &mut HeaderMap, selection: &PoolSelection, attempt: u32) {
+    insert_bounded_header(
+        headers,
+        "x-pooler-routing-provider",
+        selection.provider().as_str(),
+    );
+    insert_bounded_header(
+        headers,
+        "x-pooler-routing-model",
+        selection.model().as_str(),
+    );
+    insert_bounded_header(headers, "x-pooler-routing-attempt", &attempt.to_string());
+    if let Some(target) = selection.target_binding_id() {
+        insert_bounded_header(headers, "x-pooler-routing-target", target);
+    }
+}
+
+fn insert_bounded_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    if value.len() <= 128 {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            headers.insert(name, value);
+        }
     }
 }
 
@@ -5905,7 +6128,7 @@ routes:
         assert_eq!(json.observe(br#"{"id":"int_"#, false), None);
         assert_eq!(
             json.observe(br#"json","status":"completed"}"#, true),
-            Some(AffinityKey::new("int_json").expect("hashed JSON ID"))
+            Some("int_json".to_owned())
         );
         assert!(matches!(json, InteractionIdObservation::Done));
 
@@ -5919,7 +6142,7 @@ routes:
         );
         assert_eq!(
             sse.observe(b"sse\",\"status\":\"in_progress\"}}\n\n", false),
-            Some(AffinityKey::new("int_sse").expect("hashed SSE ID"))
+            Some("int_sse".to_owned())
         );
         assert!(matches!(sse, InteractionIdObservation::Done));
 

@@ -21,9 +21,13 @@ mod doctor;
 mod fixture_replay;
 mod migrate;
 mod preflight;
+mod production_migrate;
 mod tui;
 pub use auth::{AuthCommand, AuthLoginMethod, OAuthEncodingArgument, OAuthOverrideArgs};
 pub use catalog::{CatalogCommand, VENDORED_MODEL_FACTS_PATH};
+pub use production_migrate::{
+    migrate as migrate_pooler_v1, recover_transaction, MigrationOptions, MigrationReport,
+};
 
 /// Top-level command-line arguments.
 #[derive(Debug, Parser)]
@@ -111,6 +115,14 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print every configured listener and management endpoint without using
+    /// a named client/tool profile.
+    EndpointInventory {
+        /// Emit the inventory as JSON (the default output is also JSON for
+        /// machine-readable scripting).
+        #[arg(long)]
+        json: bool,
+    },
     /// Maintain the vendored per-model request-facts snapshot.
     Catalog {
         /// Catalog data operation.
@@ -159,6 +171,43 @@ pub enum MigrateCommand {
         /// New owner-private Pooler configuration path for a non-dry migration.
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+    /// Convert one quiesced Pooler-v1 configuration and encrypted store.
+    #[command(name = "pooler-v1", alias = "production")]
+    PoolerV1 {
+        /// Retired Pooler-v1 configuration.
+        #[arg(long = "config", alias = "source-config")]
+        source_config: Option<PathBuf>,
+        /// Retired Pooler-v1 encrypted SQLite store.
+        #[arg(long = "store", alias = "source-store")]
+        source_store: Option<PathBuf>,
+        /// Raw owner-private source store key file.
+        #[arg(long = "key", alias = "source-key")]
+        source_key: Option<PathBuf>,
+        /// Canonical v2 configuration destination.
+        #[arg(long = "output-config")]
+        output_config: Option<PathBuf>,
+        /// Canonical v2 encrypted SQLite store destination.
+        #[arg(long = "output-store")]
+        output_store: Option<PathBuf>,
+        /// Canonical v2 store-key destination.
+        #[arg(long = "output-key")]
+        output_key: Option<PathBuf>,
+        /// Private transaction directory used for staging and recovery.
+        #[arg(long)]
+        transaction_dir: Option<PathBuf>,
+        /// Validate and stage without checkpointing or promoting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Required acknowledgement that every source writer is stopped.
+        #[arg(long)]
+        quiesced: bool,
+        /// Recover and reverse a prior transaction instead of starting one.
+        #[arg(long)]
+        recover: bool,
+        /// Replace existing destinations after copying private rollback backups.
+        #[arg(long)]
+        replace_existing: bool,
     },
 }
 
@@ -331,6 +380,14 @@ pub fn run(cli: Cli) -> Result<()> {
             credential_key_ref.as_deref(),
             json,
         ),
+        Command::EndpointInventory { json: _ } => {
+            let config = load(&config_path::resolve(config.as_deref())?)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&pooler_server::endpoint_inventory(&config))?
+            );
+            Ok(())
+        }
         Command::Catalog { command } => catalog::run(command),
         Command::Providers { search, json } => catalog::providers(search.as_deref(), json),
         Command::Fixture { command } => fixture_replay::run(command),
@@ -342,6 +399,61 @@ pub fn run(cli: Cli) -> Result<()> {
                     output,
                 },
         } => migrate::cliproxy(&input, dry_run, output.as_deref()),
+        Command::Migrate {
+            command:
+                MigrateCommand::PoolerV1 {
+                    source_config,
+                    source_store,
+                    source_key,
+                    output_config,
+                    output_store,
+                    output_key,
+                    transaction_dir,
+                    dry_run,
+                    quiesced,
+                    recover,
+                    replace_existing,
+                },
+        } => {
+            let recovery = if recover {
+                Some(
+                    transaction_dir
+                        .clone()
+                        .ok_or_else(|| anyhow!("--recover requires --transaction-dir"))?,
+                )
+            } else {
+                None
+            };
+            let options = if recover {
+                MigrationOptions::new(".", ".", ".", ".", ".", ".")
+            } else {
+                MigrationOptions {
+                    source_config: source_config.ok_or_else(|| {
+                        anyhow!("--config is required unless --recover is supplied")
+                    })?,
+                    source_store: source_store.ok_or_else(|| {
+                        anyhow!("--store is required unless --recover is supplied")
+                    })?,
+                    source_key: source_key
+                        .ok_or_else(|| anyhow!("--key is required unless --recover is supplied"))?,
+                    destination_config: output_config.ok_or_else(|| {
+                        anyhow!("--output-config is required unless --recover is supplied")
+                    })?,
+                    destination_store: output_store.ok_or_else(|| {
+                        anyhow!("--output-store is required unless --recover is supplied")
+                    })?,
+                    destination_key: output_key.ok_or_else(|| {
+                        anyhow!("--output-key is required unless --recover is supplied")
+                    })?,
+                    transaction_dir: transaction_dir.clone(),
+                    dry_run,
+                    quiesced,
+                    replace_existing,
+                    fail_after: None,
+                }
+            };
+            production_migrate::run(options, recovery)
+        }
         Command::Auth { command } => auth::run(
             command,
             &config_path::resolve(config.as_deref())?,
@@ -430,12 +542,25 @@ fn serve(
         .build()
         .context("failed to initialize the async runtime")?;
     runtime.block_on(async move {
-        let server = pooler_server::HttpProxyServer::bind_with_native_runtime_and_pooling(
-            config,
-            resources.native,
-            resources.pooling,
-        )
-        .await?;
+        let server = match resources.management_store {
+            Some(store) => {
+                pooler_server::HttpProxyServer::bind_with_native_runtime_and_pooling_and_management_store(
+                    config,
+                    resources.native,
+                    resources.pooling,
+                    store,
+                )
+                .await?
+            }
+            None => {
+                pooler_server::HttpProxyServer::bind_with_native_runtime_and_pooling(
+                    config,
+                    resources.native,
+                    resources.pooling,
+                )
+                .await?
+            }
+        };
         if server.management_api().is_some() {
             server
                 .enable_config_management(&operator_config_source)
@@ -581,11 +706,11 @@ async fn reload_loop(
             } => {
                 match server.refresh_catalog(generation).await {
                     Ok(changed) => {
-                        server.complete_management_reload(request_id, Some(changed));
+                        server.complete_management_reload(request_id, Some(changed), None);
                         tracing::info!(request_id, changed, "model catalog refresh completed");
                     }
                     Err(error) => {
-                        server.complete_management_reload(request_id, None);
+                        server.complete_management_reload(request_id, None, None);
                         tracing::warn!(request_id, error = %error, "model catalog refresh failed");
                     }
                 }
@@ -625,7 +750,7 @@ async fn reload_loop(
                 Ok(candidate) => candidate,
                 Err(error) => {
                     if let Some((request_id, _, _)) = &management_request {
-                        server.complete_management_reload(*request_id, None);
+                        server.complete_management_reload(*request_id, None, None);
                     }
                     tracing::warn!(error = %error, "configuration reload source rejected");
                     continue;
@@ -673,20 +798,29 @@ async fn apply_reload_candidate(
         Ok(config) => config,
         Err(error) => {
             if let Some((request_id, _, _)) = &management_request {
-                server.complete_management_reload(*request_id, None);
+                server.complete_management_reload(*request_id, None, None);
             }
             tracing::warn!(error = %error, "configuration reload rejected");
             return Ok(());
         }
     };
     let reload = match &management_request {
-        Some((_, generation, _)) => server.reload_for_generation(compiled, *generation).await,
+        Some((_, generation, Some(source))) => {
+            server
+                .reload_staged_candidate(compiled, source, *generation)
+                .await
+        }
+        Some((_, generation, None)) => server.reload_for_generation(compiled, *generation).await,
         None => server.reload(compiled).await,
     };
     match reload {
         Ok(outcome) => {
             if let Some((request_id, _, _)) = &management_request {
-                server.complete_management_reload(*request_id, Some(outcome.changed()));
+                server.complete_management_reload(
+                    *request_id,
+                    Some(outcome.changed()),
+                    Some(server.config_generation()),
+                );
             }
             tracing::info!(
                 generation = outcome.generation(),
@@ -700,7 +834,7 @@ async fn apply_reload_candidate(
         }
         Err(error) => {
             if let Some((request_id, _, _)) = &management_request {
-                server.complete_management_reload(*request_id, None);
+                server.complete_management_reload(*request_id, None, None);
             }
             tracing::warn!(error = %error, "configuration reload rejected");
         }
@@ -711,6 +845,7 @@ async fn apply_reload_candidate(
 struct RuntimeResources {
     native: Arc<NativeRuntime>,
     pooling: Arc<PoolingCoordinator>,
+    management_store: Option<Arc<SqliteStore>>,
 }
 
 fn runtime_resources(
@@ -718,19 +853,20 @@ fn runtime_resources(
     explicit_store_path: Option<&std::path::Path>,
     credential_key_ref: Option<&str>,
 ) -> Result<RuntimeResources> {
-    let has_codex = config.upstreams().values().any(|upstream| {
-        upstream
-            .native()
-            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
-    });
     let has_native = config
         .upstreams()
         .values()
         .any(|upstream| upstream.native().is_some());
+    let has_native_oauth = config.upstreams().values().any(|upstream| {
+        upstream.native().is_some_and(|native| {
+            upstream.oauth().is_some() || native.kind().eq_ignore_ascii_case("codex")
+        })
+    });
+    let durable_management_requested = config.management().is_some();
     let persistence_requested = explicit_store_path.is_some()
         || credential_key_ref.is_some()
         || std::env::var_os("POOLER_CREDENTIAL_STORE").is_some();
-    if !persistence_requested && !has_codex {
+    if !persistence_requested && !has_native_oauth && !durable_management_requested {
         let native = if has_native {
             NativeRuntime::new(config, Arc::new(MemoryOAuthTokenStore::new()))?
         } else {
@@ -739,20 +875,20 @@ fn runtime_resources(
         return Ok(RuntimeResources {
             native: Arc::new(native),
             pooling: Arc::new(PoolingCoordinator::new(config)?),
+            management_store: None,
         });
     }
     let store_path = auth::credential_store_path(explicit_store_path)?;
     let master_key = auth::load_master_key(credential_key_ref).context(
         "credential-store persistence requires --credential-key-ref (use env:, file:, or keyring:)",
     )?;
-    let store = SqliteStore::open_encrypted(store_path, master_key)
-        .context("could not open encrypted credential store")?;
-    let pooling = Arc::new(PoolingCoordinator::with_store(
-        config,
-        Arc::new(store.clone()),
-    )?);
-    let native = if has_codex {
-        let token_store = Arc::new(SqliteOAuthTokenStore::new(store));
+    let store = Arc::new(
+        SqliteStore::open_encrypted(store_path, master_key)
+            .context("could not open encrypted credential store")?,
+    );
+    let pooling = Arc::new(PoolingCoordinator::with_store(config, store.clone())?);
+    let native = if has_native_oauth || durable_management_requested {
+        let token_store = Arc::new(SqliteOAuthTokenStore::new((*store).clone()));
         Arc::new(NativeRuntime::new_with_sqlite(config, token_store)?)
     } else if has_native {
         Arc::new(NativeRuntime::new(
@@ -762,7 +898,11 @@ fn runtime_resources(
     } else {
         Arc::new(NativeRuntime::disabled())
     };
-    Ok(RuntimeResources { native, pooling })
+    Ok(RuntimeResources {
+        native,
+        pooling,
+        management_store: Some(store),
+    })
 }
 
 #[cfg(unix)]

@@ -38,13 +38,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures_util::{stream, StreamExt};
 use pooler_core::{
     CapabilitySet, ComponentId, IdentifierError, ModelDialect, ModelId, ModelProfile, ProviderId,
+    TargetBindingId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -180,6 +181,14 @@ pub struct CatalogSourceConfig {
     pub id: String,
     /// Provider that owns every discovered upstream model.
     pub provider: String,
+    /// Exact account that authenticated this source, when discovery is
+    /// account-scoped.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Homogeneous account pool resolved for this source, when discovery is
+    /// pool-scoped.
+    #[serde(default)]
+    pub account_pool: Option<String>,
     /// Optional client-visible namespace, emitted as `prefix/model`.
     pub prefix: Option<String>,
     /// Higher-priority targets are listed first.
@@ -203,6 +212,11 @@ impl CatalogSourceConfig {
                 source_id: source.clone(),
                 message: error.to_string(),
             })?;
+        let account = normalize_binding_name(&source, self.account, "account")?;
+        let account_pool = normalize_binding_name(&source, self.account_pool, "account pool")?;
+        if account.is_some() && account_pool.is_some() {
+            return Err(CatalogError::AmbiguousSourceBinding { source_id: source });
+        }
         let prefix = self
             .prefix
             .map(|prefix| validate_prefix(&source, prefix))
@@ -255,6 +269,8 @@ impl CatalogSourceConfig {
         Ok(CatalogSource {
             id: source,
             provider,
+            account,
+            account_pool,
             prefix,
             priority: self.priority,
             aliases,
@@ -458,6 +474,8 @@ impl CompiledCatalogConfig {
 pub struct CatalogSource {
     id: SourceId,
     provider: ProviderId,
+    account: Option<String>,
+    account_pool: Option<String>,
     prefix: Option<String>,
     priority: i32,
     aliases: Vec<CatalogAlias>,
@@ -478,6 +496,50 @@ impl CatalogSource {
         &self.provider
     }
 
+    /// Exact account that authenticated this discovery source, if any.
+    #[must_use]
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+
+    /// Homogeneous account pool resolved for this discovery source, if any.
+    #[must_use]
+    pub fn account_pool(&self) -> Option<&str> {
+        self.account_pool.as_deref()
+    }
+
+    /// Attach the resolved account or homogeneous pool from the compiled
+    /// configuration plan before publication.
+    pub fn with_binding(
+        mut self,
+        account: Option<String>,
+        account_pool: Option<String>,
+    ) -> Result<Self, CatalogError> {
+        let account = normalize_binding_name(&self.id, account, "account")?;
+        let account_pool = normalize_binding_name(&self.id, account_pool, "account pool")?;
+        if account.is_some() && account_pool.is_some() {
+            return Err(CatalogError::AmbiguousSourceBinding {
+                source_id: self.id.clone(),
+            });
+        }
+        if self.account.is_some() && account.is_some() && self.account != account {
+            return Err(CatalogError::AmbiguousSourceBinding {
+                source_id: self.id.clone(),
+            });
+        }
+        if self.account_pool.is_some()
+            && account_pool.is_some()
+            && self.account_pool != account_pool
+        {
+            return Err(CatalogError::AmbiguousSourceBinding {
+                source_id: self.id.clone(),
+            });
+        }
+        self.account = self.account.or(account);
+        self.account_pool = self.account_pool.or(account_pool);
+        Ok(self)
+    }
+
     /// Optional client-visible namespace.
     #[must_use]
     pub fn prefix(&self) -> Option<&str> {
@@ -487,6 +549,12 @@ impl CatalogSource {
     /// Target ordering priority.
     #[must_use]
     pub const fn priority(&self) -> i32 {
+        self.priority
+    }
+
+    /// Original signed higher-wins priority retained for diagnostics.
+    #[must_use]
+    pub const fn signed_priority(&self) -> i32 {
         self.priority
     }
 
@@ -716,8 +784,45 @@ impl CatalogInput {
     }
 }
 
+/// Typed bulk model-exposure operation for one discovery source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSelectionAction {
+    /// Expose every newly discovered model except explicit exclusions.
+    SelectAll,
+    /// Expose no discovered models until individual selection is added.
+    SelectNone,
+}
+
+impl Default for ModelSelectionAction {
+    fn default() -> Self {
+        Self::SelectAll
+    }
+}
+
+/// Current source-local bulk selection state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ModelSelectionState {
+    action: ModelSelectionAction,
+    explicit_exclusions: Vec<ModelId>,
+}
+
+impl ModelSelectionState {
+    /// Current bulk action.
+    #[must_use]
+    pub const fn action(&self) -> ModelSelectionAction {
+        self.action
+    }
+
+    /// Explicit upstream model exclusions retained across refreshes.
+    #[must_use]
+    pub fn explicit_exclusions(&self) -> &[ModelId] {
+        &self.explicit_exclusions
+    }
+}
+
 /// How a discovered upstream model became client-visible.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExposureKind {
     /// Provider-native model name.
@@ -728,16 +833,99 @@ pub enum ExposureKind {
     ForkedAlias,
 }
 
+/// Stable identity and selection metadata shared with the later runtime
+/// binding registry.
+///
+/// Discovery deliberately emits this descriptor without constructing a
+/// runtime registry. A target is scoped by its public model and source
+/// identity, while account and homogeneous-pool bindings remain explicit.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct CatalogBindingDescriptor {
+    binding_id: String,
+    model: ModelId,
+    target_id: String,
+    provider: ProviderId,
+    account: Option<String>,
+    account_pool: Option<String>,
+    upstream_model: ModelId,
+    priority: u32,
+    signed_priority: i32,
+}
+
+/// Alias used by consumers that refer to catalog bindings by their runtime
+/// target terminology.
+pub type TargetBindingDescriptor = CatalogBindingDescriptor;
+
+impl CatalogBindingDescriptor {
+    /// Stable composite model/target identity.
+    #[must_use]
+    pub fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    /// Public logical model ID carried by this binding.
+    #[must_use]
+    pub const fn model(&self) -> &ModelId {
+        &self.model
+    }
+
+    /// Stable source/target component used to construct the composite ID.
+    #[must_use]
+    pub fn target_id(&self) -> &str {
+        &self.target_id
+    }
+
+    /// Provider/upstream instance owning the binding.
+    #[must_use]
+    pub const fn provider(&self) -> &ProviderId {
+        &self.provider
+    }
+
+    /// Exact account bound to this target, if any.
+    #[must_use]
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+
+    /// Homogeneous account pool bound to this target, if any.
+    #[must_use]
+    pub fn account_pool(&self) -> Option<&str> {
+        self.account_pool.as_deref()
+    }
+
+    /// Provider-native model ID.
+    #[must_use]
+    pub const fn upstream_model(&self) -> &ModelId {
+        &self.upstream_model
+    }
+
+    /// Canonical positive lower-wins priority tier.
+    #[must_use]
+    pub const fn priority(&self) -> u32 {
+        self.priority
+    }
+
+    /// Original signed higher-wins source priority retained for diagnostics.
+    #[must_use]
+    pub const fn signed_priority(&self) -> i32 {
+        self.signed_priority
+    }
+}
+
 /// Auditable origin for one public model target.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct ModelProvenance {
     source: SourceId,
     provider: ProviderId,
+    account: Option<String>,
+    account_pool: Option<String>,
     upstream_model: ModelId,
     revision: Option<String>,
     observed_at_unix_ms: u64,
     exposure: ExposureKind,
     prefix: Option<String>,
+    signed_priority: i32,
+    priority_tier: u32,
 }
 
 impl ModelProvenance {
@@ -751,6 +939,18 @@ impl ModelProvenance {
     #[must_use]
     pub const fn provider(&self) -> &ProviderId {
         &self.provider
+    }
+
+    /// Exact account used to authenticate this observation, if any.
+    #[must_use]
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+
+    /// Homogeneous pool used to authenticate this observation, if any.
+    #[must_use]
+    pub fn account_pool(&self) -> Option<&str> {
+        self.account_pool.as_deref()
     }
 
     /// Provider-native model ID.
@@ -782,18 +982,32 @@ impl ModelProvenance {
     pub fn prefix(&self) -> Option<&str> {
         self.prefix.as_deref()
     }
+
+    /// Original signed higher-wins source priority.
+    #[must_use]
+    pub const fn signed_priority(&self) -> i32 {
+        self.signed_priority
+    }
+
+    /// Canonical positive lower-wins priority tier.
+    #[must_use]
+    pub const fn priority_tier(&self) -> u32 {
+        self.priority_tier
+    }
 }
 
 /// One provider/upstream routing target for a public model.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct CatalogTarget {
+    binding: CatalogBindingDescriptor,
     provider: ProviderId,
     upstream_model: ModelId,
     capabilities: CapabilitySet,
     dialect: ModelDialect,
     profile: ModelProfile,
     force_mapping: bool,
-    priority: i32,
+    priority: u32,
+    signed_priority: i32,
     provenance: Vec<ModelProvenance>,
 }
 
@@ -802,6 +1016,36 @@ impl CatalogTarget {
     #[must_use]
     pub const fn provider(&self) -> &ProviderId {
         &self.provider
+    }
+
+    /// Common staged binding descriptor for the later runtime registry.
+    #[must_use]
+    pub const fn binding(&self) -> &CatalogBindingDescriptor {
+        &self.binding
+    }
+
+    /// Alias for [`Self::binding`] at the staged handoff boundary.
+    #[must_use]
+    pub const fn binding_descriptor(&self) -> &CatalogBindingDescriptor {
+        &self.binding
+    }
+
+    /// Stable composite model/target identity.
+    #[must_use]
+    pub fn binding_id(&self) -> &str {
+        self.binding.binding_id()
+    }
+
+    /// Exact account bound to this target, if any.
+    #[must_use]
+    pub fn account(&self) -> Option<&str> {
+        self.binding.account()
+    }
+
+    /// Homogeneous account pool bound to this target, if any.
+    #[must_use]
+    pub fn account_pool(&self) -> Option<&str> {
+        self.binding.account_pool()
     }
 
     /// Provider-native model ID.
@@ -845,8 +1089,14 @@ impl CatalogTarget {
 
     /// Target ordering priority.
     #[must_use]
-    pub const fn priority(&self) -> i32 {
+    pub const fn priority(&self) -> u32 {
         self.priority
+    }
+
+    /// Original signed higher-wins source priority retained for diagnostics.
+    #[must_use]
+    pub const fn signed_priority(&self) -> i32 {
+        self.signed_priority
     }
 
     /// Every source that reported this target.
@@ -895,6 +1145,9 @@ impl CatalogModel {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CatalogSourceState {
     provider: ProviderId,
+    account: Option<String>,
+    account_pool: Option<String>,
+    signed_priority: i32,
     revision: Option<String>,
     observed_at_unix_ms: u64,
     discovered_models: usize,
@@ -908,6 +1161,24 @@ impl CatalogSourceState {
     #[must_use]
     pub const fn provider(&self) -> &ProviderId {
         &self.provider
+    }
+
+    /// Exact account used for this source, if any.
+    #[must_use]
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+
+    /// Homogeneous account pool used for this source, if any.
+    #[must_use]
+    pub fn account_pool(&self) -> Option<&str> {
+        self.account_pool.as_deref()
+    }
+
+    /// Original signed source priority retained for diagnostics.
+    #[must_use]
+    pub const fn signed_priority(&self) -> i32 {
+        self.signed_priority
     }
 
     /// Provider revision.
@@ -1029,6 +1300,22 @@ pub fn merge_discoveries(
         });
     }
     inputs.sort_by(|left, right| source_order(&left.source, &right.source));
+    let mut signed_priorities = inputs
+        .iter()
+        .map(|input| input.source.priority)
+        .collect::<Vec<_>>();
+    signed_priorities.sort_unstable_by(|left, right| right.cmp(left));
+    signed_priorities.dedup();
+    let priority_tiers = signed_priorities
+        .into_iter()
+        .enumerate()
+        .map(|(index, priority)| {
+            (
+                priority,
+                u32::try_from(index + 1).expect("source count is bounded by usize and u32"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut seen_sources = BTreeSet::new();
     let mut total_models = 0usize;
     let mut merge_operations = 0usize;
@@ -1072,6 +1359,10 @@ pub fn merge_discoveries(
     let mut candidates: BTreeMap<ModelId, Vec<Candidate>> = BTreeMap::new();
     let mut source_states = BTreeMap::new();
     for input in inputs {
+        let priority_tier = priority_tiers
+            .get(&input.source.priority)
+            .copied()
+            .expect("every source priority was normalized before merge");
         validate_revision(&input.source.id, input.response.revision.as_deref())?;
         let mut discovered = input.response.models;
         discovered.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1129,6 +1420,7 @@ pub fn merge_discoveries(
                     model.display_name.clone(),
                     ExposureKind::Direct,
                     false,
+                    priority_tier,
                 )?;
                 exposure_count += 1;
                 continue;
@@ -1145,6 +1437,7 @@ pub fn merge_discoveries(
                     model.display_name.clone(),
                     ExposureKind::Direct,
                     false,
+                    priority_tier,
                 )?;
                 exposure_count += 1;
             }
@@ -1166,6 +1459,7 @@ pub fn merge_discoveries(
                         ExposureKind::Alias
                     },
                     alias.force_mapping,
+                    priority_tier,
                 )?;
                 exposure_count += 1;
             }
@@ -1174,6 +1468,9 @@ pub fn merge_discoveries(
             input.source.id,
             CatalogSourceState {
                 provider: input.source.provider,
+                account: input.source.account,
+                account_pool: input.source.account_pool,
+                signed_priority: input.source.priority,
                 revision: input.response.revision,
                 observed_at_unix_ms: refreshed_at_unix_ms,
                 discovered_models: discovered_count,
@@ -1201,16 +1498,26 @@ pub fn merge_discoveries(
     })
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct TargetIdentity {
+    provider: ProviderId,
+    account: Option<String>,
+    account_pool: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct Candidate {
     display_name: Option<String>,
     provider: ProviderId,
+    account: Option<String>,
+    account_pool: Option<String>,
     upstream_model: ModelId,
     capabilities: CapabilitySet,
     dialect: ModelDialect,
     profile: ModelProfile,
     force_mapping: bool,
-    priority: i32,
+    priority: u32,
+    signed_priority: i32,
     provenance: ModelProvenance,
 }
 
@@ -1225,27 +1532,47 @@ fn push_candidate(
     display_name: Option<String>,
     exposure: ExposureKind,
     force_mapping: bool,
+    priority_tier: u32,
 ) -> Result<(), CatalogError> {
     let public_id = prefixed_model_id(source, unprefixed_public_id)?;
+    let binding_id =
+        TargetBindingId::new(public_id.as_str(), source.id.as_str()).map_err(|error| {
+            CatalogError::InvalidBinding {
+                source_id: source.id.clone(),
+                model: public_id.clone(),
+                message: error.to_string(),
+            }
+        })?;
     candidates.entry(public_id).or_default().push(Candidate {
         display_name,
         provider: source.provider.clone(),
+        account: source.account.clone(),
+        account_pool: source.account_pool.clone(),
         upstream_model: model.id.clone(),
         capabilities: model.capabilities,
         dialect: model.dialect,
         profile: model.profile,
         force_mapping,
-        priority: source.priority,
+        priority: priority_tier,
+        signed_priority: source.priority,
         provenance: ModelProvenance {
             source: source.id.clone(),
             provider: source.provider.clone(),
+            account: source.account.clone(),
+            account_pool: source.account_pool.clone(),
             upstream_model: model.id.clone(),
             revision: revision.clone(),
             observed_at_unix_ms,
             exposure,
             prefix: source.prefix.clone(),
+            signed_priority: source.priority,
+            priority_tier,
         },
     });
+    // Validate the common composite identity at the catalog boundary. The
+    // descriptor is reconstructed during merge from the same source/model
+    // pair, so this check cannot silently admit an invalid target ID.
+    let _ = binding_id;
     Ok(())
 }
 
@@ -1258,15 +1585,22 @@ fn compile_public_model(
         .iter()
         .find_map(|candidate| candidate.display_name.clone());
     let mut targets: Vec<CatalogTarget> = Vec::new();
-    let mut provider_mappings: BTreeMap<ProviderId, (ModelId, SourceId)> = BTreeMap::new();
+    let mut provider_mappings: BTreeMap<TargetIdentity, (ModelId, SourceId)> = BTreeMap::new();
 
     for candidate in candidates {
-        if let Some((upstream, first_source)) = provider_mappings.get(&candidate.provider) {
+        let identity = TargetIdentity {
+            provider: candidate.provider.clone(),
+            account: candidate.account.clone(),
+            account_pool: candidate.account_pool.clone(),
+        };
+        if let Some((upstream, first_source)) = provider_mappings.get(&identity) {
             if upstream != &candidate.upstream_model {
                 return Err(CatalogError::ConflictingPublicMapping {
                     conflict: Box::new(PublicMappingConflict {
                         public_model: public_id,
                         provider: candidate.provider,
+                        account: candidate.account.clone(),
+                        account_pool: candidate.account_pool.clone(),
                         first_upstream: upstream.clone(),
                         first_source: first_source.clone(),
                         second_upstream: candidate.upstream_model,
@@ -1276,7 +1610,7 @@ fn compile_public_model(
             }
         } else {
             provider_mappings.insert(
-                candidate.provider.clone(),
+                identity,
                 (
                     candidate.upstream_model.clone(),
                     candidate.provenance.source.clone(),
@@ -1286,14 +1620,39 @@ fn compile_public_model(
 
         if let Some(target) = targets.iter_mut().find(|target| {
             target.provider == candidate.provider
+                && target.account() == candidate.account.as_deref()
+                && target.account_pool() == candidate.account_pool.as_deref()
                 && target.upstream_model == candidate.upstream_model
         }) {
             target.capabilities = target.capabilities.intersection(candidate.capabilities);
             target.force_mapping |= candidate.force_mapping;
-            target.priority = target.priority.max(candidate.priority);
+            if candidate.priority < target.priority {
+                target.priority = candidate.priority;
+                target.signed_priority = candidate.signed_priority;
+                target.binding.priority = candidate.priority;
+                target.binding.signed_priority = candidate.signed_priority;
+            }
             target.provenance.push(candidate.provenance);
         } else {
+            let binding_id =
+                TargetBindingId::new(public_id.as_str(), candidate.provenance.source.as_str())
+                    .map_err(|error| CatalogError::InvalidBinding {
+                        source_id: candidate.provenance.source.clone(),
+                        model: public_id.clone(),
+                        message: error.to_string(),
+                    })?;
             targets.push(CatalogTarget {
+                binding: CatalogBindingDescriptor {
+                    binding_id: binding_id.to_string(),
+                    model: public_id.clone(),
+                    target_id: candidate.provenance.source.to_string(),
+                    provider: candidate.provider.clone(),
+                    account: candidate.account.clone(),
+                    account_pool: candidate.account_pool.clone(),
+                    upstream_model: candidate.upstream_model.clone(),
+                    priority: candidate.priority,
+                    signed_priority: candidate.signed_priority,
+                },
                 provider: candidate.provider,
                 upstream_model: candidate.upstream_model,
                 capabilities: candidate.capabilities,
@@ -1301,6 +1660,7 @@ fn compile_public_model(
                 profile: candidate.profile,
                 force_mapping: candidate.force_mapping,
                 priority: candidate.priority,
+                signed_priority: candidate.signed_priority,
                 provenance: vec![candidate.provenance],
             });
         }
@@ -1343,6 +1703,9 @@ pub enum DiscoveryFailureKind {
     Provider,
     /// The provider response did not match the selected bounded parser.
     InvalidResponse,
+    /// No verified provider model-list contract exists; an operator must
+    /// supply an explicit model ID instead of an invented discovery path.
+    ManualModelRequired,
     /// A response or parser resource bound was exceeded.
     LimitExceeded,
     /// Runtime shutdown cancelled the discovery attempt.
@@ -1358,6 +1721,7 @@ impl Display for DiscoveryFailureKind {
             Self::Authentication => "authentication",
             Self::Provider => "provider",
             Self::InvalidResponse => "invalid_response",
+            Self::ManualModelRequired => "manual_model_required",
             Self::LimitExceeded => "limit_exceeded",
             Self::Cancelled => "cancelled",
             Self::Internal => "internal",
@@ -1443,6 +1807,13 @@ pub struct CatalogService {
     overrides: Arc<ModelOverrides>,
     snapshot: ArcSwap<CatalogSnapshot>,
     refresh_gate: Arc<Semaphore>,
+    selections: Arc<Mutex<BTreeMap<SourceId, SourceSelection>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceSelection {
+    action: ModelSelectionAction,
+    explicit_exclusions: BTreeSet<ModelId>,
 }
 
 impl CatalogService {
@@ -1472,6 +1843,12 @@ impl CatalogService {
             overrides: Arc::new(ModelOverrides::default()),
             snapshot: ArcSwap::from_pointee(CatalogSnapshot::empty()),
             refresh_gate: Arc::new(Semaphore::new(1)),
+            selections: Arc::new(Mutex::new(
+                source_ids
+                    .into_iter()
+                    .map(|source_id| (source_id, SourceSelection::default()))
+                    .collect(),
+            )),
         })
     }
 
@@ -1492,6 +1869,114 @@ impl CatalogService {
     #[must_use]
     pub fn snapshot(&self) -> Arc<CatalogSnapshot> {
         self.snapshot.load_full()
+    }
+
+    /// Apply one typed source-local bulk exposure operation.
+    pub fn apply_selection(
+        &self,
+        source_id: &str,
+        action: ModelSelectionAction,
+    ) -> Result<(), CatalogError> {
+        let mut selections = self
+            .selections
+            .lock()
+            .map_err(|_| CatalogError::SelectionStateUnavailable)?;
+        let source_id = SourceId::new(source_id.to_owned()).map_err(|_| {
+            CatalogError::UnknownSelectionSource {
+                source_id: source_id.to_owned(),
+            }
+        })?;
+        let selection =
+            selections
+                .get_mut(&source_id)
+                .ok_or_else(|| CatalogError::UnknownSelectionSource {
+                    source_id: source_id.to_string(),
+                })?;
+        selection.action = action;
+        Ok(())
+    }
+
+    /// Convenience operation equivalent to [`ModelSelectionAction::SelectAll`].
+    pub fn select_all(&self, source_id: &str) -> Result<(), CatalogError> {
+        self.apply_selection(source_id, ModelSelectionAction::SelectAll)
+    }
+
+    /// Convenience operation equivalent to [`ModelSelectionAction::SelectNone`].
+    pub fn select_none(&self, source_id: &str) -> Result<(), CatalogError> {
+        self.apply_selection(source_id, ModelSelectionAction::SelectNone)
+    }
+
+    /// Add one explicit upstream model exclusion without changing the bulk
+    /// action. The exclusion is preserved across every later refresh.
+    pub fn exclude_model(&self, source_id: &str, model: &str) -> Result<(), CatalogError> {
+        let mut selections = self
+            .selections
+            .lock()
+            .map_err(|_| CatalogError::SelectionStateUnavailable)?;
+        let source_id = SourceId::new(source_id.to_owned()).map_err(|_| {
+            CatalogError::UnknownSelectionSource {
+                source_id: source_id.to_owned(),
+            }
+        })?;
+        let model =
+            ModelId::new(model.to_owned()).map_err(|_| CatalogError::InvalidSelectionModel {
+                model: model.to_owned(),
+            })?;
+        let selection =
+            selections
+                .get_mut(&source_id)
+                .ok_or_else(|| CatalogError::UnknownSelectionSource {
+                    source_id: source_id.to_string(),
+                })?;
+        selection.explicit_exclusions.insert(model);
+        Ok(())
+    }
+
+    /// Remove one explicit exclusion, retaining the current bulk action.
+    pub fn include_model(&self, source_id: &str, model: &str) -> Result<(), CatalogError> {
+        let mut selections = self
+            .selections
+            .lock()
+            .map_err(|_| CatalogError::SelectionStateUnavailable)?;
+        let source_id = SourceId::new(source_id.to_owned()).map_err(|_| {
+            CatalogError::UnknownSelectionSource {
+                source_id: source_id.to_owned(),
+            }
+        })?;
+        let model =
+            ModelId::new(model.to_owned()).map_err(|_| CatalogError::InvalidSelectionModel {
+                model: model.to_owned(),
+            })?;
+        let selection =
+            selections
+                .get_mut(&source_id)
+                .ok_or_else(|| CatalogError::UnknownSelectionSource {
+                    source_id: source_id.to_string(),
+                })?;
+        selection.explicit_exclusions.remove(&model);
+        Ok(())
+    }
+
+    /// Read the redacted source-local selection state.
+    pub fn selection_state(&self, source_id: &str) -> Result<ModelSelectionState, CatalogError> {
+        let selections = self
+            .selections
+            .lock()
+            .map_err(|_| CatalogError::SelectionStateUnavailable)?;
+        let source_id_value = SourceId::new(source_id.to_owned()).map_err(|_| {
+            CatalogError::UnknownSelectionSource {
+                source_id: source_id.to_owned(),
+            }
+        })?;
+        let selection = selections.get(&source_id_value).ok_or_else(|| {
+            CatalogError::UnknownSelectionSource {
+                source_id: source_id.to_owned(),
+            }
+        })?;
+        Ok(ModelSelectionState {
+            action: selection.action,
+            explicit_exclusions: selection.explicit_exclusions.iter().cloned().collect(),
+        })
     }
 
     /// Refresh all sources and atomically publish only a complete valid result.
@@ -1520,12 +2005,18 @@ impl CatalogService {
             })?;
         responses.sort_by(|left, right| source_order(&left.0, &right.0));
 
+        let selections = self
+            .selections
+            .lock()
+            .map_err(|_| CatalogError::SelectionStateUnavailable)?
+            .clone();
         let mut inputs = Vec::with_capacity(responses.len());
         for (source, response) in responses {
-            let response = response.map_err(|failure| CatalogError::DiscoveryFailed {
+            let mut response = response.map_err(|failure| CatalogError::DiscoveryFailed {
                 source_id: source.id.clone(),
                 kind: failure.kind(),
             })?;
+            apply_selection(&mut response, selections.get(&source.id));
             inputs.push(CatalogInput::new(source, response));
         }
 
@@ -1559,6 +2050,16 @@ impl CatalogService {
         self.snapshot.store(Arc::new(candidate));
         Ok(report)
     }
+}
+
+fn apply_selection(response: &mut DiscoveryResponse, selection: Option<&SourceSelection>) {
+    let Some(selection) = selection else {
+        return;
+    };
+    response.models.retain(|model| {
+        matches!(selection.action, ModelSelectionAction::SelectAll)
+            && !selection.explicit_exclusions.contains(&model.id)
+    });
 }
 
 impl fmt::Debug for CatalogService {
@@ -1610,11 +2111,13 @@ impl RefreshReport {
 /// Deterministic details for an ambiguous public/provider mapping.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error(
-    "public model {public_model} maps provider {provider} to both {first_upstream} ({first_source}) and {second_upstream} ({second_source})"
+    "public model {public_model} maps provider {provider} account {account:?} pool {account_pool:?} to both {first_upstream} ({first_source}) and {second_upstream} ({second_source})"
 )]
 pub struct PublicMappingConflict {
     public_model: ModelId,
     provider: ProviderId,
+    account: Option<String>,
+    account_pool: Option<String>,
     first_upstream: ModelId,
     first_source: SourceId,
     second_upstream: ModelId,
@@ -1632,6 +2135,18 @@ impl PublicMappingConflict {
     #[must_use]
     pub const fn provider(&self) -> &ProviderId {
         &self.provider
+    }
+
+    /// Exact account binding whose upstream mapping is ambiguous.
+    #[must_use]
+    pub fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+
+    /// Homogeneous pool binding whose upstream mapping is ambiguous.
+    #[must_use]
+    pub fn account_pool(&self) -> Option<&str> {
+        self.account_pool.as_deref()
     }
 
     /// Higher-priority deterministic mapping.
@@ -1674,6 +2189,22 @@ pub enum CatalogError {
     /// Invalid source prefix.
     #[error("catalog source {source_id} has invalid prefix {prefix:?}")]
     InvalidPrefix { source_id: SourceId, prefix: String },
+    /// A discovery source selected both one account and one account pool.
+    #[error("catalog source {source_id} must select exactly one account or account pool")]
+    AmbiguousSourceBinding { source_id: SourceId },
+    /// An account or account-pool selector is malformed.
+    #[error("catalog source {source_id} has an invalid {field} selector")]
+    InvalidSourceBindingName {
+        source_id: SourceId,
+        field: &'static str,
+    },
+    /// A staged model binding could not be represented by the stable ID type.
+    #[error("catalog source {source_id} cannot bind model {model}: {message}")]
+    InvalidBinding {
+        source_id: SourceId,
+        model: ModelId,
+        message: String,
+    },
     /// Invalid overridden model identifier.
     #[error("invalid model override id: {message}")]
     InvalidOverrideModel { message: String },
@@ -1810,6 +2341,15 @@ pub enum CatalogError {
     /// A refresh is already active.
     #[error("model catalog refresh is already in progress")]
     RefreshInProgress,
+    /// A source selection operation named an unknown source.
+    #[error("catalog source {source_id} is not registered for model selection")]
+    UnknownSelectionSource { source_id: String },
+    /// A selection operation could not validate its model ID.
+    #[error("catalog selection model {model:?} is invalid")]
+    InvalidSelectionModel { model: String },
+    /// The in-memory selection control state was poisoned or unavailable.
+    #[error("catalog model selection state is unavailable")]
+    SelectionStateUnavailable,
     /// Complete refresh deadline elapsed.
     #[error("model catalog refresh exceeded {timeout_ms}ms")]
     RefreshTimedOut { timeout_ms: u64 },
@@ -1835,19 +2375,18 @@ fn source_order(left: &CatalogSource, right: &CatalogSource) -> std::cmp::Orderi
 }
 
 fn candidate_order(left: &Candidate, right: &Candidate) -> std::cmp::Ordering {
-    right
-        .priority
-        .cmp(&left.priority)
+    left.priority
+        .cmp(&right.priority)
         .then_with(|| left.provenance.source.cmp(&right.provenance.source))
         .then_with(|| left.provider.cmp(&right.provider))
         .then_with(|| left.upstream_model.cmp(&right.upstream_model))
 }
 
 fn target_order(left: &CatalogTarget, right: &CatalogTarget) -> std::cmp::Ordering {
-    right
-        .priority
-        .cmp(&left.priority)
+    left.priority
+        .cmp(&right.priority)
         .then_with(|| left.provider.cmp(&right.provider))
+        .then_with(|| left.binding.binding_id.cmp(&right.binding.binding_id))
         .then_with(|| left.upstream_model.cmp(&right.upstream_model))
 }
 
@@ -1895,6 +2434,29 @@ fn validate_prefix(source: &SourceId, prefix: String) -> Result<String, CatalogE
     } else {
         Ok(prefix)
     }
+}
+
+fn normalize_binding_name(
+    source: &SourceId,
+    value: Option<String>,
+    field: &'static str,
+) -> Result<Option<String>, CatalogError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim().to_owned();
+    if value.is_empty()
+        || value.len() > pooler_core::MAX_IDENTIFIER_LENGTH
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(CatalogError::InvalidSourceBindingName {
+            source_id: source.clone(),
+            field,
+        });
+    }
+    Ok(Some(value))
 }
 
 fn validate_display_name(source: &SourceId, display_name: &str) -> Result<(), CatalogError> {

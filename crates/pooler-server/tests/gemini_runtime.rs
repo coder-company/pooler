@@ -941,7 +941,7 @@ async fn gemini_returned_interaction_id_keeps_follow_ups_on_the_creating_account
     let config = compile_yaml(
         "gemini-interaction-affinity-runtime.yaml",
         &format!(
-            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: 'file:{}'}}\n  second: {{provider: local, secret: 'file:{}'}}\naccount_pools: {{pool: {{provider: local, accounts: [first, second]}}}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{id: public-gemini-target, provider: local, account_pool: pool, priority: 1, upstream_model: private-gemini, capabilities: [text], codecs: [], wire_family: gemini}}\npolicies:\n  interactions:\n    selection:\n      strategy: round_robin\n      affinity: {{key: gemini.interaction_id, ttl: 30m}}\nroutes:\n  - id: create\n    listen: local\n    match: {{method: POST, path: /v1beta/interactions, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model, policy: interactions}}\n    response: {{mode: opaque}}\n  - id: resource\n    listen: local\n    match: {{methods: [GET, DELETE], path_template: '/v1beta/interactions/{{interaction}}'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, policy: interactions}}\n    response: {{mode: opaque}}\n  - id: cancel\n    listen: local\n    match: {{method: POST, path_template: '/v1beta/interactions/{{interaction}}/cancel'}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, policy: interactions}}\n    response: {{mode: opaque}}\n",
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: 'file:{}'}}\n  second: {{provider: local, secret: 'file:{}'}}\naccount_pools: {{pool: {{provider: local, accounts: [first, second]}}}}\nmodels:\n  - id: public-gemini\n    targets:\n      - {{id: public-gemini-target, provider: local, account_pool: pool, priority: 1, upstream_model: private-gemini, capabilities: [text], codecs: [], wire_family: gemini}}\npolicies:\n  interactions:\n    selection:\n      strategy: round_robin\n      affinity: {{key: gemini.interaction_id, ttl: 30m}}\nroutes:\n  - id: create\n    listen: local\n    match: {{method: POST, path: /v1beta/interactions, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.gemini.generate_content}}\n    target: {{provider: local, model_from: request.model, policy: interactions}}\n    response: {{mode: opaque}}\n  - id: resource\n    listen: local\n    match: {{methods: [GET, DELETE], path_template: '/v1beta/interactions/{{interaction}}'}}\n    ingress: {{mode: opaque}}\n    target: {{provider: local, policy: interactions}}\n    response: {{mode: opaque}}\n  - id: cancel\n    listen: local\n    match: {{method: POST, path_template: '/v1beta/interactions/{{interaction}}/cancel'}}\n    ingress: {{mode: opaque}}\n    target: {{provider: local, policy: interactions}}\n    response: {{mode: opaque}}\n",
             first_secret.display(),
             second_secret.display(),
         ),
@@ -1008,10 +1008,11 @@ async fn gemini_returned_interaction_id_keeps_follow_ups_on_the_creating_account
         .expect("upstream timeout")
         .expect("upstream task");
     assert_eq!(requests.len(), 7);
-    for request in &requests {
+    for (index, request) in requests.iter().enumerate() {
         assert_eq!(
             header_value(request, "authorization"),
-            Some("Bearer first-token")
+            Some("Bearer first-token"),
+            "request {index} did not preserve the creating account"
         );
         if request.starts_with(b"POST /v1beta/interactions ") {
             assert_eq!(header_value(request, "accept-encoding"), Some("identity"));
@@ -1022,6 +1023,7 @@ async fn gemini_returned_interaction_id_keeps_follow_ups_on_the_creating_account
 
 #[tokio::test]
 async fn gemini_interaction_create_rejects_compressed_responses_before_commitment() {
+    std::env::set_var("POOLER_TEST_MODEL_KEY", "server-key");
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("compressed upstream binds");
@@ -1133,6 +1135,7 @@ fn gemini_same_wire_alias_config(
     method: &str,
     downstream_path: &str,
 ) -> pooler_config::CompiledConfig {
+    std::env::set_var("POOLER_TEST_MODEL_KEY", "server-key");
     compile_yaml(
         "gemini-same-wire-alias-runtime.yaml",
         &format!(
@@ -1143,6 +1146,7 @@ fn gemini_same_wire_alias_config(
 }
 
 fn gemini_alias_config(upstream_address: SocketAddr) -> pooler_config::CompiledConfig {
+    std::env::set_var("POOLER_TEST_MODEL_KEY", "server-key");
     compile_yaml(
         "gemini-alias-runtime.yaml",
         &format!(
@@ -1301,12 +1305,19 @@ async fn spawn_strict_codex_streaming_upstream(
                 "application/json",
                 br#"{"error":{"message":"Stream must be set to true"}}"#.to_vec(),
             )
-        } else if !request_line_ok || !authorization_ok {
+        } else if !request_line_ok {
             (
                 401,
                 "Unauthorized",
                 "application/json",
-                br#"{"error":{"message":"strict Codex contract rejected request"}}"#.to_vec(),
+                br#"{"error":{"message":"strict Codex path rejected request"}}"#.to_vec(),
+            )
+        } else if !authorization_ok {
+            (
+                401,
+                "Unauthorized",
+                "application/json",
+                br#"{"error":{"message":"strict Codex auth rejected request"}}"#.to_vec(),
             )
         } else {
             (200, "OK", "text/event-stream", streaming_body)

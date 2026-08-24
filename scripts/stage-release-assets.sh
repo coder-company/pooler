@@ -66,6 +66,7 @@ for deployment_asset in \
     "$deploy_directory"/*.example.yaml \
     "$deploy_directory"/*.service; do
     [ -e "$deployment_asset" ] || [ -L "$deployment_asset" ] || continue
+    [ "$(basename -- "$deployment_asset")" = "pooler@.service" ] && continue
     copy_regular_asset "$deployment_asset" "$stage_directory/deploy"
     deployment_count=$((deployment_count + 1))
 done
@@ -75,5 +76,12 @@ done
 }
 
 copy_regular_asset "$root_directory/docs/deployment.md" "$stage_directory/docs"
-copy_regular_asset "$root_directory/scripts/check-deployment-config.py" \
-    "$stage_directory/scripts"
+for required_script in \
+    check-deployment-config.py \
+    install-system-pooler.sh \
+    test-system-install.sh \
+    check-staged-secrets.sh \
+    release.sh; do
+    copy_regular_asset "$root_directory/scripts/$required_script" \
+        "$stage_directory/scripts"
+done

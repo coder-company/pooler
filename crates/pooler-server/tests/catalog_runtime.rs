@@ -319,6 +319,14 @@ async fn fake_provider_snapshot_drives_cli_management_shape_and_retains_last_goo
         .find(|model| model["id"] == "team/best")
         .expect("discovered alias");
     assert_eq!(discovered["selection_origin"], "discovered");
+    assert_eq!(discovered["targets"][0]["account"], "catalog-account");
+    assert_eq!(
+        discovered["targets"][0]["binding"]["provider"],
+        "provider-a"
+    );
+    assert!(discovered["targets"][0]["binding"]["binding_id"]
+        .as_str()
+        .is_some_and(|binding| binding.contains("team/best/provider-a.primary")));
     assert_eq!(
         discovered["targets"][0]["provenance"][0]["revision"],
         "fixture-revision"
@@ -327,12 +335,55 @@ async fn fake_provider_snapshot_drives_cli_management_shape_and_retains_last_goo
     let catalog = api.handle(&Method::GET, "/catalog", &management_headers);
     assert_eq!(catalog.status, StatusCode::OK);
     let catalog_text = String::from_utf8(catalog.body).expect("catalog UTF-8");
+    let catalog_value: serde_json::Value =
+        serde_json::from_str(&catalog_text).expect("catalog JSON");
     assert!(catalog_text.contains("\"prefix\":\"team\""));
     assert!(catalog_text.contains("\"alias\":\"best\""));
     assert!(catalog_text.contains("\"account\":\"catalog-account\""));
     assert!(catalog_text.contains("\"included_models\":[\"model-*\"]"));
     assert!(catalog_text.contains("\"excluded_models\":[\"*-old\"]"));
+    assert!(catalog_value["sources"]
+        .as_array()
+        .expect("catalog sources")
+        .iter()
+        .any(|source| source["state"]["provider"] == "provider-a"));
+    assert!(catalog_text.contains("\"state\":\"manual_model_required\""));
     assert!(!catalog_text.contains(SECRET_SENTINEL));
+}
+
+#[tokio::test]
+async fn an_unverified_custom_catalog_reports_manual_model_requirement_without_path() {
+    let config = pooler_config::compile_yaml(
+        "catalog-manual-model.yaml",
+        r#"
+version: 2
+management: {bind: 127.0.0.1:0}
+upstreams: {custom: {url: http://127.0.0.1:1}}
+catalog:
+  sources: [{id: custom.primary, provider: custom, parser: openai, path: /v1/models}]
+"#,
+    )
+    .expect("custom catalog config");
+    let provider = Arc::new(FakeProvider::new([Ok(FetchedCatalog::new(
+        br#"{"data":[{"id":"manual-model"}]}"#.as_slice(),
+        None,
+    ))]));
+    let runtime =
+        Arc::new(
+            CatalogRuntime::with_fetchers(
+                config.catalog().expect("catalog plan").clone(),
+                vec![CatalogFetcherRegistration::new("custom.primary", provider)
+                    .expect("registration")],
+            )
+            .expect("runtime"),
+        );
+    runtime.refresh().await.expect("bounded fixture refresh");
+    let view = pooler_server::merged_model_catalog_value(&config, Some(&runtime));
+    let source = &view["catalog_sources"][0];
+    assert_eq!(source["discovery"]["state"], "manual_model_required");
+    assert!(source["path"].is_null());
+    assert!(source["parser"].is_null());
+    assert_eq!(view["models"][0]["id"], "manual-model");
 }
 
 #[tokio::test]

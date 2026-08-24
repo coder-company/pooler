@@ -2130,6 +2130,10 @@ pub enum OAuthStoreError {
     /// The expected generation did not match the current one.
     #[error("oauth token generation conflict")]
     Conflict,
+    /// The immutable account/provider configuration no longer matches the
+    /// encrypted record being accessed.
+    #[error("oauth credential identity conflict")]
+    IdentityConflict,
     /// No token record exists for the credential.
     #[error("oauth token record was not found")]
     NotFound,
@@ -2153,6 +2157,18 @@ pub trait OAuthTokenStore: Send + Sync {
         credential: &'a CredentialId,
     ) -> OAuthStoreFuture<'a, Option<TokenSnapshot>>;
 
+    /// Load only when the persisted credential configuration fingerprint
+    /// matches the caller's compiled identity. Implementations that do not
+    /// persist identity metadata retain the legacy behavior for tests and
+    /// explicitly ephemeral stores.
+    fn load_for_fingerprint<'a>(
+        &'a self,
+        credential: &'a CredentialId,
+        _fingerprint: &'a str,
+    ) -> OAuthStoreFuture<'a, Option<TokenSnapshot>> {
+        self.load(credential)
+    }
+
     /// Commit new tokens only when the caller still owns `expected_generation`.
     fn compare_and_swap<'a>(
         &'a self,
@@ -2160,6 +2176,18 @@ pub trait OAuthTokenStore: Send + Sync {
         expected_generation: u64,
         tokens: OAuthTokens,
     ) -> OAuthStoreFuture<'a, TokenSnapshot>;
+
+    /// Commit new tokens only when both generation and immutable credential
+    /// identity still match.
+    fn compare_and_swap_for_fingerprint<'a>(
+        &'a self,
+        credential: &'a CredentialId,
+        expected_generation: u64,
+        _fingerprint: &'a str,
+        tokens: OAuthTokens,
+    ) -> OAuthStoreFuture<'a, TokenSnapshot> {
+        self.compare_and_swap(credential, expected_generation, tokens)
+    }
 
     /// Remove persisted token material after revocation or account removal.
     fn remove<'a>(&'a self, credential: &'a CredentialId) -> OAuthStoreFuture<'a, ()>;
@@ -2277,6 +2305,31 @@ pub async fn refresh_with_store_if_generation(
         expected_generation,
         cancellation,
         RenewalStrategy::RefreshToken,
+        None,
+    )
+    .await
+}
+
+/// Refresh one persisted credential under an immutable configuration
+/// fingerprint. The fingerprint is part of the singleflight and CAS key.
+pub async fn refresh_with_store_if_generation_for_fingerprint(
+    coordinator: &RefreshCoordinator,
+    provider: &dyn OAuthRefresher,
+    store: &dyn OAuthTokenStore,
+    credential: CredentialId,
+    fingerprint: impl Into<String>,
+    expected_generation: Option<u64>,
+    cancellation: CancellationToken,
+) -> Result<TokenSnapshot, OAuthError> {
+    renew_store_generation(
+        coordinator,
+        provider,
+        store,
+        credential,
+        expected_generation,
+        cancellation,
+        RenewalStrategy::RefreshToken,
+        Some(fingerprint.into()),
     )
     .await
 }
@@ -2299,6 +2352,32 @@ pub async fn renew_with_store_if_generation(
         expected_generation,
         cancellation,
         RenewalStrategy::GrantAware,
+        None,
+    )
+    .await
+}
+
+/// Renew a persisted credential under an immutable configuration fingerprint.
+/// Client-credentials and refresh-token rotations share no lease or CAS path
+/// with another configuration that reuses the same account ID.
+pub async fn renew_with_store_if_generation_for_fingerprint(
+    coordinator: &RefreshCoordinator,
+    provider: &dyn OAuthRefresher,
+    store: &dyn OAuthTokenStore,
+    credential: CredentialId,
+    fingerprint: impl Into<String>,
+    expected_generation: Option<u64>,
+    cancellation: CancellationToken,
+) -> Result<TokenSnapshot, OAuthError> {
+    renew_store_generation(
+        coordinator,
+        provider,
+        store,
+        credential,
+        expected_generation,
+        cancellation,
+        RenewalStrategy::GrantAware,
+        Some(fingerprint.into()),
     )
     .await
 }
@@ -2309,6 +2388,7 @@ enum RenewalStrategy {
     GrantAware,
 }
 
+#[allow(clippy::too_many_arguments)] // The explicit fence/cancellation inputs define one atomic refresh.
 async fn renew_store_generation(
     coordinator: &RefreshCoordinator,
     provider: &dyn OAuthRefresher,
@@ -2317,53 +2397,85 @@ async fn renew_store_generation(
     expected_generation: Option<u64>,
     cancellation: CancellationToken,
     strategy: RenewalStrategy,
+    fingerprint: Option<String>,
 ) -> Result<TokenSnapshot, OAuthError> {
     let operation_credential = credential.clone();
     let operation_cancellation = cancellation.clone();
+    let operation_fingerprint = fingerprint.clone();
+    let lease_fingerprint = fingerprint.as_deref().unwrap_or("").to_owned();
     coordinator
-        .refresh_cancellable(credential.clone(), cancellation, || async move {
-            let snapshot = store
-                .load(&operation_credential)
-                .await
+        .refresh_cancellable_for_fingerprint(
+            credential.clone(),
+            lease_fingerprint,
+            cancellation,
+            || async move {
+                let snapshot = match operation_fingerprint.as_deref() {
+                    Some(fingerprint) => {
+                        store
+                            .load_for_fingerprint(&operation_credential, fingerprint)
+                            .await
+                    }
+                    None => store.load(&operation_credential).await,
+                }
                 .map_err(|error| RefreshError::OAuth(OAuthError::Store(error)))?
                 .ok_or(RefreshError::OAuth(OAuthError::NoRefreshToken))?;
-            if expected_generation.is_some_and(|expected| snapshot.generation() != expected) {
-                return Ok(snapshot.tokens().clone());
-            }
-            let tokens = match strategy {
-                RenewalStrategy::RefreshToken => {
-                    let refresh_token = snapshot
-                        .tokens()
-                        .refresh_token()
-                        .ok_or(RefreshError::OAuth(OAuthError::NoRefreshToken))?
-                        .clone();
-                    provider
-                        .refresh(&refresh_token, operation_cancellation.clone())
-                        .await
+                if expected_generation.is_some_and(|expected| snapshot.generation() != expected) {
+                    return Ok(snapshot.tokens().clone());
                 }
-                RenewalStrategy::GrantAware => {
-                    provider
-                        .renew(snapshot.tokens(), operation_cancellation.clone())
-                        .await
+                let tokens = match strategy {
+                    RenewalStrategy::RefreshToken => {
+                        let refresh_token = snapshot
+                            .tokens()
+                            .refresh_token()
+                            .ok_or(RefreshError::OAuth(OAuthError::NoRefreshToken))?
+                            .clone();
+                        provider
+                            .refresh(&refresh_token, operation_cancellation.clone())
+                            .await
+                    }
+                    RenewalStrategy::GrantAware => {
+                        provider
+                            .renew(snapshot.tokens(), operation_cancellation.clone())
+                            .await
+                    }
                 }
-            }
-            .map_err(refresh_error)?;
-            store
-                .compare_and_swap(&operation_credential, snapshot.generation(), tokens.clone())
-                .await
-                .map_err(|error| match error {
+                .map_err(refresh_error)?;
+                let result = match operation_fingerprint.as_deref() {
+                    Some(fingerprint) => {
+                        store
+                            .compare_and_swap_for_fingerprint(
+                                &operation_credential,
+                                snapshot.generation(),
+                                fingerprint,
+                                tokens.clone(),
+                            )
+                            .await
+                    }
+                    None => {
+                        store
+                            .compare_and_swap(
+                                &operation_credential,
+                                snapshot.generation(),
+                                tokens.clone(),
+                            )
+                            .await
+                    }
+                };
+                result.map_err(|error| match error {
                     OAuthStoreError::Conflict => RefreshError::GenerationConflict,
                     other => RefreshError::OAuth(OAuthError::Store(other)),
                 })?;
-            Ok(tokens)
-        })
+                Ok(tokens)
+            },
+        )
         .await
         .map_err(oauth_refresh_error)?;
-    store
-        .load(&credential)
-        .await
-        .map_err(OAuthError::Store)?
-        .ok_or(OAuthError::NoRefreshToken)
+    match fingerprint.as_deref() {
+        Some(fingerprint) => store.load_for_fingerprint(&credential, fingerprint).await,
+        None => store.load(&credential).await,
+    }
+    .map_err(OAuthError::Store)?
+    .ok_or(OAuthError::NoRefreshToken)
 }
 
 fn refresh_error(error: OAuthError) -> RefreshError {

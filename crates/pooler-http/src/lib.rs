@@ -43,8 +43,9 @@ pub use media::{
     MediaSemanticAdapter, MediaSemanticAdapterError, MEDIA_BINARY_DECODER, MEDIA_MULTIPART_DECODER,
 };
 pub use native::{
-    NativeAuthorization, NativeAuthorizationRequest, NativeBrowserAuthorization,
-    NativeBrowserLoginSession, NativeOAuthLoginResult, NativeRuntime, NativeRuntimeError,
+    account_configuration_fingerprint, NativeAuthorization, NativeAuthorizationRequest,
+    NativeBrowserAuthorization, NativeBrowserLoginSession, NativeOAuthLoginResult, NativeRuntime,
+    NativeRuntimeError,
 };
 pub use pool::{
     apply_configured_account_auth, PersistenceStatus, PersistenceStream, PoolError, PoolFailure,

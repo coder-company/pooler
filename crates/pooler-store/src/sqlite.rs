@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{
+    backup::Backup, params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 
 use crate::{
-    encrypted::{CredentialCipher, CredentialPayload},
+    encrypted::{CredentialCipher, CredentialPayload, CREDENTIAL_IDENTITY_AAD_VERSION},
     hex_digest, non_empty, validate_fingerprint, AffinityBindingIdentity, AuditRecord,
     CooldownState, CredentialHealthState, CredentialHealthStatus, CredentialState, DecisionRecord,
     DraftRecord, ManagedSecretRecord, ManagementSessionRecord, MasterKey, MemoryStore,
@@ -23,7 +25,7 @@ use crate::{
 };
 
 const MAX_COOLDOWNS: usize = 4_096;
-const LATEST_SCHEMA_VERSION: i64 = 8;
+const LATEST_SCHEMA_VERSION: i64 = 9;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/001_initial.sql")),
     (2, include_str!("migrations/002_health_and_cooldowns.sql")),
@@ -33,6 +35,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, include_str!("migrations/006_request_event_indexes.sql")),
     (7, include_str!("migrations/007_encryption_fence.sql")),
     (8, include_str!("migrations/008_control_plane_identity.sql")),
+    (
+        9,
+        include_str!("migrations/009_reload_completion_generation.sql"),
+    ),
 ];
 
 /// A transactional, WAL-backed SQLite [`Store`].
@@ -55,6 +61,30 @@ impl std::fmt::Debug for SqliteStore {
 }
 
 impl SqliteStore {
+    /// Checkpoint a quiesced source database and copy its main database with
+    /// SQLite's online-backup API.
+    ///
+    /// The caller must have stopped every writer before entering this
+    /// boundary. The exclusive transaction is an additional fail-closed
+    /// guard against a writer that was not stopped; it is released only after
+    /// the backup has completed. WAL and SHM files are intentionally not
+    /// copied: a completed TRUNCATE checkpoint makes the staged main database
+    /// self-contained.
+    pub fn checkpoint_and_backup_quiesced(
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> StoreResult<()> {
+        checkpoint_and_backup_quiesced(source.as_ref(), destination.as_ref())
+    }
+
+    /// Compatibility spelling for migration callers.
+    pub fn backup_quiesced(
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> StoreResult<()> {
+        Self::checkpoint_and_backup_quiesced(source, destination)
+    }
+
     /// Open or create a private on-disk database using the default retention.
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         Self::open_with_retention(path, RetentionPolicy::default())
@@ -180,6 +210,23 @@ impl SqliteStore {
     pub fn credential_payload_count(&self) -> StoreResult<usize> {
         let connection = self.connection()?;
         count_rows(&connection, "credential_payloads")
+    }
+
+    /// Return whether one credential owns an encrypted payload without
+    /// opening its envelope. This metadata-only check lets callers reject
+    /// legacy identity adoption before any token material is touched.
+    pub fn credential_payload_exists(&self, credential_id: &str) -> StoreResult<bool> {
+        non_empty("credential_id", credential_id)?;
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT 1 FROM credential_payloads WHERE credential_id = ?1",
+                [credential_id],
+                |_row| Ok(true),
+            )
+            .optional()
+            .map(|value| value.is_some())
+            .map_err(sqlite_error)
     }
 
     /// Persist one encrypted credential payload.
@@ -523,6 +570,58 @@ impl SqliteStore {
                 .map(|payload| (state, payload))
         })
         .transpose()
+    }
+
+    /// Load credential metadata and its encrypted payload only after the
+    /// caller's immutable configuration fingerprint matches. The comparison
+    /// is deliberately performed while the ciphertext is still opaque so a
+    /// reused account ID cannot become a decryption oracle or overwrite path.
+    pub fn credential_payload_with_state_for_fingerprint(
+        &self,
+        credential_id: &str,
+        configuration_fingerprint: &str,
+    ) -> StoreResult<Option<(CredentialState, Option<CredentialPayload>)>> {
+        non_empty("credential_id", credential_id)?;
+        validate_fingerprint(configuration_fingerprint)?;
+        let encryption = self.encryption_read()?;
+        let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
+        let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, cipher)?;
+        let row = connection
+            .query_row(
+                "SELECT c.credential_id, c.provider_id, c.configuration_fingerprint,
+                        c.enabled, c.updated_at, c.revision, p.envelope
+                 FROM credentials AS c
+                 LEFT JOIN credential_payloads AS p
+                   ON p.credential_id = c.credential_id
+                 WHERE c.credential_id = ?1",
+                [credential_id],
+                |row| {
+                    let state = CredentialState {
+                        credential_id: row.get(0)?,
+                        provider_id: row.get(1)?,
+                        configuration_fingerprint: row.get(2)?,
+                        enabled: row.get::<_, i64>(3)? != 0,
+                        updated_at: row.get(4)?,
+                        revision: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(u64::MAX),
+                    };
+                    let envelope = row.get::<_, Option<Vec<u8>>>(6)?;
+                    Ok((state, envelope))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        let Some((state, envelope)) = row else {
+            return Ok(None);
+        };
+        if state.configuration_fingerprint != configuration_fingerprint {
+            return Err(StoreError::CredentialFingerprintConflict);
+        }
+        let aad = credential_payload_aad(credential_id, &state.configuration_fingerprint);
+        envelope
+            .map(|value| cipher.open_for(&value, &aad))
+            .transpose()
+            .map(|payload| Some((state, payload)))
     }
 
     /// Explicitly adopt a new immutable credential identity. Legacy rows use
@@ -1644,12 +1743,15 @@ impl SqliteStore {
             transaction
                 .execute(
                     "INSERT INTO management_reload_records
-                     (owner_id, generation, status, etag, error_code,
+                     (owner_id, generation, completed_generation, status, etag, error_code,
                       started_at, completed_at, revision)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
                     params![
                         &record.owner_id,
                         i64::try_from(record.generation).unwrap_or(i64::MAX),
+                        record
+                            .completed_generation
+                            .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
                         &record.status,
                         &record.etag,
                         &record.error_code,
@@ -1678,6 +1780,7 @@ impl SqliteStore {
         status: &str,
         error_code: Option<&str>,
         completed_at: Option<Timestamp>,
+        completed_generation: Option<u64>,
     ) -> StoreResult<ReloadRecord> {
         validate_control_text("status", status, 128)?;
         if let Some(error_code) = error_code {
@@ -1686,7 +1789,7 @@ impl SqliteStore {
         self.with_immediate_transaction(|transaction| {
             let current = transaction
                 .query_row(
-                    "SELECT id, owner_id, generation, status, etag, error_code,
+                    "SELECT id, owner_id, generation, completed_generation, status, etag, error_code,
                             started_at, completed_at, revision
                      FROM management_reload_records WHERE id = ?1",
                     [i64::try_from(record_id).unwrap_or(i64::MAX)],
@@ -1702,12 +1805,14 @@ impl SqliteStore {
             let changed = transaction
                 .execute(
                     "UPDATE management_reload_records
-                     SET status = ?1, error_code = ?2, completed_at = ?3, revision = ?4
-                     WHERE id = ?5 AND revision = ?6",
+                     SET status = ?1, error_code = ?2, completed_at = ?3,
+                         completed_generation = ?4, revision = ?5
+                     WHERE id = ?6 AND revision = ?7",
                     params![
                         status,
                         error_code,
                         completed_at,
+                        completed_generation.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
                         i64::try_from(revision).unwrap_or(i64::MAX),
                         i64::try_from(record_id).unwrap_or(i64::MAX),
                         i64::try_from(expected_revision).unwrap_or(i64::MAX),
@@ -1721,6 +1826,7 @@ impl SqliteStore {
                 status: status.to_owned(),
                 error_code: error_code.map(ToOwned::to_owned),
                 completed_at,
+                completed_generation,
                 revision,
                 ..current
             })
@@ -1731,7 +1837,7 @@ impl SqliteStore {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT id, owner_id, generation, status, etag, error_code,
+                "SELECT id, owner_id, generation, completed_generation, status, etag, error_code,
                         started_at, completed_at, revision
                  FROM management_reload_records ORDER BY id ASC",
             )
@@ -2117,6 +2223,109 @@ fn initialize_connection(
         path,
         encryption: Arc::new(RwLock::new(encryption)),
     })
+}
+
+fn checkpoint_and_backup_quiesced(source: &Path, destination: &Path) -> StoreResult<()> {
+    if source.as_os_str().is_empty() || destination.as_os_str().is_empty() {
+        return Err(StoreError::InvalidPath(
+            "SQLite backup paths must not be empty".to_owned(),
+        ));
+    }
+    let source_metadata = fs::symlink_metadata(source).map_err(io_error)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(StoreError::InvalidPath(
+            "SQLite backup source must be a regular file".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if source_metadata.permissions().mode() & 0o077 != 0 {
+            return Err(StoreError::UnsafePath(
+                "SQLite backup source must be owner-private".to_owned(),
+            ));
+        }
+    }
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(StoreError::InvalidPath(
+            "SQLite backup destination already exists".to_owned(),
+        ));
+    }
+    if let Some(parent) = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        if !parent.is_dir() {
+            return Err(StoreError::InvalidPath(
+                "SQLite backup destination parent is not a directory".to_owned(),
+            ));
+        }
+    }
+
+    let source_connection = Connection::open(source).map_err(sqlite_error)?;
+    source_connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(sqlite_error)?;
+    let result = (|| {
+        // The caller has already quiesced the owning service. Checkpoint first
+        // so the backup does not depend on WAL/SHM sidecars. SQLite's online
+        // backup API must not be started from a connection holding a write
+        // transaction, so the quiescence contract is enforced by the caller.
+        checkpoint_connection(&source_connection)?;
+        let mut destination_connection = Connection::open(destination).map_err(sqlite_error)?;
+        let backup_result = (|| {
+            let backup = Backup::new(&source_connection, &mut destination_connection)
+                .map_err(sqlite_error)?;
+            backup
+                .run_to_completion(256, Duration::from_millis(1), None)
+                .map_err(sqlite_error)
+        })();
+        drop(destination_connection);
+        backup_result?;
+        checkpoint_connection(&source_connection)?;
+        let destination_connection = Connection::open(destination).map_err(sqlite_error)?;
+        let integrity: String = destination_connection
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .map_err(sqlite_error)?;
+        if !integrity.eq_ignore_ascii_case("ok") {
+            return Err(StoreError::Sqlite(format!(
+                "SQLite backup integrity check reported `{integrity}`"
+            )));
+        }
+        drop(destination_connection);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(destination, fs::Permissions::from_mode(0o600))
+                .map_err(io_error)?;
+        }
+        fs::File::open(destination)
+            .and_then(|file| file.sync_all())
+            .map_err(io_error)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(destination);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = destination.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(sidecar));
+        }
+    }
+    result
+}
+
+fn checkpoint_connection(connection: &Connection) -> StoreResult<()> {
+    let result = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(sqlite_error)?;
+    if result.0 != 0 {
+        return Err(StoreError::Sqlite(
+            "SQLite WAL checkpoint remained busy".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn migrate(connection: &mut Connection) -> StoreResult<()> {
@@ -3031,12 +3240,15 @@ fn reload_from_row(row: &Row<'_>) -> rusqlite::Result<ReloadRecord> {
         id: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(u64::MAX),
         owner_id: row.get(1)?,
         generation: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(u64::MAX),
-        status: row.get(3)?,
-        etag: row.get(4)?,
-        error_code: row.get(5)?,
-        started_at: row.get(6)?,
-        completed_at: row.get(7)?,
-        revision: u64::try_from(row.get::<_, i64>(8)?).unwrap_or(u64::MAX),
+        completed_generation: row
+            .get::<_, Option<i64>>(3)?
+            .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+        status: row.get(4)?,
+        etag: row.get(5)?,
+        error_code: row.get(6)?,
+        started_at: row.get(7)?,
+        completed_at: row.get(8)?,
+        revision: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(u64::MAX),
     })
 }
 
@@ -3429,7 +3641,8 @@ fn credential_payload_aad(credential_id: &str, fingerprint: &str) -> Vec<u8> {
         return credential_id.as_bytes().to_vec();
     }
     format!(
-        "pooler-credential-payload:v2:{}:{}:{}",
+        "pooler-credential-payload:v{}:{}:{}:{}",
+        CREDENTIAL_IDENTITY_AAD_VERSION,
         credential_id.len(),
         credential_id,
         fingerprint
@@ -3609,32 +3822,37 @@ impl Store for SqliteStore {
         non_empty("provider_id", &state.provider_id)?;
         validate_fingerprint(&state.configuration_fingerprint)?;
         let (revision, configuration_fingerprint) = self.with_transaction(|transaction| {
-            let existing: Option<(i64, String)> = transaction
+            let existing: Option<(String, i64, String, bool)> = transaction
                 .query_row(
-                    "SELECT revision, configuration_fingerprint
+                    "SELECT provider_id, revision, configuration_fingerprint,
+                            EXISTS(SELECT 1 FROM credential_payloads
+                                   WHERE credential_id = credentials.credential_id)
                      FROM credentials WHERE credential_id = ?1",
                     [&state.credential_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(sqlite_error)?;
-            if let Some((_, existing_fingerprint)) = &existing {
-                if !state.configuration_fingerprint.is_empty()
-                    && !existing_fingerprint.is_empty()
-                    && existing_fingerprint != &state.configuration_fingerprint
-                {
+            if let Some((existing_provider, _, existing_fingerprint, payload_exists)) = &existing {
+                let provider_changed = existing_provider != &state.provider_id;
+                let fingerprint_changed = !state.configuration_fingerprint.is_empty()
+                    && existing_fingerprint != &state.configuration_fingerprint;
+                if *payload_exists && (provider_changed || fingerprint_changed) {
                     return Err(StoreError::CredentialFingerprintConflict);
                 }
             }
             let configuration_fingerprint = if state.configuration_fingerprint.is_empty() {
                 existing
                     .as_ref()
-                    .map_or_else(String::new, |(_, fingerprint)| fingerprint.clone())
+                    .filter(|(provider, _, _, _)| provider == &state.provider_id)
+                    .map_or_else(String::new, |(_, _, fingerprint, _)| fingerprint.clone())
             } else {
                 state.configuration_fingerprint.clone()
             };
             let revision = existing
-                .map(|(value, _)| u64::try_from(value).unwrap_or(u64::MAX).saturating_add(1))
+                .map(|(_, value, _, _)| {
+                    u64::try_from(value).unwrap_or(u64::MAX).saturating_add(1)
+                })
                 .unwrap_or(1);
             let revision_i64 = i64::try_from(revision).unwrap_or(i64::MAX);
             transaction

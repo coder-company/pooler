@@ -962,6 +962,22 @@ pub struct AttemptRecord {
     pub duration_ms: u64,
 }
 
+/// One bounded adaptive-routing telemetry observation. The binding label is a
+/// stable target identity, never a credential or request value.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RoutingTelemetryRecord {
+    pub route: String,
+    pub provider: String,
+    pub binding: String,
+    pub observed_at_ms: u64,
+    pub sample_count: u32,
+    pub rolling_window_ms: u64,
+    pub stale_after_ms: u64,
+    pub latency_ms: Option<u64>,
+    pub ttft_ms: Option<u64>,
+    pub throughput_per_second: Option<u64>,
+}
+
 impl AttemptRecord {
     #[must_use]
     pub fn new(route: impl AsRef<str>, provider: impl AsRef<str>, result: AttemptResult) -> Self {
@@ -1131,6 +1147,7 @@ struct MetricsState {
     states: BTreeMap<StateKey, u64>,
     usage: BTreeMap<UsageKey, UsageMetric>,
     decisions: BTreeMap<DecisionKey, u64>,
+    routing_telemetry: BTreeMap<(String, String, String), RoutingTelemetryRecord>,
     series: usize,
     dropped_series: u64,
 }
@@ -1240,6 +1257,26 @@ impl MetricsRegistry {
             record.duration_ms,
             self.config.max_series,
         );
+    }
+
+    /// Retain one bounded routing sample for adaptive policy. Values are
+    /// folded by route/provider/binding and never retain request content.
+    pub fn record_routing_telemetry(&self, mut record: RoutingTelemetryRecord) {
+        record.route = bounded_label(&record.route);
+        record.provider = bounded_label(&record.provider);
+        record.binding = bounded_label(&record.binding);
+        record.sample_count = record.sample_count.max(1);
+        let key = (
+            record.route.clone(),
+            record.provider.clone(),
+            record.binding.clone(),
+        );
+        let mut state = lock_unpoisoned(&self.state);
+        let exists = state.routing_telemetry.contains_key(&key);
+        if !exists && !reserve_series(&mut state, false, self.config.max_series) {
+            return;
+        }
+        state.routing_telemetry.insert(key, record);
     }
 
     /// Record a retry or fallback decision.
@@ -1422,6 +1459,7 @@ impl MetricsRegistry {
                 count: *count,
             })
             .collect();
+        let routing_telemetry = state.routing_telemetry.values().cloned().collect();
         MetricsSnapshot {
             routes,
             attempts,
@@ -1431,6 +1469,7 @@ impl MetricsRegistry {
             states,
             usage,
             decisions,
+            routing_telemetry,
             dropped_series: state.dropped_series,
         }
     }
@@ -1694,6 +1733,7 @@ pub struct MetricsSnapshot {
     pub states: Vec<StateMetric>,
     pub usage: Vec<UsageMetricSnapshot>,
     pub decisions: Vec<DecisionMetric>,
+    pub routing_telemetry: Vec<RoutingTelemetryRecord>,
     pub dropped_series: u64,
 }
 
@@ -2289,12 +2329,39 @@ impl From<&pooler_store::DecisionRecord> for DecisionRecord {
 fn observe_filter_reason(reason: &pooler_policy::FilterReason) -> String {
     match reason {
         pooler_policy::FilterReason::ModelMismatch => "model_mismatch".to_owned(),
+        pooler_policy::FilterReason::ProviderNotAllowed => "provider_not_allowed".to_owned(),
+        pooler_policy::FilterReason::ProviderDenied => "provider_denied".to_owned(),
+        pooler_policy::FilterReason::TargetNotAllowed => "target_not_allowed".to_owned(),
+        pooler_policy::FilterReason::TargetDenied => "target_denied".to_owned(),
+        pooler_policy::FilterReason::FallbackDisabled => "fallback_disabled".to_owned(),
         pooler_policy::FilterReason::MissingCapability(value) => {
             format!("missing_capability:{value}")
         }
         pooler_policy::FilterReason::CodecUnavailable(value) => {
             format!("codec_unavailable:{value}")
         }
+        pooler_policy::FilterReason::MissingParameter(value) => {
+            format!("missing_parameter:{value}")
+        }
+        pooler_policy::FilterReason::UnknownParameters => "unknown_parameters".to_owned(),
+        pooler_policy::FilterReason::MissingContext => "missing_context".to_owned(),
+        pooler_policy::FilterReason::UnknownContext => "unknown_context".to_owned(),
+        pooler_policy::FilterReason::MissingQuantization(value) => {
+            format!("missing_quantization:{value}")
+        }
+        pooler_policy::FilterReason::UnknownQuantization => "unknown_quantization".to_owned(),
+        pooler_policy::FilterReason::PrivacyMismatch => "privacy_mismatch".to_owned(),
+        pooler_policy::FilterReason::UnknownPrivacy => "unknown_privacy".to_owned(),
+        pooler_policy::FilterReason::ZdrRequired => "zdr_required".to_owned(),
+        pooler_policy::FilterReason::UnknownZdr => "unknown_zdr".to_owned(),
+        pooler_policy::FilterReason::DataPolicyMismatch => "data_policy_mismatch".to_owned(),
+        pooler_policy::FilterReason::UnknownDataPolicy => "unknown_data_policy".to_owned(),
+        pooler_policy::FilterReason::RegionMismatch => "region_mismatch".to_owned(),
+        pooler_policy::FilterReason::UnknownRegion => "unknown_region".to_owned(),
+        pooler_policy::FilterReason::PriceExceeded => "price_exceeded".to_owned(),
+        pooler_policy::FilterReason::UnknownPrice => "unknown_price".to_owned(),
+        pooler_policy::FilterReason::StaleTelemetry => "stale_telemetry".to_owned(),
+        pooler_policy::FilterReason::UnknownTelemetry => "unknown_telemetry".to_owned(),
         pooler_policy::FilterReason::CredentialUnavailable => "credential_unavailable".to_owned(),
         pooler_policy::FilterReason::CredentialCooldown => "credential_cooldown".to_owned(),
         pooler_policy::FilterReason::CredentialModelCooldown => {

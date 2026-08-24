@@ -536,6 +536,8 @@ impl DecisionRecord {
             record.selected_provider = Some(selected.provider.to_string());
             record.selected_credential = Some(selected.credential_pseudonym.as_str().to_owned());
             record.upstream_model = Some(selected.model.to_string());
+            record.target_binding_id = selected.target_id.as_ref().map(ToString::to_string);
+            record.priority_tier = selected.priority;
         }
         record.reason = selection_reason(selection);
         record
@@ -794,6 +796,7 @@ pub struct ReloadRecord {
     pub id: u64,
     pub owner_id: Option<String>,
     pub generation: u64,
+    pub completed_generation: Option<u64>,
     pub status: String,
     pub etag: Option<String>,
     pub error_code: Option<String>,
@@ -814,6 +817,7 @@ impl ReloadRecord {
             id: 0,
             owner_id,
             generation,
+            completed_generation: None,
             status: status.into(),
             etag: None,
             error_code: None,
@@ -935,12 +939,39 @@ fn decision_reason(reasons: &[pooler_policy::FilterReason]) -> Option<String> {
 fn filter_reason(reason: &pooler_policy::FilterReason) -> String {
     match reason {
         pooler_policy::FilterReason::ModelMismatch => "model_mismatch".to_owned(),
+        pooler_policy::FilterReason::ProviderNotAllowed => "provider_not_allowed".to_owned(),
+        pooler_policy::FilterReason::ProviderDenied => "provider_denied".to_owned(),
+        pooler_policy::FilterReason::TargetNotAllowed => "target_not_allowed".to_owned(),
+        pooler_policy::FilterReason::TargetDenied => "target_denied".to_owned(),
+        pooler_policy::FilterReason::FallbackDisabled => "fallback_disabled".to_owned(),
         pooler_policy::FilterReason::MissingCapability(value) => {
             format!("missing_capability:{value}")
         }
         pooler_policy::FilterReason::CodecUnavailable(value) => {
             format!("codec_unavailable:{value}")
         }
+        pooler_policy::FilterReason::MissingParameter(value) => {
+            format!("missing_parameter:{value}")
+        }
+        pooler_policy::FilterReason::UnknownParameters => "unknown_parameters".to_owned(),
+        pooler_policy::FilterReason::MissingContext => "missing_context".to_owned(),
+        pooler_policy::FilterReason::UnknownContext => "unknown_context".to_owned(),
+        pooler_policy::FilterReason::MissingQuantization(value) => {
+            format!("missing_quantization:{value}")
+        }
+        pooler_policy::FilterReason::UnknownQuantization => "unknown_quantization".to_owned(),
+        pooler_policy::FilterReason::PrivacyMismatch => "privacy_mismatch".to_owned(),
+        pooler_policy::FilterReason::UnknownPrivacy => "unknown_privacy".to_owned(),
+        pooler_policy::FilterReason::ZdrRequired => "zdr_required".to_owned(),
+        pooler_policy::FilterReason::UnknownZdr => "unknown_zdr".to_owned(),
+        pooler_policy::FilterReason::DataPolicyMismatch => "data_policy_mismatch".to_owned(),
+        pooler_policy::FilterReason::UnknownDataPolicy => "unknown_data_policy".to_owned(),
+        pooler_policy::FilterReason::RegionMismatch => "region_mismatch".to_owned(),
+        pooler_policy::FilterReason::UnknownRegion => "unknown_region".to_owned(),
+        pooler_policy::FilterReason::PriceExceeded => "price_exceeded".to_owned(),
+        pooler_policy::FilterReason::UnknownPrice => "unknown_price".to_owned(),
+        pooler_policy::FilterReason::StaleTelemetry => "stale_telemetry".to_owned(),
+        pooler_policy::FilterReason::UnknownTelemetry => "unknown_telemetry".to_owned(),
         pooler_policy::FilterReason::CredentialUnavailable => "credential_unavailable".to_owned(),
         pooler_policy::FilterReason::CredentialCooldown => "credential_cooldown".to_owned(),
         pooler_policy::FilterReason::CredentialModelCooldown => {

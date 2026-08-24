@@ -8,6 +8,7 @@ usage: scripts/release.sh [options]
 Build and package Pooler for the four first-release targets.
 
 Options:
+  --check                 Validate the release asset inventory without building.
   --target TARGET       Package one target (may be repeated).
   --output DIRECTORY    Write archives and SHA256SUMS there (default: dist).
   --epoch SECONDS       Override SOURCE_DATE_EPOCH.
@@ -31,6 +32,7 @@ target_count=4
 output_directory=$root_directory/dist
 provided_binary=
 reproducibility_check=1
+check_only=0
 epoch=${SOURCE_DATE_EPOCH-}
 
 validate_target() {
@@ -46,6 +48,10 @@ validate_target() {
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --check)
+            check_only=1
+            shift
+            ;;
         --target)
             [ "$#" -ge 2 ] || usage
             validate_target "$2" || exit 2
@@ -85,6 +91,48 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+check_release_assets() {
+    required_assets="\
+deploy/pooler.service
+deploy/pooler.systemd.example.yaml
+schema/pooler.schema.json
+scripts/check-deployment-config.py
+scripts/install-system-pooler.sh
+scripts/test-system-install.sh
+scripts/check-staged-secrets.sh
+scripts/release.sh"
+    for relative_path in $required_assets; do
+        asset="$root_directory/$relative_path"
+        if [ -L "$asset" ] || [ ! -f "$asset" ]; then
+            printf 'release asset is missing or unsafe: %s\n' "$relative_path" >&2
+            exit 1
+        fi
+    done
+    if [ -f "$root_directory/Cargo.toml" ] &&
+        [ ! -f "$root_directory/crates/pooler-cli/src/production_migrate.rs" ]; then
+        printf 'release source is missing the Pooler-v1 migrator module\n' >&2
+        exit 1
+    fi
+    config_count=0
+    for config in "$root_directory"/config/*.example.yaml; do
+        [ -e "$config" ] || [ -L "$config" ] || continue
+        [ -f "$config" ] && config_count=$((config_count + 1))
+    done
+    [ "$config_count" -gt 0 ] || {
+        printf 'release asset inventory has no example configuration\n' >&2
+        exit 1
+    }
+    if [ -e "$root_directory/deploy/pooler@.service" ]; then
+        printf 'release inventory excludes the pooler@.service template\n'
+    fi
+    printf 'release asset inventory passed (unit, schema, installer, smoke, migration CLI, and staged-secret audit)\n'
+}
+
+if [ "$check_only" -eq 1 ]; then
+    check_release_assets
+    exit 0
+fi
 
 [ "$target_count" -gt 0 ] || usage
 if [ -n "$provided_binary" ] && [ "$target_count" -ne 1 ]; then

@@ -89,6 +89,10 @@ pub const MAX_CATALOG_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 /// dependency from allocating without limit before YAML validation runs.
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 
+const PALANTIR_MODEL_RID_PREFIX: &str = "ri.language-model-service..language-model.";
+const PALANTIR_OPENAI_PROXY_PREFIX: &str = "/api/v2/llm/proxy/openai";
+const PALANTIR_ANTHROPIC_PROXY_PREFIX: &str = "/api/v2/llm/proxy/anthropic";
+
 /// Location of a declaration in its source document.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SourceLabel {
@@ -499,6 +503,24 @@ pub struct ModelTargetConfig {
     pub codecs: Option<Vec<String>>,
     /// Provider wire family used by this target.
     pub wire_family: Option<String>,
+    /// Request parameters this target is verified or explicitly declared to
+    /// support. Values are metadata, never copied from a request body.
+    pub parameters: Option<Vec<String>>,
+    /// Context window in tokens, when established by provider evidence or an
+    /// operator-owned model override.
+    pub context_window: Option<u64>,
+    /// Quantization labels established for this target.
+    pub quantization: Option<Vec<String>>,
+    /// Privacy posture for this target.
+    pub privacy: Option<String>,
+    /// Whether the target is explicitly verified to provide zero retention.
+    pub zdr: Option<bool>,
+    /// Provider data policy for this target.
+    pub data_policy: Option<String>,
+    /// Geographic region for this target, when declared.
+    pub region: Option<String>,
+    /// Integer micro-USD per million tokens for deterministic price policy.
+    pub price: Option<u64>,
     /// Optional positive same-tier weight.
     pub weight: Option<u32>,
 }
@@ -572,6 +594,8 @@ pub struct ModelCatalogSourceConfig {
     pub provider: String,
     /// Optional existing account used for account or native OAuth auth.
     pub account: Option<String>,
+    /// Optional homogeneous account pool used for discovery authentication.
+    pub account_pool: Option<String>,
     /// Bounded provider response parser.
     pub parser: Option<CatalogParserKind>,
     /// Relative provider endpoint. OpenAI/Kimi/Antigravity have safe defaults.
@@ -680,12 +704,25 @@ pub struct PolicyConfig {
 pub struct RoutingPolicyConfig {
     /// Explicit provider order used as the deterministic tie-breaker.
     pub order: Vec<String>,
+    /// Explicit target-binding order used after provider order.
+    pub target_order: Vec<String>,
     /// Provider allow-list.
     pub allow: Vec<String>,
+    /// OpenRouter-compatible spelling for a provider allow-list.
+    pub only: Vec<String>,
     /// Provider deny-list.
     pub deny: Vec<String>,
+    /// OpenRouter-compatible spelling for a provider deny-list.
+    pub ignore: Vec<String>,
+    /// Target-binding allow-list.
+    pub target_allow: Vec<String>,
+    /// Target-binding deny-list.
+    pub target_deny: Vec<String>,
     /// Whether lower-priority targets may be attempted.
     pub allow_fallbacks: Option<bool>,
+    /// Explicit public model IDs tried when the requested model is unavailable
+    /// and fallback is enabled.
+    pub fallback_models: Vec<String>,
     /// Hard parameter requirements.
     pub required_parameters: Vec<String>,
     /// Hard capability requirements.
@@ -700,6 +737,8 @@ pub struct RoutingPolicyConfig {
     pub require_zdr: Option<bool>,
     /// Provider data-policy requirement.
     pub data_policy: Option<String>,
+    /// Geographic region requirement.
+    pub region: Option<String>,
     /// Optional maximum verified price in micro-USD per million tokens.
     pub max_price: Option<u64>,
     /// Optional soft ranking preferences.
@@ -716,6 +755,14 @@ pub struct RoutingPreferenceConfig {
     pub latency: Option<bool>,
     /// Prefer higher verified throughput.
     pub throughput: Option<bool>,
+    /// Optional upper bound used only as a soft ranking preference.
+    pub max_latency_ms: Option<u64>,
+    /// Optional lower bound used only as a soft ranking preference.
+    pub min_throughput: Option<u64>,
+    /// Minimum number of samples before telemetry is considered fresh.
+    pub min_samples: Option<u32>,
+    /// Maximum age of a telemetry observation in milliseconds.
+    pub stale_after_ms: Option<u64>,
 }
 
 /// Target-selection declaration.
@@ -1930,9 +1977,13 @@ impl CooldownPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoutingPolicyPlan {
     order: Vec<Arc<str>>,
+    target_order: Vec<Arc<str>>,
     allow: Vec<Arc<str>>,
     deny: Vec<Arc<str>>,
+    target_allow: Vec<Arc<str>>,
+    target_deny: Vec<Arc<str>>,
     allow_fallbacks: bool,
+    fallback_models: Vec<Arc<str>>,
     required_parameters: Vec<Arc<str>>,
     required_capabilities: CapabilitySet,
     minimum_context: Option<u64>,
@@ -1940,6 +1991,7 @@ pub struct RoutingPolicyPlan {
     privacy: Option<Arc<str>>,
     require_zdr: bool,
     data_policy: Option<Arc<str>>,
+    region: Option<Arc<str>>,
     max_price: Option<u64>,
     preference: RoutingPreferencePlan,
 }
@@ -1949,6 +2001,12 @@ impl RoutingPolicyPlan {
     #[must_use]
     pub fn order(&self) -> &[Arc<str>] {
         &self.order
+    }
+
+    /// Explicit target-binding order used after provider order.
+    #[must_use]
+    pub fn target_order(&self) -> &[Arc<str>] {
+        &self.target_order
     }
 
     /// Provider allow-list.
@@ -1963,10 +2021,28 @@ impl RoutingPolicyPlan {
         &self.deny
     }
 
+    /// Target-binding allow-list.
+    #[must_use]
+    pub fn target_allow(&self) -> &[Arc<str>] {
+        &self.target_allow
+    }
+
+    /// Target-binding deny-list.
+    #[must_use]
+    pub fn target_deny(&self) -> &[Arc<str>] {
+        &self.target_deny
+    }
+
     /// Whether lower-priority target tiers may be attempted.
     #[must_use]
     pub const fn allow_fallbacks(&self) -> bool {
         self.allow_fallbacks
+    }
+
+    /// Explicit public-model fallbacks.
+    #[must_use]
+    pub fn fallback_models(&self) -> &[Arc<str>] {
+        &self.fallback_models
     }
 
     /// Hard request-parameter requirements.
@@ -2011,6 +2087,12 @@ impl RoutingPolicyPlan {
         self.data_policy.as_deref()
     }
 
+    /// Geographic region requirement.
+    #[must_use]
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
+    }
+
     /// Maximum verified price in micro-USD per million tokens.
     #[must_use]
     pub const fn max_price(&self) -> Option<u64> {
@@ -2030,6 +2112,10 @@ pub struct RoutingPreferencePlan {
     price: bool,
     latency: bool,
     throughput: bool,
+    max_latency_ms: Option<u64>,
+    min_throughput: Option<u64>,
+    min_samples: u32,
+    stale_after_ms: u64,
 }
 
 impl RoutingPreferencePlan {
@@ -2049,6 +2135,30 @@ impl RoutingPreferencePlan {
     #[must_use]
     pub const fn throughput(&self) -> bool {
         self.throughput
+    }
+
+    /// Optional soft latency ceiling.
+    #[must_use]
+    pub const fn max_latency_ms(&self) -> Option<u64> {
+        self.max_latency_ms
+    }
+
+    /// Optional soft throughput floor.
+    #[must_use]
+    pub const fn min_throughput(&self) -> Option<u64> {
+        self.min_throughput
+    }
+
+    /// Minimum sample count for fresh telemetry.
+    #[must_use]
+    pub const fn min_samples(&self) -> u32 {
+        self.min_samples
+    }
+
+    /// Maximum telemetry age in milliseconds.
+    #[must_use]
+    pub const fn stale_after_ms(&self) -> u64 {
+        self.stale_after_ms
     }
 }
 
@@ -2122,6 +2232,14 @@ pub struct ModelTargetPlan {
     capabilities: CapabilitySet,
     codecs: Vec<Arc<str>>,
     wire_family: Arc<str>,
+    parameters: Vec<Arc<str>>,
+    context_window: Option<u64>,
+    quantization: Vec<Arc<str>>,
+    privacy: Option<Arc<str>>,
+    zdr: Option<bool>,
+    data_policy: Option<Arc<str>>,
+    region: Option<Arc<str>>,
+    price: Option<u64>,
 }
 
 impl ModelTargetPlan {
@@ -2190,6 +2308,54 @@ impl ModelTargetPlan {
     pub fn wire_family(&self) -> &str {
         &self.wire_family
     }
+
+    /// Parameters supported by this target.
+    #[must_use]
+    pub fn parameters(&self) -> &[Arc<str>] {
+        &self.parameters
+    }
+
+    /// Declared context window.
+    #[must_use]
+    pub const fn context_window(&self) -> Option<u64> {
+        self.context_window
+    }
+
+    /// Quantization labels declared by this target.
+    #[must_use]
+    pub fn quantization(&self) -> &[Arc<str>] {
+        &self.quantization
+    }
+
+    /// Privacy posture.
+    #[must_use]
+    pub fn privacy(&self) -> Option<&str> {
+        self.privacy.as_deref()
+    }
+
+    /// Explicit zero-data-retention declaration.
+    #[must_use]
+    pub const fn zdr(&self) -> Option<bool> {
+        self.zdr
+    }
+
+    /// Data handling policy.
+    #[must_use]
+    pub fn data_policy(&self) -> Option<&str> {
+        self.data_policy.as_deref()
+    }
+
+    /// Geographic region.
+    #[must_use]
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
+    }
+
+    /// Integer micro-USD price per million tokens.
+    #[must_use]
+    pub const fn price(&self) -> Option<u64> {
+        self.price
+    }
 }
 
 /// Immutable public model registry entry.
@@ -2254,6 +2420,7 @@ pub struct ModelCatalogSourcePlan {
     source: pooler_model_catalog::CatalogSource,
     parser: CatalogParserKind,
     account: Option<Arc<str>>,
+    account_pool: Option<Arc<str>>,
     path: Arc<str>,
     max_response_bytes: u64,
     model_facts_provider: Arc<str>,
@@ -2277,6 +2444,12 @@ impl ModelCatalogSourcePlan {
     #[must_use]
     pub fn account(&self) -> Option<&str> {
         self.account.as_deref()
+    }
+
+    /// Homogeneous account pool used for discovery authentication.
+    #[must_use]
+    pub fn account_pool(&self) -> Option<&str> {
+        self.account_pool.as_deref()
     }
 
     /// Relative provider endpoint including an optional query string.
@@ -2737,6 +2910,7 @@ pub struct TargetPlan {
     policy: Option<Arc<str>>,
     capabilities: CapabilitySet,
     codecs: Vec<Arc<str>>,
+    endpoint_family: Option<Arc<str>>,
 }
 
 /// JSON model value used for static model-registry selection.
@@ -2792,6 +2966,12 @@ impl TargetPlan {
     #[must_use]
     pub fn codecs(&self) -> &[Arc<str>] {
         &self.codecs
+    }
+
+    /// Explicit provider endpoint family used by this route, when declared.
+    #[must_use]
+    pub fn endpoint_family(&self) -> Option<&str> {
+        self.endpoint_family.as_deref()
     }
 }
 
@@ -3236,7 +3416,14 @@ fn compile_config(
     let account_pools = compile_account_pools(config, source, &accounts)?;
     let policies = compile_policies(config, source, &upstreams)?;
     let models = compile_models(config, source, &upstreams, &accounts, &account_pools)?;
-    let catalog = compile_catalog(config.catalog.as_ref(), source, &upstreams, &accounts)?;
+    validate_routing_model_references(&policies, &models)?;
+    let catalog = compile_catalog(
+        config.catalog.as_ref(),
+        source,
+        &upstreams,
+        &accounts,
+        &account_pools,
+    )?;
     let usage_price_book = match config.usage_price_book.as_ref() {
         Some(declaration) => {
             let label = SourceLabel::new(source, None, None, "$.usage_price_book");
@@ -3434,6 +3621,7 @@ fn compile_config(
         });
     }
 
+    validate_model_targets_against_routes(&models, &routes, &upstreams)?;
     detect_conflicts(&routes)?;
     routes.sort_by(compare_routes);
     Ok(CompiledConfig {
@@ -3450,6 +3638,51 @@ fn compile_config(
         routes,
         management,
     })
+}
+
+fn validate_routing_model_references(
+    policies: &BTreeMap<Arc<str>, PolicyPlan>,
+    models: &BTreeMap<Arc<str>, ModelPlan>,
+) -> Result<(), ConfigError> {
+    let model_ids = models.keys().map(AsRef::as_ref).collect::<BTreeSet<_>>();
+    let target_ids = models
+        .values()
+        .flat_map(|model| {
+            model.targets().iter().flat_map(|target| {
+                [
+                    target.id().as_str().to_owned(),
+                    target.binding_id().as_str().to_owned(),
+                ]
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    for policy in policies.values() {
+        let routing = policy.routing();
+        for target in routing
+            .target_order()
+            .iter()
+            .chain(routing.target_allow().iter())
+            .chain(routing.target_deny().iter())
+        {
+            if !target_ids.contains(target.as_ref()) {
+                return Err(ConfigError::MissingReference {
+                    kind: "model target",
+                    name: target.to_string(),
+                    label: policy.source().clone(),
+                });
+            }
+        }
+        for model in routing.fallback_models() {
+            if !model_ids.contains(model.as_ref()) {
+                return Err(ConfigError::MissingReference {
+                    kind: "model",
+                    name: model.to_string(),
+                    label: policy.source().clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compile_listener_protocol(
@@ -3817,10 +4050,7 @@ fn compile_selection(
         None => SelectionStrategy::OrderedFallback,
     };
     let affinity = compile_affinity(&declaration, label)?;
-    Ok(SelectionPlan {
-        strategy,
-        affinity,
-    })
+    Ok(SelectionPlan { strategy, affinity })
 }
 
 fn compile_routing(
@@ -3850,12 +4080,28 @@ fn compile_routing(
         Ok::<Vec<Arc<str>>, ConfigError>(compiled)
     };
     let order = compile_provider_list(&declaration.order, "routing provider")?;
-    let allow = compile_provider_list(&declaration.allow, "routing provider")?;
-    let deny = compile_provider_list(&declaration.deny, "routing provider")?;
+    let target_order = compile_routing_values(&declaration.target_order, label, "routing target")?;
+    let mut allow_values = declaration.allow.clone();
+    allow_values.extend(declaration.only.clone());
+    let mut deny_values = declaration.deny.clone();
+    deny_values.extend(declaration.ignore.clone());
+    let allow = compile_provider_list(&allow_values, "routing provider")?;
+    let deny = compile_provider_list(&deny_values, "routing provider")?;
+    let target_allow = compile_routing_values(&declaration.target_allow, label, "routing target")?;
+    let target_deny = compile_routing_values(&declaration.target_deny, label, "routing target")?;
     if allow.iter().any(|provider| deny.contains(provider)) {
         return Err(invalid(
             label,
             "routing allow and deny lists must not overlap",
+        ));
+    }
+    if target_allow
+        .iter()
+        .any(|target| target_deny.contains(target))
+    {
+        return Err(invalid(
+            label,
+            "routing target allow and deny lists must not overlap",
         ));
     }
     let required_parameters = compile_routing_values(
@@ -3879,12 +4125,35 @@ fn compile_routing(
         label,
         "routing data_policy",
     )?;
+    let region =
+        compile_optional_routing_value(declaration.region.as_deref(), label, "routing region")?;
+    let fallback_models = compile_routing_values(
+        &declaration.fallback_models,
+        label,
+        "routing fallback model",
+    )?;
     let preference = declaration.preference.unwrap_or_default();
+    if preference.min_samples == Some(0) {
+        return Err(invalid(
+            label,
+            "routing preference min_samples must be greater than zero",
+        ));
+    }
+    if preference.stale_after_ms == Some(0) {
+        return Err(invalid(
+            label,
+            "routing preference stale_after_ms must be greater than zero",
+        ));
+    }
     Ok(RoutingPolicyPlan {
         order,
+        target_order,
         allow,
         deny,
+        target_allow,
+        target_deny,
         allow_fallbacks: declaration.allow_fallbacks.unwrap_or(true),
+        fallback_models,
         required_parameters,
         required_capabilities,
         minimum_context: declaration.minimum_context,
@@ -3892,11 +4161,16 @@ fn compile_routing(
         privacy,
         require_zdr: declaration.require_zdr.unwrap_or(false),
         data_policy,
+        region,
         max_price: declaration.max_price,
         preference: RoutingPreferencePlan {
             price: preference.price.unwrap_or(false),
             latency: preference.latency.unwrap_or(false),
             throughput: preference.throughput.unwrap_or(false),
+            max_latency_ms: preference.max_latency_ms,
+            min_throughput: preference.min_throughput,
+            min_samples: preference.min_samples.unwrap_or(1),
+            stale_after_ms: preference.stale_after_ms.unwrap_or(5 * 60 * 1_000),
         },
     })
 }
@@ -4236,6 +4510,14 @@ fn compile_upstream(
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(invalid(label, "upstream URL must not contain userinfo"));
+    }
+    if declaration
+        .native
+        .as_ref()
+        .and_then(|native| native.kind.as_deref())
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("palantir_aip"))
+    {
+        validate_palantir_enrollment_url(&url, label)?;
     }
     let transport_kind = transport
         .and_then(|value| value.kind.as_deref())
@@ -4760,10 +5042,21 @@ fn compile_models(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| invalid(&target_label, "model target requires upstream_model"))?;
+            if upstreams[provider]
+                .native()
+                .is_some_and(|native| native.kind().eq_ignore_ascii_case("palantir_aip"))
+                && !valid_palantir_model_rid(upstream_model)
+            {
+                return Err(invalid(
+                    &target_label,
+                    "Palantir AIP model target requires an explicit valid model RID",
+                ));
+            }
             let capabilities = compile_capabilities(
-                target.capabilities.as_deref().ok_or_else(|| {
-                    invalid(&target_label, "model target requires capabilities")
-                })?,
+                target
+                    .capabilities
+                    .as_deref()
+                    .ok_or_else(|| invalid(&target_label, "model target requires capabilities"))?,
                 &target_label,
             )?;
             let codecs = compile_codecs(
@@ -4783,6 +5076,37 @@ fn compile_models(
                     validate_component_id(value, &target_label, "model target wire_family")?;
                     Ok::<Arc<str>, ConfigError>(Arc::from(value))
                 })?;
+            let parameters = compile_metadata_values(
+                target.parameters.as_deref().unwrap_or(&[]),
+                &target_label,
+                "model target parameter",
+            )?;
+            let quantization = compile_metadata_values(
+                target.quantization.as_deref().unwrap_or(&[]),
+                &target_label,
+                "model target quantization",
+            )?;
+            let privacy = compile_optional_routing_value(
+                target.privacy.as_deref(),
+                &target_label,
+                "model target privacy",
+            )?;
+            let data_policy = compile_optional_routing_value(
+                target.data_policy.as_deref(),
+                &target_label,
+                "model target data_policy",
+            )?;
+            let region = compile_optional_routing_value(
+                target.region.as_deref(),
+                &target_label,
+                "model target region",
+            )?;
+            if target.context_window == Some(0) {
+                return Err(invalid(
+                    &target_label,
+                    "model target context_window must be greater than zero",
+                ));
+            }
             let binding_id = TargetBindingId::new(declaration.id.clone(), target_id.as_str())
                 .map_err(|_| invalid(&target_label, "target binding identity is invalid"))?;
             targets.push(ModelTargetPlan {
@@ -4797,6 +5121,14 @@ fn compile_models(
                 capabilities,
                 codecs,
                 wire_family,
+                parameters,
+                context_window: target.context_window,
+                quantization,
+                privacy,
+                zdr: target.zdr,
+                data_policy,
+                region,
+                price: target.price,
             });
         }
         models.insert(
@@ -4814,6 +5146,7 @@ fn compile_models(
 struct CatalogSourceRuntime {
     parser: CatalogParserKind,
     account: Option<Arc<str>>,
+    account_pool: Option<Arc<str>>,
     path: Arc<str>,
     max_response_bytes: u64,
     model_facts_provider: Arc<str>,
@@ -4836,6 +5169,7 @@ fn compile_catalog(
     source: &Source,
     upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
     accounts: &BTreeMap<Arc<str>, AccountPlan>,
+    account_pools: &BTreeMap<Arc<str>, AccountPoolPlan>,
 ) -> Result<Option<ModelCatalogPlan>, ConfigError> {
     let catalog_label = source_label(source, "catalog".to_owned());
     let automatic = if declaration.is_none() {
@@ -4908,6 +5242,8 @@ fn compile_catalog(
             .map(|source| pooler_model_catalog::CatalogSourceConfig {
                 id: source.id.clone(),
                 provider: source.provider.clone(),
+                account: source.account.clone(),
+                account_pool: source.account_pool.clone(),
                 prefix: source.prefix.clone(),
                 priority: source.priority,
                 aliases: source.aliases.clone(),
@@ -4951,6 +5287,32 @@ fn compile_catalog(
                 ));
             }
         }
+        let account_pool = source_declaration
+            .account_pool
+            .as_deref()
+            .map(str::trim)
+            .filter(|pool| !pool.is_empty());
+        if account.is_some() && account_pool.is_some() {
+            return Err(invalid(
+                &label,
+                "catalog source cannot bind both account and account_pool",
+            ));
+        }
+        if let Some(account_pool) = account_pool {
+            let Some(pool_plan) = account_pools.get(account_pool) else {
+                return Err(ConfigError::MissingReference {
+                    kind: "account pool",
+                    name: account_pool.to_owned(),
+                    label,
+                });
+            };
+            if pool_plan.provider() != source_declaration.provider {
+                return Err(invalid(
+                    &label,
+                    "catalog source account pool provider does not match source provider",
+                ));
+            }
+        }
         let parser = source_declaration
             .parser
             .ok_or_else(|| invalid(&label, "catalog source requires parser"))?;
@@ -4989,6 +5351,7 @@ fn compile_catalog(
             CatalogSourceRuntime {
                 parser,
                 account: account.map(Arc::<str>::from),
+                account_pool: account_pool.map(Arc::<str>::from),
                 path: Arc::<str>::from(path.as_str()),
                 max_response_bytes,
                 model_facts_provider: Arc::<str>::from(model_facts_provider),
@@ -5008,6 +5371,7 @@ fn compile_catalog(
                 source: source_policy.clone(),
                 parser: runtime.parser,
                 account: runtime.account,
+                account_pool: runtime.account_pool,
                 path: runtime.path,
                 max_response_bytes: runtime.max_response_bytes,
                 model_facts_provider: runtime.model_facts_provider,
@@ -5053,6 +5417,32 @@ fn compile_codecs(values: &[String], label: &SourceLabel) -> Result<Vec<Arc<str>
         codecs.push(Arc::from(value.to_owned()));
     }
     Ok(codecs)
+}
+
+fn compile_metadata_values(
+    values: &[String],
+    label: &SourceLabel,
+    field: &str,
+) -> Result<Vec<Arc<str>>, ConfigError> {
+    let mut compiled = Vec::with_capacity(values.len());
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty()
+            || value.chars().any(char::is_control)
+            || value.chars().any(char::is_whitespace)
+        {
+            return Err(invalid(
+                label,
+                &format!("{field} entries must be non-empty and contain no whitespace"),
+            ));
+        }
+        if !seen.insert(value.to_ascii_lowercase()) {
+            return Err(invalid(label, &format!("{field} entries must be unique")));
+        }
+        compiled.push(Arc::from(value.to_ascii_lowercase()));
+    }
+    Ok(compiled)
 }
 
 fn compile_extensions(
@@ -5872,8 +6262,44 @@ fn compile_target(
     let path = path
         .map(|value| valid_path(value.to_owned(), label))
         .transpose()?;
+    if endpoint_family.is_none() {
+        if let Some(family) = path.as_deref().and_then(path_endpoint_family) {
+            validate_endpoint_family(family, upstream, upstreams, label)?;
+        }
+    } else if let (Some(declared), Some(path_family)) = (
+        endpoint_family.and_then(normalize_endpoint_family),
+        path.as_deref().and_then(path_endpoint_family),
+    ) {
+        if declared != path_family {
+            return Err(invalid(
+                label,
+                "route endpoint_family does not match its configured path",
+            ));
+        }
+    }
+    if upstreams
+        .get(upstream)
+        .and_then(UpstreamPlan::native)
+        .is_some_and(|native| native.kind().eq_ignore_ascii_case("palantir_aip"))
+        && path
+            .as_deref()
+            .is_some_and(|path| !valid_palantir_route_path(path))
+    {
+        return Err(invalid(
+            label,
+            "Palantir AIP route path must be an exact Chat, Responses, or Messages endpoint",
+        ));
+    }
     let capabilities = compile_capabilities(&capabilities, label)?;
     let codecs = compile_codecs(&codecs, label)?;
+    let endpoint_family = endpoint_family
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            validate_component_id(value, label, "target endpoint_family")?;
+            Ok::<Arc<str>, ConfigError>(Arc::from(value))
+        })
+        .transpose()?;
     let model_source = match model_from {
         None => None,
         Some("request.model") => Some(ModelSource::Request),
@@ -5912,6 +6338,7 @@ fn compile_target(
             policy: Some(Arc::from(policy)),
             capabilities,
             codecs,
+            endpoint_family,
         });
     }
     Ok(TargetPlan {
@@ -5922,6 +6349,7 @@ fn compile_target(
         policy: None,
         capabilities,
         codecs,
+        endpoint_family,
     })
 }
 
@@ -5941,6 +6369,17 @@ fn validate_endpoint_family(
     let family = family.trim();
     if family.is_empty() {
         return Err(invalid(label, "target endpoint_family must not be empty"));
+    }
+    if upstreams
+        .get(upstream_id)
+        .and_then(UpstreamPlan::native)
+        .is_some_and(|native| native.kind().eq_ignore_ascii_case("palantir_aip"))
+        && !matches!(family, "chat_completions" | "responses" | "messages")
+    {
+        return Err(invalid(
+            label,
+            "Palantir AIP supports only chat_completions, responses, or messages endpoints",
+        ));
     }
     let Some(provider_id) = upstreams
         .get(upstream_id)
@@ -5963,6 +6402,203 @@ fn validate_endpoint_family(
         label,
         &format!("provider `{provider_id}` does not document the `{family}` endpoint family"),
     ))
+}
+
+/// Check the contract declared by a model target against every route that can
+/// select it. Selection policy routes may fail over across providers, so each
+/// target in those models is checked independently instead of trusting the
+/// route's anchor provider.
+fn validate_model_targets_against_routes(
+    models: &BTreeMap<Arc<str>, ModelPlan>,
+    routes: &[RoutePlan],
+    upstreams: &BTreeMap<Arc<str>, UpstreamPlan>,
+) -> Result<(), ConfigError> {
+    for route in routes {
+        if route.target().model_source().is_none() {
+            continue;
+        }
+        let family = route_endpoint_family(route);
+        for model in models.values() {
+            let candidates = if route.target().policy().is_some() {
+                model.targets().iter().collect::<Vec<_>>()
+            } else {
+                let target = model
+                    .targets()
+                    .iter()
+                    .find(|target| target.provider() == route.target().upstream())
+                    .or_else(|| model.targets().first());
+                target.into_iter().collect::<Vec<_>>()
+            };
+            for target in candidates {
+                if !target
+                    .capabilities()
+                    .contains_all(route.target().capabilities())
+                {
+                    return Err(invalid(
+                        route.source(),
+                        &format!(
+                            "model target `{}` does not satisfy route `{}` capabilities",
+                            target.id(),
+                            route.id()
+                        ),
+                    ));
+                }
+                if route
+                    .target()
+                    .codecs()
+                    .iter()
+                    .any(|codec| !target.codecs().iter().any(|value| value == codec))
+                {
+                    return Err(invalid(
+                        route.source(),
+                        &format!(
+                            "model target `{}` does not provide every codec required by route `{}`",
+                            target.id(),
+                            route.id()
+                        ),
+                    ));
+                }
+                if let Some(family) = family {
+                    let palantir = upstreams
+                        .get(target.provider())
+                        .and_then(UpstreamPlan::native)
+                        .is_some_and(|native| native.kind().eq_ignore_ascii_case("palantir_aip"));
+                    if !palantir && !wire_supports_endpoint(target.wire_family(), family) {
+                        return Err(invalid(
+                            route.source(),
+                            &format!(
+                                "model target `{}` wire family `{}` cannot serve route `{}` endpoint family `{family}`",
+                                target.id(),
+                                target.wire_family(),
+                                route.id()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn route_endpoint_family(route: &RoutePlan) -> Option<&'static str> {
+    route
+        .target()
+        .endpoint_family()
+        .and_then(normalize_endpoint_family)
+        .or_else(|| route.target().path().and_then(palantir_endpoint_family))
+        .or_else(|| path_endpoint_family(route.matcher().path().value()))
+}
+
+fn normalize_endpoint_family(value: &str) -> Option<&'static str> {
+    match value {
+        "chat" | "chat_completions" | "openai_chat" => Some("chat_completions"),
+        "completions" => Some("chat_completions"),
+        "responses" | "openai_responses" => Some("responses"),
+        "messages" | "anthropic_messages" => Some("messages"),
+        "models" => Some("models"),
+        "embeddings" => Some("embeddings"),
+        "images" | "image_generations" | "image_edits" => Some("images"),
+        "audio" | "audio_transcriptions" | "audio_translations" | "audio_speech" => Some("audio"),
+        "generate_content" => Some("generate_content"),
+        "predict" => Some("predict"),
+        _ => None,
+    }
+}
+
+fn path_endpoint_family(path: &str) -> Option<&'static str> {
+    let path = path
+        .strip_prefix(PALANTIR_OPENAI_PROXY_PREFIX)
+        .or_else(|| path.strip_prefix(PALANTIR_ANTHROPIC_PROXY_PREFIX))
+        .unwrap_or(path);
+    if path.ends_with("/chat/completions") {
+        Some("chat_completions")
+    } else if path.ends_with("/responses") {
+        Some("responses")
+    } else if path.ends_with("/messages") {
+        Some("messages")
+    } else if path.contains("generateContent") {
+        Some("generate_content")
+    } else if path.contains("predict") {
+        Some("predict")
+    } else if path.ends_with("/models") {
+        Some("models")
+    } else {
+        None
+    }
+}
+
+fn wire_supports_endpoint(wire: &str, family: &str) -> bool {
+    match wire.trim().to_ascii_lowercase().as_str() {
+        "openai" | "openai_compatible" => {
+            matches!(
+                family,
+                "chat_completions" | "responses" | "embeddings" | "images" | "audio" | "models"
+            )
+        }
+        "chat" | "openai_chat" | "openai_chat_completions" => family == "chat_completions",
+        "responses" | "openai_responses" => family == "responses",
+        "anthropic" | "messages" | "anthropic_messages" => family == "messages",
+        "gemini" | "vertex" | "vertex_generate_content" => family == "generate_content",
+        "vertex_predict" => family == "predict",
+        _ => true,
+    }
+}
+
+/// Return the canonical wire endpoint family represented by a Palantir AIP
+/// proxy path. Palantir deliberately exposes OpenAI and Anthropic paths under
+/// one enrollment origin; the route contract must name one of these exact
+/// surfaces rather than allowing an arbitrary provider path.
+fn palantir_endpoint_family(path: &str) -> Option<&'static str> {
+    let canonical = path
+        .strip_prefix(PALANTIR_OPENAI_PROXY_PREFIX)
+        .or_else(|| path.strip_prefix(PALANTIR_ANTHROPIC_PROXY_PREFIX))
+        .unwrap_or(path);
+    match canonical {
+        "/v1/chat/completions" => Some("chat_completions"),
+        "/v1/responses" => Some("responses"),
+        "/v1/messages" => Some("messages"),
+        _ => None,
+    }
+}
+
+fn valid_palantir_route_path(path: &str) -> bool {
+    match (
+        path.strip_prefix(PALANTIR_OPENAI_PROXY_PREFIX),
+        path.strip_prefix(PALANTIR_ANTHROPIC_PROXY_PREFIX),
+    ) {
+        (Some(path), _) => matches!(path, "/v1/chat/completions" | "/v1/responses"),
+        (None, Some(path)) => path == "/v1/messages",
+        (None, None) => false,
+    }
+}
+
+fn valid_palantir_model_rid(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(PALANTIR_MODEL_RID_PREFIX) else {
+        return false;
+    };
+    !suffix.is_empty()
+        && value.len() <= 512
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn validate_palantir_enrollment_url(url: &Url, label: &SourceLabel) -> Result<(), ConfigError> {
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(invalid(
+            label,
+            "Palantir AIP upstream URL must be a bare HTTPS enrollment origin without path, userinfo, query, or fragment",
+        ));
+    }
+    Ok(())
 }
 
 fn detect_conflicts(routes: &[RoutePlan]) -> Result<(), ConfigError> {
@@ -7592,13 +8228,18 @@ catalog:
 version: 2
 listeners: {local: {bind: 127.0.0.1:8400}}
 upstreams: {local: {url: http://127.0.0.1:8319}}
+accounts: {local: {provider: local, secret: managed:local}}
 models:
   - id: gpt-public
     targets:
       - provider: local
         id: gpt-public-target
+        account: local
+        priority: 1
         upstream_model: gpt-upstream
         capabilities: [text, tools, text]
+        codecs: []
+        wire_family: openai
 routes:
   - id: patched
     listen: local
@@ -7640,6 +8281,7 @@ upstreams:
 accounts:
   primary-a: {provider: primary, secret: managed:secret-a}
   primary-b: {provider: primary, secret: managed:secret-b}
+  backup: {provider: backup, secret: managed:secret-backup}
 account_pools:
   primary-pool:
     provider: primary
@@ -7673,11 +8315,16 @@ models:
         upstream_model: primary-model
         wire_family: openai
         capabilities: [text, streaming]
+        codecs: []
       - id: backup-target
         provider: backup
+        account: backup
         priority: 2
         weight: 1
         upstream_model: backup-model
+        wire_family: openai
+        capabilities: [text]
+        codecs: []
 "#;
         let config = compile_yaml("v2-topology.yaml", text).expect("v2 topology");
         let pool = &config.account_pools()["primary-pool"];
@@ -7740,11 +8387,12 @@ models:
         let duplicate_id = r#"
 version: 2
 upstreams: {provider: {url: http://127.0.0.1:8319}}
+accounts: {account: {provider: provider, secret: managed:account}}
 models:
   - id: first
-    targets: [{id: duplicate, provider: provider, upstream_model: first}]
+    targets: [{id: duplicate, provider: provider, account: account, priority: 1, upstream_model: first, capabilities: [], codecs: [], wire_family: openai}]
   - id: second
-    targets: [{id: duplicate, provider: provider, upstream_model: second}]
+    targets: [{id: duplicate, provider: provider, account: account, priority: 1, upstream_model: second, capabilities: [], codecs: [], wire_family: openai}]
 "#;
         assert!(compile_yaml("duplicate-target-id.yaml", duplicate_id)
             .expect_err("target IDs are globally unique")
@@ -7754,9 +8402,10 @@ models:
         let zero_priority = r#"
 version: 2
 upstreams: {provider: {url: http://127.0.0.1:8319}}
+accounts: {account: {provider: provider, secret: managed:account}}
 models:
   - id: public
-    targets: [{id: target, provider: provider, priority: 0, upstream_model: model}]
+    targets: [{id: target, provider: provider, account: account, priority: 0, upstream_model: model, capabilities: [], codecs: [], wire_family: openai}]
 "#;
         assert!(compile_yaml("zero-target-priority.yaml", zero_priority)
             .expect_err("target priority must be positive")
@@ -7853,7 +8502,7 @@ routes:
 
     #[test]
     fn rejects_unknown_capability_and_unused_transform_prefix() {
-        let capability = "version: 2\nupstreams: {local: {url: http://127.0.0.1:1}}\nmodels: [{id: m, targets: [{id: target, provider: local, upstream_model: m, capabilities: [tolos]}]}]\n";
+        let capability = "version: 2\nupstreams: {local: {url: http://127.0.0.1:1}}\naccounts: {local: {provider: local, secret: managed:local}}\nmodels: [{id: m, targets: [{id: target, provider: local, account: local, priority: 1, upstream_model: m, capabilities: [tolos], codecs: [], wire_family: openai}]}]\n";
         let error = compile_yaml("capability.yaml", capability).expect_err("unknown capability");
         assert!(error.to_string().contains("unknown model capability"));
 
@@ -8442,9 +9091,10 @@ extensions:
     limits: {max_input_bytes: 2048, max_output_bytes: 4096, timeout: 250ms, max_concurrency: 2}
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:1}}
+accounts: {local: {provider: local, secret: managed:local}}
 models:
   - id: selected
-    targets: [{id: selected-target, provider: local, upstream_model: selected}]
+    targets: [{id: selected-target, provider: local, account: local, priority: 1, upstream_model: selected, capabilities: [], codecs: [], wire_family: openai}]
 routes:
   - id: external
     listen: local

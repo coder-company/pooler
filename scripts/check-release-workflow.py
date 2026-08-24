@@ -41,6 +41,19 @@ REQUIRED_RELEASE_JOBS = {
     "assemble",
     "publish",
 }
+REQUIRED_WORKFLOW_NAMES = {
+    "ci.yml": "CI",
+    "hardening.yml": "Hardening",
+    "secret-scan.yml": "Secret Scan",
+    "release.yml": "Release",
+}
+RELEASE_SCRIPT_ASSETS = (
+    "scripts/check-deployment-config.py",
+    "scripts/install-system-pooler.sh",
+    "scripts/test-system-install.sh",
+    "scripts/check-staged-secrets.sh",
+    "scripts/release.sh",
+)
 
 
 class UniqueLoader(yaml.BaseLoader):
@@ -397,7 +410,11 @@ def release_asset_inventory(root: Path) -> list[str]:
     deployment_assets = sorted(
         {
             *((root / "deploy").glob("*.example.yaml")),
-            *((root / "deploy").glob("*.service")),
+            *(
+                asset
+                for asset in (root / "deploy").glob("*.service")
+                if asset.name != "pooler@.service"
+            ),
         }
     )
     deployment_count = 0
@@ -410,7 +427,7 @@ def release_asset_inventory(root: Path) -> list[str]:
     if deployment_count == 0:
         fail(f"no deployment assets found under {root / 'deploy'}")
 
-    for relative_path in ("docs/deployment.md", "scripts/check-deployment-config.py"):
+    for relative_path in ("docs/deployment.md", *RELEASE_SCRIPT_ASSETS):
         asset = root / relative_path
         if asset.is_symlink() or not asset.is_file():
             fail(f"required release asset is missing or unsafe: {asset}")
@@ -466,9 +483,8 @@ def assert_stager_behavior(root: Path, expected_assets: list[str]) -> None:
         (fixture / "config" / "pooler.example.yaml").write_text("ok\n", encoding="utf-8")
         (fixture / "deploy" / "pooler.service").write_text("[Unit]\n", encoding="utf-8")
         (fixture / "docs" / "deployment.md").write_text("# Deploy\n", encoding="utf-8")
-        (fixture / "scripts" / "check-deployment-config.py").write_text(
-            "print('ok')\n", encoding="utf-8"
-        )
+        for relative_path in RELEASE_SCRIPT_ASSETS:
+            (fixture / relative_path).write_text("print('ok')\n", encoding="utf-8")
         os.symlink(
             fixture / "config" / "pooler.example.yaml",
             fixture / "config" / "unsafe.example.yaml",
@@ -491,6 +507,12 @@ def validate_hosted_release_assets(
 
     expected_assets = release_asset_inventory(root)
     assert_stager_behavior(root, expected_assets)
+    schema = root / "schema" / "pooler.schema.json"
+    if schema.is_symlink() or not schema.is_file() or schema.stat().st_size == 0:
+        fail(f"required release schema is missing or unsafe: {schema}")
+    migrator = root / "crates" / "pooler-cli" / "src" / "production_migrate.rs"
+    if (root / "Cargo.toml").is_file() and not migrator.is_file():
+        fail(f"required Pooler-v1 migrator source is missing or unsafe: {migrator}")
 
     jobs = mapping(release["jobs"], f"{path}.jobs")
     build = mapping(jobs["build"], f"{path}.jobs.build")
@@ -517,6 +539,11 @@ def validate_hosted_release_assets(
         "deploy/*.service",
         "docs/deployment.md",
         "scripts/check-deployment-config.py",
+        "scripts/install-system-pooler.sh",
+        "scripts/test-system-install.sh",
+        "scripts/check-staged-secrets.sh",
+        "scripts/release.sh",
+        "schema/pooler.schema.json",
     )
     if not all(path_fragment in package_run for path_fragment in smoke_paths):
         fail(
@@ -527,6 +554,11 @@ def validate_hosted_release_assets(
         'POOLER_BIN="$packaged_binary"',
         '"${packaged_root}/scripts/check-deployment-config.py"',
         '"${packaged_root}/deploy/pooler.systemd.example.yaml" check',
+        '"${packaged_root}/scripts/test-system-install.sh" --sandbox',
+        '"${packaged_root}/scripts/release.sh" --check',
+        '"${packaged_root}/schema/pooler.schema.json"',
+        'migrate --help',
+        'config schema --output',
     )
     if not all(fragment in package_run for fragment in deployment_smoke):
         fail(
@@ -736,6 +768,11 @@ def main() -> int:
     }
     release = load_workflow(paths["release.yml"])
     workflows = {**reusable, "release.yml": release}
+    for workflow_name, expected_name in REQUIRED_WORKFLOW_NAMES.items():
+        if workflows[workflow_name].get("name") != expected_name:
+            fail(
+                f"{workflow_name} must have the hosted check name {expected_name!r}"
+            )
     validate_runner_policy(workflows)
     validate_rust_setup(workflows, root)
     validate_sanitizer_runner(root)

@@ -1704,7 +1704,7 @@ mod tests {
         let route = pooler_config::compile_yaml(
             "devin-current-client-tool.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 routes:

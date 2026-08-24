@@ -1,10 +1,10 @@
-//! Safe discovery of the Pooler source configuration file.
+//! Safe discovery of the one canonical Pooler configuration file.
 //!
-//! Discovery is intentionally small and deterministic.  An explicitly supplied
-//! path is always used as-is.  Without one, a regular `./pooler.yaml` entry (or
-//! any other existing directory entry with that name) wins, and only then is a
-//! platform configuration path selected.  In particular, this module never
-//! guesses at provider-specific filenames such as `openai-device.yaml`.
+//! Discovery is intentionally small and deterministic. An explicitly supplied
+//! path is always used as-is. Without one, a regular pooler.yaml entry (or any
+//! other existing directory entry with that name) wins, and only then is a
+//! platform configuration path selected. This module never selects an
+//! alternate generated path or guesses at provider-specific filenames.
 
 use std::ffi::OsString;
 use std::io;
@@ -35,8 +35,8 @@ fn resolve_from(
         if path.as_os_str().is_empty() {
             bail!("configuration path must not be empty");
         }
-        // An explicit path is never canonicalized or replaced by a fallback.
-        // ConfigLoader performs the final regular-file/symlink safety check.
+        // An explicit path is never replaced by a fallback. ConfigLoader
+        // performs the final regular-file and symlink safety check.
         if !directory_entry_exists(path)? {
             bail!(
                 "failed to read configuration `{}`: file does not exist",

@@ -14,6 +14,9 @@ mod lifecycle;
 mod listener;
 mod management;
 pub mod management_error;
+pub(crate) mod management_oauth;
+mod management_resources;
+mod management_state;
 mod management_ui;
 mod model_facts_refresh;
 mod server;
@@ -36,20 +39,20 @@ pub use management_error::{
     ManagementError, ManagementErrorBody, ManagementErrorCode, ManagementErrorEnvelope,
     SCHEMA_VERSION as MANAGEMENT_ERROR_SCHEMA_VERSION,
 };
+
+pub(crate) use management_state::ManagementState;
 pub use model_facts_refresh::{fetch_model_facts, project_model_facts, ModelFactsRefreshError};
 pub use pooler_core::ConfigGeneration;
 pub use server::{ReloadError, ReloadOutcome, Server, ServerError};
 
-/// Select a validated Pooler-managed sidecar when one exists, otherwise the
-/// operator-authored source. Existing sidecars must be owner-private regular
-/// files with Pooler's generated-file marker.
+/// Resolve the single canonical configuration source.
 pub fn managed_configuration_source(
     source: impl AsRef<std::path::Path>,
 ) -> std::io::Result<std::path::PathBuf> {
-    config_management::serving_source(source).map_err(|_| {
+    config_management::configured_source(source).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "managed configuration source is unsafe",
+            "canonical configuration source is unsafe",
         )
     })
 }
@@ -70,6 +73,14 @@ pub fn verify_managed_configuration_recovery(
     source: impl AsRef<std::path::Path>,
 ) -> Result<serde_json::Value, config_management::ConfigManagementError> {
     config_management::verify_recovery(source)
+}
+
+/// Return the client-agnostic endpoint inventory for a compiled configuration.
+/// The inventory contains listener bases, paths, route protocols, and auth
+/// requirements only; it never resolves or serializes secrets.
+#[must_use]
+pub fn endpoint_inventory(config: &pooler_config::CompiledConfig) -> serde_json::Value {
+    management_resources::endpoint_inventory(config)
 }
 
 /// Resume a proved-safe managed-configuration transaction and clear its

@@ -15,7 +15,7 @@ use std::{
 
 pub use pooler_core::{
     ConfigGeneration, CredentialId, ErrorClass, ErrorClassification, ErrorScope, ModelId,
-    ProviderId, ReplaySafety, Retryability, RouteId,
+    ProviderId, ReplaySafety, Retryability, RouteId, TargetId,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -32,8 +32,9 @@ pub use quota::{
 };
 
 pub use selection::{
-    AffinityKey, CredentialRegistration, CredentialRegistry, QuotaRecovery, SelectionError,
-    SelectionLease, SelectionRequest, SelectionReservation, SelectionStrategy,
+    AffinityKey, BindingKey, CandidateFacts, CredentialRegistration, CredentialRegistry,
+    QuotaRecovery, RoutingFact, RoutingRequirements, RoutingTelemetry, SelectionError,
+    SelectionLease, SelectionRequest, SelectionReservation, SelectionStrategy, TelemetrySample,
 };
 
 // -----------------------------------------------------------------------------
@@ -1018,6 +1019,15 @@ pub enum CooldownScope {
         credential: CredentialId,
         model: ModelId,
     },
+    /// One concrete target/account binding. This is emitted for a
+    /// credential-scoped failure when the request supplied a composite
+    /// binding identity, so identical account IDs cannot cool one another.
+    Binding(BindingKey),
+    /// One concrete target/account binding and model pair.
+    BindingModel {
+        binding: BindingKey,
+        model: ModelId,
+    },
     Model(ModelId),
     Provider(ProviderId),
     ProviderModel {
@@ -1034,6 +1044,8 @@ impl CooldownScope {
         match self {
             Self::Credential(_) => CooldownScopeKind::Credential,
             Self::CredentialModel { .. } => CooldownScopeKind::CredentialModel,
+            Self::Binding(_) => CooldownScopeKind::Credential,
+            Self::BindingModel { .. } => CooldownScopeKind::CredentialModel,
             Self::Model(_) => CooldownScopeKind::Model,
             Self::Provider(_) => CooldownScopeKind::Provider,
             Self::ProviderModel { .. } => CooldownScopeKind::ProviderModel,
@@ -1046,6 +1058,18 @@ impl CooldownScope {
     pub fn credential(&self) -> Option<&CredentialId> {
         match self {
             Self::Credential(id) | Self::CredentialModel { credential: id, .. } => Some(id),
+            Self::Binding(binding) | Self::BindingModel { binding, .. } => {
+                Some(binding.account_id())
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the composite binding identity for binding-scoped keys.
+    #[must_use]
+    pub fn binding(&self) -> Option<&BindingKey> {
+        match self {
+            Self::Binding(binding) | Self::BindingModel { binding, .. } => Some(binding),
             _ => None,
         }
     }
@@ -1121,6 +1145,9 @@ pub struct HealthSubject {
     pub model: Option<ModelId>,
     pub provider: Option<ProviderId>,
     pub route: Option<RouteId>,
+    /// Concrete target/account identity used to isolate credential health.
+    #[doc(hidden)]
+    pub binding: Option<BindingKey>,
 }
 
 impl HealthSubject {
@@ -1137,19 +1164,48 @@ impl HealthSubject {
             model: Some(model),
             provider: Some(provider),
             route: Some(route),
+            binding: None,
         }
+    }
+
+    /// Attach a concrete target/account binding to this health subject.
+    #[must_use]
+    pub fn with_binding(mut self, binding: BindingKey) -> Self {
+        self.credential = Some(binding.account_id().clone());
+        self.binding = Some(binding);
+        self
+    }
+
+    /// Alias that makes the composite identity explicit at call sites.
+    #[must_use]
+    pub fn with_binding_key(self, binding: BindingKey) -> Self {
+        self.with_binding(binding)
     }
 
     /// Resolve a concrete typed key, if all required IDs are present.
     #[must_use]
     pub fn resolve(&self, kind: CooldownScopeKind) -> Option<CooldownScope> {
         match kind {
-            CooldownScopeKind::Credential => self.credential.clone().map(CooldownScope::Credential),
-            CooldownScopeKind::CredentialModel => self
-                .credential
-                .clone()
-                .zip(self.model.clone())
-                .map(|(credential, model)| CooldownScope::CredentialModel { credential, model }),
+            CooldownScopeKind::Credential => self.binding.clone().map_or_else(
+                || self.credential.clone().map(CooldownScope::Credential),
+                |binding| Some(CooldownScope::Binding(binding)),
+            ),
+            CooldownScopeKind::CredentialModel => self.binding.clone().map_or_else(
+                || {
+                    self.credential
+                        .clone()
+                        .zip(self.model.clone())
+                        .map(|(credential, model)| CooldownScope::CredentialModel {
+                            credential,
+                            model,
+                        })
+                },
+                |binding| {
+                    self.model
+                        .clone()
+                        .map(|model| CooldownScope::BindingModel { binding, model })
+                },
+            ),
             CooldownScopeKind::Model => self.model.clone().map(CooldownScope::Model),
             CooldownScopeKind::Provider => self.provider.clone().map(CooldownScope::Provider),
             CooldownScopeKind::ProviderModel => self
@@ -1223,6 +1279,7 @@ impl Default for CredentialHealth {
 pub struct HealthRegistry {
     cooldowns: HashMap<CooldownScope, Instant>,
     credentials: HashMap<CredentialId, CredentialHealth>,
+    bindings: HashMap<BindingKey, CredentialHealth>,
 }
 
 impl HealthRegistry {
@@ -1239,12 +1296,14 @@ impl HealthRegistry {
             .entry(scope.clone())
             .and_modify(|old| *old = (*old).max(until))
             .or_insert(until);
-        if let CooldownScope::Credential(id) = scope {
-            let health = self.credentials.entry(id).or_default();
-            if health.status != CredentialStatus::Disabled {
-                health.status = CredentialStatus::CoolingDown;
-                health.cooldown_until = Some(until);
+        match scope {
+            CooldownScope::Credential(id) => {
+                set_cooling_down(self.credentials.entry(id).or_default(), until);
             }
+            CooldownScope::Binding(binding) | CooldownScope::BindingModel { binding, .. } => {
+                set_cooling_down(self.bindings.entry(binding).or_default(), until);
+            }
+            _ => {}
         }
     }
 
@@ -1281,11 +1340,18 @@ impl HealthRegistry {
                 reason: HealthMutationReason::MissingCooldownTarget,
             };
         };
-        if scope.credential().is_some_and(|id| {
-            self.credentials
-                .get(id)
-                .is_some_and(|health| health.status == CredentialStatus::Disabled)
-        }) {
+        let disabled = match &scope {
+            CooldownScope::Binding(binding) | CooldownScope::BindingModel { binding, .. } => self
+                .bindings
+                .get(binding)
+                .is_some_and(|health| health.status == CredentialStatus::Disabled),
+            _ => scope.credential().is_some_and(|id| {
+                self.credentials
+                    .get(id)
+                    .is_some_and(|health| health.status == CredentialStatus::Disabled)
+            }),
+        };
+        if disabled {
             return HealthMutation::NoChange {
                 reason: HealthMutationReason::CredentialDisabled,
             };
@@ -1299,10 +1365,14 @@ impl HealthRegistry {
             .copied()
             .map_or(until, |old| old.max(until));
         self.cooldowns.insert(scope.clone(), until);
-        if let CooldownScope::Credential(id) = &scope {
-            let health = self.credentials.entry(id.clone()).or_default();
-            health.status = CredentialStatus::CoolingDown;
-            health.cooldown_until = Some(until);
+        match &scope {
+            CooldownScope::Credential(id) => {
+                set_cooling_down(self.credentials.entry(id.clone()).or_default(), until);
+            }
+            CooldownScope::Binding(binding) | CooldownScope::BindingModel { binding, .. } => {
+                set_cooling_down(self.bindings.entry(binding.clone()).or_default(), until);
+            }
+            _ => {}
         }
         HealthMutation::CooldownApplied { scope, until }
     }
@@ -1388,10 +1458,28 @@ impl HealthRegistry {
         self.credentials.get(id)
     }
 
+    /// Return health for one concrete target/account binding.
+    #[must_use]
+    pub fn binding_health(&self, binding: &BindingKey) -> Option<&CredentialHealth> {
+        self.bindings.get(binding)
+    }
+
     /// Disable a credential until an outer control plane re-enables it.
     pub fn disable_credential(&mut self, id: CredentialId) {
         self.credentials.insert(
             id,
+            CredentialHealth {
+                status: CredentialStatus::Disabled,
+                cooldown_until: None,
+            },
+        );
+    }
+
+    /// Disable one concrete target/account binding without affecting a sibling
+    /// binding that happens to reuse the same account ID.
+    pub fn disable_binding(&mut self, binding: BindingKey) {
+        self.bindings.insert(
+            binding,
             CredentialHealth {
                 status: CredentialStatus::Disabled,
                 cooldown_until: None,
@@ -1410,6 +1498,31 @@ impl HealthRegistry {
         }
     }
 
+    /// Re-enable one concrete target/account binding.
+    pub fn enable_binding(&mut self, binding: &BindingKey) {
+        let health = self.bindings.entry(binding.clone()).or_default();
+        if health.status == CredentialStatus::Disabled {
+            health.status = CredentialStatus::Healthy;
+            health.cooldown_until = None;
+        }
+    }
+
+    /// Remove all binding-scoped health state when a compiled binding is
+    /// unregistered. Shared provider/model cooldowns remain intact.
+    pub fn remove_binding(&mut self, binding: &BindingKey) {
+        self.bindings.remove(binding);
+        self.cooldowns.retain(|scope, _| {
+            !matches!(
+                scope,
+                CooldownScope::Binding(candidate)
+                    | CooldownScope::BindingModel {
+                        binding: candidate,
+                        ..
+                    } if candidate == binding
+            )
+        });
+    }
+
     /// Remove expired entries and restore expired credential status.
     pub fn clear_expired(&mut self, now: Instant) -> usize {
         let expired: Vec<_> = self
@@ -1420,16 +1533,31 @@ impl HealthRegistry {
             .collect();
         for scope in &expired {
             self.cooldowns.remove(scope);
-            if let CooldownScope::Credential(id) = scope {
-                if let Some(health) = self.credentials.get_mut(id) {
-                    if health.status == CredentialStatus::CoolingDown {
-                        health.status = CredentialStatus::Healthy;
-                        health.cooldown_until = None;
-                    }
+            match scope {
+                CooldownScope::Credential(id) => clear_cooling_down(self.credentials.get_mut(id)),
+                CooldownScope::Binding(binding) | CooldownScope::BindingModel { binding, .. } => {
+                    clear_cooling_down(self.bindings.get_mut(binding));
                 }
+                _ => {}
             }
         }
         expired.len()
+    }
+}
+
+fn set_cooling_down(health: &mut CredentialHealth, until: Instant) {
+    if health.status != CredentialStatus::Disabled {
+        health.status = CredentialStatus::CoolingDown;
+        health.cooldown_until = Some(until);
+    }
+}
+
+fn clear_cooling_down(health: Option<&mut CredentialHealth>) {
+    if let Some(health) = health {
+        if health.status == CredentialStatus::CoolingDown {
+            health.status = CredentialStatus::Healthy;
+            health.cooldown_until = None;
+        }
     }
 }
 
@@ -1468,6 +1596,18 @@ pub struct SelectionTarget {
     pub provider: ProviderId,
     pub model: ModelId,
     pub credential_pseudonym: CredentialPseudonym,
+    /// Stable target ID, when selection came from a structured target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<TargetId>,
+    /// Redacted composite target/account identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_pseudonym: Option<String>,
+    /// Priority tier used by the selector; lower values win.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
+    /// Optional homogeneous account-pool ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_id: Option<String>,
 }
 
 impl SelectionTarget {
@@ -1478,6 +1618,33 @@ impl SelectionTarget {
             provider,
             model,
             credential_pseudonym: credential,
+            target_id: None,
+            binding_pseudonym: None,
+            priority: None,
+            pool_id: None,
+        }
+    }
+
+    /// Construct a target explanation from a concrete registration.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn structured(
+        provider: ProviderId,
+        model: ModelId,
+        credential: CredentialPseudonym,
+        target_id: TargetId,
+        binding_pseudonym: String,
+        priority: u32,
+        pool_id: Option<String>,
+    ) -> Self {
+        Self {
+            provider,
+            model,
+            credential_pseudonym: credential,
+            target_id: Some(target_id),
+            binding_pseudonym: Some(binding_pseudonym),
+            priority: Some(priority),
+            pool_id,
         }
     }
 }
@@ -1488,6 +1655,29 @@ pub enum FilterReason {
     ModelMismatch,
     MissingCapability(String),
     CodecUnavailable(String),
+    ProviderNotAllowed,
+    ProviderDenied,
+    TargetNotAllowed,
+    TargetDenied,
+    FallbackDisabled,
+    MissingParameter(String),
+    UnknownParameters,
+    MissingContext,
+    UnknownContext,
+    MissingQuantization(String),
+    UnknownQuantization,
+    PrivacyMismatch,
+    UnknownPrivacy,
+    ZdrRequired,
+    UnknownZdr,
+    DataPolicyMismatch,
+    UnknownDataPolicy,
+    RegionMismatch,
+    UnknownRegion,
+    PriceExceeded,
+    UnknownPrice,
+    StaleTelemetry,
+    UnknownTelemetry,
     CredentialUnavailable,
     CredentialCooldown,
     CredentialModelCooldown,
@@ -1599,6 +1789,10 @@ pub struct SelectionExplanation {
     pub affinity: AffinityDecision,
     pub selected: Option<SelectionTarget>,
     pub selected_score: Option<f64>,
+    /// Priority tier that won the decision, when target metadata was
+    /// structured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_priority: Option<u32>,
     pub model_alias_resolution: ModelAliasResolution,
     pub attempt: u32,
     pub configuration_generation: ConfigGeneration,
@@ -1613,6 +1807,7 @@ impl SelectionExplanation {
             affinity: AffinityDecision::NotRequested,
             selected: None,
             selected_score: None,
+            selected_priority: None,
             model_alias_resolution: model,
             attempt,
             configuration_generation: generation,
@@ -1631,6 +1826,7 @@ impl SelectionExplanation {
 
     /// Set the selected target.
     pub fn set_selected(&mut self, target: SelectionTarget, score: Option<f64>) {
+        self.selected_priority = target.priority;
         self.selected = Some(target);
         self.selected_score = score;
     }

@@ -203,7 +203,7 @@ fn test_config() -> pooler_config::CompiledConfig {
     compile_yaml(
         "fx-adapter-test.yaml",
         r#"
-version: 1
+version: 2
 listeners:
   local:
     bind: 127.0.0.1:0

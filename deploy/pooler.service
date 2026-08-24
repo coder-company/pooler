@@ -4,10 +4,8 @@ Documentation=https://github.com/coder-company/pooler/blob/main/docs/deployment.
 Wants=network-online.target
 After=network-online.target
 ConditionPathExists=/etc/pooler/pooler.yaml
-ConditionPathExists=/etc/pooler/pooler.example.yaml
 ConditionPathExists=/etc/pooler/store.key
-ConditionPathExists=/etc/pooler/upstream.key
-ConditionPathExists=/etc/pooler/downstream.key
+ConditionPathExists=/etc/pooler/management.key
 
 [Service]
 Type=simple
@@ -20,7 +18,7 @@ StateDirectoryMode=0700
 
 # Check syntax before every start. Secret references are not resolved by the
 # check, so this command never prints or persists provider credentials.
-ExecStartPre=/usr/local/bin/pooler --config /etc/pooler/pooler.yaml check
+ExecStartPre=/usr/local/bin/pooler --config /etc/pooler/pooler.yaml --credential-store /var/lib/pooler/credentials.sqlite3 --credential-key-ref file:/etc/pooler/store.key check
 ExecStart=/usr/local/bin/pooler --config /etc/pooler/pooler.yaml --credential-store /var/lib/pooler/credentials.sqlite3 --credential-key-ref file:/etc/pooler/store.key serve
 
 Restart=on-failure
@@ -49,9 +47,7 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 AmbientCapabilities=
-ReadWritePaths=/var/lib/pooler
-BindReadOnlyPaths=/etc/pooler/upstream.key:/run/secrets/upstream.key
-BindReadOnlyPaths=/etc/pooler/downstream.key:/run/secrets/downstream.key
+ReadWritePaths=/etc/pooler /var/lib/pooler
 
 [Install]
 WantedBy=multi-user.target

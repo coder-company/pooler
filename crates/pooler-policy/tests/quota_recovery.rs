@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use pooler_core::{CapabilitySet, CredentialId, ModelId};
 use pooler_policy::{
-    AffinityDecision, CommitmentState, CredentialRegistration, CredentialRegistry,
+    AffinityDecision, BindingKey, CommitmentState, CredentialRegistration, CredentialRegistry,
     ProviderNeutralQuotaClassifier, QuotaClassifier, QuotaObservation, QuotaProjectKey, QuotaScope,
     QuotaSignal, QuotaUnit, ReplayCheck, RetryContext, RetryDecision, RetryPolicy, RetryReason,
     RetryStopReason, SelectionRequest, SelectionStrategy,
@@ -391,4 +391,35 @@ fn unregister_removes_quota_with_no_remaining_subject_member() {
         .register(account("a", "provider", &project, None))
         .expect("reregister");
     assert!(registry.select(selection(Instant::now())).is_ok());
+}
+
+#[test]
+fn binding_quota_isolated_for_identical_account_ids() {
+    let registry = CredentialRegistry::new();
+    let first = CredentialRegistration::with_binding(
+        BindingKey::new("target-a", "shared", "fingerprint-a").expect("binding"),
+        pooler_core::ProviderId::new("provider-a").expect("provider"),
+        ModelId::new("model").expect("model"),
+        CapabilitySet::new(),
+    )
+    .expect("registration");
+    let second = CredentialRegistration::with_binding(
+        BindingKey::new("target-b", "shared", "fingerprint-b").expect("binding"),
+        pooler_core::ProviderId::new("provider-b").expect("provider"),
+        ModelId::new("model").expect("model"),
+        CapabilitySet::new(),
+    )
+    .expect("registration");
+    let first_binding = first.binding_key().clone();
+    let second_binding = second.binding_key().clone();
+    registry.register(first).expect("register first");
+    registry.register(second).expect("register second");
+    registry
+        .mark_binding_quota_exhausted(&first_binding, None)
+        .expect("exhaust first");
+
+    let selected = registry
+        .select(selection(Instant::now()))
+        .expect("second binding remains eligible");
+    assert_eq!(selected.binding_key(), &second_binding);
 }

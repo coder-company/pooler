@@ -11,6 +11,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use adapter_anthropic::AnthropicSemanticAdapter;
 use adapter_devin::DevinSemanticAdapter;
 use adapter_droid::DroidOpenAiSemanticAdapter;
@@ -39,6 +42,8 @@ use pooler_http::{
     SemanticResponseHint, SemanticWebSocketTransport,
 };
 use pooler_observe::MetricsRegistry;
+use pooler_store::{SecretPayload, SqliteStore};
+use ring::digest::{digest, SHA256};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixListener},
@@ -48,6 +53,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::config_management::ActivationCandidate;
 use crate::management::{
     ManagementOAuthBroker, ManagementOAuthError, ManagementOAuthFuture, ManagementReloadKind,
     ManagementRuntimeServices, NativeAccountAction, NativeAccountCommand,
@@ -55,7 +61,7 @@ use crate::management::{
 use crate::tls::{PreparedTls, TlsError};
 use crate::{
     ActiveCounts, ActiveGuard, CatalogRuntime, CatalogRuntimeError, ManagementApi,
-    ManagementHttpServer, ManagementServerError,
+    ManagementHttpServer, ManagementServerError, ManagementState,
 };
 
 const FORCE_CANCEL_GRACE: Duration = Duration::from_secs(1);
@@ -74,6 +80,45 @@ const MAX_RETIRED_GENERATIONS: usize = 2;
 /// alive connections are intentionally not subject to this deadline.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_NATIVE_BROWSER_OAUTH_SESSIONS: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeActivationStage {
+    Candidate,
+    Native,
+    Catalog,
+    Pooling,
+    Proxy,
+    Session,
+    Publish,
+    Acknowledge,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ACTIVATION_FAILURE_HOOK: Cell<Option<RuntimeActivationStage>> = const { Cell::new(None) };
+}
+
+fn activation_stage(_stage: RuntimeActivationStage) -> Result<(), HttpProxyServerError> {
+    #[cfg(test)]
+    if ACTIVATION_FAILURE_HOOK.with(|hook| hook.get() == Some(_stage)) {
+        return Err(HttpProxyServerError::NativeRuntimeActivation(format!(
+            "injected activation failure at {_stage:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn fail_activation_at(stage: RuntimeActivationStage) {
+    ACTIVATION_FAILURE_HOOK.with(|hook| hook.set(Some(stage)));
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn clear_activation_failure() {
+    ACTIVATION_FAILURE_HOOK.with(|hook| hook.set(None));
+}
 
 type RuntimeProxy = HttpProxy<RuntimeSemanticAdapter>;
 
@@ -445,6 +490,9 @@ pub enum HttpProxyServerError {
     /// Reload tried to change provider bindings owned by the native runtime.
     #[error("configuration reload cannot change native provider bindings; restart is required")]
     NativeRuntimeChanged,
+    /// A generation could not construct its native provider resources.
+    #[error("native runtime activation failed: {0}")]
+    NativeRuntimeActivation(String),
     /// The configured management listener could not be started.
     #[error(transparent)]
     Management(#[from] ManagementServerError),
@@ -516,8 +564,7 @@ struct RuntimeState {
     listeners: Mutex<Option<Vec<BoundListener>>>,
     dispatch: Arc<ArcSwap<RuntimeGeneration>>,
     reload_lock: Arc<AsyncMutex<()>>,
-    native: Arc<NativeRuntime>,
-    retired: Mutex<Vec<Vec<Arc<RuntimeProxy>>>>,
+    retired: Arc<Mutex<Vec<Arc<RuntimeGeneration>>>>,
     metrics: MetricsRegistry,
     traces: pooler_observe::TraceRecorder,
     active: ActiveCounts,
@@ -535,10 +582,26 @@ struct RuntimeState {
 /// generation until the response body ends.
 pub(crate) struct RuntimeGeneration {
     pub(crate) config: Arc<CompiledConfig>,
+    #[allow(dead_code)] // Surfaced by the structured activation graph in Task 14.
+    pub(crate) digest: Option<Arc<str>>,
     proxies: BTreeMap<Arc<str>, Arc<RuntimeProxy>>,
     tls: BTreeMap<Arc<str>, Option<Arc<PreparedTls>>>,
     pub(crate) pooling: Arc<PoolingCoordinator>,
     pub(crate) catalog: Option<Arc<CatalogRuntime>>,
+    pub(crate) native: Arc<NativeRuntime>,
+    oauth_sessions: Arc<GenerationOAuthSessions>,
+}
+
+struct GenerationOAuthSessions {
+    browser: Mutex<BTreeMap<u64, NativeBrowserSession>>,
+}
+
+impl GenerationOAuthSessions {
+    fn new() -> Self {
+        Self {
+            browser: Mutex::new(BTreeMap::new()),
+        }
+    }
 }
 
 struct NativeBrowserSession {
@@ -547,24 +610,53 @@ struct NativeBrowserSession {
 }
 
 struct NativeManagementOAuthBroker {
-    native: Arc<NativeRuntime>,
     dispatch: Arc<ArcSwap<RuntimeGeneration>>,
+    retired: Arc<Mutex<Vec<Arc<RuntimeGeneration>>>>,
     reload_lock: Arc<AsyncMutex<()>>,
-    browser_sessions: Mutex<BTreeMap<u64, NativeBrowserSession>>,
 }
 
 impl NativeManagementOAuthBroker {
     fn new(
-        native: Arc<NativeRuntime>,
         dispatch: Arc<ArcSwap<RuntimeGeneration>>,
+        retired: Arc<Mutex<Vec<Arc<RuntimeGeneration>>>>,
         reload_lock: Arc<AsyncMutex<()>>,
     ) -> Self {
         Self {
-            native,
             dispatch,
+            retired,
             reload_lock,
-            browser_sessions: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn generations(&self) -> Vec<Arc<RuntimeGeneration>> {
+        let current = self.dispatch.load_full();
+        let mut generations = vec![current];
+        generations.extend(
+            self.retired
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned(),
+        );
+        generations
+    }
+
+    fn remove_browser_session(
+        &self,
+        request_id: u64,
+    ) -> Option<(Arc<RuntimeGeneration>, NativeBrowserSession)> {
+        for generation in self.generations() {
+            let session = generation
+                .oauth_sessions
+                .browser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&request_id);
+            if let Some(session) = session {
+                return Some((generation, session));
+            }
+        }
+        None
     }
 
     fn callback_for(config: &CompiledConfig, account_id: &str) -> Option<url::Url> {
@@ -575,12 +667,16 @@ impl NativeManagementOAuthBroker {
             .oauth()?
             .callback()
             .clone();
-        let management_port = config
-            .management()?
-            .bind()
+        let management_bind = config.management()?.bind();
+        let management_port = management_bind
             .parse::<std::net::SocketAddr>()
-            .ok()?
-            .port();
+            .map(|address| address.port())
+            .ok()
+            .or_else(|| {
+                management_bind
+                    .strip_prefix("localhost:")
+                    .and_then(|port| port.parse::<u16>().ok())
+            })?;
         (callback.path() == "/management/oauth/browser/callback"
             && callback.query().is_none()
             && callback.fragment().is_none()
@@ -606,48 +702,158 @@ fn map_management_oauth_error(error: NativeRuntimeError) -> ManagementOAuthError
 impl ManagementOAuthBroker for NativeManagementOAuthBroker {
     fn start_browser(
         &self,
-        config: &CompiledConfig,
+        _config: &CompiledConfig,
         account: &str,
         request_id: u64,
     ) -> Result<url::Url, ManagementOAuthError> {
-        let callback =
-            Self::callback_for(config, account).ok_or(ManagementOAuthError::Unsupported)?;
-        let (authorization, session) = self
+        let generation = self.dispatch.load_full();
+        let callback = Self::callback_for(&generation.config, account)
+            .ok_or(ManagementOAuthError::Unsupported)?;
+        let (authorization, session) = generation
             .native
-            .start_browser_login(config, account)
+            .start_browser_login(generation.config.as_ref(), account)
             .map_err(map_management_oauth_error)?;
-        let mut sessions = self
-            .browser_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if sessions.len() >= MAX_NATIVE_BROWSER_OAUTH_SESSIONS || sessions.contains_key(&request_id)
+        let active_sessions = self
+            .generations()
+            .iter()
+            .map(|generation| {
+                generation
+                    .oauth_sessions
+                    .browser
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
+            .sum::<usize>();
+        if active_sessions >= MAX_NATIVE_BROWSER_OAUTH_SESSIONS
+            || self.generations().iter().any(|generation| {
+                generation
+                    .oauth_sessions
+                    .browser
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&request_id)
+            })
         {
             return Err(ManagementOAuthError::Unavailable);
         }
-        sessions.insert(request_id, NativeBrowserSession { session, callback });
+        generation
+            .oauth_sessions
+            .browser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request_id, NativeBrowserSession { session, callback });
+        if self.dispatch.load().config.generation() != generation.config.generation() {
+            generation
+                .oauth_sessions
+                .browser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&request_id);
+            return Err(ManagementOAuthError::StaleGeneration);
+        }
         Ok(authorization.authorization_url().clone())
     }
 
-    fn state_matches(&self, request_id: u64, candidate: &str) -> bool {
-        self.browser_sessions
+    fn restore_browser(
+        &self,
+        _config: &CompiledConfig,
+        account: &str,
+        request_id: u64,
+        state: &str,
+        verifier: &[u8],
+    ) -> Result<url::Url, ManagementOAuthError> {
+        let generation = self.dispatch.load_full();
+        let callback = Self::callback_for(&generation.config, account)
+            .ok_or(ManagementOAuthError::Unsupported)?;
+        let (authorization, session) = generation
+            .native
+            .restore_browser_login(generation.config.as_ref(), account, state, verifier)
+            .map_err(map_management_oauth_error)?;
+        let active_sessions = self
+            .generations()
+            .iter()
+            .map(|generation| {
+                generation
+                    .oauth_sessions
+                    .browser
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
+            .sum::<usize>();
+        if active_sessions >= MAX_NATIVE_BROWSER_OAUTH_SESSIONS {
+            return Err(ManagementOAuthError::Unavailable);
+        }
+        generation
+            .oauth_sessions
+            .browser
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&request_id)
-            .is_some_and(|session| session.session.matches_state(candidate))
+            .insert(request_id, NativeBrowserSession { session, callback });
+        if self.dispatch.load().config.generation() != generation.config.generation() {
+            generation
+                .oauth_sessions
+                .browser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&request_id);
+            return Err(ManagementOAuthError::StaleGeneration);
+        }
+        Ok(authorization.authorization_url().clone())
+    }
+
+    fn browser_flow_persistence(&self, request_id: u64) -> Option<(Vec<u8>, SecretPayload)> {
+        for generation in self.generations() {
+            let sessions = generation
+                .oauth_sessions
+                .browser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(session) = sessions.get(&request_id) else {
+                continue;
+            };
+            let state = session.session.state_value()?;
+            let verifier = SecretPayload::new(session.session.pkce_verifier()).ok()?;
+            return Some((state.into_bytes(), verifier));
+        }
+        None
+    }
+
+    fn state_matches(&self, request_id: u64, candidate: &str) -> bool {
+        self.generations().iter().any(|generation| {
+            generation
+                .oauth_sessions
+                .browser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&request_id)
+                .is_some_and(|session| session.session.matches_state(candidate))
+        })
     }
 
     fn callback_host_matches(&self, request_id: u64, candidate: &str) -> bool {
         let Ok(candidate) = url::Url::parse(&format!("http://{candidate}/")) else {
             return false;
         };
-        self.browser_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&request_id)
-            .is_some_and(|session| {
-                candidate.host_str() == session.callback.host_str()
-                    && candidate.port_or_known_default() == session.callback.port_or_known_default()
-            })
+        self.generations().iter().any(|generation| {
+            generation
+                .oauth_sessions
+                .browser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&request_id)
+                .is_some_and(|session| {
+                    candidate
+                        .host_str()
+                        .zip(session.callback.host_str())
+                        .is_some_and(|(candidate, expected)| {
+                            candidate.eq_ignore_ascii_case(expected)
+                        })
+                        && candidate.port_or_known_default()
+                            == session.callback.port_or_known_default()
+                })
+        })
     }
 
     fn finish_browser<'a>(
@@ -658,20 +864,22 @@ impl ManagementOAuthBroker for NativeManagementOAuthBroker {
         cancellation: CancellationToken,
     ) -> ManagementOAuthFuture<'a> {
         Box::pin(async move {
-            let NativeBrowserSession {
-                session,
-                mut callback,
-            } = self
-                .browser_sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&request_id)
+            let (
+                session_generation,
+                NativeBrowserSession {
+                    session,
+                    mut callback,
+                },
+            ) = self
+                .remove_browser_session(request_id)
                 .ok_or(ManagementOAuthError::NotFound)?;
-            if self.dispatch.load().config.generation() != generation {
+            if session_generation.config.generation() != generation
+                || self.dispatch.load().config.generation() != generation
+            {
                 return Err(ManagementOAuthError::StaleGeneration);
             }
             callback.set_query(Some(&callback_query));
-            let result = self
+            let result = session_generation
                 .native
                 .exchange_browser_login(session, callback, cancellation)
                 .await
@@ -680,7 +888,8 @@ impl ManagementOAuthBroker for NativeManagementOAuthBroker {
             if self.dispatch.load().config.generation() != generation {
                 return Err(ManagementOAuthError::StaleGeneration);
             }
-            self.native
+            session_generation
+                .native
                 .persist_oauth_login(result)
                 .map(|_| ())
                 .map_err(map_management_oauth_error)
@@ -698,7 +907,7 @@ impl ManagementOAuthBroker for NativeManagementOAuthBroker {
             if runtime.config.generation() != generation {
                 return Err(ManagementOAuthError::StaleGeneration);
             }
-            let result = self
+            let result = runtime
                 .native
                 .acquire_client_credentials(runtime.config.as_ref(), account, cancellation)
                 .await
@@ -707,7 +916,8 @@ impl ManagementOAuthBroker for NativeManagementOAuthBroker {
             if self.dispatch.load().config.generation() != generation {
                 return Err(ManagementOAuthError::StaleGeneration);
             }
-            self.native
+            runtime
+                .native
                 .persist_oauth_login(result)
                 .map(|_| ())
                 .map_err(map_management_oauth_error)
@@ -715,10 +925,7 @@ impl ManagementOAuthBroker for NativeManagementOAuthBroker {
     }
 
     fn discard_browser(&self, request_id: u64) {
-        self.browser_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&request_id);
+        let _ = self.remove_browser_session(request_id);
     }
 }
 
@@ -771,7 +978,7 @@ impl HttpProxyServer {
         native: Arc<NativeRuntime>,
         pooling: Arc<PoolingCoordinator>,
     ) -> Result<Self, HttpProxyServerError> {
-        Self::bind_inner(config, native, pooling).await
+        Self::bind_inner(config, native, pooling, None).await
     }
 
     /// Bind listeners with an injected native provider runtime. This keeps
@@ -785,13 +992,27 @@ impl HttpProxyServer {
             Arc::new(PoolingCoordinator::new(&config).map_err(|error| {
                 HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string()))
             })?);
-        Self::bind_inner(config, native, pooling).await
+        Self::bind_inner(config, native, pooling, None).await
+    }
+
+    /// Bind listeners while sharing the encrypted SQLite store with the
+    /// durable management control plane. Existing callers can continue using
+    /// [`Self::bind_with_native_runtime_and_pooling`] and receive the bounded
+    /// process-local management fallback.
+    pub async fn bind_with_native_runtime_and_pooling_and_management_store(
+        config: CompiledConfig,
+        native: Arc<NativeRuntime>,
+        pooling: Arc<PoolingCoordinator>,
+        management_store: Arc<SqliteStore>,
+    ) -> Result<Self, HttpProxyServerError> {
+        Self::bind_inner(config, native, pooling, Some(management_store)).await
     }
 
     async fn bind_inner(
         config: CompiledConfig,
         native: Arc<NativeRuntime>,
         pooling: Arc<PoolingCoordinator>,
+        management_store: Option<Arc<SqliteStore>>,
     ) -> Result<Self, HttpProxyServerError> {
         let catalog = prepare_catalog(&config, Arc::clone(&native)).await?;
         let pooling = Arc::new(
@@ -802,12 +1023,17 @@ impl HttpProxyServer {
         );
         let config = Arc::new(config);
         let resources = RuntimeResources::new();
+        let retired = Arc::new(Mutex::new(Vec::new()));
+        let oauth_sessions = Arc::new(GenerationOAuthSessions::new());
         let dispatch = Arc::new(ArcSwap::from_pointee(RuntimeGeneration {
             config: Arc::clone(&config),
+            digest: None,
             proxies: BTreeMap::new(),
             tls: BTreeMap::new(),
             pooling: Arc::clone(&pooling),
             catalog: catalog.clone(),
+            native: Arc::clone(&native),
+            oauth_sessions: Arc::clone(&oauth_sessions),
         }));
         let metrics = MetricsRegistry::default();
         let traces = pooler_observe::TraceRecorder::default();
@@ -817,8 +1043,8 @@ impl HttpProxyServer {
         let reload_lock = Arc::new(AsyncMutex::new(()));
         let browser_oauth: Arc<dyn ManagementOAuthBroker> =
             Arc::new(NativeManagementOAuthBroker::new(
-                Arc::clone(&native),
                 Arc::clone(&dispatch),
+                Arc::clone(&retired),
                 Arc::clone(&reload_lock),
             ));
         let management_api = config.management().map(|plan| {
@@ -833,13 +1059,14 @@ impl HttpProxyServer {
                     traces: traces.clone(),
                     native_commands,
                     browser_oauth: Some(Arc::clone(&browser_oauth)),
+                    management_state: management_store
+                        .map(|store| Arc::new(ManagementState::new(Some(store)))),
                 },
             ))
         });
         if let Some(api) = management_api.as_ref() {
             tokio::spawn(run_native_account_commands(
                 native_command_receiver,
-                Arc::clone(&native),
                 Arc::clone(&dispatch),
                 Arc::clone(&reload_lock),
                 Arc::downgrade(api),
@@ -940,10 +1167,13 @@ impl HttpProxyServer {
 
         dispatch.store(Arc::new(RuntimeGeneration {
             config: Arc::clone(&config),
+            digest: None,
             proxies,
             tls: tls_by_listener,
             pooling: Arc::clone(&pooling),
             catalog,
+            native: Arc::clone(&native),
+            oauth_sessions,
         }));
 
         Ok(Self {
@@ -951,8 +1181,7 @@ impl HttpProxyServer {
                 listeners: Mutex::new(Some(listeners)),
                 dispatch,
                 reload_lock,
-                native,
-                retired: Mutex::new(Vec::new()),
+                retired,
                 metrics,
                 traces,
                 active,
@@ -1057,7 +1286,12 @@ impl HttpProxyServer {
     /// Record a correlated management reload completion in bounded API state.
     /// `changed` is `None` for failure, `Some(false)` for unchanged, and
     /// `Some(true)` for success with newly published state.
-    pub fn complete_management_reload(&self, request_id: u64, changed: Option<bool>) {
+    pub fn complete_management_reload(
+        &self,
+        request_id: u64,
+        changed: Option<bool>,
+        configuration_generation: Option<u64>,
+    ) {
         let generation = self.state.dispatch.load_full();
         let outcome = match changed {
             Some(true) => "succeeded",
@@ -1072,7 +1306,7 @@ impl HttpProxyServer {
             api.complete_reload(
                 request_id,
                 outcome,
-                generation.config.generation(),
+                configuration_generation.unwrap_or_else(|| generation.config.generation()),
                 catalog_generation,
             );
         }
@@ -1116,10 +1350,19 @@ impl HttpProxyServer {
     /// Return live and peak counts from production runtime ownership guards.
     #[must_use]
     pub fn resource_snapshot(&self) -> RuntimeResourceSnapshot {
-        self.state
-            .resources
-            .snapshot()
-            .merge(self.state.native.resource_snapshot())
+        let mut snapshot = self.state.resources.snapshot();
+        let current = self.state.dispatch.load_full();
+        snapshot = snapshot.merge(current.native.resource_snapshot());
+        for generation in self
+            .state
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            snapshot = snapshot.merge(generation.native.resource_snapshot());
+        }
+        snapshot
     }
 
     /// Whether shutdown has begun on any listener.
@@ -1162,12 +1405,13 @@ impl HttpProxyServer {
     /// requests retain their old proxy `Arc`, while new requests load the new
     /// immutable generation from the dispatch table. A changed socket set is
     /// rejected because replacing bound sockets requires a process-level
-    /// listener handoff; the current service remains untouched.
+    /// listener handoff; native provider resources are rebuilt off-path for
+    /// the candidate generation.
     pub async fn reload(
         &self,
         candidate: CompiledConfig,
     ) -> Result<HttpReloadOutcome, HttpProxyServerError> {
-        self.reload_inner(candidate, None).await
+        self.reload_inner(candidate, None, None).await
     }
 
     /// Apply a management-requested candidate only if its accepting generation
@@ -1177,14 +1421,73 @@ impl HttpProxyServer {
         candidate: CompiledConfig,
         expected_generation: u64,
     ) -> Result<HttpReloadOutcome, HttpProxyServerError> {
-        self.reload_inner(candidate, Some(expected_generation))
+        self.reload_inner(candidate, Some(expected_generation), None)
             .await
+    }
+
+    /// Activate a compiler-validated staged file while retaining its exact
+    /// digest in the generation. The file manager still owns promotion and
+    /// rollback; this boundary only reads the immutable staged bytes and
+    /// rebuilds runtime resources before publishing them.
+    pub async fn reload_staged_candidate(
+        &self,
+        compiled: CompiledConfig,
+        staged_path: impl AsRef<std::path::Path>,
+        expected_generation: u64,
+    ) -> Result<HttpReloadOutcome, HttpProxyServerError> {
+        let staged_path = staged_path.as_ref().to_owned();
+        let bytes = std::fs::read(&staged_path).map_err(|error| {
+            HttpProxyServerError::NativeRuntimeActivation(format!(
+                "staged activation could not be read: {error}"
+            ))
+        })?;
+        let next_digest = sha256_hex(&bytes);
+        self.reload_activation(ActivationCandidate {
+            base_generation: expected_generation,
+            target_generation: expected_generation.saturating_add(1),
+            compiled,
+            canonical_path: staged_path.clone(),
+            staged_path: staged_path.clone(),
+            backup_path: staged_path.clone(),
+            rollback_path: staged_path,
+            prior_digest: String::new(),
+            next_digest,
+            bytes,
+        })
+        .await
+    }
+
+    /// Activate a file-management candidate whose runtime resources have not
+    /// yet been published. The caller retains the prepared file transaction;
+    /// this method only consumes the immutable compiled candidate and its
+    /// digest for generation construction.
+    pub(crate) async fn reload_activation(
+        &self,
+        candidate: ActivationCandidate,
+    ) -> Result<HttpReloadOutcome, HttpProxyServerError> {
+        if candidate.target_generation != candidate.base_generation.saturating_add(1) {
+            return Err(HttpProxyServerError::NativeRuntimeActivation(
+                "activation generation is not adjacent to its base".to_owned(),
+            ));
+        }
+        if sha256_hex(&candidate.bytes) != candidate.next_digest {
+            return Err(HttpProxyServerError::NativeRuntimeActivation(
+                "staged activation digest changed before runtime build".to_owned(),
+            ));
+        }
+        self.reload_inner(
+            candidate.compiled,
+            Some(candidate.base_generation),
+            Some(Arc::from(candidate.next_digest)),
+        )
+        .await
     }
 
     async fn reload_inner(
         &self,
         candidate: CompiledConfig,
         expected_generation: Option<u64>,
+        digest: Option<Arc<str>>,
     ) -> Result<HttpReloadOutcome, HttpProxyServerError> {
         let _guard = self.state.reload_lock.lock().await;
         let current = self.state.dispatch.load_full();
@@ -1200,19 +1503,27 @@ impl HttpProxyServer {
         if current.config.management() != candidate.management() {
             return Err(HttpProxyServerError::ListenerSetChanged);
         }
-        if !same_native_runtime_bindings(&current.config, &candidate) {
-            return Err(HttpProxyServerError::NativeRuntimeChanged);
-        }
+        activation_stage(RuntimeActivationStage::Candidate)?;
         let tls = prepare_tls_map(&candidate)?;
         if current.config.equivalent(&candidate) && same_tls_map(&current.tls, &tls) {
             return Ok(HttpReloadOutcome::Unchanged {
                 generation: current.config.generation(),
             });
         }
-        let catalog = prepare_catalog(&candidate, Arc::clone(&self.state.native)).await?;
-
         let generation = current.config.generation().saturating_add(1);
         let config = Arc::new(candidate.with_generation(generation));
+        activation_stage(RuntimeActivationStage::Native)?;
+        let native = Arc::new(
+            current
+                .native
+                .rebuild_for_config(&config)
+                .map_err(|error| {
+                    HttpProxyServerError::NativeRuntimeActivation(error.to_string())
+                })?,
+        );
+        activation_stage(RuntimeActivationStage::Catalog)?;
+        let catalog = prepare_catalog(&config, Arc::clone(&native)).await?;
+        activation_stage(RuntimeActivationStage::Pooling)?;
         let pooling = Arc::new(
             current
                 .pooling
@@ -1221,6 +1532,7 @@ impl HttpProxyServer {
                 .with_optional_catalog(catalog.as_ref().map(|catalog| catalog.service())),
         );
         let mut proxies = BTreeMap::new();
+        activation_stage(RuntimeActivationStage::Proxy)?;
         let extensions = extension_registry(&config)?;
         for plan in config.listeners().values() {
             let id: Arc<str> = Arc::from(plan.id());
@@ -1230,7 +1542,7 @@ impl HttpProxyServer {
                     Arc::clone(&id),
                     RuntimeSemanticAdapter,
                     Arc::clone(&pooling),
-                    Arc::clone(&self.state.native),
+                    Arc::clone(&native),
                 )?
                 .with_extensions(Arc::clone(&extensions))
                 .with_observability(self.state.metrics.clone())
@@ -1239,22 +1551,43 @@ impl HttpProxyServer {
             );
             proxies.insert(id, proxy);
         }
+        activation_stage(RuntimeActivationStage::Session)?;
 
+        let previous_generation = current.config.generation();
+        activation_stage(RuntimeActivationStage::Publish)?;
         let mut retired = self
             .state
             .retired
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        retired.push(current.proxies.values().cloned().collect());
+        retired.push(Arc::clone(&current));
         prune_retired_generations(&mut retired, true);
         drop(retired);
         self.state.dispatch.store(Arc::new(RuntimeGeneration {
             config: Arc::clone(&config),
+            digest,
             proxies,
             tls,
             pooling: Arc::clone(&pooling),
             catalog,
+            native,
+            oauth_sessions: Arc::new(GenerationOAuthSessions::new()),
         }));
+        if let Err(error) = activation_stage(RuntimeActivationStage::Acknowledge) {
+            self.state.dispatch.store(current);
+            let mut retired = self
+                .state
+                .retired
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retired
+                .last()
+                .is_some_and(|generation| generation.config.generation() == previous_generation)
+            {
+                retired.pop();
+            }
+            return Err(error);
+        }
         Ok(HttpReloadOutcome::Reloaded { generation })
     }
 
@@ -1397,11 +1730,22 @@ impl HttpProxyServer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         prune_retired_generations(&mut retired, false);
-        for group in retired.iter() {
-            proxies.extend(group.iter().cloned());
+        for generation in retired.iter() {
+            proxies.extend(generation.proxies.values().cloned());
         }
         proxies
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    digest(&SHA256, bytes)
+        .as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut value, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(value, "{byte:02x}");
+            value
+        })
 }
 
 /// Remove retired generations that no longer own in-flight requests and cap
@@ -1412,32 +1756,38 @@ impl HttpProxyServer {
 /// group becomes idle, it is safe to drop and the newest idle groups win the
 /// bounded retention policy. `all_proxies` passes `false` so its drain view
 /// drops idle groups immediately, matching the original drain behavior.
-fn prune_retired_generations(retired: &mut Vec<Vec<Arc<RuntimeProxy>>>, retain_idle: bool) {
-    let mut active_groups = Vec::with_capacity(retired.len());
-    let mut idle_groups = Vec::with_capacity(retired.len());
-    for group in retired.drain(..) {
-        if group
-            .iter()
+fn prune_retired_generations(retired: &mut Vec<Arc<RuntimeGeneration>>, retain_idle: bool) {
+    let mut active_generations = Vec::with_capacity(retired.len());
+    let mut idle_generations = Vec::with_capacity(retired.len());
+    for generation in retired.drain(..) {
+        if generation
+            .proxies
+            .values()
             .any(|proxy| proxy.drain_controller().active() > 0)
+            || !generation
+                .oauth_sessions
+                .browser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
         {
-            active_groups.push(group);
+            active_generations.push(generation);
         } else {
-            idle_groups.push(group);
+            idle_generations.push(generation);
         }
     }
     if retain_idle {
-        if idle_groups.len() > MAX_RETIRED_GENERATIONS {
-            let keep_from = idle_groups.len() - MAX_RETIRED_GENERATIONS;
-            idle_groups.drain(..keep_from);
+        if idle_generations.len() > MAX_RETIRED_GENERATIONS {
+            let keep_from = idle_generations.len() - MAX_RETIRED_GENERATIONS;
+            idle_generations.drain(..keep_from);
         }
-        active_groups.extend(idle_groups);
+        active_generations.extend(idle_generations);
     }
-    *retired = active_groups;
+    *retired = active_generations;
 }
 
 async fn run_native_account_commands(
     mut commands: mpsc::Receiver<NativeAccountCommand>,
-    native: Arc<NativeRuntime>,
     dispatch: Arc<ArcSwap<RuntimeGeneration>>,
     reload_lock: Arc<AsyncMutex<()>>,
     management: Weak<ManagementApi>,
@@ -1453,7 +1803,6 @@ async fn run_native_account_commands(
         };
         let outcome = match command.action {
             NativeAccountAction::DeviceLogin { request_id } => {
-                let native = Arc::clone(&native);
                 let dispatch = Arc::clone(&dispatch);
                 let management = management.clone();
                 let reload_lock = Arc::clone(&reload_lock);
@@ -1465,7 +1814,8 @@ async fn run_native_account_commands(
                     let outcome = if generation.config.generation() != expected_generation {
                         "stale_generation"
                     } else if let Some(management_api) = management.upgrade() {
-                        match native
+                        match generation
+                            .native
                             .start_device_login(
                                 generation.config.as_ref(),
                                 &account,
@@ -1481,14 +1831,22 @@ async fn run_native_account_commands(
                                     prompt.user_code(),
                                     prompt.expires_in_seconds(),
                                 );
-                                match native.poll_device_login(session, cancellation).await {
+                                match generation
+                                    .native
+                                    .poll_device_login(session, cancellation)
+                                    .await
+                                {
                                     Ok(result) => {
                                         let _reload_guard = reload_lock.lock().await;
                                         if dispatch.load().config.generation()
                                             != expected_generation
                                         {
                                             "stale_generation"
-                                        } else if native.persist_device_login(result).is_ok() {
+                                        } else if generation
+                                            .native
+                                            .persist_device_login(result)
+                                            .is_ok()
+                                        {
                                             "succeeded"
                                         } else {
                                             "failed"
@@ -1521,7 +1879,8 @@ async fn run_native_account_commands(
                     "stale_generation"
                 } else {
                     let succeeded = match command.action {
-                        NativeAccountAction::Refresh => native
+                        NativeAccountAction::Refresh => generation
+                            .native
                             .refresh_account(
                                 generation.config.as_ref(),
                                 &command.account,
@@ -1530,7 +1889,8 @@ async fn run_native_account_commands(
                             .await
                             .is_ok(),
                         NativeAccountAction::Revoke => {
-                            let revoked = native
+                            let revoked = generation
+                                .native
                                 .revoke_account(generation.config.as_ref(), &command.account)
                                 .await
                                 .is_ok();
@@ -1579,28 +1939,6 @@ fn same_listener_bindings(current: &CompiledConfig, candidate: &CompiledConfig) 
         && current.listeners().iter().all(|(id, plan)| {
             candidate.listeners().get(id).is_some_and(|other| {
                 other.bind() == plan.bind() && other.protocol() == plan.protocol()
-            })
-        })
-}
-
-fn same_native_runtime_bindings(current: &CompiledConfig, candidate: &CompiledConfig) -> bool {
-    let current_count = current
-        .upstreams()
-        .values()
-        .filter(|upstream| upstream.native().is_some())
-        .count();
-    let candidate_count = candidate
-        .upstreams()
-        .values()
-        .filter(|upstream| upstream.native().is_some())
-        .count();
-    current_count == candidate_count
-        && current.upstreams().iter().all(|(id, upstream)| {
-            let Some(native) = upstream.native() else {
-                return true;
-            };
-            candidate.upstreams().get(id).is_some_and(|other| {
-                other.native() == Some(native) && other.oauth() == upstream.oauth()
             })
         })
 }
@@ -4008,7 +4346,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "pooling.yaml",
             &format!(
-                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  a-backup: {{provider: local, secret: {}}}\n  z-primary: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{provider: local, accounts: [z-primary, a-backup]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  a-backup: {{provider: local, secret: {}}}\n  z-primary: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{provider: local, accounts: [z-primary, a-backup]}}\nmodels:\n  - id: public\n    targets: [{{id: public-local, provider: local, account_pool: pool, priority: 1, upstream_model: public, capabilities: [text], codecs: [], wire_family: openai}}]\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, model_from: request.model, policy: pooled}}\n    response: {{mode: opaque}}\n",
                 second_secret.reference(),
                 first_secret.reference()
             ),
@@ -4099,7 +4437,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "pooling-restart.yaml",
             &format!(
-                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{provider: local, accounts: [first, second]}}\npolicies:\n  pooled:\n    selection:\n      strategy: ordered_fallback\n      affinity: {{key: header:x-session, ttl: 10m, rebind: true}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{provider: local, accounts: [first, second]}}\nmodels:\n  - id: public\n    targets: [{{id: public-local, provider: local, account_pool: pool, priority: 1, upstream_model: public, capabilities: [text], codecs: [], wire_family: openai}}]\npolicies:\n  pooled:\n    selection:\n      strategy: ordered_fallback\n      affinity: {{key: header:x-session, ttl: 10m, rebind: true}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, model_from: request.model, policy: pooled}}\n    response: {{mode: opaque}}\n",
                 first_secret.reference(),
                 second_secret.reference()
             ),
@@ -4150,11 +4488,11 @@ mod tests {
             .cooldowns(0)
             .expect("cooldowns")
             .iter()
-            .any(|cooldown| cooldown.scope == "credential" && cooldown.key == "first"));
+            .any(|cooldown| cooldown.scope == "binding"));
         assert!(!store.session_affinities(0).expect("affinities").is_empty());
         assert!(store.decisions().expect("decisions").len() >= 2);
 
-        let restart_listener = TcpListener::bind("127.0.0.1:0")
+        let restart_listener = TcpListener::bind(upstream_address)
             .await
             .expect("restart upstream binds");
         let restart_address = restart_listener
@@ -4181,7 +4519,7 @@ mod tests {
             request
         });
         let restart_yaml = format!(
-            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{restart_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{provider: local, accounts: [first, second]}}\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, affinity: {{key: header:x-session, ttl: 10m, rebind: true}}}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, policy: pooled}}\n    response: {{mode: opaque}}\n",
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{restart_address}}}}}\naccounts:\n  first: {{provider: local, secret: {}}}\n  second: {{provider: local, secret: {}}}\naccount_pools:\n  pool: {{provider: local, accounts: [first, second]}}\nmodels:\n  - id: public\n    targets: [{{id: public-local, provider: local, account_pool: pool, priority: 1, upstream_model: public, capabilities: [text], codecs: [], wire_family: openai}}]\npolicies:\n  pooled:\n    selection: {{strategy: ordered_fallback, affinity: {{key: header:x-session, ttl: 10m, rebind: true}}}}\nroutes:\n  - id: pooled\n    listen: local\n    match: {{method: POST, path: /pooled}}\n    ingress: {{mode: patch}}\n    target: {{provider: local, model_from: request.model, policy: pooled}}\n    response: {{mode: opaque}}\n",
             first_secret.reference(),
             second_secret.reference()
         );
@@ -5166,10 +5504,17 @@ mod tests {
             MasterKey::from_bytes(b"mixed-openai-auth-test-key").expect("master key"),
         )
         .expect("encrypted credential store");
+        let fingerprint = pooler_http::account_configuration_fingerprint(
+            &config.upstreams()["subscription"],
+            "a-subscription-account",
+            pooler_config::AccountAuthKind::OAuth,
+        )
+        .expect("compiled account fingerprint");
         let state = store
-            .upsert_credential_state(CredentialState::new(
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
                 "a-subscription-account",
                 "subscription",
+                fingerprint.clone(),
                 true,
                 1,
             ))
@@ -5187,7 +5532,12 @@ mod tests {
         )
         .with_account_id("chatgpt-subscription-account");
         token_store
-            .compare_and_swap_profile(&credential, state.revision, &profile)
+            .compare_and_swap_profile_for_fingerprint(
+                &credential,
+                &fingerprint,
+                state.revision,
+                &profile,
+            )
             .expect("imported subscription profile persists");
         let native = Arc::new(
             NativeRuntime::new_with_sqlite(&config, token_store)
@@ -5362,7 +5712,7 @@ mod tests {
             assert_eq!(retired.len(), index.min(MAX_RETIRED_GENERATIONS));
             assert!(retired
                 .iter()
-                .flatten()
+                .flat_map(|generation| generation.proxies.values())
                 .all(|proxy| proxy.drain_controller().active() == 0));
         }
 
@@ -5370,7 +5720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_rejects_native_provider_binding_changes() {
+    async fn native_runtime_reload_adds_provider_atomically() {
         let config = pooler_config::compile_yaml(
             "native-reload.yaml",
             "version: 2\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  provider: {url: https://example.com}\n",
@@ -5383,11 +5733,42 @@ mod tests {
         )
         .expect("native candidate");
 
+        assert_eq!(
+            server.reload(candidate).await.expect("native reload"),
+            HttpReloadOutcome::Reloaded { generation: 2 }
+        );
+        assert_eq!(server.config_generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_native_activation_rolls_back() {
+        let config = pooler_config::compile_yaml(
+            "native-activation-failure.yaml",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  provider: {url: https://example.com}\n",
+        )
+        .expect("initial config");
+        let server = HttpProxyServer::bind(config).await.expect("proxy binds");
+        let candidate = pooler_config::compile_yaml(
+            "native-activation-failure.yaml",
+            "version: 2\nlisteners: {local: {bind: 127.0.0.1:0}}\nupstreams:\n  provider:\n    url: https://example.com\n    native: {kind: antigravity}\n",
+        )
+        .expect("native candidate");
+
+        fail_activation_at(RuntimeActivationStage::Native);
+        let result = server.reload(candidate).await;
+        clear_activation_failure();
+
         assert!(matches!(
-            server.reload(candidate).await,
-            Err(HttpProxyServerError::NativeRuntimeChanged)
+            result,
+            Err(HttpProxyServerError::NativeRuntimeActivation(_))
         ));
         assert_eq!(server.config_generation(), 1);
+        assert!(server
+            .state
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
     }
 
     #[tokio::test]
@@ -5641,7 +6022,7 @@ mod tests {
                 actual: 3
             })
         ));
-        server.complete_management_reload(second_request_id, None);
+        server.complete_management_reload(second_request_id, None, None);
         server.begin_drain();
         std::env::remove_var(SECRET_ENV);
     }
@@ -5690,7 +6071,6 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let stale_worker = tokio::spawn(run_native_account_commands(
             receiver,
-            Arc::clone(&server.state.native),
             Arc::clone(&server.state.dispatch),
             Arc::clone(&server.state.reload_lock),
             Arc::downgrade(&api),
@@ -5751,18 +6131,22 @@ mod tests {
                 .expect("native runtime"),
         );
         let pooling = Arc::new(PoolingCoordinator::new(config.as_ref()).expect("pooling"));
+        let retired = Arc::new(Mutex::new(Vec::new()));
         let dispatch = Arc::new(ArcSwap::from_pointee(RuntimeGeneration {
             config: Arc::clone(&config),
+            digest: None,
             proxies: BTreeMap::new(),
             tls: BTreeMap::new(),
             pooling: Arc::clone(&pooling),
             catalog: None,
+            native: Arc::clone(&native),
+            oauth_sessions: Arc::new(GenerationOAuthSessions::new()),
         }));
         let reload_lock = Arc::new(AsyncMutex::new(()));
         let browser_oauth: Arc<dyn ManagementOAuthBroker> =
             Arc::new(NativeManagementOAuthBroker::new(
-                Arc::clone(&native),
                 Arc::clone(&dispatch),
+                Arc::clone(&retired),
                 Arc::clone(&reload_lock),
             ));
         let (native_commands, _native_receiver) = mpsc::channel(1);
@@ -5777,6 +6161,7 @@ mod tests {
                 traces: pooler_observe::TraceRecorder::default(),
                 native_commands,
                 browser_oauth: Some(browser_oauth),
+                management_state: None,
             },
         ));
         let server = ManagementHttpServer::bind(Arc::clone(&api))
@@ -5807,10 +6192,13 @@ mod tests {
         let replacement = Arc::new(config.with_generation(config.generation() + 1));
         dispatch.store(Arc::new(RuntimeGeneration {
             config: replacement,
+            digest: None,
             proxies: BTreeMap::new(),
             tls: BTreeMap::new(),
             pooling,
             catalog: None,
+            native,
+            oauth_sessions: Arc::new(GenerationOAuthSessions::new()),
         }));
         let wrong_port = if address.port() == u16::MAX {
             address.port() - 1
@@ -5826,7 +6214,7 @@ mod tests {
             "GET /management/oauth/browser/callback?state={state}&code=unused-code HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
         );
         let response = send_request(address, callback.as_bytes()).await;
-        assert_eq!(status(&response), 409);
+        assert_eq!(status(&response), 410);
         let poll = format!(
             "GET /management/oauth/browser/1 HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer browser-generation-secret\r\nConnection: close\r\n\r\n"
         );
@@ -5906,7 +6294,8 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(retired.iter().any(|group| {
                 group
-                    .iter()
+                    .proxies
+                    .values()
                     .any(|proxy| proxy.drain_controller().active() > 0)
             }));
         }

@@ -10,6 +10,7 @@
 (() => {
   const BASE = "/management";
   const POLL_MS = 10_000;
+  let controlMutationQueue = Promise.resolve();
 
   /* ---------------- State ---------------- */
 
@@ -31,27 +32,87 @@
     endpointMeta: {},
     lastSuccessfulRefresh: null,
     pending: new Set(),
-    connectionAccount: "",
-    oauthDevice: {
-      account: "",
-      requestId: null,
-      status: "",
-      verificationUri: "",
-      verificationUriComplete: "",
-      userCode: "",
+    controlDraft: {
+      id: null,
+      etag: "",
+      baseGeneration: null,
+      dirty: false,
+      busy: false,
+      conflict: false,
+      confirmationToken: "",
+    },
+    providerDraft: {
+      id: "",
+      origin: "",
+      visible: false,
       busy: false,
     },
     accountDraft: {
       id: "",
       provider: "",
       authKind: "api_key",
-      secretKind: "env",
-      envName: "",
-      filePath: "",
-      keyringService: "pooler",
-      keyringAccount: "",
+      secret: "",
       busy: false,
     },
+    poolDraft: {
+      id: "",
+      provider: "",
+      accounts: [],
+      strategy: "ordered_fallback",
+      busy: false,
+    },
+    onboarding: {
+      provider: "",
+      providerDetails: null,
+      account: "",
+      phase: "provider",
+      discoveryBusy: false,
+      selectedModels: new Set(),
+      modelsInitialized: false,
+    },
+    oauthCapabilities: {},
+    oauthFlow: {
+      account: "",
+      requestId: null,
+      method: "",
+      status: "",
+      authorizationUrl: "",
+      verificationUri: "",
+      verificationUriComplete: "",
+      userCode: "",
+      expiresAt: 0,
+      busy: false,
+    },
+    targetOrders: {},
+    targetFocus: "",
+    targetAnnouncement: "",
+    targetDrag: null,
+    policyEditor: {
+      id: "",
+      strategy: "ordered_fallback",
+      ranking: "deterministic",
+      allow: "",
+      deny: "",
+      allowFallbacks: true,
+      requiredParameters: "",
+      requiredCapabilities: "",
+      minimumContext: "",
+      quantization: "",
+      privacy: "",
+      requireZdr: false,
+      dataPolicy: "",
+      maxPrice: "",
+      price: false,
+      latency: false,
+      throughput: false,
+      maxLatency: "",
+      minThroughput: "",
+      minSamples: "",
+      staleAfter: "",
+      dirty: false,
+      busy: false,
+    },
+    connectionAccount: "",
     usageRange: "24h",
     requestExplorer: {
       route: "",
@@ -70,18 +131,6 @@
       diff: [],
       confirmationToken: "",
       busy: false,
-    },
-    setup: {
-      step: 1,
-      provider: "",
-      auth: "",
-      account: "",
-      model: "",
-      client: "",
-      configuration: "",
-      testResult: null,
-      busy: false,
-      generation: 0,
     },
   };
 
@@ -320,29 +369,40 @@
       state.endpointMeta = {};
       state.lastSuccessfulRefresh = null;
       state.connectionAccount = "";
-      state.accountDraft.busy = false;
-      state.oauthDevice = {
+      state.controlDraft = {
+        id: null,
+        etag: "",
+        baseGeneration: null,
+        dirty: false,
+        busy: false,
+        conflict: false,
+      };
+      state.oauthCapabilities = {};
+      state.targetOrders = {};
+      state.targetFocus = "";
+      state.targetAnnouncement = "";
+      state.targetDrag = null;
+      state.policyEditor.dirty = false;
+      controlMutationQueue = Promise.resolve();
+      state.oauthFlow = {
         account: "",
         requestId: null,
+        method: "",
         status: "",
+        authorizationUrl: "",
         verificationUri: "",
         verificationUriComplete: "",
         userCode: "",
+        expiresAt: 0,
         busy: false,
       };
+      state.accountDraft.busy = false;
       state.requestExplorer.route = "";
       state.requestExplorer.provider = "";
       state.requestExplorer.status = "";
       state.requestExplorer.timeline = {};
       state.requestExplorer.busy = false;
     }
-  }
-
-  function clearSetupResults() {
-    state.setup.generation += 1;
-    state.setup.configuration = "";
-    state.setup.testResult = null;
-    state.setup.busy = false;
   }
 
   function clearConfigurationDraft() {
@@ -370,7 +430,6 @@
     const firstPrompt = !state.authPrompted;
     state.sessionGeneration += 1;
     state.pending.clear();
-    clearSetupResults();
     clearConfigurationDraft();
     invalidateReads({ clearData: true });
     state.authState = "required";
@@ -750,7 +809,8 @@
   }
 
   const ENDPOINTS = {
-    setupOptions: { path: "/setup/options" },
+    controlPlane: { path: "/control-plane" },
+    endpointInventory: { path: "/control-plane/endpoints" },
     configuration: { path: "/config" },
     health: { path: "/health" },
     active: { path: "/active" },
@@ -828,12 +888,12 @@
       endpoints: ["configuration", "reloads"],
       render: renderConfiguration,
     },
-    setup: {
-      title: "First-run setup",
+    providers: {
+      title: "Providers",
       subtitle:
-        "Choose a provider, connect an account safely, select a model and client, then verify the active runtime.",
-      endpoints: ["setupOptions", "models", "accounts", "health"],
-      render: renderSetup,
+        "Add a provider instance, connect an account, verify its model catalog, and choose what to expose.",
+      endpoints: ["controlPlane"],
+      render: renderProviders,
     },
     overview: {
       title: "Overview",
@@ -853,15 +913,29 @@
     models: {
       title: "Models",
       subtitle:
-        "Published model view: configured entries, discovered catalog, aliases, and exposure.",
-      endpoints: ["models", "catalog"],
+        "Review verified model discovery and choose the models exposed to every client.",
+      endpoints: ["controlPlane", "models", "catalog"],
       render: renderModels,
     },
     accounts: {
       title: "Accounts",
-      subtitle: "Redacted account state and operator controls.",
-      endpoints: ["accounts", "setupOptions"],
+      subtitle: "Independent account health, quota, authentication, and actions.",
+      endpoints: ["controlPlane", "accounts", "quota"],
       render: renderAccounts,
+    },
+    pools: {
+      title: "Pools",
+      subtitle:
+        "Optionally group accounts with the same provider for bounded failover and quota-aware routing.",
+      endpoints: ["controlPlane"],
+      render: renderPools,
+    },
+    endpoints: {
+      title: "Endpoints",
+      subtitle:
+        "Client-agnostic base URLs, paths, authentication requirements, and machine-readable inventory.",
+      endpoints: ["endpointInventory", "controlPlane"],
+      render: renderEndpoints,
     },
     usage: {
       title: "Usage",
@@ -1037,407 +1111,347 @@
     return active.etag || `generation-${active.configuration_generation}`;
   }
 
-  /* ---------------- First-run setup ---------------- */
-  function setupProvider() {
-    const providers = state.data.setupOptions?.providers || [];
-    return (
-      providers.find((provider) => provider.id === state.setup.provider) || null
-    );
+  /* ---------------- Structured provider control plane ---------------- */
+
+  function controlGraph() {
+    return state.data.controlPlane || {};
   }
 
-  function setupDefaults() {
-    const providers = state.data.setupOptions?.providers || [];
-    if (!providers.length) return;
-    if (!providers.some((provider) => provider.id === state.setup.provider)) {
-      const configured = providers.find(
-        (provider) => (provider.configured_upstreams || []).length,
-      );
-      state.setup.provider = (
-        configured ||
-        providers.find((provider) => provider.id === "openai") ||
-        providers[0]
-      ).id;
+  function graphProviders() {
+    const providers = [...(controlGraph().providers || [])];
+    if (state.onboarding.provider && state.onboarding.providerDetails && !providers.some((provider) => provider.id === state.onboarding.provider)) {
+      providers.push(state.onboarding.providerDetails);
     }
-    const provider = setupProvider();
-    const methods = (provider?.authentication || []).filter(
-      (method) => method.support === "supported",
-    );
-    if (!methods.some((method) => method.method === state.setup.auth)) {
-      state.setup.auth =
-        (
-          methods.find((method) => method.method === "api_key") ||
-          methods[0] ||
-          {}
-        ).method || "";
+    return providers;
+  }
+
+  function graphAccounts() {
+    return controlGraph().accounts || [];
+  }
+
+  function graphPools() {
+    return controlGraph().pools || [];
+  }
+
+  function graphModels() {
+    const discovery = controlGraph().discovery || {};
+    return controlGraph().models || discovery.models || [];
+  }
+
+  function draftBar() {
+    const draft = state.controlDraft;
+    if (!draft.id) {
+      return `<div class="callout callout-info draft-bar"><strong>Changes are staged safely.</strong> Create a structured draft when you are ready to add a provider, account, pool, or model exposure.</div>`;
     }
-    if (!(provider?.clients || []).includes(state.setup.client)) {
-      state.setup.client = (provider?.clients || ["native"])[0];
-    }
-    if (!state.setup.account)
-      state.setup.account = `${state.setup.provider}-primary`;
-    const configuredModels = setupModels(provider);
-    if (!state.setup.model && configuredModels.length)
-      state.setup.model = configuredModels[0].id;
+    const conflict = draft.conflict
+      ? `<div class="callout callout-warning draft-conflict" role="alert"><strong>Draft conflict.</strong> The active generation changed while this draft was open. <button class="btn btn-outline btn-xs" type="button" data-control-action="recover">Reload current state</button> and review the staged values before continuing.</div>`
+      : "";
+    return `${conflict}<div class="draft-bar" role="status"><span class="badge ${draft.dirty ? "badge-warning" : "badge-accent"}">${draft.dirty ? "Unsaved draft" : "Draft ready"}</span><span class="mono">${esc(draft.id)}</span><span class="muted">base generation ${esc(draft.baseGeneration)}</span><span class="spacer"></span><button class="btn btn-outline btn-xs" type="button" data-control-action="validate"${draft.busy || draft.conflict ? " disabled" : ""}>Review changes</button>${draft.confirmationToken ? `<button class="btn btn-primary btn-xs" type="button" data-control-action="commit"${draft.busy ? " disabled" : ""}>Commit changes</button>` : ""}<button class="btn btn-ghost btn-xs" type="button" data-control-action="discard"${draft.busy ? " disabled" : ""}>Discard</button></div>`;
   }
 
-  function setupModels(provider = setupProvider()) {
-    const upstreams = new Set(provider?.configured_upstreams || []);
-    if (provider?.id) upstreams.add(provider.id);
-    return (state.data.models?.models || []).filter((model) =>
-      (model.targets || []).some((target) => upstreams.has(target.provider)),
-    );
-  }
-
-  function setupQuery() {
-    const query = new URLSearchParams({
-      provider: state.setup.provider,
-      auth: state.setup.auth,
-      account: state.setup.account,
-      model: state.setup.model,
-      client: state.setup.client,
-    });
-    return query.toString();
-  }
-
-  function setupReadyForStep(step) {
-    if (step === 1) return Boolean(state.setup.provider);
-    if (step === 2)
-      return Boolean(
-        state.setup.auth && /^[A-Za-z0-9_.-]{1,128}$/.test(state.setup.account),
-      );
-    if (step === 3)
-      return Boolean(
-        state.setup.model &&
-          state.setup.model.length <= 256 &&
-          !/[\u0000-\u001F\u007F]/u.test(state.setup.model),
-      );
-    if (step === 4) return Boolean(state.setup.client);
-    return true;
-  }
-
-  function setupAuthInstructions(provider) {
-    const method = (provider?.authentication || []).find(
-      (item) => item.method === state.setup.auth,
-    );
-    if (!provider || !method)
-      return `<p class="empty-description">Select a supported authentication method.</p>`;
-    const environments = provider.credential_environment_variables || [];
-    const secretGuidance =
-      state.setup.auth === "api_key"
-        ? `<p>After generating and downloading the sidecar, set the provider key outside the browser using one of these documented environment names: ${environments.length ? environments.map((name) => `<code class="mono">${esc(name)}</code>`).join(", ") : "no built-in environment variable is documented"}.</p>`
-        : `<p>Authentication happens from a trusted terminal after the sidecar has been generated and downloaded. Browser/device tokens are written only to Pooler's encrypted credential store.</p>`;
-    return `${secretGuidance}<p class="muted">No credential value is accepted, retained, or placed in a URL by this dashboard.</p>`;
-  }
-
-  function setupActivationInstructions(provider) {
-    const methodName = {
-      authorization_code_pkce: "oauth",
-      device_code: "device-code",
-      api_key: "api-key",
-    }[state.setup.auth];
-    const login = [
-      "pooler",
-      "--config",
-      "pooler.setup.yaml",
-      "--credential-key-ref",
-      "env:POOLER_STORE_KEY",
-      "auth",
-      "login",
-      provider?.id || state.setup.provider,
-      "--account",
-      state.setup.account,
-      "--method",
-      methodName,
-    ]
-      .map(shellArg)
-      .join(" ");
-    const serve = [
-      "pooler",
-      "--config",
-      "pooler.setup.yaml",
-      "--credential-key-ref",
-      "env:POOLER_STORE_KEY",
-      "serve",
-    ]
-      .map(shellArg)
-      .join(" ");
-    return `<ol class="check-list"><li>Download <code class="mono">pooler.setup.yaml</code> and set the referenced environment secrets, including <code class="mono">POOLER_STORE_KEY</code> and <code class="mono">POOLER_MANAGEMENT_TOKEN</code>.</li><li>Validate it: <code class="mono">pooler check --config pooler.setup.yaml</code>.</li><li>Complete provider authentication: <code class="mono">${esc(login)}</code>.</li><li>Start Pooler with the same credential-store key: <code class="mono">${esc(serve)}</code>.</li><li>Reopen or reconnect this dashboard, then verify the newly running instance.</li></ol>`;
-  }
-
-  function setupClientInstructions() {
-    const addresses = {
-      factory: "http://127.0.0.1:18474",
-      devin: "http://127.0.0.1:18473",
+  function resetControlDraft() {
+    state.controlDraft = {
+      id: null,
+      etag: "",
+      baseGeneration: null,
+      dirty: false,
+      busy: false,
+      conflict: false,
+      confirmationToken: "",
     };
-    const base = addresses[state.setup.client] || "http://127.0.0.1:8319";
-    if (["openai", "codex", "cursor", "droid"].includes(state.setup.client)) {
-      return `Set the client's OpenAI-compatible base URL to <code class="mono">${base}/v1</code>. Use a non-secret local placeholder only if the client requires an API-key field; Pooler resolves the upstream credential server-side.`;
-    }
-    if (state.setup.client === "anthropic")
-      return `Set the Anthropic SDK base URL to <code class="mono">${base}</code>. Pooler supplies the upstream <code class="mono">x-api-key</code> header server-side.`;
-    if (state.setup.client === "gemini")
-      return `Set the Gemini client base URL to <code class="mono">${base}</code>. Pooler supplies the upstream Google credential server-side.`;
-    return `Point the selected client at <code class="mono">${base}</code>. The generated route preserves the selected provider's request dialect.`;
   }
 
-  function renderSetup(root) {
-    setupDefaults();
-    const provider = setupProvider();
-    const methods = (provider?.authentication || []).filter(
-      (method) => method.support === "supported",
-    );
-    const unavailableMethods = (provider?.authentication || []).filter(
-      (method) => method.support !== "supported",
-    );
-    const models = setupModels(provider);
-    const clients = state.data.setupOptions?.clients || [];
-    const compatibleClients = new Set(provider?.clients || []);
-    const steps = [
-      "Provider",
-      "Account",
-      "Model",
-      "Client",
-      "Activate & verify",
-    ];
-    const stepNav = steps
-      .map((label, index) => {
-        const number = index + 1;
-        const current = number === state.setup.step;
-        return `<li class="setup-step${current ? " active" : ""}${number < state.setup.step ? " complete" : ""}"${current ? ' aria-current="step"' : ""}><span>${number}</span>${esc(label)}</li>`;
-      })
-      .join("");
-    let body = "";
-    if (state.setup.step === 1) {
-      body = `
-        <fieldset class="wizard-fieldset"><legend>Choose a provider</legend>
-          <label class="field"><span class="field-label">Provider</span><select id="setup-provider" data-setup-field="provider">
-            ${(state.data.setupOptions?.providers || []).map((item) => `<option value="${esc(item.id)}"${item.id === state.setup.provider ? " selected" : ""}>${esc(item.name)} · ${esc(item.id)}</option>`).join("")}
-          </select></label>
-          ${provider ? `<div class="setup-facts"><span class="badge badge-neutral">${esc(provider.request_dialect)} dialect</span><span class="badge badge-neutral">${esc(provider.native_kind)}</span>${(provider.capabilities || []).map((capability) => `<span class="badge badge-neutral">${esc(capability)}</span>`).join("")}</div><p class="muted">${provider.discovery?.available ? "Bounded model discovery is documented for this provider." : "This provider has no catalog discovery contract; enter a documented model ID manually."}</p>` : ""}
-        </fieldset>`;
-    } else if (state.setup.step === 2) {
-      body = `
-        <fieldset class="wizard-fieldset"><legend>Connect an account</legend>
-          <label class="field"><span class="field-label">Authentication method</span><select id="setup-auth" data-setup-field="auth">
-            ${methods.map((method) => `<option value="${esc(method.method)}"${method.method === state.setup.auth ? " selected" : ""}>${esc(method.method.replaceAll("_", " "))} · ${esc(method.support.replaceAll("_", " "))}</option>`).join("")}
-          </select></label>
-          <label class="field"><span class="field-label">Account ID</span><input id="setup-account" data-setup-field="account" value="${esc(state.setup.account)}" maxlength="128" pattern="[A-Za-z0-9_.-]+" autocomplete="off" spellcheck="false"></label>
-          <div class="callout">${setupAuthInstructions(provider)}</div>
-          ${unavailableMethods.length ? `<div class="callout callout-warning"><strong>Methods not offered by this wizard</strong><ul class="check-list">${unavailableMethods.map((method) => `<li><span class="mono">${esc(method.method.replaceAll("_", " "))}</span> — ${esc(method.note || method.support.replaceAll("_", " "))}</li>`).join("")}</ul></div>` : ""}
-        </fieldset>`;
-    } else if (state.setup.step === 3) {
-      body = `
-        <fieldset class="wizard-fieldset"><legend>Select a model</legend>
-          <label class="field"><span class="field-label">Published or documented model ID</span><input id="setup-model" data-setup-field="model" list="setup-models" value="${esc(state.setup.model)}" maxlength="256" autocomplete="off" spellcheck="false"><datalist id="setup-models">${models.map((model) => `<option value="${esc(model.id)}"></option>`).join("")}</datalist></label>
-          <p class="muted">${models.length ? `${fmtInt(models.length)} active model mapping${models.length === 1 ? "" : "s"} match this provider.` : provider?.discovery?.available ? "No active model mapping matches yet. Enter a provider-documented ID; the generated configuration enables bounded discovery." : "No active model mapping matches yet. Enter a provider-documented ID; the generated configuration adds an explicit mapping."}</p>
-        </fieldset>`;
-    } else if (state.setup.step === 4) {
-      body = `
-        <fieldset class="wizard-fieldset"><legend>Choose a client</legend>
-          <label class="field"><span class="field-label">Client or protocol</span><select id="setup-client" data-setup-field="client">
-            ${clients
-              .filter((client) => compatibleClients.has(client.id))
-              .map(
-                (client) =>
-                  `<option value="${esc(client.id)}"${client.id === state.setup.client ? " selected" : ""}>${esc(client.name)}</option>`,
-              )
-              .join("")}
-          </select></label>
-          <div class="callout">${setupClientInstructions()}</div>
-        </fieldset>`;
-    } else {
-      const test = state.setup.testResult;
-      const checks = test?.checks || [];
-      body = `
-        <section aria-labelledby="setup-review-title"><h2 id="setup-review-title" class="section-title">Review and verify</h2>
-          <dl class="detail-grid"><div><dt>Provider</dt><dd>${esc(provider?.name || state.setup.provider)}</dd></div><div><dt>Account</dt><dd class="mono">${esc(state.setup.account)}</dd></div><div><dt>Model</dt><dd class="mono">${esc(state.setup.model)}</dd></div><div><dt>Client</dt><dd>${esc(clients.find((client) => client.id === state.setup.client)?.name || state.setup.client)}</dd></div></dl>
-          <div class="callout callout-warning"><strong>Generate before authenticating.</strong> Pooler validates this sidecar but does not overwrite your hand-written YAML. The verification action checks the currently running process, so start that generated configuration and reconnect this dashboard before verifying.</div>
-          <div class="button-row"><button class="btn btn-outline btn-sm" type="button" data-setup-action="generate"${state.setup.busy ? " disabled" : ""}>Generate configuration</button>${state.setup.configuration ? '<button class="btn btn-outline btn-sm" type="button" data-setup-action="copy">Copy YAML</button><button class="btn btn-outline btn-sm" type="button" data-setup-action="download">Download sidecar</button>' : ""}<button class="btn btn-primary btn-sm" type="button" data-setup-action="test"${state.setup.busy || !state.setup.configuration ? " disabled" : ""}>${state.setup.busy ? "Checking…" : "Verify running instance"}</button>${test?.ready ? '<a class="btn btn-primary btn-sm" href="#/overview">Finish setup</a>' : ""}</div>
-          ${state.setup.configuration ? `${setupActivationInstructions(provider)}<pre class="code-block setup-config"><code>${esc(state.setup.configuration)}</code></pre>` : '<div class="empty-state"><p class="empty-title">Configuration not generated</p><p class="empty-description">Generate a compiler-validated, secret-reference-only sidecar before setting secrets or running provider login.</p></div>'}
-          ${test ? `<div class="callout ${test.ready ? "callout-success" : "callout-warning"}" role="status"><strong>${test.ready ? "Connection evidence verified" : "Setup is not verified yet"}</strong><p>${test.connection === "verified" ? "A successful bounded model-discovery observation exists for this provider and account." : "No outbound catalog observation has succeeded for this provider and account. Pooler did not send a billable inference request."}</p><ul class="check-list">${checks.map((check) => `<li><span class="badge ${check.status === "passed" ? "badge-success" : "badge-neutral"}">${esc(check.status)}</span> <strong>${esc(check.id.replaceAll("_", " "))}</strong> — ${esc(check.detail)}</li>`).join("")}</ul></div>` : ""}
-        </section>`;
-    }
-    const nextDisabled =
-      !setupReadyForStep(state.setup.step) || state.setup.busy;
-    root.innerHTML = `
-      ${viewHeader("First-run setup", "No credentials are entered in or retained by this dashboard.")}
-      <ol class="setup-progress" aria-label="Setup progress">${stepNav}</ol>
-      <div class="panel wizard-panel">${body}<div class="wizard-actions">${state.setup.step > 1 ? `<button class="btn btn-outline" type="button" data-setup-action="back"${state.setup.busy ? " disabled" : ""}>Back</button>` : ""}${state.setup.step < 5 ? `<button class="btn btn-primary" type="button" data-setup-action="next"${nextDisabled ? " disabled" : ""}>Continue</button>` : ""}</div></div>`;
+  async function ensureControlDraft() {
+    if (state.controlDraft.id) return state.controlDraft;
+    const result = await mutate("/control-plane/drafts");
+    state.controlDraft.id = result.draft_id;
+    state.controlDraft.etag = result.etag || "";
+    state.controlDraft.baseGeneration = result.base_generation ?? controlGraph().configuration?.generation;
+    state.controlDraft.dirty = false;
+    state.controlDraft.conflict = false;
+    return state.controlDraft;
   }
 
-  async function generateSetupConfiguration() {
-    const setupGeneration = state.setup.generation;
-    state.setup.busy = true;
-    renderSetup($("#view"));
-    const sessionGeneration = state.sessionGeneration;
-    try {
-      const result = await readJson(`/setup/config?${setupQuery()}`);
-      if (
-        sessionGeneration !== state.sessionGeneration ||
-        setupGeneration !== state.setup.generation
-      )
-        return;
-      state.setup.configuration = result.configuration || "";
-      state.setup.testResult = null;
-    } catch (error) {
-      if (
-        sessionGeneration !== state.sessionGeneration ||
-        setupGeneration !== state.setup.generation
-      )
-        return;
-      if (error.status === 401) authRequired();
-      else notify("error", error.message);
-    } finally {
-      if (
-        sessionGeneration === state.sessionGeneration &&
-        setupGeneration === state.setup.generation
-      ) {
-        state.setup.busy = false;
-        if (state.route === "setup") renderSetup($("#view"));
-      }
-    }
-  }
-
-  async function waitForSetupReload(requestId, sessionGeneration) {
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      if (sessionGeneration !== state.sessionGeneration) return null;
-      const reloads = await readJson("/reloads");
-      const record = (reloads.reloads || []).find(
-        (item) => item.request_id === requestId,
-      );
-      if (record && record.status !== "pending") return record;
-    }
-    return null;
-  }
-
-  async function runSetupConnectionTest() {
-    const setupGeneration = state.setup.generation;
-    state.setup.busy = true;
-    state.setup.testResult = null;
-    renderSetup($("#view"));
-    const sessionGeneration = state.sessionGeneration;
-    try {
-      if (
-        !state.data.health?.management?.mutations ||
-        state.authState !== "authenticated"
-      ) {
-        throw new Error(
-          "Verification requires an authenticated running instance with catalog reload enabled.",
-        );
-      }
-      const request = await mutate("/models/reload");
-      const result = await waitForSetupReload(
-        request.request_id,
-        sessionGeneration,
-      );
-      if (
-        sessionGeneration !== state.sessionGeneration ||
-        setupGeneration !== state.setup.generation
-      )
-        return;
-      if (!result || result.status !== "succeeded") {
-        state.setup.testResult = {
-          ready: false,
-          connection: "not_probed",
-          checks: [
-            {
-              id: "catalog_reload",
-              status: "failed",
-              detail:
-                result?.detail ||
-                "The correlated catalog reload did not succeed.",
-            },
-          ],
-        };
-        return;
-      }
-      const query = `${setupQuery()}&reload_request_id=${encodeURIComponent(request.request_id)}`;
-      const testResult = await readJson(`/setup/test?${query}`);
-      if (
-        sessionGeneration !== state.sessionGeneration ||
-        setupGeneration !== state.setup.generation
-      )
-        return;
-      state.setup.testResult = testResult;
-    } catch (error) {
-      if (
-        sessionGeneration !== state.sessionGeneration ||
-        setupGeneration !== state.setup.generation
-      )
-        return;
-      if (error.status === 401) authRequired();
-      else notify("error", error.message);
-    } finally {
-      if (
-        sessionGeneration === state.sessionGeneration &&
-        setupGeneration === state.setup.generation
-      ) {
-        state.setup.busy = false;
-        if (state.route === "setup") renderSetup($("#view"));
-      }
-    }
-  }
-
-  function downloadSetupConfiguration() {
-    const blob = new Blob([state.setup.configuration], {
-      type: "application/yaml;charset=utf-8",
-    });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "pooler.setup.yaml";
-    link.hidden = true;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-  }
-
-  async function setupAction(action) {
-    if (action === "back") {
-      state.setup.step = Math.max(1, state.setup.step - 1);
-      renderSetup($("#view"));
-      return;
-    }
-    if (action === "next") {
-      if (!setupReadyForStep(state.setup.step)) return;
-      state.setup.step = Math.min(5, state.setup.step + 1);
-      renderSetup($("#view"));
-      if (state.setup.step === 5 && !state.setup.configuration)
-        await generateSetupConfiguration();
-      return;
-    }
-    if (action === "generate") await generateSetupConfiguration();
-    else if (action === "test") await runSetupConnectionTest();
-    else if (action === "copy") {
+  function applyControlResource(resource, value, id = "") {
+    const operation = async () => {
+      const draft = await ensureControlDraft();
+      const suffix = id ? `/${encodeURIComponent(id)}` : "";
       try {
-        await navigator.clipboard.writeText(state.setup.configuration);
-        notify("success", "Configuration copied.");
-      } catch {
-        notify(
-          "warning",
-          "Clipboard access was unavailable. Select the YAML manually.",
+        const result = await mutateJson(
+          `/control-plane/drafts/${encodeURIComponent(draft.id)}/${resource}${suffix}`,
+          "POST",
+          value,
+          draft.etag,
         );
+        draft.etag = result.etag || draft.etag;
+        draft.dirty = true;
+        draft.conflict = false;
+        return result;
+      } catch (error) {
+        if (error.status === 409) {
+          draft.conflict = true;
+          notify("warning", "This draft is out of date. Reload current state and review before retrying.", { sticky: true });
+        }
+        throw error;
       }
-    } else if (action === "download") downloadSetupConfiguration();
+    };
+    const result = controlMutationQueue.then(operation, operation);
+    controlMutationQueue = result.catch(() => undefined);
+    return result;
   }
 
-  function updateSetupField(field, value) {
-    if (!Object.hasOwn(state.setup, field)) return;
-    const changed = state.setup[field] !== value;
-    state.setup[field] = value;
-    if (!changed) return;
-    state.setup.generation += 1;
-    state.setup.busy = false;
-    state.setup.configuration = "";
-    state.setup.testResult = null;
-    if (field === "provider") {
-      state.setup.auth = "";
-      state.setup.client = "";
-      state.setup.account = `${value}-primary`;
-      state.setup.model = "";
-      setupDefaults();
+  async function controlDraftAction(action) {
+    const draft = state.controlDraft;
+    if (action === "recover") {
+      resetControlDraft();
+      await refreshCurrentView();
+      return;
+    }
+    if (!draft.id) return;
+    draft.busy = true;
+    try {
+      if (action === "discard") {
+        resetControlDraft();
+        notify("info", "Structured draft discarded.");
+        return;
+      }
+      if (action === "validate") {
+        const result = await mutateJson(
+          `/control-plane/drafts/${encodeURIComponent(draft.id)}/validate`,
+          "POST",
+          undefined,
+          draft.etag,
+        );
+        draft.etag = result.etag || draft.etag;
+        draft.confirmationToken = result.confirmation_token || "";
+        notify("success", "Draft compiled. Review the redacted semantic diff before committing.");
+        return;
+      }
+      if (action === "commit") {
+        const result = await mutateJson(
+          `/control-plane/drafts/${encodeURIComponent(draft.id)}/commit`,
+          "POST",
+          { confirmation_token: draft.confirmationToken },
+          draft.etag,
+        );
+        resetControlDraft();
+        notify("success", `Configuration reload request ${text(result.request_id)} accepted.`);
+        await refreshCurrentView();
+      }
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else if (error.status !== 409) notify("error", error.message);
+    } finally {
+      draft.busy = false;
+      if (state.route !== "configuration") renderCurrentViewIfVisible();
+    }
+  }
+
+  async function prepareExplicitRouteDraft(client) {
+    try {
+      const result = await mutate("/config/drafts");
+      state.configuration.draftId = result.draft_id;
+      state.configuration.etag = result.etag || "";
+      state.configuration.operation = "upsert";
+      state.configuration.section = "routes";
+      state.configuration.id = `${String(client).toLowerCase().replace(/[^a-z0-9]+/gu, "-")}-route`;
+      state.configuration.value = JSON.stringify({ id: state.configuration.id, client, explicit: true }, null, 2);
+      state.configuration.diff = [];
+      state.configuration.confirmationToken = "";
+      notify("info", "A visible route draft is prepared for review; no route was created or enabled.");
+      window.location.hash = "configuration";
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else notify("error", `Route draft could not be prepared: ${error.message}`);
+    }
+  }
+
+  function renderCurrentViewIfVisible() {
+    const root = $("#view");
+    const view = views[state.route];
+    if (root && view) {
+      view.render(root);
+      renderEndpointState(root, view.endpoints);
+    }
+  }
+
+  function providerInstanceForm() {
+    const draft = state.providerDraft;
+    return `<section class="panel" aria-labelledby="provider-instance-title"><div class="panel-head"><div><h2 class="panel-title" id="provider-instance-title">Add provider instance</h2><p class="muted">Each instance keeps its own origin, account health, quota, and pool membership—even when two instances use the same base URL.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Instance ID</span><input data-provider-field="id" value="${esc(draft.id)}" maxlength="128" autocomplete="off" placeholder="team-a"></label><label class="field"><span class="field-label">Base URL</span><input data-provider-field="origin" value="${esc(draft.origin)}" maxlength="2048" inputmode="url" autocomplete="url" placeholder="https://api.example.com"></label></div><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-provider-action="create"${draft.busy ? " disabled aria-busy=\"true\"" : ""}>Add instance</button></div><p class="muted">Only the URL is sent here. Authentication is connected separately to the account.</p></section>`;
+  }
+
+  function accountForm(providerId = "") {
+    const draft = state.accountDraft;
+    const providers = graphProviders();
+    if (!draft.provider) draft.provider = providerId || providers[0]?.id || "";
+    const oauth = draft.authKind === "oauth";
+    return `<section class="panel" aria-labelledby="account-create-title"><div class="panel-head"><div><h2 class="panel-title" id="account-create-title">Add an account</h2><p class="muted">Accounts are isolated within their provider instance. Health, quota, authentication, and actions never spill across accounts.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Provider instance</span><select data-account-new-field="provider"${providerId ? " disabled" : ""}>${providers.map((provider) => `<option value="${esc(provider.id)}"${provider.id === draft.provider ? " selected" : ""}>${esc(provider.id)} · ${esc(provider.origin || provider.base_url || "")}</option>`).join("")}</select></label><label class="field"><span class="field-label">Account ID</span><input data-account-new-field="id" value="${esc(draft.id)}" maxlength="128" autocomplete="off" placeholder="personal"></label><label class="field"><span class="field-label">Authentication</span><select data-account-new-field="authKind"><option value="api_key"${draft.authKind === "api_key" ? " selected" : ""}>API key</option><option value="oauth"${oauth ? " selected" : ""}>OAuth</option></select></label></div>${oauth ? `<p class="callout">Save the account first, then choose a supported browser, device, or client-credentials flow. OAuth secrets stay in Pooler’s encrypted store.</p>` : `<label class="field"><span class="field-label">One-time provider secret</span><input data-account-new-field="secret" type="password" value="${esc(draft.secret)}" autocomplete="new-password" spellcheck="false" placeholder="Cleared immediately after save"></label><p class="muted">The value is sent once to the managed secret endpoint, replaced by an opaque reference, and cleared from this tab immediately.</p>`}<div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-account-new-action="create"${draft.busy || !draft.provider ? " disabled" : ""}>Create account</button></div></section>`;
+  }
+
+  function bindAccountCreate(root) {
+    $("[data-account-new-action]", root)?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const oneTimeSecret = state.accountDraft.secret;
+      state.accountDraft.secret = "";
+      const secretInput = $("[data-account-new-field=\"secret\"]", root);
+      if (secretInput) {
+        secretInput.value = "";
+        secretInput.defaultValue = "";
+        secretInput.setAttribute("value", "");
+      }
+      createStructuredAccount(oneTimeSecret);
+    });
+  }
+
+  function providerAccounts(providerId) {
+    return graphAccounts().filter((account) => account.provider === providerId);
+  }
+
+  function renderProviders(root) {
+    const providers = graphProviders();
+    const selectedId = state.onboarding.provider;
+    const selected = providers.find((provider) => provider.id === selectedId);
+    const cards = providers.map((provider) => {
+      const accounts = providerAccounts(provider.id);
+      return `<article class="panel provider-instance-card" data-provider-instance="${esc(provider.id)}"><div class="toolbar"><h2 class="panel-title">${providerCell(provider.id, false)}</h2><span class="spacer"></span>${statusBadge(accounts.length ? "connected" : "needs account", accounts.length ? "success" : "warning")}</div><dl class="detail-grid"><div><dt>Instance</dt><dd class="mono">${esc(provider.instance_id || provider.id)}</dd></div><div><dt>Origin</dt><dd class="mono">${esc(provider.origin || provider.base_url)}</dd></div><div><dt>Accounts</dt><dd>${fmtInt(accounts.length)} independent</dd></div><div><dt>Pools</dt><dd>${fmtInt(provider.pools)} optional</dd></div></dl><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-onboarding-provider="${esc(provider.id)}">${accounts.length ? "Add account" : "Connect account"}</button><a class="btn btn-outline btn-sm" href="#/accounts?provider=${encodeURIComponent(provider.id)}">View accounts</a></div></article>`;
+    }).join("");
+    const onboarding = selected
+      ? `<section class="panel onboarding-panel" aria-labelledby="onboarding-title"><div class="toolbar"><h2 class="panel-title" id="onboarding-title">Connect ${providerCell(selected.id, false)}</h2><span class="spacer"></span><button class="btn btn-ghost btn-xs" type="button" data-onboarding-action="close">Close</button></div><ol class="check-list onboarding-steps"><li class="badge badge-success">1 · Provider instance selected</li><li class="${["account", "auth"].includes(state.onboarding.phase) ? "badge-accent" : "badge-neutral"}">2 · Account and authentication</li><li class="${state.onboarding.phase === "models" ? "badge-accent" : "badge-neutral"}">3 · Verified model discovery</li><li class="${state.onboarding.phase === "review" ? "badge-accent" : "badge-neutral"}">4 · Review exposure</li></ol>${state.onboarding.phase === "account" ? accountForm(selected.id) : state.onboarding.phase === "auth" ? onboardingAuthPanel(selected) : state.onboarding.phase === "models" ? discoveryPanel(selected) : state.onboarding.phase === "review" ? modelReviewPanel() : `<p class="muted">Select an account to continue.</p>`}</section>`
+      : "";
+    root.innerHTML = `${viewHeader("Providers", views.providers.subtitle, `<button class="btn btn-primary btn-sm" type="button" data-provider-action="show-form">Add provider instance</button>`)}${draftBar()}${state.providerDraft.visible ? providerInstanceForm() : ""}${onboarding}${cards ? `<section class="section"><div class="toolbar"><h2 class="section-title">Configured instances</h2><span class="section-hint">Same-origin instances remain separate by ID.</span></div><div class="grid-2">${cards}</div></section>` : `<div class="panel empty-state"><p class="empty-title">No provider instances yet</p><p class="empty-description">Add the first provider instance to begin account authentication and verified model discovery.</p></div>`}`;
+    bindAccountCreate(root);
+  }
+
+  function discoveryPanel(provider) {
+    const discovered = graphModels();
+    const matching = discovered.filter((model) => (model.targets || []).some((target) => target.provider === provider.id));
+    const models = matching.length || !state.onboarding.providerDetails ? matching : discovered;
+    return `<section class="panel" aria-labelledby="discovery-title"><h2 class="panel-title" id="discovery-title">Verified model discovery</h2><p class="muted">After account authentication, Pooler reads the provider’s bounded model list. No inference request is sent.</p><p class="callout">${models.length ? `${fmtInt(models.length)} verified model${models.length === 1 ? "" : "s"} available.` : "No verified models are available yet."}</p><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-onboarding-action="discover"${state.onboarding.discoveryBusy ? " disabled aria-busy=\"true\"" : ""}>${state.onboarding.discoveryBusy ? "Discovering…" : "Discover verified models"}</button>${models.length ? `<button class="btn btn-outline btn-sm" type="button" data-onboarding-action="review">Review models</button>` : ""}</div></section>`;
+  }
+
+  function onboardingAuthPanel(provider) {
+    const account = { id: state.onboarding.account, provider: provider.id, auth_kind: "oauth", enabled: true, health: { status: "pending" } };
+    const panel = accountOAuthPanel(account);
+    if (!state.oauthCapabilities[account.id]) loadOAuthCapabilities(account.id).then(() => renderCurrentViewIfVisible());
+    return `${panel}<div class="button-row"><button class="btn btn-outline btn-sm" type="button" data-onboarding-action="continue-models">Continue to verified model discovery</button></div>`;
+  }
+
+  function ensureSelectedModels(models) {
+    const ids = new Set(models.map((model) => model.id));
+    if (!state.onboarding.modelsInitialized) {
+      state.onboarding.selectedModels = new Set(models.filter((model) => model.enabled !== false && model.exposed !== false).map((model) => model.id));
+      state.onboarding.modelsInitialized = true;
+    } else {
+      state.onboarding.selectedModels = new Set([...state.onboarding.selectedModels].filter((id) => ids.has(id)));
+    }
+  }
+
+  function modelReviewPanel() {
+    const models = graphModels();
+    ensureSelectedModels(models);
+    return `<section class="panel" aria-labelledby="model-review-title"><div class="toolbar"><div><h2 class="panel-title" id="model-review-title">Review verified models</h2><p class="muted">Models are initially exposed. Exclude only the ones this dashboard should hide.</p></div><span class="spacer"></span><button class="btn btn-outline btn-xs" type="button" data-model-selection="all">Select all</button><button class="btn btn-outline btn-xs" type="button" data-model-selection="none">Select none</button></div><div class="model-review-list">${models.map((model) => `<label class="model-review-row"><input type="checkbox" data-model-selection-id="${esc(model.id)}"${state.onboarding.selectedModels.has(model.id) ? " checked" : ""}><span class="mono">${esc(model.id)}</span><span class="muted">${fmtInt((model.targets || []).length)} target${(model.targets || []).length === 1 ? "" : "s"}</span></label>`).join("") || `<div class="empty-state"><p class="empty-title">No verified models</p><p class="empty-description">Run discovery after connecting the account.</p></div>`}</div><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-onboarding-action="save-models"${!models.length ? " disabled" : ""}>Save model exposure</button></div></section>`;
+  }
+
+  async function createProviderInstance() {
+    const draft = state.providerDraft;
+    if (!draft.id.trim() || !/^https?:\/\/[^\s]+$/u.test(draft.origin.trim())) {
+      notify("error", "Enter an instance ID and a valid http(s) base URL.");
+      return;
+    }
+    draft.busy = true;
+    try {
+      await applyControlResource("providers", { id: draft.id.trim(), url: draft.origin.trim() });
+      state.onboarding.provider = draft.id.trim();
+      state.onboarding.providerDetails = { id: draft.id.trim(), instance_id: draft.id.trim(), origin: draft.origin.trim(), base_url: draft.origin.trim(), accounts: 0, pools: 0 };
+      state.onboarding.phase = "account";
+      state.providerDraft.visible = false;
+      draft.id = "";
+      draft.origin = "";
+      draft.busy = false;
+      notify("success", "Provider instance staged. Add its first account, then review the draft before committing.");
+      renderProviders($("#view"));
+    } catch (error) {
+      draft.busy = false;
+      if (error.status === 401) authRequired();
+      else if (error.status !== 409) notify("error", error.message);
+    }
+  }
+
+  async function createStructuredAccount(oneTimeSecret = "") {
+    const draft = state.accountDraft;
+    if (!draft.id.trim() || !draft.provider) {
+      notify("error", "Choose a provider instance and enter an account ID.");
+      return;
+    }
+    draft.busy = true;
+    let managedReference = "";
+    try {
+      if (draft.authKind === "api_key") {
+        if (!oneTimeSecret) throw new Error("Enter the one-time provider secret.");
+        const secret = await mutateJson("/control-plane/secrets", "POST", { kind: "api_key", value: oneTimeSecret });
+        managedReference = secret.managed_secret?.reference || "";
+        if (!managedReference) throw new Error("Managed secret storage did not return an opaque reference.");
+      }
+      await applyControlResource("accounts", { id: draft.id.trim(), provider: draft.provider, auth_kind: draft.authKind, ...(managedReference ? { secret: managedReference } : {}) });
+      state.onboarding.account = draft.id.trim();
+      state.onboarding.phase = draft.authKind === "oauth" ? "auth" : "models";
+      draft.id = "";
+      draft.secret = "";
+      draft.busy = false;
+      notify("success", "Account staged. Authenticate it, then run verified model discovery.");
+      await refreshCurrentView();
+    } catch (error) {
+      draft.busy = false;
+      if (error.status === 401) authRequired();
+      else if (error.status !== 409) notify("error", error.message);
+    } finally {
+      draft.secret = "";
+    }
+  }
+
+  async function discoverVerifiedModels() {
+    if (state.onboarding.discoveryBusy) return;
+    state.onboarding.discoveryBusy = true;
+    try {
+      await mutate("/models/reload");
+      await refreshCurrentView();
+      state.onboarding.phase = "review";
+      renderProviders($("#view"));
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else notify("error", `Model discovery failed: ${error.message}`);
+    } finally {
+      state.onboarding.discoveryBusy = false;
+    }
+  }
+
+  async function saveModelExposure() {
+    const models = graphModels();
+    if (!models.length) return;
+    try {
+      const discovery = controlGraph().discovery || {};
+      const sources = discovery.sources || state.data.catalog?.sources || [];
+      const overrides = models
+        .filter((model) => !state.onboarding.selectedModels.has(model.id))
+        .map((model) => ({ model: model.id, disabled: true }));
+      const draft = await ensureControlDraft();
+      const result = await mutateJson(
+        `/control-plane/drafts/${encodeURIComponent(draft.id)}/models/select_all_models`,
+        "POST",
+        { id: "catalog", sources, overrides },
+        draft.etag,
+      );
+      draft.etag = result.etag || draft.etag;
+      draft.dirty = true;
+      notify("success", "Model exposure is staged in the structured draft.");
+      await refreshCurrentView();
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else if (error.status === 409) {
+        state.controlDraft.conflict = true;
+        notify("warning", "The model exposure draft is out of date. Reload current state before retrying.", { sticky: true });
+      }
+      else if (error.status !== 409) notify("error", error.message);
     }
   }
 
@@ -1876,426 +1890,384 @@
     return `${statusBadge(status || "unknown")}${detail ? ` <span class="muted" title="${esc(detail)}">${esc(shortId(detail, 40))}</span>` : ""}`;
   }
 
-  /* ---------------- Accounts ---------------- */
+  /* ---------------- Structured models, pools, accounts, and endpoints ---------------- */
 
-  function accountIsSelected(account) {
-    return account.selected === true || account.is_selected === true;
-  }
-
-  function accountSupports(account, action) {
-    if (state.errors.accounts) return false;
-    const explicit =
-      account.available_actions ??
-      account.capabilities ??
-      account.actions ??
-      account.supported_actions;
-    if (Array.isArray(explicit)) return explicit.includes(action);
-    if (
-      explicit &&
-      typeof explicit === "object" &&
-      Object.hasOwn(explicit, action)
-    )
-      return Boolean(explicit[action]);
-    for (const key of [`can_${action}`, `supports_${action}`]) {
-      if (Object.hasOwn(account, key)) return Boolean(account[key]);
+  function renderModels(root) {
+    const graph = controlGraph();
+    const models = graph.models || state.data.models?.models || [];
+    const discovery = graph.discovery || {};
+    const selected = new Set(state.onboarding.selectedModels);
+    if (!state.onboarding.modelsInitialized && models.length) {
+      models.filter((model) => model.enabled !== false && model.exposed !== false).forEach((model) => selected.add(model.id));
+      state.onboarding.selectedModels = selected;
+      state.onboarding.modelsInitialized = true;
     }
-    if (action === "refresh" || action === "revoke")
-      return (
-        String(
-          account.auth_kind || account.authentication || "",
-        ).toLowerCase() === "oauth"
-      );
-    return true;
+    const ordered = graph.effective_order || [];
+    const rows = models.map((model) => `<div class="model-review-row"><label><input type="checkbox" data-model-selection-id="${esc(model.id)}"${selected.has(model.id) ? " checked" : ""}><span class="mono">${esc(model.id)}</span></label><span class="muted">${fmtInt((model.targets || []).length)} target${(model.targets || []).length === 1 ? "" : "s"}</span><span class="spacer"></span><span class="badge ${selected.has(model.id) ? "badge-success" : "badge-neutral"}">${selected.has(model.id) ? "exposed" : "hidden"}</span></div>`).join("");
+    const targetSections = models.map((model) => `<section class="panel target-model-panel" data-target-model-panel="${esc(model.id)}"><div class="toolbar"><div><h2 class="panel-title mono">${esc(model.id)}</h2><p class="muted">Provider, account or pool, upstream model, capabilities, health, quota, and numeric priority are all visible. Lower tiers fail over only before commitment.</p></div><span class="spacer"></span><span class="badge badge-neutral">${fmtInt((model.targets || []).length)} targets</span></div>${renderTargetRows(model)}</section>`).join("");
+    const effectivePreview = ordered.map((entry) => `<section class="panel-flat"><h3 class="section-title mono">${esc(entry.model)}</h3><p class="muted">${(entry.candidates || []).map((candidate) => `${esc(candidate.provider)} · tier ${esc(candidate.priority)}${candidate.account ? ` · ${esc(candidate.account)}` : candidate.account_pool ? ` · pool ${esc(candidate.account_pool)}` : ""}`).join(" → ")}</p></section>`).join("");
+    root.innerHTML = `${viewHeader("Models", views.models.subtitle, `<button class="btn btn-outline btn-sm" type="button" data-model-action="discover"${state.pending.has("/models/reload") ? " disabled aria-busy=\"true\"" : ""}>${ic("refresh-double", 15)} Discover verified models</button>`)}${draftBar()}<p id="target-announcement" class="sr-only" aria-live="polite">${esc(state.targetAnnouncement)}</p><section class="grid-stats grid-stats-4">${statCard("Verified", `<span class="num">${fmtInt(models.length)}</span>`, discovery.refreshed_at_unix_ms ? `updated ${esc(relTime(discovery.refreshed_at_unix_ms))}` : "No catalog refresh yet")}${statCard("Exposed", `<span class="num">${fmtInt([...selected].length)}</span>`, "Initially all verified models")}${statCard("Sources", `<span class="num">${fmtInt((discovery.sources || []).length)}</span>`, "Provider model lists")}${statCard("Priority sets", `<span class="num">${fmtInt(ordered.length)}</span>`, "Cross-provider order")}</section><section class="panel" aria-labelledby="model-exposure-title"><div class="toolbar"><div><h2 class="panel-title" id="model-exposure-title">Review exposure</h2><p class="muted">Choose which verified models are exposed. Changes remain in the owned draft until committed.</p></div><span class="spacer"></span><button class="btn btn-outline btn-xs" type="button" data-model-selection="all">Select all</button><button class="btn btn-outline btn-xs" type="button" data-model-selection="none">Select none</button></div><div class="model-review-list">${rows || `<div class="empty-state"><p class="empty-title">No verified models discovered</p><p class="empty-description">Connect an account from Providers, then refresh discovery.</p></div>`}</div><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-model-selection="save"${models.length ? "" : " disabled"}>Save exposure</button></div></section><section class="section" aria-labelledby="target-order-title"><div class="toolbar"><div><h2 class="section-title" id="target-order-title">Ordered targets</h2><span class="section-hint">Drag a row, use numeric priority, move buttons, or Alt+Arrow/Home/End. Combine is an explicit tie only.</span></div><a class="btn btn-outline btn-sm" href="#/pools">Manage optional pools</a></div>${targetSections || `<div class="panel empty-state"><p class="empty-title">No target bindings are configured</p></div>`}</section><section class="panel" aria-labelledby="effective-order-title"><div class="toolbar"><h2 class="panel-title" id="effective-order-title">Effective order preview</h2><span class="badge badge-neutral">runtime evidence</span></div>${effectivePreview || `<p class="empty-description">No effective order is available.</p>`}</section>${renderPolicyControls()}`;
+    root.querySelectorAll("[data-target-row]").forEach((row) => {
+      row.addEventListener("dragstart", () => {
+        const model = graphModels().find((item) => item.id === row.dataset.targetModel);
+        state.targetDrag = model ? { modelId: model.id, targetId: row.dataset.targetId, original: orderedTargetIds(model), dropped: false } : null;
+        row.classList.add("dragging");
+      });
+      row.addEventListener("dragover", (event) => event.preventDefault());
+      row.addEventListener("drop", (event) => {
+        event.preventDefault();
+        if (state.targetDrag) {
+          state.targetDrag.dropped = true;
+          moveTarget(state.targetDrag.modelId, state.targetDrag.targetId, Number(row.dataset.targetIndex));
+        }
+      });
+      row.addEventListener("dragend", () => {
+        row.classList.remove("dragging");
+        if (state.targetDrag && !state.targetDrag.dropped) state.targetDrag = null;
+      });
+    });
   }
 
-  function accountActionButton(account, action, label, icon, title) {
-    const supported = accountSupports(account, action);
-    const selected = action === "switch" && accountIsSelected(account);
-    if (!supported || selected) return "";
-    const path = `/accounts/${encodeURIComponent(account.id)}/${action}`;
-    const pending = state.pending.has(path);
-    return `<button class="btn btn-subtle btn-xs" type="button" data-account-action="${action}" data-account-id="${esc(account.id)}" data-account-provider="${esc(account.provider)}" title="${esc(title || label)}"${pending ? ` disabled aria-busy="true"` : ""}>${ic(icon, 13)} ${esc(label)}</button>`;
+  function renderPools(root) {
+    const pools = graphPools();
+    const accounts = graphAccounts();
+    const providers = graphProviders();
+    const draft = state.poolDraft;
+    const selectedProvider = draft.provider || providers[0]?.id || "";
+    const providerAccountsList = accounts.filter((account) => account.provider === selectedProvider);
+    const poolRows = pools.map((pool) => `<article class="panel"><div class="toolbar"><h2 class="panel-title">${esc(pool.id)}</h2><span class="spacer"></span>${statusBadge(pool.homogeneous ? "homogeneous" : "mixed", pool.homogeneous ? "success" : "warning")}</div><dl class="detail-grid"><div><dt>Provider</dt><dd class="mono">${esc(pool.provider)}</dd></div><div><dt>Strategy</dt><dd>${esc(pool.strategy)}</dd></div><div><dt>Accounts</dt><dd>${(pool.accounts || []).map((id) => `<span class="chip mono">${esc(id)}</span>`).join(" ") || "—"}</dd></div><div><dt>Failover</dt><dd>bounded and before commitment</dd></div></dl></article>`).join("");
+    root.innerHTML = `${viewHeader("Pools", views.pools.subtitle)}${draftBar()}<section class="panel" aria-labelledby="pool-create-title"><div class="panel-head"><div><h2 class="panel-title" id="pool-create-title">Create an optional pool</h2><p class="muted">Pools are homogeneous by provider. Accounts retain independent health and quota state inside the pool.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Pool ID</span><input data-pool-field="id" value="${esc(draft.id)}" maxlength="128" placeholder="production-pool" autocomplete="off"></label><label class="field"><span class="field-label">Provider instance</span><select data-pool-field="provider">${providers.map((provider) => `<option value="${esc(provider.id)}"${provider.id === selectedProvider ? " selected" : ""}>${esc(provider.id)}</option>`).join("")}</select></label><label class="field"><span class="field-label">Selection strategy</span><select data-pool-field="strategy"><option value="ordered_fallback"${draft.strategy === "ordered_fallback" ? " selected" : ""}>Ordered fallback</option><option value="health_weighted"${draft.strategy === "health_weighted" ? " selected" : ""}>Health weighted</option></select></label></div><fieldset class="field-group"><legend class="field-label">Accounts in pool</legend><div class="model-review-list">${providerAccountsList.map((account) => `<label class="model-review-row"><input type="checkbox" data-pool-account="${esc(account.id)}"${draft.accounts.includes(account.id) ? " checked" : ""}><span class="mono">${esc(account.id)}</span><span class="muted">${esc(account.health?.status || "unknown")} · ${account.enabled === false ? "disabled" : "enabled"}</span></label>`).join("") || `<p class="empty-description">Add two or more accounts for a homogeneous pool.</p>`}</div></fieldset><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-pool-action="create"${draft.busy || !providerAccountsList.length ? " disabled" : ""}>Stage pool</button></div></section>${poolRows ? `<section class="section"><div class="toolbar"><h2 class="section-title">Configured pools</h2><span class="section-hint">No pool is required for a single account.</span></div><div class="grid-2">${poolRows}</div></section>` : `<div class="panel empty-state"><p class="empty-title">No optional pools</p><p class="empty-description">Routing can use an individual account directly.</p></div>`}`;
   }
 
-  function shellArg(value) {
-    const raw = String(value);
-    return /^[A-Za-z0-9_./:@-]+$/u.test(raw)
-      ? raw
-      : `'${raw.replaceAll("'", "'\\''")}'`;
+  function renderEndpoints(root) {
+    const inventory = state.data.endpointInventory || {};
+    const listeners = inventory.listeners || [];
+    const management = inventory.management;
+    const clientLabels = inventory.downstream_clients || ["Factory", "Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"];
+    const listenerSections = listeners.map((listener) => `<article class="panel endpoint-card"><div class="toolbar"><h2 class="panel-title">${esc(listener.id)}</h2><span class="spacer"></span><span class="badge badge-accent">client-agnostic</span></div><p class="mono endpoint-base">${(listener.base_urls || []).map((url) => esc(url)).join(" · ") || esc(listener.bind || "local socket")}</p>${(listener.routes || []).map((route) => `<div class="endpoint-route"><div class="toolbar"><span class="badge badge-neutral">${(route.methods || []).join(", ")}</span><code class="mono">${esc(route.path)}</code><span class="spacer"></span><span class="muted">${esc(route.protocol || "http")}</span></div><p class="muted">Authentication: ${route.downstream_auth?.required ? `${esc(route.downstream_auth.kind || "required")} ${route.downstream_auth.header ? `in ${esc(route.downstream_auth.header)}` : ""}` : "not required"}</p></div>`).join("")}</article>`).join("");
+    const tools = clientLabels.map((label) => `<details class="connect-tool"><summary>${esc(label)}</summary><p>Use any listed base URL and path with this client. Pooler does not select a client, add an allowlist, or route implicitly.</p><button class="btn btn-outline btn-xs" type="button" data-connect-tool="${esc(label)}">Prepare explicit route draft</button></details>`).join("");
+    root.innerHTML = `${viewHeader("Endpoints", views.endpoints.subtitle, `<button class="btn btn-outline btn-sm" type="button" data-endpoints-copy>${ic("copy", 15)} Copy JSON</button>`)}<section class="callout callout-info"><strong>Client-agnostic inventory.</strong> Configure any client or custom route directly with these base URLs and paths. Authentication requirements are shown per endpoint; no secret is returned.</section>${management ? `<section class="panel endpoint-card"><div class="toolbar"><h2 class="panel-title">Management API</h2><span class="spacer"></span>${statusBadge(management.auth?.required ? "Bearer required" : "loopback read-only", management.auth?.required ? "warning" : "success")}</div><p class="mono endpoint-base">${(management.base_urls || []).map((url) => esc(url)).join(" · ")}</p><p class="muted">Paths: ${(management.paths || []).map((path) => `<code class="mono">${esc(path)}</code>`).join(" · ")}</p></section>` : ""}<section class="section"><div class="toolbar"><h2 class="section-title">Serving endpoints</h2><span class="section-hint">Base URL, path, protocol, and auth are explicit.</span></div><div class="grid-2">${listenerSections || `<div class="panel empty-state"><p class="empty-title">No serving listeners</p></div>`}</div></section><section class="panel" aria-labelledby="connect-tools-title"><div class="toolbar"><div><h2 class="panel-title" id="connect-tools-title">Optional Connect tools</h2><p class="muted">Convenience instructions only. They never become required, an allowlist, or an implicit route.</p></div><span class="badge badge-neutral">optional · routing effect none</span></div><div class="connect-tool-list">${tools}</div></section><pre class="code-block endpoint-json" id="endpoint-json"><code>${esc(JSON.stringify(inventory, null, 2))}</code></pre>`;
   }
 
-  function accountProviderProfile(account) {
-    return (
-      (state.data.setupOptions?.providers || []).find(
-        (provider) =>
-          provider.id === account.provider ||
-          (provider.configured_upstreams || []).includes(account.provider),
-      ) || null
-    );
+  function modelTargets(model) {
+    const targets = [...(model?.targets || [])];
+    const byId = new Map(targets.map((target) => [target.binding_id || target.id, target]));
+    const saved = state.targetOrders[model?.id];
+    if (!saved) {
+      return targets.sort((left, right) => {
+        const priority = (Number(left.priority) || 1) - (Number(right.priority) || 1);
+        return priority || String(left.binding_id || left.id).localeCompare(String(right.binding_id || right.id));
+      });
+    }
+    const ordered = saved.map((id) => byId.get(id)).filter(Boolean);
+    targets.forEach((target) => {
+      if (!saved.includes(target.binding_id || target.id)) ordered.push(target);
+    });
+    return ordered;
   }
 
-  function accountConnectionGuide(account) {
-    if (!account) return "";
-    const provider = accountProviderProfile(account);
-    const expectedMethod =
-      account.auth_kind === "oauth"
-        ? new Set(["authorization_code_pkce", "device_code"])
-        : new Set(["api_key"]);
-    const methods = (provider?.authentication || []).filter(
-      (method) =>
-        expectedMethod.has(method.method) && method.support === "supported",
-    );
-    const unavailable = (provider?.authentication || []).filter(
-      (method) =>
-        expectedMethod.has(method.method) && method.support !== "supported",
-    );
-    const commands = methods
-      .map((method) => {
-        const methodName = {
-          authorization_code_pkce: "oauth",
-          device_code: "device-code",
-          api_key: "api-key",
-        }[method.method];
-        const args = [
-          "pooler",
-          "--credential-key-ref",
-          "env:POOLER_STORE_KEY",
-          "auth",
-          "login",
-          account.provider,
-        ];
-        if (provider?.id) args.push("--profile", provider.id);
-        args.push("--account", account.id, "--method", methodName);
-        return `<div><strong>${esc(method.method.replaceAll("_", " "))}</strong><pre class="code-block"><code>${esc(args.map(shellArg).join(" "))}</code></pre><p class="muted">${esc(method.note)}</p></div>`;
-      })
-      .join("");
-    const environments = provider?.credential_environment_variables || [];
-    const deviceSupported = (account.available_actions || []).includes(
-      "oauth_device",
-    );
-    const device =
-      state.oauthDevice.account === account.id ? state.oauthDevice : null;
-    const deviceTarget =
-      device?.verificationUriComplete || device?.verificationUri;
-    const devicePanel =
-      account.auth_kind === "oauth" && deviceSupported
-        ? `<div class="callout"><strong>Brokered device OAuth</strong><p>Pooler starts and polls the documented provider flow on the server. The browser receives only the provider page and short user code; token responses remain in the encrypted server-side store.</p>${
-            device
-              ? `<p>Status: ${statusBadge(device.status || "starting")}</p>${deviceTarget && deviceTarget.startsWith("https://") ? `<p><a class="btn btn-outline btn-sm" href="${esc(deviceTarget)}" target="_blank" rel="noreferrer">Open provider authorization</a></p>` : ""}${device.userCode ? `<p>Enter code <code class="mono">${esc(device.userCode)}</code> if prompted.</p>` : ""}`
-              : ""
-          }<button class="btn btn-primary btn-sm" type="button" data-account-oauth-device="${esc(account.id)}"${state.oauthDevice.busy ? " disabled" : ""}>${device ? "Restart device authorization" : "Start device authorization"}</button></div>`
-        : "";
-    const keyInstructions =
-      account.auth_kind === "api_key"
-        ? `<p>Set the provider key outside this browser using ${environments.length ? environments.map((name) => `<code class="mono">${esc(name)}</code>`).join(" or ") : "the protected secret reference already declared in configuration"}. The API-key command prints provider-safe guidance and never accepts the key as an argument.</p>`
-        : `<p>OAuth runs in a trusted terminal and writes tokens only to Pooler's encrypted credential store. The dashboard never receives the authorization code, refresh token, client secret, or access token.</p>`;
-    return `<section class="panel connection-panel" aria-labelledby="connection-title">
-      <div class="toolbar"><h2 class="section-title" id="connection-title" tabindex="-1">Connect ${esc(account.id)}</h2><span class="spacer"></span><button class="btn btn-ghost btn-sm" type="button" data-account-connect-close>Close</button></div>
-      ${keyInstructions}
-      ${devicePanel}
-      ${commands || '<div class="callout callout-warning"><strong>No safe built-in connection command is available.</strong> Keep using the protected secret or OAuth registration already declared by the operator.</div>'}
-      ${unavailable.length ? `<div class="callout callout-warning"><strong>Not offered</strong><ul class="check-list">${unavailable.map((method) => `<li><span class="mono">${esc(method.method.replaceAll("_", " "))}</span> — ${esc(method.note)}</li>`).join("")}</ul></div>` : ""}
-      ${provider?.documentation_url ? `<p><a class="text-link" href="${esc(provider.documentation_url)}" target="_blank" rel="noreferrer">Open provider authentication documentation</a></p>` : ""}
-      <div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-account-connect-check>Check redacted account status</button></div>
-      <p class="muted">Current local state: ${statusBadge(account.status)}. An available credential is not a provider connectivity probe.</p>
-    </section>`;
+  function targetConfig(target, position) {
+    const value = {
+      id: target.binding_id || target.id || `target-${position + 1}`,
+      provider: target.provider,
+      priority: Number(target.priority) > 0 ? Number(target.priority) : position + 1,
+      upstream_model: target.upstream_model,
+      capabilities: target.capabilities || [],
+      codecs: target.codecs || [],
+    };
+    for (const key of ["account", "account_pool", "wire_family", "parameters", "context_window", "quantization", "privacy", "zdr", "data_policy", "region", "price", "weight"]) {
+      if (target[key] !== undefined && target[key] !== null && target[key] !== "") value[key] = target[key];
+    }
+    return value;
   }
 
-  async function pollOAuthDevice(requestId, account, sessionGeneration) {
-    for (let attempt = 0; attempt < 450; attempt += 1) {
+  function targetAccounts(target) {
+    if (target.account) return [target.account];
+    const pool = graphPools().find((item) => item.id === target.account_pool);
+    return pool?.accounts || [];
+  }
+
+  function targetEvidence(target) {
+    const accounts = new Set(targetAccounts(target));
+    const credentials = controlGraph().health?.credentials || [];
+    const health = credentials.filter((entry) => accounts.has(entry.account));
+    const quota = (controlGraph().quota || []).filter((entry) => accounts.has(entry.identity?.credential || entry.account));
+    const healthText = health.length ? health.map((entry) => entry.status).join(", ") : "unknown health";
+    const quotaText = quota.length ? quota.map((entry) => entry.state || entry.remaining === undefined ? "quota observed" : `quota ${entry.remaining} remaining`).join(", ") : "unknown quota";
+    const provider = graphProviders().find((entry) => entry.id === target.provider);
+    return {
+      healthText,
+      quotaText,
+      providerText: provider ? "provider configured" : "provider unknown",
+      unknown: !health.length || !quota.length,
+    };
+  }
+
+  function orderedTargetIds(model) {
+    return modelTargets(model).map((target) => target.binding_id || target.id);
+  }
+
+  async function stageModelTargets(model, targets) {
+    const value = { id: model.id, targets: targets.map((target, index) => targetConfig(target, index)) };
+    try {
+      await applyControlResource("models", value, model.id);
+      notify("success", `Target order staged for ${model.id}.`);
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else if (error.status !== 409) notify("error", error.message);
+    }
+  }
+
+  function announceTarget(message, focusId = "") {
+    state.targetAnnouncement = message;
+    state.targetFocus = focusId;
+    renderCurrentViewIfVisible();
+    if (focusId) requestAnimationFrame(() => $(`[data-target-id="${CSS.escape(focusId)}"]`)?.focus());
+  }
+
+  function moveTarget(modelId, targetId, destinationIndex) {
+    const model = graphModels().find((item) => item.id === modelId);
+    if (!model) return;
+    const targets = modelTargets(model);
+    const sourceIndex = targets.findIndex((target) => (target.binding_id || target.id) === targetId);
+    if (sourceIndex < 0) return;
+    const boundedIndex = Math.max(0, Math.min(destinationIndex, targets.length - 1));
+    if (sourceIndex === boundedIndex) return;
+    const [target] = targets.splice(sourceIndex, 1);
+    targets.splice(boundedIndex, 0, target);
+    targets.forEach((item, index) => {
+      item.priority = index + 1;
+    });
+    state.targetOrders[modelId] = orderedTargetIds({ ...model, targets });
+    state.targetDrag = null;
+    announceTarget(`${targetId} moved to priority ${boundedIndex + 1} of ${targets.length}.`, targetId);
+    stageModelTargets(model, targets);
+  }
+
+  function setTargetPriority(modelId, targetId, priority) {
+    const model = graphModels().find((item) => item.id === modelId);
+    const value = Number(priority);
+    if (!model || !Number.isSafeInteger(value) || value < 1 || value > 2 ** 31 - 1) return;
+    const targets = modelTargets(model);
+    const target = targets.find((item) => (item.binding_id || item.id) === targetId);
+    if (!target) return;
+    target.priority = value;
+    targets.sort((left, right) => (Number(left.priority) || 1) - (Number(right.priority) || 1) || String(left.binding_id || left.id).localeCompare(String(right.binding_id || right.id)));
+    state.targetOrders[modelId] = orderedTargetIds({ ...model, targets });
+    announceTarget(`${targetId} priority set to ${value}.`, targetId);
+    stageModelTargets(model, targets);
+  }
+
+  function combineTarget(modelId, targetId, withTargetId) {
+    const model = graphModels().find((item) => item.id === modelId);
+    const targets = model ? modelTargets(model) : [];
+    const target = targets.find((item) => (item.binding_id || item.id) === targetId);
+    const peer = targets.find((item) => (item.binding_id || item.id) === withTargetId);
+    if (!model || !target || !peer) return;
+    target.priority = peer.priority;
+    state.targetOrders[modelId] = orderedTargetIds({ ...model, targets });
+    announceTarget(`${targetId} combined into priority tier ${peer.priority} with ${withTargetId}.`, targetId);
+    stageModelTargets(model, targets);
+  }
+
+  function renderTargetRows(model) {
+    const targets = modelTargets(model);
+    return `<ol class="target-order" data-target-model="${esc(model.id)}" aria-label="Ordered targets for ${esc(model.id)}">${targets.map((target, index) => {
+      const targetId = target.binding_id || target.id;
+      const evidence = targetEvidence(target);
+      const capabilities = (target.capabilities || []).slice(0, 6).map((capability) => `<span class="chip">${esc(capability)}</span>`).join(" ");
+      return `<li class="target-row" draggable="true" tabindex="0" data-target-row data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" data-target-index="${index}" aria-label="${esc(targetId)}, priority ${esc(target.priority || index + 1)}"><span class="drag-handle" aria-hidden="true">⋮⋮</span><span class="target-position num">${index + 1}</span>${providerCell(target.provider, false)}${target.account ? `<span class="chip mono">account ${esc(target.account)}</span>` : ""}${target.account_pool ? `<span class="chip mono">pool ${esc(target.account_pool)}</span>` : ""}<span class="target-upstream mono">${esc(text(target.upstream_model))}</span><span class="target-capabilities">${capabilities || `<span class="muted">unknown capabilities</span>`}</span><span class="target-evidence"><span class="badge ${evidence.unknown ? "badge-warning" : "badge-success"}">${esc(evidence.healthText)}</span><span class="badge ${evidence.unknown ? "badge-warning" : "badge-neutral"}">${esc(evidence.quotaText)}</span><span class="muted">${esc(evidence.providerText)}</span></span><label class="target-priority"><span class="sr-only">Numeric priority for ${esc(targetId)}</span><input type="number" min="1" max="2147483647" step="1" value="${esc(target.priority || index + 1)}" data-target-priority data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}"></label><span class="target-actions"><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="up" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(targetId)} up"${index === 0 ? " disabled" : ""}>↑</button><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="down" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(targetId)} down"${index === targets.length - 1 ? " disabled" : ""}>↓</button><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="home" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(targetId)} to first"${index === 0 ? " disabled" : ""}>Home</button><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="end" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(targetId)} to last"${index === targets.length - 1 ? " disabled" : ""}>End</button>${index > 0 ? `<button class="btn btn-outline btn-xs target-combine" type="button" data-target-combine="${esc(targets[index - 1].binding_id || targets[index - 1].id)}" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}">Combine tier</button>` : ""}</span></li>`;
+    }).join("")}</ol>`;
+  }
+
+  function syncPolicyEditor() {
+    if (state.policyEditor.dirty) return;
+    const policy = controlGraph().policies?.[0];
+    if (!policy) return;
+    const routing = policy.routing || {};
+    const preference = routing.preference || {};
+    state.policyEditor = {
+      ...state.policyEditor,
+      id: policy.id || "default",
+      strategy: policy.selection?.strategy || "ordered_fallback",
+      ranking: preference.price || preference.latency || preference.throughput ? "adaptive" : "deterministic",
+      allow: (routing.allow || []).join(", "),
+      deny: (routing.deny || []).join(", "),
+      allowFallbacks: routing.allow_fallbacks !== false,
+      requiredParameters: (routing.required_parameters || []).join(", "),
+      requiredCapabilities: (routing.required_capabilities || []).join(", "),
+      minimumContext: routing.minimum_context ?? "",
+      quantization: (routing.quantization || []).join(", "),
+      privacy: routing.privacy || "",
+      requireZdr: routing.require_zdr === true,
+      dataPolicy: routing.data_policy || "",
+      maxPrice: routing.max_price ?? "",
+      price: preference.price === true,
+      latency: preference.latency === true,
+      throughput: preference.throughput === true,
+      maxLatency: preference.max_latency_ms ?? "",
+      minThroughput: preference.min_throughput ?? "",
+      minSamples: preference.min_samples ?? "",
+      staleAfter: preference.stale_after_ms ?? "",
+    };
+  }
+
+  function csvValues(value) {
+    return String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
+  }
+
+  function positiveInteger(value) {
+    if (value === "" || value === null || value === undefined) return null;
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 ? number : null;
+  }
+
+  function policyConfig() {
+    const editor = state.policyEditor;
+    const preference = {};
+    if (editor.ranking === "adaptive" || editor.price) preference.price = editor.price;
+    if (editor.ranking === "adaptive" || editor.latency) preference.latency = editor.latency;
+    if (editor.ranking === "adaptive" || editor.throughput) preference.throughput = editor.throughput;
+    for (const [key, value] of [["max_latency_ms", editor.maxLatency], ["min_throughput", editor.minThroughput], ["min_samples", editor.minSamples], ["stale_after_ms", editor.staleAfter]]) {
+      const number = positiveInteger(value);
+      if (number !== null) preference[key] = number;
+    }
+    const routing = {
+      allow: csvValues(editor.allow),
+      deny: csvValues(editor.deny),
+      allow_fallbacks: editor.allowFallbacks,
+      required_parameters: csvValues(editor.requiredParameters),
+      required_capabilities: csvValues(editor.requiredCapabilities),
+      quantization: csvValues(editor.quantization),
+      ...(positiveInteger(editor.minimumContext) ? { minimum_context: positiveInteger(editor.minimumContext) } : {}),
+      ...(editor.privacy ? { privacy: editor.privacy } : {}),
+      ...(editor.requireZdr ? { require_zdr: true } : {}),
+      ...(editor.dataPolicy ? { data_policy: editor.dataPolicy } : {}),
+      ...(positiveInteger(editor.maxPrice) !== null ? { max_price: positiveInteger(editor.maxPrice) } : {}),
+      ...(Object.keys(preference).length ? { preference } : {}),
+    };
+    return {
+      id: editor.id || "default",
+      selection: { strategy: editor.strategy },
+      routing,
+    };
+  }
+
+  async function savePolicyControls() {
+    const editor = state.policyEditor;
+    if (editor.busy) return;
+    editor.busy = true;
+    try {
+      await applyControlResource("policies", policyConfig(), editor.id || "default");
+      editor.dirty = false;
+      notify("success", "Routing policy controls staged in the structured draft.");
+      await refreshCurrentView();
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else if (error.status !== 409) notify("error", error.message);
+    } finally {
+      editor.busy = false;
+    }
+  }
+
+  function renderPolicyControls() {
+    syncPolicyEditor();
+    const editor = state.policyEditor;
+    const policy = controlGraph().policies?.[0];
+    const unknownFacts = !policy || !(policy.routing?.allow || []).length && !(policy.routing?.deny || []).length;
+    return `<section class="panel policy-panel" aria-labelledby="policy-controls-title"><div class="toolbar"><div><h2 class="panel-title" id="policy-controls-title">Routing policy</h2><p class="muted">These controls are durable policy fields. Request bodies cannot override them.</p></div><span class="spacer"></span><button class="btn btn-primary btn-sm" type="button" data-policy-action="save"${editor.busy ? " disabled aria-busy=\"true\"" : ""}>Save policy</button></div><div class="form-grid policy-grid"><label class="field"><span class="field-label">Policy ID</span><input data-policy-field="id" value="${esc(editor.id)}" maxlength="128"></label><label class="field"><span class="field-label">Deterministic selection</span><select data-policy-field="strategy"><option value="ordered_fallback"${editor.strategy === "ordered_fallback" ? " selected" : ""}>Ordered fallback</option><option value="fill_first"${editor.strategy === "fill_first" ? " selected" : ""}>Fill first</option><option value="health_weighted"${editor.strategy === "health_weighted" ? " selected" : ""}>Health weighted</option><option value="round_robin"${editor.strategy === "round_robin" ? " selected" : ""}>Round robin</option></select></label><label class="field"><span class="field-label">Ranking mode</span><select data-policy-field="ranking"><option value="deterministic"${editor.ranking === "deterministic" ? " selected" : ""}>Deterministic facts only</option><option value="adaptive"${editor.ranking === "adaptive" ? " selected" : ""}>Adaptive price · latency · throughput</option></select></label><label class="field"><span class="field-label">Provider allow list</span><input data-policy-field="allow" value="${esc(editor.allow)}" placeholder="provider-a, provider-b" autocomplete="off"></label><label class="field"><span class="field-label">Provider deny list</span><input data-policy-field="deny" value="${esc(editor.deny)}" placeholder="provider-c" autocomplete="off"></label><label class="field"><span class="field-label">Maximum verified price</span><input type="number" min="0" step="1" data-policy-field="maxPrice" value="${esc(editor.maxPrice)}" placeholder="micro-USD / million"></label><label class="field"><span class="field-label">Minimum context window</span><input type="number" min="1" step="1" data-policy-field="minimumContext" value="${esc(editor.minimumContext)}"></label><label class="field"><span class="field-label">Required parameters</span><input data-policy-field="requiredParameters" value="${esc(editor.requiredParameters)}" placeholder="streaming, tools"></label><label class="field"><span class="field-label">Required capabilities</span><input data-policy-field="requiredCapabilities" value="${esc(editor.requiredCapabilities)}" placeholder="text, reasoning"></label><label class="field"><span class="field-label">Quantization</span><input data-policy-field="quantization" value="${esc(editor.quantization)}" placeholder="fp16"></label><label class="field"><span class="field-label">Privacy requirement</span><input data-policy-field="privacy" value="${esc(editor.privacy)}" placeholder="zero-retention"></label><label class="field"><span class="field-label">Data policy</span><input data-policy-field="dataPolicy" value="${esc(editor.dataPolicy)}" placeholder="no-training"></label></div><div class="policy-toggles"><label class="toggle-field"><input type="checkbox" data-policy-field="allowFallbacks"${editor.allowFallbacks ? " checked" : ""}>Allow bounded lower-tier failover</label><label class="toggle-field"><input type="checkbox" data-policy-field="requireZdr"${editor.requireZdr ? " checked" : ""}>Require verified zero-data-retention</label><label class="toggle-field"><input type="checkbox" data-policy-field="price"${editor.price ? " checked" : ""}>Prefer verified price</label><label class="toggle-field"><input type="checkbox" data-policy-field="latency"${editor.latency ? " checked" : ""}>Prefer observed latency</label><label class="toggle-field"><input type="checkbox" data-policy-field="throughput"${editor.throughput ? " checked" : ""}>Prefer observed throughput</label></div><div class="policy-preview"><strong>Effective preview</strong><span class="muted">allow ${editor.allow || "any"} · deny ${editor.deny || "none"} · ${editor.allowFallbacks ? "fallbacks enabled" : "fallbacks disabled"} · ${editor.ranking === "adaptive" ? "adaptive observations" : "deterministic facts"}</span></div>${unknownFacts ? `<div class="callout callout-warning" role="status"><strong>Unknown facts stay unknown.</strong> No verified allow/deny or telemetry provenance is available yet; adaptive ranking cannot invent health, quota, price, latency, or throughput evidence.</div>` : `<div class="callout callout-info" role="status"><strong>Provenance.</strong> Hard filters use configured IDs and verified facts. Adaptive preferences use only fresh observations and remain visible in the effective preview.</div>`}</section>`;
+  }
+
+  async function loadOAuthCapabilities(account) {
+    if (state.oauthCapabilities[account]) return state.oauthCapabilities[account];
+    try {
+      const result = await readJson(`/accounts/${encodeURIComponent(account)}/oauth-capabilities`);
+      state.oauthCapabilities[account] = result;
+      return result;
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else notify("error", `Authentication options unavailable: ${error.message}`);
+      return null;
+    }
+  }
+
+  async function startOAuthFlow(account, method) {
+    if (state.oauthFlow.busy) return;
+    state.oauthFlow = { account, requestId: null, method, status: "starting", authorizationUrl: "", verificationUri: "", verificationUriComplete: "", userCode: "", expiresAt: Date.now() + 600_000, busy: true };
+    try {
+      const result = await mutateJson("/oauth/start", "POST", { account, method });
+      state.oauthFlow.requestId = result.request_id;
+      state.oauthFlow.authorizationUrl = result.authorization_url || "";
+      state.oauthFlow.verificationUri = result.verification_uri || "";
+      state.oauthFlow.verificationUriComplete = result.verification_uri_complete || "";
+      state.oauthFlow.userCode = result.user_code || "";
+      state.oauthFlow.expiresAt = result.expires_at_ms || state.oauthFlow.expiresAt;
+      state.oauthFlow.status = result.status || (state.oauthFlow.authorizationUrl ? "authorization_required" : "starting");
+      state.oauthFlow.busy = false;
+      if (state.oauthFlow.authorizationUrl) window.open(state.oauthFlow.authorizationUrl, "pooler-oauth", "popup,width=640,height=760");
+      renderCurrentViewIfVisible();
+      if (state.oauthFlow.requestId) pollOAuthFlow(state.oauthFlow.requestId, state.sessionGeneration);
+    } catch (error) {
+      state.oauthFlow.busy = false;
+      if (error.status === 401) authRequired();
+      else notify("error", `Authentication flow failed: ${error.message}`);
+      renderCurrentViewIfVisible();
+    }
+  }
+
+  async function pollOAuthFlow(requestId, sessionGeneration) {
+    for (let attempt = 0; attempt < 300; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 2_000));
-      if (
-        sessionGeneration !== state.sessionGeneration ||
-        state.oauthDevice.requestId !== requestId ||
-        state.oauthDevice.account !== account
-      )
-        return;
+      if (sessionGeneration !== state.sessionGeneration || state.oauthFlow.requestId !== requestId) return;
       try {
-        const result = await readJson(
-          `/oauth/device/${encodeURIComponent(requestId)}`,
-        );
-        state.oauthDevice.status = result.status || "failed";
-        state.oauthDevice.verificationUri = result.verification_uri || "";
-        state.oauthDevice.verificationUriComplete =
-          result.verification_uri_complete || "";
-        state.oauthDevice.userCode = result.user_code || "";
-        if (state.route === "accounts") renderAccounts($("#view"));
-        if (
-          ["succeeded", "failed", "stale_generation"].includes(result.status)
-        ) {
-          state.oauthDevice.busy = false;
-          notify(
-            result.status === "succeeded" ? "success" : "error",
-            result.status === "succeeded"
-              ? "OAuth credential stored server-side."
-              : "OAuth device authorization did not complete.",
-          );
+        const result = await readJson(`/oauth/status/${encodeURIComponent(requestId)}`);
+        state.oauthFlow.status = result.status || "failed";
+        state.oauthFlow.verificationUri = result.verification_uri || state.oauthFlow.verificationUri;
+        state.oauthFlow.verificationUriComplete = result.verification_uri_complete || state.oauthFlow.verificationUriComplete;
+        state.oauthFlow.userCode = result.user_code || state.oauthFlow.userCode;
+        state.oauthFlow.expiresAt = result.expires_at_ms || state.oauthFlow.expiresAt;
+        renderCurrentViewIfVisible();
+        if (["succeeded", "failed", "cancelled", "stale_generation", "expired"].includes(state.oauthFlow.status)) {
+          state.oauthFlow.busy = false;
+          if (state.oauthFlow.status === "succeeded" && state.route === "providers" && state.onboarding.account === state.oauthFlow.account) state.onboarding.phase = "models";
+          notify(state.oauthFlow.status === "succeeded" ? "success" : "warning", state.oauthFlow.status === "succeeded" ? "Authentication completed and the credential was stored securely." : `Authentication ended: ${state.oauthFlow.status}.`);
           await refreshCurrentView();
           return;
         }
       } catch (error) {
-        state.oauthDevice.busy = false;
+        state.oauthFlow.busy = false;
         if (error.status === 401) authRequired();
-        else notify("error", `OAuth status failed: ${error.message}`);
+        else notify("error", `Authentication status failed: ${error.message}`);
         return;
       }
     }
-    state.oauthDevice.busy = false;
-    state.oauthDevice.status = "expired";
-    if (state.route === "accounts") renderAccounts($("#view"));
-    notify("warning", "OAuth device authorization polling expired.");
+    state.oauthFlow.busy = false;
+    state.oauthFlow.status = "expired";
+    renderCurrentViewIfVisible();
   }
 
-  async function startOAuthDevice(account, trigger) {
-    if (state.oauthDevice.busy) return;
-    const sessionGeneration = state.sessionGeneration;
-    state.oauthDevice = {
-      account,
-      requestId: null,
-      status: "starting",
-      verificationUri: "",
-      verificationUriComplete: "",
-      userCode: "",
-      busy: true,
-    };
-    if (trigger) trigger.disabled = true;
-    try {
-      const result = await mutate(
-        `/accounts/${encodeURIComponent(account)}/oauth-device`,
-      );
-      if (sessionGeneration !== state.sessionGeneration) return;
-      state.oauthDevice.requestId = result.request_id;
-      if (!Number.isSafeInteger(result.request_id))
-        throw new Error("server did not return a bounded OAuth request ID");
-      renderAccounts($("#view"));
-      pollOAuthDevice(result.request_id, account, sessionGeneration);
-    } catch (error) {
-      if (sessionGeneration !== state.sessionGeneration) return;
-      state.oauthDevice.busy = false;
-      state.oauthDevice.status = "failed";
-      if (error.status === 401) {
-        authRequired();
-      } else {
-        notify("error", `OAuth device authorization failed: ${error.message}`);
-        if (state.route === "accounts") renderAccounts($("#view"));
-      }
-    }
+  function oauthCountdown() {
+    const remaining = Math.max(0, state.oauthFlow.expiresAt - Date.now());
+    return `${Math.ceil(remaining / 1000)}s remaining`;
   }
 
-  function accountDraftForm() {
-    const draft = state.accountDraft;
-    const upstreams = Array.from(
-      new Set(
-        (state.data.setupOptions?.providers || []).flatMap(
-          (provider) => provider.configured_upstreams || [],
-        ),
-      ),
-    ).sort();
-    if (!draft.provider && upstreams.length) draft.provider = upstreams[0];
-    const secretFields =
-      draft.authKind === "oauth"
-        ? '<p class="muted">OAuth tokens are connected after the account draft is committed and remain server-side.</p>'
-        : `<label>Secret source<select data-account-draft-field="secretKind"><option value="env"${draft.secretKind === "env" ? " selected" : ""}>Environment variable</option><option value="file"${draft.secretKind === "file" ? " selected" : ""}>Owner-private file</option><option value="keyring"${draft.secretKind === "keyring" ? " selected" : ""}>OS keyring</option></select></label>
-          ${
-            draft.secretKind === "env"
-              ? `<label>Environment name<input data-account-draft-field="envName" value="${esc(draft.envName)}" placeholder="PROVIDER_API_KEY" autocomplete="off" /></label>`
-              : draft.secretKind === "file"
-                ? `<label>Secret file path<input data-account-draft-field="filePath" value="${esc(draft.filePath)}" placeholder="/run/secrets/provider-key" autocomplete="off" /></label>`
-                : `<div class="form-grid"><label>Keyring service<input data-account-draft-field="keyringService" value="${esc(draft.keyringService)}" autocomplete="off" /></label><label>Keyring account<input data-account-draft-field="keyringAccount" value="${esc(draft.keyringAccount)}" autocomplete="off" /></label></div>`
-          }`;
-    return `<section class="panel" aria-labelledby="account-draft-title">
-      <div class="panel-head"><div><h2 class="panel-title" id="account-draft-title">Create typed account draft</h2><p class="muted">Creates a compiler-validated draft only. Review its value-free semantic diff and confirm it from Configuration before activation.</p></div></div>
-      ${
-        upstreams.length
-          ? `<div class="form-grid"><label>Account ID<input data-account-draft-field="id" value="${esc(draft.id)}" placeholder="primary" autocomplete="off" /></label><label>Configured upstream<select data-account-draft-field="provider">${upstreams.map((provider) => `<option value="${esc(provider)}"${provider === draft.provider ? " selected" : ""}>${esc(provider)}</option>`).join("")}</select></label><label>Authentication<select data-account-draft-field="authKind"><option value="api_key"${draft.authKind === "api_key" ? " selected" : ""}>API key</option><option value="oauth"${draft.authKind === "oauth" ? " selected" : ""}>OAuth</option></select></label></div>${secretFields}<div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-account-draft-action="create"${draft.busy ? " disabled" : ""}>Create and validate draft</button></div>`
-          : '<div class="empty-state"><p class="empty-title">No configured upstream is available</p><p class="empty-description">Add an upstream through the typed Configuration editor before creating its account.</p></div>'
-      }
-      <p class="muted">The request carries only typed reference metadata. Secret values are never accepted or returned.</p>
-    </section>`;
-  }
-
-  async function createAccountDraft(trigger) {
-    const draft = state.accountDraft;
-    if (draft.busy) return;
-    const sessionGeneration = state.sessionGeneration;
-    const secret =
-      draft.authKind === "oauth"
-        ? undefined
-        : draft.secretKind === "env"
-          ? { kind: "env", name: draft.envName }
-          : draft.secretKind === "file"
-            ? { kind: "file", path: draft.filePath }
-            : {
-                kind: "keyring",
-                service: draft.keyringService,
-                account: draft.keyringAccount,
-              };
-    if (!draft.id.trim() || !draft.provider) {
-      notify("error", "Account ID and configured upstream are required.");
-      return;
-    }
-    draft.busy = true;
-    if (trigger) trigger.disabled = true;
-    try {
-      const result = await mutateJson("/config/accounts/draft", "POST", {
-        id: draft.id.trim(),
-        provider: draft.provider,
-        auth_kind: draft.authKind,
-        ...(secret ? { secret } : {}),
-      });
-      if (sessionGeneration !== state.sessionGeneration) return;
-      state.configuration.draftId = result.draft_id;
-      state.configuration.etag = result.etag;
-      state.configuration.diff = result.semantic_diff || [];
-      state.configuration.confirmationToken = result.confirmation_token || "";
-      notify(
-        "success",
-        "Account draft validated. Review and explicitly commit it.",
-      );
-      window.location.hash = "configuration";
-    } catch (error) {
-      if (sessionGeneration !== state.sessionGeneration) return;
-      if (error.status === 401) authRequired();
-      else notify("error", `Account draft failed: ${error.message}`);
-    } finally {
-      if (sessionGeneration === state.sessionGeneration) {
-        draft.busy = false;
-        if (state.route === "accounts" && state.authState !== "required")
-          renderAccounts($("#view"));
-      }
-    }
+  function accountOAuthPanel(account) {
+    if (!account || account.auth_kind !== "oauth") return "";
+    const capabilities = state.oauthCapabilities[account.id];
+    const methods = capabilities?.methods || [];
+    const flow = state.oauthFlow.account === account.id ? state.oauthFlow : null;
+    return `<section class="panel oauth-panel" aria-labelledby="oauth-title"><div class="toolbar"><h2 class="panel-title" id="oauth-title">Authenticate ${esc(account.id)}</h2><span class="spacer"></span>${flow ? statusBadge(flow.status || "starting") : ""}</div><p class="muted">Choose one supported flow. The callback uses one-time state; this dashboard never receives a token or secret.</p><div class="button-row">${methods.map((method) => `<button class="btn btn-outline btn-sm" type="button" data-oauth-start="${esc(method.method)}" data-oauth-account="${esc(account.id)}"${flow?.busy ? " disabled" : ""}>${esc(method.method.replaceAll("_", " "))}</button>`).join("") || `<span class="muted">Loading supported authentication methods…</span>`}</div>${flow ? `<div class="callout" role="status">${flow.authorizationUrl ? `<a class="btn btn-primary btn-sm" href="${esc(flow.authorizationUrl)}" target="_blank" rel="noreferrer">Open authorization page</a>` : ""}${flow.verificationUri ? `<p>Device URL: <a href="${esc(flow.verificationUri)}" target="_blank" rel="noreferrer">${esc(flow.verificationUri)}</a></p>` : ""}${flow.userCode ? `<p>Device code: <code class="mono">${esc(flow.userCode)}</code></p>` : ""}<p>${esc(oauthCountdown())}</p>${flow.requestId && !["succeeded", "failed", "cancelled", "expired"].includes(flow.status) ? `<button class="btn btn-ghost btn-xs" type="button" data-oauth-cancel="${esc(flow.requestId)}">Cancel</button>` : ""}</div>` : ""}</section>`;
   }
 
   function renderAccounts(root) {
-    const accounts = state.data.accounts?.accounts || [];
-
-    const selectable = accounts.filter(
-      (a) => a.enabled && a.status === "available",
-    ).length;
-    const cooling = accounts.filter((a) => a.status === "cooling_down").length;
-
-    const stats = [
-      statCard(
-        "Accounts",
-        `<span class="num">${fmtInt(accounts.length)}</span>`,
-        "Configured accounts",
-      ),
-      statCard(
-        "Selectable",
-        `<span class="num">${fmtInt(selectable)}</span>`,
-        "Enabled and not cooling down",
-      ),
-      statCard(
-        "Cooling down",
-        `<span class="num">${fmtInt(cooling)}</span>`,
-        "Temporarily excluded",
-      ),
-      statCard(
-        "Enabled",
-        `<span class="num">${fmtInt(accounts.filter((a) => a.enabled).length)}</span>`,
-        "Operator-enabled",
-      ),
-    ].join("");
-
-    const accountTable = tableWrap(
-      [
-        {
-          label: "ID",
-          mono: true,
-          nowrap: false,
-          render: (a) =>
-            `<div class="cell-ellipsis" title="${esc(a.id)}">${esc(a.id)}</div>`,
-        },
-        {
-          label: "Provider",
-          mono: true,
-          render: (a) => providerCell(a.provider),
-        },
-        {
-          label: "Selected",
-          render: (a) =>
-            accountIsSelected(a)
-              ? statusBadge("selected", "accent")
-              : `<span class="muted">—</span>`,
-        },
-        { label: "Enabled", render: (a) => enabledBadge(a.enabled) },
-        { label: "Status", render: (a) => statusBadge(a.status) },
-        {
-          label: "Failures",
-          align: "right",
-          render: (a) => `<span class="num">${fmtInt(a.failure_count)}</span>`,
-        },
-        {
-          label: "Cooldown",
-          render: (a) =>
-            a.cooldown_until
-              ? `<span class="num" title="${esc(fmtTime(a.cooldown_until))}">${esc(relTime(a.cooldown_until))}</span>`
-              : `<span class="muted">—</span>`,
-        },
-        {
-          label: "Actions",
-          nowrap: false,
-          render: (a) => {
-            const enableAction = a.enabled ? "disable" : "enable";
-            const menuItem = (action, label, icon, title, danger) => {
-              const supported = accountSupports(a, action);
-              if (!supported) return "";
-              const path = `/accounts/${encodeURIComponent(a.id)}/${action}`;
-              const pending = state.pending.has(path);
-              return `<button class="menu-item${danger ? " menu-danger" : ""}" type="button" data-account-action="${action}" data-account-id="${esc(a.id)}" data-account-provider="${esc(a.provider)}" title="${esc(title || label)}"${pending ? ` disabled aria-busy="true"` : ""}>${ic(icon, 14)} ${esc(label)}</button>`;
-            };
-            const menuItems = [
-              menuItem(
-                enableAction,
-                a.enabled ? "Disable" : "Enable",
-                a.enabled ? "pause" : "play",
-              ),
-              menuItem(
-                "refresh",
-                "Refresh",
-                "refresh-double",
-                "Queue an OAuth token refresh",
-              ),
-              menuItem(
-                "revoke",
-                "Revoke",
-                "trash",
-                "Remove Pooler's local credential and disable the account",
-                true,
-              ),
-            ].join("");
-            return `<div class="row-actions">
-            <button class="btn btn-subtle btn-xs" type="button" data-account-connect="${esc(a.id)}">${ic("key-alt", 13)} Connect</button>
-            ${accountActionButton(a, "switch", "Switch", "switch-on", "Select this account and disable its same-provider siblings")}
-            ${menuItems ? `<details class="menu"><summary class="btn btn-subtle btn-xs btn-icon-xs" aria-label="More actions for ${esc(a.id)}" title="More actions">${ic("more-vert", 14)}</summary><div class="menu-list">${menuItems}</div></details>` : ""}
-          </div>`;
-          },
-        },
-      ],
-      accounts,
-      {
-        loading: state.loading && !state.data.accounts,
-        error: endpointError("accounts"),
-        emptyTitle: "No accounts configured",
-        emptyDescription:
-          "Accounts are declared in configuration and authenticated on the server.",
-      },
-    );
-
-    const connectionAccount = accounts.find(
-      (account) => account.id === state.connectionAccount,
-    );
-
-    root.innerHTML = `
-      ${viewHeader("Accounts", views.accounts.subtitle)}
-      <section class="grid-stats grid-stats-4">${stats}</section>
-      ${accountDraftForm()}
-      ${section("Accounts", accountTable, "Switch enables the account and disables its same-provider siblings atomically.")}
-      ${accountConnectionGuide(connectionAccount)}
-      <div class="banner banner-info">
-        <span class="banner-icon">${ic("shield", 16)}</span>
-        <div class="banner-body">Refresh and revoke apply to OAuth accounts only, are queued on the native runtime, and their result lands in the audit log under Operations. Revocation removes Pooler's local credential payload; it does not claim provider-side revocation.</div>
-      </div>`;
+    const accounts = graphAccounts();
+    const connectionAccount = accounts.find((account) => account.id === state.connectionAccount);
+    const grouped = accounts.map((account) => `<article class="panel account-card"><div class="toolbar"><h2 class="panel-title mono">${esc(account.id)}</h2><span class="spacer"></span>${statusBadge(account.health?.status || "unknown")}</div><p class="muted">Provider instance <code class="mono">${esc(account.provider)}</code></p><dl class="detail-grid"><div><dt>Authentication</dt><dd>${esc(account.auth_kind)}</dd></div><div><dt>Enabled</dt><dd>${account.enabled === false ? "disabled" : "enabled"}</dd></div><div><dt>Failures</dt><dd>${fmtInt(account.health?.failure_count)}</dd></div><div><dt>Cooldown</dt><dd>${account.health?.cooldown_until ? esc(relTime(account.health.cooldown_until)) : "—"}</dd></div></dl><div class="button-row"><button class="btn btn-primary btn-xs" type="button" data-account-connect="${esc(account.id)}">${account.auth_kind === "oauth" ? "Authenticate" : "View account"}</button>${account.enabled === false ? `<button class="btn btn-outline btn-xs" type="button" data-account-action="enable" data-account-id="${esc(account.id)}">Enable</button>` : `<button class="btn btn-outline btn-xs" type="button" data-account-action="disable" data-account-id="${esc(account.id)}">Disable</button>`}<button class="btn btn-ghost btn-xs" type="button" data-account-action="refresh" data-account-id="${esc(account.id)}">Refresh status</button><button class="btn btn-ghost btn-xs" type="button" data-account-action="revoke" data-account-id="${esc(account.id)}">Revoke local credential</button></div></article>`).join("");
+    const quotaRowsSource = (controlGraph().quota || []).length ? controlGraph().quota : (state.data.quota?.windows || []);
+    const quotaRows = quotaRowsSource.filter((row) => !connectionAccount || row.identity?.credential === connectionAccount.id || row.account === connectionAccount.id).map((row) => `<li><span class="mono">${esc(row.identity?.credential || row.account || "account")}</span><span class="muted">${esc(row.state || row.unit || "quota")}</span><span class="spacer"></span>${row.remaining === undefined ? "—" : esc(fmtInt(row.remaining))}</li>`).join("");
+    root.innerHTML = `${viewHeader("Accounts", views.accounts.subtitle)}${draftBar()}${accountForm()}${grouped ? `<section class="section"><div class="toolbar"><h2 class="section-title">Configured accounts</h2><span class="section-hint">Every row has independent health and quota state.</span></div><div class="grid-2">${grouped}</div></section>` : `<div class="panel empty-state"><p class="empty-title">No accounts configured</p><p class="empty-description">Add a provider instance first.</p></div>`}${connectionAccount ? accountOAuthPanel(connectionAccount) : ""}${quotaRows ? `<section class="panel"><h2 class="panel-title">Account quota</h2><ul class="check-list">${quotaRows}</ul></section>` : ""}`;
+    bindAccountCreate(root);
+    if (connectionAccount && connectionAccount.auth_kind === "oauth" && !state.oauthCapabilities[connectionAccount.id]) loadOAuthCapabilities(connectionAccount.id).then(() => renderCurrentViewIfVisible());
   }
 
   /* ---------------- Usage ---------------- */
@@ -3313,21 +3285,6 @@
         trigger,
       );
     }
-    if (action === "switch") {
-      return runMutation(
-        path,
-        {
-          confirm: {
-            title: `Switch selected account to ${accountId}?`,
-            copy: `Select <span class="mono">${esc(accountId)}</span>${provider ? ` for <span class="mono">${esc(provider)}</span>` : ""} and disable its same-provider siblings?`,
-            acceptLabel: "Switch account",
-          },
-          successMessage: () =>
-            `Switched to ${accountId}; same-provider siblings were disabled.`,
-        },
-        trigger,
-      );
-    }
     return runMutation(
       path,
       { successMessage: () => `${label}d ${accountId}.` },
@@ -3411,9 +3368,16 @@
       if (active) link.setAttribute("aria-current", "page");
       else link.removeAttribute("aria-current");
     });
-    document
-      .querySelector('.nav-link[aria-current="page"]')
-      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    const activeNavigation = document.querySelector('.nav-link[aria-current="page"]');
+    const navigation = activeNavigation?.parentElement;
+    if (activeNavigation && navigation && navigation.scrollWidth > navigation.clientWidth) {
+      const left = activeNavigation.offsetLeft;
+      const right = left + activeNavigation.offsetWidth;
+      if (left < navigation.scrollLeft) navigation.scrollLeft = left;
+      else if (right > navigation.scrollLeft + navigation.clientWidth) {
+        navigation.scrollLeft = right - navigation.clientWidth;
+      }
+    }
     const view = views[state.route];
     $("#view").className = `view view-${state.route}`;
     $("#view").innerHTML = `
@@ -3447,6 +3411,16 @@
 
     document.addEventListener("keydown", (event) => {
       if (event.key !== "Escape") return;
+      if (state.targetDrag) {
+        state.targetOrders[state.targetDrag.modelId] = [...state.targetDrag.original];
+        state.targetAnnouncement = "Target drag cancelled; the previous order was restored.";
+        state.targetFocus = state.targetDrag.targetId;
+        state.targetDrag = null;
+        event.preventDefault();
+        renderCurrentViewIfVisible();
+        requestAnimationFrame(() => $(`[data-target-id="${CSS.escape(state.targetFocus)}"]`)?.focus());
+        return;
+      }
       const menu = document.querySelector("details.menu[open]");
       if (!menu) return;
       event.preventDefault();
@@ -3485,7 +3459,6 @@
     $("#token-apply").addEventListener("click", () => {
       state.sessionGeneration += 1;
       state.pending.clear();
-      clearSetupResults();
       clearConfigurationDraft();
       invalidateReads({ clearData: true });
       state.token = $("#token-input").value.trim();
@@ -3504,7 +3477,6 @@
     $("#token-clear").addEventListener("click", () => {
       state.sessionGeneration += 1;
       state.pending.clear();
-      clearSetupResults();
       clearConfigurationDraft();
       invalidateReads({ clearData: true });
       state.token = "";
@@ -3540,6 +3512,155 @@
         return;
       }
 
+      const controlAction = event.target.closest("[data-control-action]");
+      if (controlAction) {
+        controlDraftAction(controlAction.dataset.controlAction);
+        return;
+      }
+
+      const providerAction = event.target.closest("[data-provider-action]");
+      if (providerAction) {
+        if (providerAction.dataset.providerAction === "show-form") {
+          state.providerDraft.visible = true;
+          renderProviders($("#view"));
+        } else if (providerAction.dataset.providerAction === "create") {
+          createProviderInstance();
+        }
+        return;
+      }
+
+      const providerChoice = event.target.closest("[data-onboarding-provider]");
+      if (providerChoice) {
+        state.onboarding.provider = providerChoice.dataset.onboardingProvider;
+        state.onboarding.phase = "account";
+        state.onboarding.selectedModels = new Set();
+        state.onboarding.modelsInitialized = false;
+        state.accountDraft.provider = state.onboarding.provider;
+        renderProviders($("#view"));
+        return;
+      }
+
+      const onboardingAction = event.target.closest("[data-onboarding-action]");
+      if (onboardingAction) {
+        const action = onboardingAction.dataset.onboardingAction;
+        if (action === "close") {
+          state.onboarding.provider = "";
+          state.onboarding.providerDetails = null;
+          state.onboarding.phase = "provider";
+        } else if (action === "discover") {
+          discoverVerifiedModels();
+          return;
+        } else if (action === "review") {
+          state.onboarding.phase = "review";
+        } else if (action === "continue-models") {
+          state.onboarding.phase = "models";
+        } else if (action === "save-models") {
+          saveModelExposure();
+          return;
+        }
+        renderProviders($("#view"));
+        return;
+      }
+
+      const targetMove = event.target.closest("[data-target-move]");
+      if (targetMove) {
+        const model = graphModels().find((item) => item.id === targetMove.dataset.targetModel);
+        const targets = model ? modelTargets(model) : [];
+        const index = targets.findIndex((target) => (target.binding_id || target.id) === targetMove.dataset.targetId);
+        if (index >= 0) {
+          const destination = { up: index - 1, down: index + 1, home: 0, end: targets.length - 1 }[targetMove.dataset.targetMove];
+          moveTarget(targetMove.dataset.targetModel, targetMove.dataset.targetId, destination);
+        }
+        return;
+      }
+
+      const targetCombine = event.target.closest("[data-target-combine]");
+      if (targetCombine) {
+        combineTarget(targetCombine.dataset.targetModel, targetCombine.dataset.targetId, targetCombine.dataset.targetCombine);
+        return;
+      }
+
+      const policyAction = event.target.closest("[data-policy-action]");
+      if (policyAction && policyAction.dataset.policyAction === "save") {
+        savePolicyControls();
+        return;
+      }
+
+      const modelSelection = event.target.closest("[data-model-selection]");
+      if (modelSelection) {
+        const action = modelSelection.dataset.modelSelection;
+        const models = graphModels();
+        if (action === "all") {
+          state.onboarding.selectedModels = new Set(models.map((model) => model.id));
+          state.onboarding.modelsInitialized = true;
+        } else if (action === "none") {
+          state.onboarding.selectedModels = new Set();
+          state.onboarding.modelsInitialized = true;
+        }
+        else if (action === "save") saveModelExposure();
+        renderCurrentViewIfVisible();
+        return;
+      }
+
+      const poolAction = event.target.closest("[data-pool-action]");
+      if (poolAction && poolAction.dataset.poolAction === "create") {
+        const draft = state.poolDraft;
+        if (!draft.id.trim() || !draft.provider || draft.accounts.length === 0) {
+          notify("error", "Enter a pool ID and select at least one account.");
+          return;
+        }
+        draft.busy = true;
+        applyControlResource("pools", { id: draft.id.trim(), provider: draft.provider, accounts: draft.accounts, strategy: draft.strategy })
+          .then(() => {
+            draft.busy = false;
+            notify("success", "Pool staged in the structured draft.");
+            refreshCurrentView();
+          })
+          .catch((error) => {
+            draft.busy = false;
+            if (error.status === 401) authRequired();
+            else if (error.status !== 409) notify("error", error.message);
+            renderCurrentViewIfVisible();
+          });
+        return;
+      }
+
+      const oauthStart = event.target.closest("[data-oauth-start]");
+      if (oauthStart) {
+        startOAuthFlow(oauthStart.dataset.oauthAccount, oauthStart.dataset.oauthStart);
+        return;
+      }
+      const oauthCancel = event.target.closest("[data-oauth-cancel]");
+      if (oauthCancel) {
+        mutate(`/oauth/cancel/${encodeURIComponent(oauthCancel.dataset.oauthCancel)}`)
+          .then(() => {
+            state.oauthFlow.status = "cancelled";
+            state.oauthFlow.busy = false;
+            renderCurrentViewIfVisible();
+          })
+          .catch((error) => {
+            if (error.status === 401) authRequired();
+            else notify("error", error.message);
+          });
+        return;
+      }
+
+      const endpointsCopy = event.target.closest("[data-endpoints-copy]");
+      if (endpointsCopy) {
+        const payload = JSON.stringify(state.data.endpointInventory || {}, null, 2);
+        Promise.resolve(navigator.clipboard?.writeText(payload)).then(
+          () => notify("success", "Endpoint inventory copied."),
+          () => notify("warning", "Clipboard access was unavailable; use the machine-readable block below."),
+        );
+        return;
+      }
+
+      const connectTool = event.target.closest("[data-connect-tool]");
+      if (connectTool) {
+        prepareExplicitRouteDraft(connectTool.dataset.connectTool);
+        return;
+      }
+
       const requestId = event.target.closest("[data-request-id]");
       if (requestId) {
         loadRequestTimeline(requestId.dataset.requestId);
@@ -3561,12 +3682,6 @@
         return;
       }
 
-      const setupButton = event.target.closest("[data-setup-action]");
-      if (setupButton) {
-        setupAction(setupButton.dataset.setupAction);
-        return;
-      }
-
       const railButton = event.target.closest("[data-models-provider]");
       if (railButton) {
         state.modelsProvider = railButton.dataset.modelsProvider;
@@ -3580,39 +3695,11 @@
         return;
       }
 
-      const oauthDeviceButton = event.target.closest(
-        "[data-account-oauth-device]",
-      );
-      if (oauthDeviceButton) {
-        startOAuthDevice(
-          oauthDeviceButton.dataset.accountOauthDevice,
-          oauthDeviceButton,
-        );
-        return;
-      }
-
-      const accountDraftButton = event.target.closest(
-        "[data-account-draft-action]",
-      );
-      if (accountDraftButton) {
-        createAccountDraft(accountDraftButton);
-        return;
-      }
-
       const connectionButton = event.target.closest("[data-account-connect]");
       if (connectionButton) {
         state.connectionAccount = connectionButton.dataset.accountConnect;
         renderAccounts($("#view"));
-        $("#connection-title")?.focus();
-        return;
-      }
-      if (event.target.closest("[data-account-connect-close]")) {
-        state.connectionAccount = "";
-        renderAccounts($("#view"));
-        return;
-      }
-      if (event.target.closest("[data-account-connect-check]")) {
-        refreshCurrentView();
+        $("#oauth-title")?.focus();
         return;
       }
 
@@ -3629,6 +3716,10 @@
       }
       const modelButton = event.target.closest("[data-model-action]");
       if (modelButton) {
+        if (modelButton.dataset.modelAction === "discover") {
+          runMutation("/models/reload", { queuedMessage: (result) => `Model discovery request ${result.request_id} accepted.` }, modelButton);
+          return;
+        }
         modelAction(
           modelButton.dataset.modelId,
           modelButton.dataset.modelAction,
@@ -3658,6 +3749,39 @@
     });
 
     $("#view").addEventListener("input", (event) => {
+      const policyField = event.target.closest("[data-policy-field]");
+      if (policyField && state.route === "models") {
+        const field = policyField.dataset.policyField;
+        state.policyEditor[field] = policyField.type === "checkbox" ? policyField.checked : policyField.value;
+        state.policyEditor.dirty = true;
+        if (field === "ranking" || field === "allowFallbacks") renderModels($("#view"));
+        return;
+      }
+      const providerField = event.target.closest("[data-provider-field]");
+      if (providerField && state.route === "providers") {
+        state.providerDraft[providerField.dataset.providerField] = providerField.value;
+        return;
+      }
+      const accountNewField = event.target.closest("[data-account-new-field]");
+      if (accountNewField && state.route === "accounts" || accountNewField && state.route === "providers") {
+        state.accountDraft[accountNewField.dataset.accountNewField] = accountNewField.value;
+        return;
+      }
+      const poolField = event.target.closest("[data-pool-field]");
+      if (poolField && state.route === "pools") {
+        state.poolDraft[poolField.dataset.poolField] = poolField.value;
+        if (poolField.dataset.poolField === "provider") state.poolDraft.accounts = [];
+        return;
+      }
+      const modelSelection = event.target.closest("[data-model-selection-id]");
+      if (modelSelection) {
+        const selected = new Set(state.onboarding.selectedModels);
+        if (modelSelection.checked) selected.add(modelSelection.dataset.modelSelectionId);
+        else selected.delete(modelSelection.dataset.modelSelectionId);
+        state.onboarding.selectedModels = selected;
+        state.onboarding.modelsInitialized = true;
+        return;
+      }
       const requestFilter = event.target.closest("[data-request-filter]");
       if (requestFilter && state.route === "requests") {
         state.requestExplorer[requestFilter.dataset.requestFilter] =
@@ -3679,13 +3803,42 @@
         state.configuration.confirmationToken = "";
         return;
       }
-      const field = event.target.closest("[data-setup-field]");
-      if (!field || state.route !== "setup") return;
-      updateSetupField(field.dataset.setupField, field.value);
-      const next = $('[data-setup-action="next"]', $("#view"));
-      if (next) next.disabled = !setupReadyForStep(state.setup.step);
     });
     $("#view").addEventListener("change", (event) => {
+      const targetPriority = event.target.closest("[data-target-priority]");
+      if (targetPriority) {
+        setTargetPriority(targetPriority.dataset.targetModel, targetPriority.dataset.targetId, targetPriority.value);
+        return;
+      }
+      const policyField = event.target.closest("[data-policy-field]");
+      if (policyField && state.route === "models") {
+        state.policyEditor[policyField.dataset.policyField] = policyField.type === "checkbox" ? policyField.checked : policyField.value;
+        state.policyEditor.dirty = true;
+        return;
+      }
+      const accountNewField = event.target.closest("[data-account-new-field]");
+      if (accountNewField && state.route === "accounts") {
+        const field = accountNewField.dataset.accountNewField;
+        state.accountDraft[field] = accountNewField.value;
+        if (field === "provider") state.onboarding.provider = accountNewField.value;
+        if (field === "provider" || field === "authKind") renderCurrentViewIfVisible();
+        return;
+      }
+      const poolField = event.target.closest("[data-pool-field]");
+      if (poolField && state.route === "pools") {
+        state.poolDraft[poolField.dataset.poolField] = poolField.value;
+        if (poolField.dataset.poolField === "provider") state.poolDraft.accounts = [];
+        renderCurrentViewIfVisible();
+        return;
+      }
+      const poolAccount = event.target.closest("[data-pool-account]");
+      if (poolAccount && state.route === "pools") {
+        const selected = new Set(state.poolDraft.accounts);
+        if (poolAccount.checked) selected.add(poolAccount.dataset.poolAccount);
+        else selected.delete(poolAccount.dataset.poolAccount);
+        state.poolDraft.accounts = [...selected];
+        return;
+      }
       const accountDraftField = event.target.closest(
         "[data-account-draft-field]",
       );
@@ -3715,12 +3868,19 @@
         renderConfiguration($("#view"));
         return;
       }
-      const field = event.target.closest("[data-setup-field]");
-      if (!field || state.route !== "setup" || field.tagName !== "SELECT")
-        return;
-      updateSetupField(field.dataset.setupField, field.value);
-      renderSetup($("#view"));
-      $(`#setup-${field.dataset.setupField}`)?.focus();
+    });
+
+    $("#view").addEventListener("keydown", (event) => {
+      const row = event.target.closest("[data-target-row]");
+      if (!row || !event.altKey) return;
+      const model = graphModels().find((item) => item.id === row.dataset.targetModel);
+      const targets = model ? modelTargets(model) : [];
+      const index = targets.findIndex((target) => (target.binding_id || target.id) === row.dataset.targetId);
+      if (index < 0) return;
+      const destination = event.key === "ArrowUp" ? index - 1 : event.key === "ArrowDown" ? index + 1 : event.key === "Home" ? 0 : event.key === "End" ? targets.length - 1 : null;
+      if (destination === null) return;
+      event.preventDefault();
+      moveTarget(row.dataset.targetModel, row.dataset.targetId, destination);
     });
 
     $("#banner-area").addEventListener("click", (event) => {

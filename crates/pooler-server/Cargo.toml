@@ -48,6 +48,7 @@ tracing.workspace = true
 futures-util.workspace = true
 pooler-testkit = { path = "../pooler-testkit" }
 pooler-protocol = { path = "../pooler-protocol" }
+pooler-policy = { path = "../pooler-policy" }
 prost = "0.14"
 serde.workspace = true
 tokio-tungstenite.workspace = true

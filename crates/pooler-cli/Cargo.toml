@@ -28,6 +28,7 @@ pooler-observe = { path = "../pooler-observe" }
 pooler-store = { path = "../pooler-store" }
 pooler-server = { path = "../pooler-server" }
 pooler-testkit = { path = "../pooler-testkit" }
+rusqlite.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tokio-util.workspace = true

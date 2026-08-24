@@ -363,6 +363,10 @@
           "pattern": "^[A-Za-z0-9._-]{1,128}$",
           "type": "string"
         },
+        "account_pool": {
+          "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        },
         "aliases": {
           "items": {
             "$ref": "#/$defs/catalog_alias"
@@ -1066,6 +1070,28 @@
     },
     "model_target": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "not": {
+            "required": [
+              "account_pool"
+            ]
+          },
+          "required": [
+            "account"
+          ]
+        },
+        {
+          "not": {
+            "required": [
+              "account"
+            ]
+          },
+          "required": [
+            "account_pool"
+          ]
+        }
+      ],
       "properties": {
         "account": {
           "pattern": "^[A-Za-z0-9._-]{1,128}$",
@@ -1119,17 +1145,53 @@
           "minItems": 0,
           "type": "array"
         },
+        "context_window": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "data_policy": {
+          "minLength": 1,
+          "type": "string"
+        },
         "id": {
           "pattern": "^[A-Za-z0-9._-]{1,128}$",
           "type": "string"
+        },
+        "parameters": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "price": {
+          "minimum": 0,
+          "type": "integer"
         },
         "priority": {
           "maximum": 4294967295,
           "minimum": 1,
           "type": "integer"
         },
+        "privacy": {
+          "minLength": 1,
+          "type": "string"
+        },
         "provider": {
           "pattern": "^[A-Za-z0-9._-]{1,128}$",
+          "type": "string"
+        },
+        "quantization": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "region": {
+          "minLength": 1,
           "type": "string"
         },
         "upstream_model": {
@@ -1143,12 +1205,19 @@
         },
         "wire_family": {
           "type": "string"
+        },
+        "zdr": {
+          "type": "boolean"
         }
       },
       "required": [
         "id",
         "provider",
-        "upstream_model"
+        "priority",
+        "upstream_model",
+        "capabilities",
+        "codecs",
+        "wire_family"
       ],
       "type": "object"
     },
@@ -1489,6 +1558,22 @@
           "minItems": 0,
           "type": "array"
         },
+        "fallback_models": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "ignore": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
         "max_price": {
           "minimum": 0,
           "type": "integer"
@@ -1496,6 +1581,14 @@
         "minimum_context": {
           "minimum": 1,
           "type": "integer"
+        },
+        "only": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
         },
         "order": {
           "items": {
@@ -1519,6 +1612,10 @@
           },
           "minItems": 0,
           "type": "array"
+        },
+        "region": {
+          "minLength": 1,
+          "type": "string"
         },
         "require_zdr": {
           "type": "boolean"
@@ -1567,6 +1664,30 @@
           },
           "minItems": 0,
           "type": "array"
+        },
+        "target_allow": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "target_deny": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
+        },
+        "target_order": {
+          "items": {
+            "pattern": "^[A-Za-z0-9._-]{1,128}$",
+            "type": "string"
+          },
+          "minItems": 0,
+          "type": "array"
         }
       },
       "type": "object"
@@ -1577,8 +1698,24 @@
         "latency": {
           "type": "boolean"
         },
+        "max_latency_ms": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_samples": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_throughput": {
+          "minimum": 0,
+          "type": "integer"
+        },
         "price": {
           "type": "boolean"
+        },
+        "stale_after_ms": {
+          "minimum": 0,
+          "type": "integer"
         },
         "throughput": {
           "type": "boolean"

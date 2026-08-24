@@ -535,7 +535,7 @@ mod tests {
 
     fn route() -> pooler_config::RoutePlan {
         let source = r#"
-version: 1
+version: 2
 listeners: {droid: {bind: "127.0.0.1:18474"}}
 upstreams: {anthropic: {url: "http://127.0.0.1:18983"}}
 routes:

@@ -1,14 +1,14 @@
-//! Operator workflow for a blocked managed-configuration transaction.
+//! Operator workflow for a blocked canonical-configuration transaction.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
 
-/// Safe recovery operations for Pooler's generated configuration sidecar.
+/// Safe recovery operations for Pooler's canonical configuration transaction.
 #[derive(Debug, Subcommand)]
 pub enum ConfigRecoveryCommand {
-    /// Inspect marker, identity, digest, permission, generation, and backup state.
+    /// Inspect marker, identity, digest, permission, generation, and file state.
     Status {
         /// Emit compact JSON instead of the default pretty JSON.
         #[arg(long)]
@@ -26,7 +26,7 @@ pub enum ConfigRecoveryCommand {
         #[arg(long)]
         compact: bool,
     },
-    /// Restore the previous generated revision when exact recovery is provable.
+    /// Restore the previous canonical revision when exact recovery is provable.
     #[command(visible_alias = "abort")]
     Rollback {
         /// Emit compact JSON instead of the default pretty JSON.
@@ -40,25 +40,25 @@ pub fn run(path: &Path, command: ConfigRecoveryCommand) -> Result<()> {
         ConfigRecoveryCommand::Status { compact } => (
             pooler_server::managed_configuration_recovery_status(path)
                 .map_err(anyhow::Error::from)
-                .context("could not inspect managed-configuration recovery state")?,
+                .context("could not inspect canonical-configuration recovery state")?,
             compact,
         ),
         ConfigRecoveryCommand::Verify { compact } => (
             pooler_server::verify_managed_configuration_recovery(path)
                 .map_err(anyhow::Error::from)
-                .context("managed-configuration recovery verification failed")?,
+                .context("canonical-configuration recovery verification failed")?,
             compact,
         ),
         ConfigRecoveryCommand::Resume { compact } => (
             pooler_server::resume_managed_configuration_recovery(path)
                 .map_err(anyhow::Error::from)
-                .context("managed-configuration recovery resume was refused")?,
+                .context("canonical-configuration recovery resume was refused")?,
             compact,
         ),
         ConfigRecoveryCommand::Rollback { compact } => (
             pooler_server::abort_managed_configuration_recovery(path)
                 .map_err(anyhow::Error::from)
-                .context("managed-configuration recovery rollback was refused")?,
+                .context("canonical-configuration recovery rollback was refused")?,
             compact,
         ),
     };

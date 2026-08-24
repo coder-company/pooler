@@ -2592,7 +2592,7 @@ mod tests {
         let route = pooler_config::compile_yaml(
             "factory-route.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 routes:
@@ -2655,7 +2655,7 @@ routes:
         let route = pooler_config::compile_yaml(
             "factory-tool-result.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:0}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 routes:
@@ -2700,7 +2700,7 @@ routes:
         let route = pooler_config::compile_yaml(
             "factory-selection.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 routes:
@@ -2751,7 +2751,7 @@ routes:
         let route = pooler_config::compile_yaml(
             "factory-selection-nested.yaml",
             r#"
-version: 1
+version: 2
 listeners: {local: {bind: 127.0.0.1:1}}
 upstreams: {local: {url: http://127.0.0.1:1}}
 routes:

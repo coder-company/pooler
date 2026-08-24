@@ -1015,7 +1015,7 @@ mod tests {
         compile_yaml(
             "xai-runtime.yaml",
             &format!(
-                "version: 1\nlisteners: {{local: {{bind: 127.0.0.1:1}}}}\nupstreams: {{xai: {{url: https://api.x.ai}}}}\nroutes:\n  - id: xai\n    listen: local\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: {decoder}}}\n    target: {{provider: xai}}\n    response: {{mode: semantic, decoder: {response_decoder}, encoder: {response_encoder}}}\n    loss_policy: reject\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:1}}}}\nupstreams: {{xai: {{url: https://api.x.ai}}}}\nroutes:\n  - id: xai\n    listen: local\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: {decoder}}}\n    target: {{provider: xai}}\n    response: {{mode: semantic, decoder: {response_decoder}, encoder: {response_encoder}}}\n    loss_policy: reject\n"
             ),
         )
         .expect("xAI config")

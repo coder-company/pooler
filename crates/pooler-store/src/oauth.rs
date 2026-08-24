@@ -13,7 +13,7 @@ use pooler_auth::{
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::{CredentialPayload, SqliteStore, StoreError};
+use crate::{CredentialPayload, SqliteStore, Store, StoreError};
 
 /// SQLite-backed encrypted OAuth token store.
 #[derive(Clone)]
@@ -32,6 +32,8 @@ pub struct CredentialProfileMetadata {
     pub account_id_present: bool,
     /// Store revision used as the credential generation.
     pub generation: u64,
+    /// Immutable non-secret account/provider configuration identity.
+    pub configuration_fingerprint: String,
     /// Provider token expiry, when supplied by the provider.
     pub expires_at: Option<SystemTime>,
     /// Imported provider expiry marker.
@@ -67,6 +69,39 @@ impl SqliteOAuthTokenStore {
         &self,
         credential: &CredentialId,
         expected_generation: u64,
+        profile: &OAuthCredentialProfile,
+    ) -> Result<TokenSnapshot, OAuthStoreError> {
+        self.compare_and_swap_profile_with_fingerprint(
+            credential,
+            expected_generation,
+            None,
+            profile,
+        )
+    }
+
+    /// Atomically import an OAuth profile while fencing the immutable
+    /// account/provider configuration identity before decrypting or replacing
+    /// an existing token envelope.
+    pub fn compare_and_swap_profile_for_fingerprint(
+        &self,
+        credential: &CredentialId,
+        configuration_fingerprint: &str,
+        expected_generation: u64,
+        profile: &OAuthCredentialProfile,
+    ) -> Result<TokenSnapshot, OAuthStoreError> {
+        self.compare_and_swap_profile_with_fingerprint(
+            credential,
+            expected_generation,
+            Some(configuration_fingerprint),
+            profile,
+        )
+    }
+
+    fn compare_and_swap_profile_with_fingerprint(
+        &self,
+        credential: &CredentialId,
+        expected_generation: u64,
+        configuration_fingerprint: Option<&str>,
         profile: &OAuthCredentialProfile,
     ) -> Result<TokenSnapshot, OAuthStoreError> {
         let provider_profile = profile.provider_profile().trim();
@@ -110,15 +145,24 @@ impl SqliteOAuthTokenStore {
             }),
         };
         let payload = encode_persisted(&persisted)?;
-        let state = self
-            .store
-            .compare_and_swap_credential_payload(
+        let state = match configuration_fingerprint {
+            Some(fingerprint) => self
+                .store
+                .compare_and_swap_credential_payload_for_fingerprint(
+                    credential.as_str(),
+                    expected_generation,
+                    fingerprint,
+                    &payload,
+                    now_millis(),
+                ),
+            None => self.store.compare_and_swap_credential_payload(
                 credential.as_str(),
                 expected_generation,
                 &payload,
                 now_millis(),
-            )
-            .map_err(Self::map_store_error)?;
+            ),
+        }
+        .map_err(Self::map_store_error)?;
         Ok(TokenSnapshot::new(state.revision, profile.tokens().clone()))
     }
 
@@ -147,6 +191,48 @@ impl SqliteOAuthTokenStore {
             provider_profile: persisted.provider_profile.unwrap_or_default(),
             account_id_present: persisted.account_id.is_some(),
             generation: state.revision,
+            configuration_fingerprint: state.configuration_fingerprint,
+            expires_at: persisted.expires_at_seconds.map(|seconds| {
+                UNIX_EPOCH
+                    .checked_add(Duration::from_secs(seconds))
+                    .unwrap_or(UNIX_EPOCH)
+            }),
+            expired: persisted.expired,
+            disabled: persisted.disabled,
+        }))
+    }
+
+    /// Load redacted profile metadata only when the immutable identity still
+    /// matches the compiled account configuration.
+    pub fn profile_metadata_for_fingerprint(
+        &self,
+        credential: &CredentialId,
+        configuration_fingerprint: &str,
+    ) -> Result<Option<CredentialProfileMetadata>, OAuthStoreError> {
+        let Some((state, payload)) = self
+            .store
+            .credential_payload_with_state_for_fingerprint(
+                credential.as_str(),
+                configuration_fingerprint,
+            )
+            .map_err(Self::map_store_error)?
+        else {
+            return Ok(None);
+        };
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let persisted = decode_persisted(payload)?;
+        let auth_kind = match persisted.auth_type.as_str() {
+            "oauth" | "oauth2" | "codex" => AuthKind::OAuth,
+            _ => return Err(OAuthStoreError::Unavailable),
+        };
+        Ok(Some(CredentialProfileMetadata {
+            auth_kind,
+            provider_profile: persisted.provider_profile.unwrap_or_default(),
+            account_id_present: persisted.account_id.is_some(),
+            generation: state.revision,
+            configuration_fingerprint: state.configuration_fingerprint,
             expires_at: persisted.expires_at_seconds.map(|seconds| {
                 UNIX_EPOCH
                     .checked_add(Duration::from_secs(seconds))
@@ -213,6 +299,43 @@ impl SqliteOAuthTokenStore {
         Ok(decode_persisted(payload)?.account_id)
     }
 
+    /// Return the provider subject only after the compiled credential
+    /// fingerprint matches the encrypted record metadata.
+    pub fn account_id_for_fingerprint(
+        &self,
+        credential: &CredentialId,
+        configuration_fingerprint: &str,
+    ) -> Result<Option<String>, OAuthStoreError> {
+        let Some(state) = self
+            .store
+            .credential_state(credential.as_str())
+            .map_err(Self::map_store_error)?
+        else {
+            return Ok(None);
+        };
+        if state.configuration_fingerprint.is_empty() {
+            if self
+                .store
+                .credential_payload_exists(credential.as_str())
+                .map_err(Self::map_store_error)?
+            {
+                return Err(OAuthStoreError::IdentityConflict);
+            }
+            return Ok(None);
+        }
+        if state.configuration_fingerprint != configuration_fingerprint {
+            return Err(OAuthStoreError::IdentityConflict);
+        }
+        let payload = self
+            .store
+            .credential_payload_for_fingerprint(credential.as_str(), configuration_fingerprint)
+            .map_err(Self::map_store_error)?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        Ok(decode_persisted(payload)?.account_id)
+    }
+
     fn decode(payload: CredentialPayload) -> Result<OAuthTokens, OAuthStoreError> {
         let bytes = Zeroizing::new(payload.into_bytes());
         let persisted: PersistedTokens =
@@ -240,6 +363,7 @@ impl SqliteOAuthTokenStore {
         match error {
             StoreError::CredentialNotFound(_) => OAuthStoreError::NotFound,
             StoreError::CredentialRevisionConflict => OAuthStoreError::Conflict,
+            StoreError::CredentialFingerprintConflict => OAuthStoreError::IdentityConflict,
             _ => OAuthStoreError::Unavailable,
         }
     }
@@ -267,6 +391,31 @@ impl OAuthTokenStore for SqliteOAuthTokenStore {
         Box::pin(async move { result })
     }
 
+    fn load_for_fingerprint<'a>(
+        &'a self,
+        credential: &'a CredentialId,
+        configuration_fingerprint: &'a str,
+    ) -> OAuthStoreFuture<'a, Option<TokenSnapshot>> {
+        let result = (|| {
+            let Some((state, payload)) = self
+                .store
+                .credential_payload_with_state_for_fingerprint(
+                    credential.as_str(),
+                    configuration_fingerprint,
+                )
+                .map_err(Self::map_store_error)?
+            else {
+                return Ok(None);
+            };
+            payload
+                .map(|payload| {
+                    Self::decode(payload).map(|tokens| TokenSnapshot::new(state.revision, tokens))
+                })
+                .transpose()
+        })();
+        Box::pin(async move { result })
+    }
+
     fn compare_and_swap<'a>(
         &'a self,
         credential: &'a CredentialId,
@@ -284,6 +433,38 @@ impl OAuthTokenStore for SqliteOAuthTokenStore {
                 .compare_and_swap_credential_payload(
                     credential.as_str(),
                     expected_generation,
+                    &payload,
+                    now_millis(),
+                )
+                .map_err(Self::map_store_error)?;
+            Ok(TokenSnapshot::new(state.revision, tokens))
+        })();
+        Box::pin(async move { result })
+    }
+
+    fn compare_and_swap_for_fingerprint<'a>(
+        &'a self,
+        credential: &'a CredentialId,
+        expected_generation: u64,
+        configuration_fingerprint: &'a str,
+        tokens: OAuthTokens,
+    ) -> OAuthStoreFuture<'a, TokenSnapshot> {
+        let result = (|| {
+            let existing = self
+                .store
+                .credential_payload_with_state_for_fingerprint(
+                    credential.as_str(),
+                    configuration_fingerprint,
+                )
+                .map_err(Self::map_store_error)?
+                .and_then(|(_, payload)| payload);
+            let payload = encode_preserving_identity(&tokens, existing)?;
+            let state = self
+                .store
+                .compare_and_swap_credential_payload_for_fingerprint(
+                    credential.as_str(),
+                    expected_generation,
+                    configuration_fingerprint,
                     &payload,
                     now_millis(),
                 )

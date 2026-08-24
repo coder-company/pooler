@@ -1117,11 +1117,17 @@ fn valid_devin_request() -> Vec<u8> {
 
 fn credential_cooldown_present(server: &HttpProxyServer) -> bool {
     let pooling = server.pooling();
-    pooling
+    let credential = pooling
         .credential_health_states()
         .expect("credential health")
         .iter()
-        .any(|health| health.failure_count > 0 && health.cooldown_until.is_some())
+        .any(|health| health.failure_count > 0 && health.cooldown_until.is_some());
+    credential
+        || pooling
+            .cooldowns()
+            .expect("binding cooldowns")
+            .iter()
+            .any(|cooldown| cooldown.scope == "binding")
 }
 
 fn assert_health(case: &Case, credential_cooldown: bool) {

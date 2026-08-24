@@ -137,8 +137,16 @@ impl CatalogRuntime {
                 .get(source.source().provider().as_str())
                 .cloned()
                 .ok_or(CatalogRuntimeError::MissingProvider)?;
-            let account = source
-                .account()
+            let account_id = source.account().or_else(|| {
+                source.account_pool().and_then(|pool| {
+                    config
+                        .account_pools()
+                        .get(pool)
+                        .and_then(|pool| pool.accounts().first())
+                        .map(AsRef::as_ref)
+                })
+            });
+            let account = account_id
                 .map(|account| {
                     config
                         .accounts()
@@ -202,7 +210,11 @@ impl CatalogRuntime {
                 plan.limits().max_models_per_source(),
                 fetcher,
             ));
-            sources.push(RegisteredSource::new(source.source().clone(), discovery));
+            let source_policy = source.source().clone().with_binding(
+                source.account().map(str::to_owned),
+                source.account_pool().map(str::to_owned),
+            )?;
+            sources.push(RegisteredSource::new(source_policy, discovery));
         }
         let service =
             CatalogService::new(sources, plan.limits())?.with_overrides(plan.overrides().clone());
@@ -228,6 +240,36 @@ impl CatalogRuntime {
     #[must_use]
     pub fn service(&self) -> Arc<CatalogService> {
         Arc::clone(&self.service)
+    }
+
+    /// Apply a typed bulk exposure action to one source. The next bounded
+    /// refresh publishes the resulting model set.
+    pub fn apply_selection(
+        &self,
+        source_id: &str,
+        action: pooler_model_catalog::ModelSelectionAction,
+    ) -> Result<(), CatalogError> {
+        self.service.apply_selection(source_id, action)
+    }
+
+    /// Expose all newly discovered models except explicit exclusions.
+    pub fn select_all(&self, source_id: &str) -> Result<(), CatalogError> {
+        self.service.select_all(source_id)
+    }
+
+    /// Hide all discovered models until an explicit select-all operation.
+    pub fn select_none(&self, source_id: &str) -> Result<(), CatalogError> {
+        self.service.select_none(source_id)
+    }
+
+    /// Preserve one explicit upstream-model exclusion across refreshes.
+    pub fn exclude_model(&self, source_id: &str, model: &str) -> Result<(), CatalogError> {
+        self.service.exclude_model(source_id, model)
+    }
+
+    /// Remove one explicit upstream-model exclusion across refreshes.
+    pub fn include_model(&self, source_id: &str, model: &str) -> Result<(), CatalogError> {
+        self.service.include_model(source_id, model)
     }
 
     /// Compiled source policy and parser metadata for management diagnostics.
@@ -710,8 +752,13 @@ pub fn merged_model_catalog_value(
                 .iter()
                 .map(|target| {
                     json!({
+                        "binding_id": target.binding_id().as_str(),
                         "provider": target.provider(),
+                        "account": target.account(),
+                        "account_pool": target.account_pool(),
+                        "priority": target.priority(),
                         "upstream_model": target.upstream_model(),
+                        "wire_family": target.wire_family(),
                         "capabilities": target
                             .capabilities()
                             .iter()
@@ -754,7 +801,13 @@ pub fn merged_model_catalog_value(
             .plan()
             .sources()
             .iter()
-            .map(|source| catalog_source_value(source, snapshot))
+            .map(|source| {
+                let selection = catalog
+                    .service()
+                    .selection_state(source.source().id().as_str())
+                    .ok();
+                catalog_source_value(source, snapshot, selection.as_ref())
+            })
             .collect()
     });
     json!({
@@ -793,6 +846,9 @@ fn discovered_model_value(model: &pooler_model_catalog::CatalogModel) -> Value {
         .map(|target| {
             json!({
                 "provider": target.provider(),
+                "binding": target.binding(),
+                "account": target.account(),
+                "account_pool": target.account_pool(),
                 "upstream_model": target.upstream_model(),
                 "capabilities": target
                     .capabilities()
@@ -803,6 +859,7 @@ fn discovered_model_value(model: &pooler_model_catalog::CatalogModel) -> Value {
                 "profile": target.profile(),
                 "force_mapping": target.force_mapping(),
                 "priority": target.priority(),
+                "signed_priority": target.signed_priority(),
                 "provenance": target.provenance(),
             })
         })
@@ -816,8 +873,22 @@ fn discovered_model_value(model: &pooler_model_catalog::CatalogModel) -> Value {
     })
 }
 
-fn catalog_source_value(plan: &ModelCatalogSourcePlan, snapshot: &CatalogSnapshot) -> Value {
+fn catalog_source_value(
+    plan: &ModelCatalogSourcePlan,
+    snapshot: &CatalogSnapshot,
+    selection: Option<&pooler_model_catalog::ModelSelectionState>,
+) -> Value {
     let source = plan.source();
+    let verified_discovery = ProviderCatalog::builtin()
+        .get(source.provider().as_str())
+        .and_then(|provider| {
+            provider
+                .integration
+                .discovery_parser
+                .as_deref()
+                .zip(provider.integration.discovery_path.as_deref())
+        })
+        .is_some_and(|(parser, path)| parser == plan.parser().as_str() && path == plan.path());
     let aliases = source
         .aliases()
         .iter()
@@ -834,16 +905,26 @@ fn catalog_source_value(plan: &ModelCatalogSourcePlan, snapshot: &CatalogSnapsho
     json!({
         "id": source.id(),
         "provider": source.provider(),
-        "parser": plan.parser(),
-        "path": plan.path(),
+        "parser": verified_discovery.then_some(plan.parser()),
+        "path": verified_discovery.then_some(plan.path()),
+        "discovery": {
+            "state": if verified_discovery { "verified" } else { "manual_model_required" },
+            "verified": verified_discovery,
+            "automatic": verified_discovery,
+        },
         "max_response_bytes": plan.max_response_bytes(),
-        "account": plan.account(),
-        "account_configured": plan.account().is_some(),
+        "account": source.account().or_else(|| plan.account()),
+        "account_pool": source.account_pool().or_else(|| plan.account_pool()),
+        "account_configured": source.account().is_some()
+            || source.account_pool().is_some()
+            || plan.account().is_some()
+            || plan.account_pool().is_some(),
         "prefix": source.prefix(),
         "priority": source.priority(),
         "aliases": aliases,
         "included_models": source.included_models().collect::<Vec<_>>(),
         "excluded_models": source.excluded_models().collect::<Vec<_>>(),
+        "selection": selection,
         "state": snapshot.sources().get(source.id()),
     })
 }
