@@ -8,6 +8,8 @@ It exists because the tools and the accounts do not line up. Cursor, Devin, Fact
 
 **Translates protocols.** Pooler serves OpenAI, Anthropic, Gemini, xAI, Factory, fx, and ConnectRPC routes from one binary. A route either forwards bytes opaquely or performs a bounded semantic translation with an explicit decoder and encoder. Opaque forwarding is never presented as translation.
 
+**Knows 172 providers and accepts any other.** Declaring `known_provider` supplies a provider's base URL, credential environment variable, discovery parser, request dialect, endpoint families, model aliases, and quota classifier. That list is a convenience, not a boundary: any HTTP or WebSocket endpoint works as a custom upstream and participates in pooling, failover, and the dashboard identically.
+
 **Pools accounts.** Declare several accounts in a pool with a selection strategy and a retry policy. When an account hits a quota or cooldown, the next request goes to the next eligible account. Retries are commit-safe: once bytes have been committed to the client, Pooler does not silently replay to a different account.
 
 **Protects credentials.** Sign in with a provider's own device or browser OAuth flow. Tokens are encrypted at rest in SQLite. Configuration references secrets as `env:`, `file:`, or `keyring:` only; a literal secret is rejected, and an API key is never accepted as a command-line value.
@@ -64,9 +66,42 @@ For a shared machine or server, the hardened systemd layout is fixed instead: th
 | Inference and management, systemd service | `127.0.0.1:18400` and `127.0.0.1:18401` |
 | Browser OAuth loopback callback | `http://localhost:1455/auth/callback` |
 
+## Providers
+
+This build ships endpoint integrations for **172 known providers**. List or search them without reading credentials:
+
+```sh
+pooler providers
+pooler providers --search groq --json
+```
+
+A known provider needs only a name and a credential reference:
+
+```yaml
+upstreams:
+  groq:
+    known_provider: groq
+    auth:
+      secret: env:GROQ_API_KEY
+```
+
+Anything not on that list is a custom upstream, declared with an explicit URL and authentication placement:
+
+```yaml
+upstreams:
+  my-private-llm:
+    url: https://llm.internal.example.com
+    auth:
+      kind: header
+      header: x-internal-key
+      secret: env:MY_PRIVATE_LLM_KEY
+```
+
+Accepted `auth.kind` values are `bearer`, `bearer_secret`, `x_api_key`, `x_goog_api_key`, and `header`. Providers requiring an account-specific region, project, or hostname, such as Azure OpenAI, Bedrock, and Vertex, are deliberately absent from the known list rather than shipped as a guessed URL template; configure them as custom upstreams. See [provider catalog](provider-catalog.md).
+
 ## Provider login support
 
-Which login methods exist is decided by the provider. Verify with `pooler auth providers` rather than assuming.
+A login flow is a narrower thing than an endpoint integration: it is only needed when you sign in rather than paste a key. Which methods exist is decided by the provider, so verify with `pooler auth providers` rather than assuming.
 
 | Provider | Aliases | API key | Browser PKCE | Device code |
 | :--- | :--- | :---: | :---: | :---: |

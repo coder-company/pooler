@@ -1,12 +1,19 @@
 # Known-provider integrations
 
-`known_provider` selects a vendored integration contract rather than only a URL.
-For example:
+This build ships endpoint integrations for **172 known providers**. `known_provider`
+selects a vendored integration contract rather than only a URL. For example:
 
 ```yaml
 upstreams:
   groq:
     known_provider: groq
+```
+
+List or search the shipped table without reading credentials:
+
+```console
+pooler providers
+pooler providers --search groq
 ```
 
 Pooler supplies the provider base URL, a protected reference to the provider's
@@ -38,7 +45,39 @@ specializations include Anthropic header/version semantics, Gemini model
 parsing and API-key placement, xAI failure classification, and Kimi discovery.
 Providers whose endpoint requires an operator-owned resource, region, project,
 or hostname (for example Azure OpenAI, Bedrock, and Vertex) remain absent rather
-than using fabricated URL templates.
+than using fabricated URL templates. Configure those as custom upstreams.
+
+## Custom endpoints
+
+The known list is a convenience, not a boundary. Any other HTTP or WebSocket
+endpoint works as a custom upstream: declare an explicit `url` and state how the
+credential is presented.
+
+```yaml
+upstreams:
+  my-private-llm:
+    url: https://llm.internal.example.com
+    auth:
+      kind: header
+      header: x-internal-key
+      secret: env:MY_PRIVATE_LLM_KEY
+```
+
+Accepted `auth.kind` values are `bearer`, `bearer_secret`, `x_api_key`,
+`x_goog_api_key`, and `header`. Use `kind: header` with a `header` name for a
+provider that expects its key in a non-standard header, and `value_prefix` when
+the header value carries one. The field is `header`, not `header_name`.
+
+A custom upstream is a first-class upstream. It participates in account pooling,
+retry and failover policy, quota cooldowns, usage and cost accounting, and the
+dashboard exactly like a known provider. What it does not inherit is the
+vendored contract: Pooler cannot supply a discovery parser, model aliases, or a
+quota classifier it has never seen, so declare a `catalog` source and any
+`overrides` the deployment needs.
+
+An explicit `auth`, `url`, `native`, `query`, or `catalog` declaration on a
+`known_provider` upstream is also an override, so a self-hosted deployment of a
+known provider can reuse its dialect while replacing the base URL.
 
 ## Per-model profiles
 

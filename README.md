@@ -38,6 +38,8 @@ Pooler runs as one local process on your machine. Your coding tools point at it 
 
 **Every tool, one endpoint.** Cursor, Devin, Factory Droid, Claude Code, Vercel fx, and plain OpenAI, Anthropic, or Gemini SDKs each speak a different wire protocol. Pooler translates them, so a tool built for one provider can reach another.
 
+**172 known providers, plus anything you point it at.** Naming a provider with `known_provider` pulls in its base URL, credential environment variable, discovery parser, request dialect, endpoint families, model aliases, and quota classifier. Nothing is hardcoded to that list: any HTTP or WebSocket endpoint works as a custom upstream, including a private or self-hosted model.
+
 **Rate limits stop being your problem.** Add several subscriptions and API keys to a pool. When one hits a quota or cooldown, Pooler moves the next request to the next eligible account and records why.
 
 **Credentials stay out of your config files.** Sign in with a provider's own OAuth device or browser flow. Tokens are encrypted at rest in local SQLite. Pooler rejects a literal secret in YAML and never accepts an API key as a command-line argument.
@@ -176,6 +178,37 @@ pooler auth import codex-account --profile codex --from-file ~/.codex/credential
 ```
 
 Details, including operator-owned OAuth registration, in [provider login](docs/provider-login.md).
+
+### Any provider, including your own
+
+The six providers above are the ones with a built-in *login* flow. Credentials are only part of the story: this build also ships endpoint integrations for **172 known providers**, so most only need a key and a name.
+
+```sh
+pooler providers                 # all 172
+pooler providers --search groq   # narrow it down
+```
+
+```yaml
+upstreams:
+  groq:
+    known_provider: groq         # base URL, dialect, discovery, aliases, quota
+    auth:
+      secret: env:GROQ_API_KEY
+```
+
+You are not limited to that list. Point Pooler at any HTTP or WebSocket endpoint, including a private or self-hosted deployment, and choose how the credential is presented:
+
+```yaml
+upstreams:
+  my-private-llm:
+    url: https://llm.internal.example.com
+    auth:
+      kind: header                 # bearer, bearer_secret, x_api_key, x_goog_api_key, header
+      header: x-internal-key
+      secret: env:MY_PRIVATE_LLM_KEY
+```
+
+Custom upstreams pool, fail over, and appear in the dashboard exactly like known ones. Providers whose endpoint needs an account-specific region, project, or hostname — Azure OpenAI, Bedrock, Vertex — are deliberately absent from the known list rather than shipped as a guessed URL template; configure those as custom upstreams. See [provider catalog](docs/provider-catalog.md).
 
 ---
 
