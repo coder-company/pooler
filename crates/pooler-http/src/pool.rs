@@ -2877,6 +2877,10 @@ fn register_model_accounts(
     Ok(())
 }
 
+/// Canonical endpoint family for a wire family that serves exactly one.
+///
+/// The OpenAI wire deliberately has no entry: it serves several families, so
+/// the endpoint is chosen from the route rather than from the target.
 fn static_endpoint_family(wire_family: &str) -> Option<&'static str> {
     match wire_family {
         "anthropic" | "anthropic_messages" => Some("messages"),

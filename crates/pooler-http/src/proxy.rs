@@ -4472,6 +4472,23 @@ fn selected_semantic_wire(
         Some("chat_completions") => Some(SemanticWire::OpenAiChat),
         Some("messages") => Some(SemanticWire::AnthropicMessages),
         Some("generate_content") => Some(SemanticWire::GeminiGenerateContent),
+        Some(_) => None,
+        None => route_semantic_wire(route),
+    }
+}
+
+/// Upstream wire implied by a semantic route's own response contract.
+///
+/// A target that declares only the OpenAI wire does not say which OpenAI
+/// surface to use, and a route is not required to name an endpoint family. The
+/// route's response decoder resolves it, because it names the upstream event
+/// shape the route was built to read.
+fn route_semantic_wire(route: &RoutePlan) -> Option<SemanticWire> {
+    match route.response().decoder()? {
+        "decode.openai.chat.events" => Some(SemanticWire::OpenAiChat),
+        "decode.openai.responses" | "decode.openai.responses.events" => {
+            Some(SemanticWire::OpenAiResponses)
+        }
         _ => None,
     }
 }
