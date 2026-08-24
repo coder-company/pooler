@@ -1,6 +1,6 @@
 # Pooler
 
-> Pooler is a local proxy that connects AI coding tools (Cursor, Devin, Factory Droid, Claude Code, and AI SDKs) to model providers (OpenAI, Anthropic Claude, Google Gemini, xAI Grok). It translates request formats, pools multiple accounts to bypass rate limits, stores credentials in encrypted SQLite, and provides a local web dashboard for monitoring requests.
+> Pooler is a local proxy that connects AI coding tools (Cursor, Devin, Factory Droid, Claude Code, and AI SDKs) to AI subscriptions (ChatGPT / Codex) and model providers (OpenAI, Anthropic Claude, Google Gemini, xAI Grok). It translates request formats, pools multiple accounts to bypass rate limits, stores credentials in encrypted SQLite, and provides a local web dashboard for monitoring requests.
 
 Pooler is configured using YAML with safe secret references (`env:`, `file:`, `keyring:`) and provides built-in presets for coding agents.
 
@@ -8,15 +8,18 @@ Pooler is configured using YAML with safe secret references (`env:`, `file:`, `k
 
 Give these prompts to any AI coding agent to automate setup and configuration:
 
-- [Agent Native Prompts](docs/agent-native.md): Ready-to-use prompt cookbook for coding agents.
+- [Agent Native Prompts Cookbook](docs/agent-native.md): Ready-to-use task recipes for coding agents.
 - [Bootstrap Starter](docs/agent-native.md#bootstrap-starter-deployment): "Initialize a new secure Pooler deployment in ./pooler-starter, generate secrets, and verify configuration."
-- [Configure Cursor Adapter](docs/agent-native.md#configure-cursor-adapter): "Configure Pooler with the Cursor preset on port 8333 with gpt- prefix routing and high reasoning effort."
-- [Configure Devin ConnectRPC](docs/agent-native.md#configure-devin-connectrpc-adapter): "Configure Pooler for Devin ConnectRPC translation on port 18473 translating to OpenAI upstream."
+- [Connect Codex Subscription](docs/agent-native.md#connect-chatgpt--codex-subscription-via-device-flow): "Authenticate an OpenAI / ChatGPT / Codex subscription via device code flow and verify encrypted storage."
+- [Import Local Codex Credentials](docs/agent-native.md#import-local-codex-cli-credentials): "Import local Codex CLI credentials from ~/.codex/credentials.json into Pooler's encrypted store."
+- [Connect Google Gemini](docs/agent-native.md#connect-google-gemini-via-browser-pkce-oauth): "Authenticate Google Gemini via browser PKCE OAuth and verify account status."
+- [Configure Multi-Account Failover](docs/agent-native.md#pool-multiple-codex-subscriptions--api-keys-with-automatic-failover): "Configure account pooling across multiple subscriptions and API keys with automatic rate-limit failover."
+- [Configure Cursor Adapter](docs/agent-native.md#configure-cursor-ide-adapter): "Configure Pooler with the Cursor preset on port 8333 with gpt- prefix routing and high reasoning effort."
+- [Configure Devin ConnectRPC](docs/agent-native.md#configure-devin-connectrpc-bridge): "Configure Pooler for Devin ConnectRPC translation on port 18473 translating to OpenAI upstream."
 - [Configure Factory Droid](docs/agent-native.md#configure-factory-droid-adapter): "Configure Pooler for Factory Droid language-model routes on port 18474."
-- [Configure OpenAI/Claude/Gemini Gateway](docs/agent-native.md#configure-multi-provider-gateway): "Configure Pooler multi-provider gateway on port 8400 with model routing and pooling."
-- [Add & Authenticate Provider Account](docs/agent-native.md#authenticate-provider-account): "Log into provider via OAuth device flow or browser loopback and store credentials in encrypted SQLite."
-- [Migrate from CLIProxyAPI](docs/agent-native.md#migrate-from-cliproxyapi): "Perform dry-run migration of legacy CLIProxyAPI YAML to validated Pooler configuration."
-- [Run System Diagnostics](docs/agent-native.md#run-system-diagnostics): "Run pooler doctor and pooler preflight to inspect DNS, TLS, listener ports, and credentials."
+- [Configure Multi-Provider Gateway](docs/agent-native.md#configure-universal-multi-provider-gateway): "Configure Pooler universal gateway on port 8400 supporting OpenAI, Anthropic, and Gemini SDKs."
+- [Migrate from CLIProxyAPI](docs/agent-native.md#migrate-legacy-cliproxyapi-configuration): "Perform dry-run migration of legacy CLIProxyAPI YAML to validated Pooler configuration."
+- [Run System Diagnostics](docs/agent-native.md#run-system-diagnostics--health-checks): "Run pooler doctor and pooler preflight to inspect DNS, TLS, listener ports, and credentials."
 
 ## Core Documentation
 

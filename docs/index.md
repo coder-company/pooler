@@ -1,6 +1,6 @@
 # Pooler
 
-Pooler is a local proxy that connects your AI coding tools to model providers. It gives you one local endpoint that works with Cursor, Devin, Factory Droid, Claude Code, and standard AI SDKs.
+Pooler is a local protocol runtime and pooling proxy by Coder Company. It connects your AI coding tools (**Cursor**, **Devin**, **Factory Droid**, **Claude Code**, and standard AI SDKs) to your **ChatGPT / Codex subscriptions** and **model provider APIs** (OpenAI, Anthropic Claude, Google Gemini, xAI Grok, and custom providers).
 
 ```
 +-----------------------------------------------------------------------+
@@ -11,16 +11,16 @@ Pooler is a local proxy that connects your AI coding tools to model providers. I
                                     v
 +-----------------------------------------------------------------------+
 |  Pooler (Local Runtime)                                               |
-|  - Translates protocols (ConnectRPC, Factory, OpenAI, Anthropic)       |
-|  - Pools multiple accounts & rotates when rate-limited                |
+|  - Translates protocols (ConnectRPC, Factory, OpenAI, Claude, Gemini)  |
+|  - Pools multiple subscriptions & API keys with automatic failover    |
 |  - Stores credentials safely in encrypted SQLite                      |
 |  - Shows live requests & token usage in a local web dashboard         |
 +-----------------------------------+-----------------------------------+
                                     |
                                     v
 +-----------------------------------------------------------------------+
-|  AI Providers                                                         |
-|  OpenAI | Anthropic Claude | Google Gemini | xAI Grok | Custom        |
+|  Subscriptions & AI Providers                                         |
+|  ChatGPT / Codex Subscriptions | Claude | Gemini | xAI Grok | Custom  |
 +-----------------------------------------------------------------------+
 ```
 
@@ -28,11 +28,11 @@ Pooler is a local proxy that connects your AI coding tools to model providers. I
 
 ## Why use Pooler?
 
-1. **One local endpoint for all your tools**: Point Cursor, Devin, Factory Droid, or standard Python/Node SDKs to Pooler. Pooler translates request formats automatically so your tools can talk to any provider.
-2. **Account pooling and failover**: Add multiple accounts or API keys for OpenAI, Claude, or Gemini. When one account hits a rate limit or cooldown, Pooler switches to the next available account.
-3. **Safe authentication**: Log in using official provider OAuth (like OpenAI device login or Google OAuth) without copying tokens into plaintext config files. Credentials stay encrypted in a local SQLite database.
-4. **Agent-native setup**: Set up integrations by copying short prompts into your coding agent (Cursor, Devin, Claude Code) and letting the agent configure everything for you.
-5. **Built-in dashboard**: Run `pooler dashboard` to watch live requests, latency, time-to-first-token (TTFT), token counts, and cost estimates in real time.
+1. **One local endpoint for all your tools**: Point Cursor, Devin, Factory Droid, or standard Python/Node SDKs to Pooler. Pooler translates request formats automatically so your tools can talk to any provider or subscription.
+2. **Account pooling and automatic failover**: Connect multiple subscriptions or API keys for OpenAI, Claude, or Gemini. When one hits a rate limit or hourly quota, Pooler switches to the next available account.
+3. **Safe authentication**: Log in using official provider OAuth (like OpenAI Codex device login or Google OAuth) without copying tokens into plaintext config files. Credentials stay encrypted in a local SQLite database (`AES-GCM`).
+4. **Agent-native setup**: Configure integrations by copying short task prompts into your coding agent (Cursor, Devin, Claude Code) and letting the agent configure everything for you.
+5. **Built-in dashboard**: Run `pooler dashboard` to watch live requests, latency, time-to-first-token (TTFT), token counts, and cost estimates on `http://127.0.0.1:18477`.
 
 ---
 
@@ -44,11 +44,12 @@ Run `pooler init` to create an owner-private setup folder with safe defaults:
 pooler init --output pooler-starter
 ```
 
-### Step 2: Add your credentials
-Put your API key in `pooler-starter/provider.key` or log in using OAuth:
+### Step 2: Connect your subscription or API key
+Log in using the official device OAuth flow:
 ```sh
 pooler --config pooler-starter/pooler.yaml auth login openai --method device-code
 ```
+*(Or write your API key to `pooler-starter/provider.key`)*
 
 ### Step 3: Start serving and connect your tool
 Start the proxy:
@@ -63,8 +64,8 @@ Then point your tool (like Cursor or your Python script) to `http://127.0.0.1:83
 
 | Guide | What you will learn |
 | :--- | :--- |
-| [Quickstart](quickstart.md) | Set up and run Pooler in under 3 minutes. |
 | [Agent Native Guide](agent-native.md) | Ready-made prompts for Cursor, Devin, and coding agents to configure Pooler for you. |
+| [Quickstart](quickstart.md) | Set up and run Pooler in under 3 minutes. |
 | [Adapters & Presets](adapters-and-presets.md) | Pre-built configurations for Cursor, Devin, Factory Droid, and multi-provider gateways. |
 | [CLI Reference](cli-reference.md) | Complete list of all commands, options, and flags. |
 | [Provider Login & Auth](provider-login.md) | How to log into OpenAI, Claude, Google Gemini, and manage accounts. |

@@ -1,32 +1,92 @@
-# Agent-native guide
+# Agent-native prompts cookbook
 
-Agent-native documentation provides actionable prompts that AI coding agents (such as Cursor, Devin, Factory Droid, Claude Code, and Codex) can execute to configure, test, and manage Pooler deployments autonomously.
+Agent-native documentation empowers AI coding agents (such as Cursor, Devin, Factory Droid, Claude Code, and Codex) to autonomously bootstrap, configure, authenticate, and manage Pooler.
 
-Instead of manually executing setup steps, copy any of the task prompts below and give it to your coding agent.
+Instead of manually crafting YAML or running terminal sequences, pass any of the task prompts below to your coding agent.
 
 ---
 
-## Agent prompt recipes
+## 1. Subscriptions & OAuth authentication prompts
 
-### Bootstrap starter deployment
-
+### Connect ChatGPT / Codex subscription via device flow
 ```text
-Initialize and verify a new Pooler starter deployment:
-1. Run `pooler init --output ./pooler-starter` to create an owner-private setup directory.
-2. Verify that the files `pooler.yaml`, `management.token`, `store.key`, and `provider.key` exist in ./pooler-starter.
-3. Check the configuration with `pooler check --config ./pooler-starter/pooler.yaml`.
-4. Run preflight network checks with `pooler --config ./pooler-starter/pooler.yaml preflight`.
-5. Report the generated management token and command to start Pooler.
+Task: Authenticate an OpenAI / ChatGPT / Codex subscription account in Pooler.
+1. Run the device code login command:
+   pooler --credential-key-ref env:POOLER_STORE_KEY auth login openai --method device-code
+2. Display the official verification URL and the one-time user code to the operator.
+3. Once authorized, verify the stored credential with:
+   pooler --credential-key-ref env:POOLER_STORE_KEY auth status --provider openai
+4. Report that the subscription token is active in the encrypted SQLite store.
 ```
 
-### Configure Cursor adapter
-
+### Import local Codex CLI credentials
 ```text
-Configure Pooler as a dedicated proxy for Cursor IDE on port 8333:
-1. Create a configuration file named `config/cursor.yaml` with the following contents:
+Task: Import local OpenAI Codex CLI subscription tokens into Pooler.
+1. Check that ~/.codex/credentials.json exists and contains valid subscription tokens.
+2. Import the credentials into Pooler's encrypted store:
+   pooler --credential-key-ref env:POOLER_STORE_KEY auth import codex-sub --profile codex --from-file ~/.codex/credentials.json
+3. Verify the imported account status:
+   pooler --credential-key-ref env:POOLER_STORE_KEY auth status --provider codex
+```
+
+### Connect Google Gemini via browser PKCE OAuth
+```text
+Task: Authenticate a Google Gemini subscription or OAuth account.
+1. Run browser PKCE login:
+   pooler --credential-key-ref env:POOLER_STORE_KEY auth login google --method oauth
+2. If non-interactive, print the local loopback callback redirect URL.
+3. Confirm that the refresh token is stored securely using `pooler auth status --provider google`.
+```
+
+### Connect Anthropic, xAI, or custom API keys
+```text
+Task: Configure an Anthropic Claude or xAI Grok provider key using safe secret references.
+1. Never put the literal API key in YAML or CLI arguments.
+2. In pooler.yaml under upstreams, set the secret reference:
+   upstreams:
+     anthropic-upstream:
+       known_provider: anthropic
+       auth:
+         secret: env:ANTHROPIC_API_KEY
+3. Verify the configuration with `pooler check --config pooler.yaml`.
+4. Run `pooler --config pooler.yaml preflight` to confirm connectivity without billable inference.
+```
+
+---
+
+## 2. Multi-account pooling & failover prompts
+
+### Pool multiple Codex subscriptions + API keys with automatic failover
+```text
+Task: Configure multi-account pooling across 2 Codex subscriptions and 1 backup API key.
+1. In pooler.yaml, configure the account pool with the fill_first strategy:
+   account_pools:
+     main-pool:
+       provider: openai
+       accounts: [codex-sub-1, codex-sub-2, openai-api-backup]
+   policies:
+     openai-policy:
+       selection:
+         strategy: fill_first
+       retry:
+         maximum_attempts: 3
+         statuses: [429, 500, 503]
+         before_commit_only: true
+2. Validate with `pooler check --config pooler.yaml`.
+3. Check route bindings with `pooler routes --config pooler.yaml`.
+```
+
+---
+
+## 3. Coding agent adapter presets
+
+### Configure Cursor IDE adapter
+```text
+Task: Configure Pooler for Cursor on port 8333 with reasoning parameter injection.
+1. Create config/cursor.yaml with:
    imports:
      - preset: cursor
-       as: cursor-high
+       as: cursor-adapter
        with:
          bind: 127.0.0.1:8333
          reasoning_effort: high
@@ -34,16 +94,14 @@ Configure Pooler as a dedicated proxy for Cursor IDE on port 8333:
          upstream_url: https://api.openai.com
          secret: env:OPENAI_API_KEY
    version: 2
-2. Validate the configuration: `pooler check --config config/cursor.yaml`.
-3. Render the expanded configuration: `pooler --config config/cursor.yaml config render`.
-4. Instruct the user to set their Cursor OpenAI Base URL to `http://127.0.0.1:8333`.
+2. Validate: `pooler check --config config/cursor.yaml`.
+3. Inform the operator to set Cursor's OpenAI Base URL to http://127.0.0.1:8333.
 ```
 
-### Configure Devin ConnectRPC adapter
-
+### Configure Devin ConnectRPC bridge
 ```text
-Set up Pooler to translate Devin ConnectRPC protocol requests to OpenAI chat completions:
-1. Create `config/devin.yaml` importing the built-in devin preset:
+Task: Bridge Devin protobuf ConnectRPC requests to upstream OpenAI / Codex subscriptions.
+1. Create config/devin.yaml:
    imports:
      - preset: devin
        as: devin-bridge
@@ -52,34 +110,31 @@ Set up Pooler to translate Devin ConnectRPC protocol requests to OpenAI chat com
          upstream_url: https://api.openai.com
          secret: env:OPENAI_API_KEY
    version: 2
-2. Verify the configuration: `pooler check --config config/devin.yaml`.
-3. Inspect compiled route precedence: `pooler --config config/devin.yaml routes`.
-4. Provide the Devin endpoint address `http://127.0.0.1:18473` to the operator.
+2. Validate with `pooler check --config config/devin.yaml`.
+3. Verify compiled routes with `pooler --config config/devin.yaml routes`.
+4. Provide the Devin endpoint address http://127.0.0.1:18473.
 ```
 
 ### Configure Factory Droid adapter
-
 ```text
-Set up Pooler to translate Factory Droid language-model requests:
-1. Create `config/factory.yaml`:
+Task: Configure Pooler to translate Factory Droid language-model endpoints.
+1. Create config/factory.yaml:
    imports:
      - preset: factory
-       as: factory-bridge
+       as: factory-adapter
        with:
          bind: 127.0.0.1:18474
          upstream_url: https://api.openai.com
          secret: env:OPENAI_API_KEY
    version: 2
-2. Validate the configuration using `pooler check --config config/factory.yaml`.
-3. Verify that `/v3/ai/language-model` and `/v4/ai/language-model` routes are compiled.
-4. Point Factory Droid to `http://127.0.0.1:18474`.
+2. Validate with `pooler check --config config/factory.yaml`.
+3. Point Factory Droid to http://127.0.0.1:18474.
 ```
 
-### Configure multi-provider gateway
-
+### Configure universal multi-provider gateway
 ```text
-Create a unified multi-provider gateway configuration on port 8400:
-1. Create `config/gateway.yaml` importing the gateway preset:
+Task: Mount a universal gateway on port 8400 supporting OpenAI, Anthropic, and Gemini SDKs.
+1. Create config/gateway.yaml:
    imports:
      - preset: gateway
        as: gateway
@@ -89,63 +144,29 @@ Create a unified multi-provider gateway configuration on port 8400:
          websocket_url: wss://api.openai.com
          secret: env:POOLER_GATEWAY_KEY
    version: 2
-2. Validate the configuration: `pooler check --config config/gateway.yaml`.
-3. Run preflight to verify endpoint connectivity: `pooler --config config/gateway.yaml preflight`.
-4. Output the active listening endpoints and available routes.
-```
-
-### Authenticate provider account via device flow
-
-```text
-Authenticate an OpenAI / Codex account using the device authorization flow:
-1. Ensure POOLER_STORE_KEY is set or provide an existing store.key reference.
-2. Run the device login command:
-   pooler --credential-key-ref env:POOLER_STORE_KEY auth login openai --method device-code
-3. Display the provider authorization URL and user code to the operator.
-4. Wait for the flow to complete and verify the credential status using:
-   pooler --credential-key-ref env:POOLER_STORE_KEY auth status --provider openai
-```
-
-### Authenticate provider account via browser PKCE
-
-```text
-Authenticate a Google Gemini provider account using the loopback browser flow:
-1. Ensure the master key is referenced: `--credential-key-ref env:POOLER_STORE_KEY`.
-2. Start the login process:
-   pooler --credential-key-ref env:POOLER_STORE_KEY auth login google --method oauth
-3. If non-interactive, report the local callback URL for the browser redirect.
-4. Verify the stored credential status with:
-   pooler --credential-key-ref env:POOLER_STORE_KEY auth status --provider google
-```
-
-### Migrate from CLIProxyAPI
-
-```text
-Migrate a legacy CLIProxyAPI configuration to a validated Pooler configuration:
-1. Perform a dry-run migration to inspect the translated configuration:
-   pooler migrate cliproxy /path/to/cliproxy.yaml --dry-run
-2. Verify that no secrets or API keys are printed in plaintext.
-3. Write the validated Pooler configuration to a new file:
-   pooler migrate cliproxy /path/to/cliproxy.yaml --output config/migrated.pooler.yaml
-4. Verify the output with `pooler check --config config/migrated.pooler.yaml`.
-```
-
-### Run system diagnostics
-
-```text
-Run comprehensive health checks on the Pooler installation:
-1. Execute `pooler doctor --config pooler.yaml` to check file permissions, store integrity, and listener binds.
-2. Execute `pooler --config pooler.yaml preflight` to check DNS, TLS, and upstream reachability without billable inference.
-3. Report any failing checks and required remediation steps.
+2. Validate with `pooler check --config config/gateway.yaml`.
+3. Run non-billable preflight: `pooler --config config/gateway.yaml preflight`.
 ```
 
 ---
 
-## Agent execution contract
+## 4. Diagnostics, migration & operations
 
-When executing any prompt recipe:
+### Run system diagnostics & health checks
+```text
+Task: Run complete diagnostics on the Pooler environment.
+1. Run `pooler doctor --config pooler.yaml` to verify port availability, store encryption keys, and file permissions.
+2. Run `pooler --config pooler.yaml preflight` to verify upstream TLS, DNS, and reachability.
+3. Report any warnings or failing checks.
+```
 
-1. **Safety first**: Never embed literal API keys, bearer tokens, or secrets in configuration files or command arguments. Use `env:`, `file:`, or `keyring:` references.
-2. **Deterministic validation**: Always run `pooler check --config <PATH>` before attempting to start a server or commit changes.
-3. **No file overwriting**: When generating new starter deployments or migrated configurations, never overwrite an existing file. Use distinct output paths.
-4. **Verification**: Confirm network listening ports with `pooler doctor` or `pooler routes` before notifying the user of task completion.
+### Migrate legacy CLIProxyAPI configuration
+```text
+Task: Convert a legacy CLIProxyAPI configuration into a native Pooler configuration.
+1. Run a dry-run migration:
+   pooler migrate cliproxy /path/to/cliproxy.yaml --dry-run
+2. Verify that no raw credentials are exposed in the output.
+3. Save the migrated configuration to config/migrated.pooler.yaml:
+   pooler migrate cliproxy /path/to/cliproxy.yaml --output config/migrated.pooler.yaml
+4. Verify with `pooler check --config config/migrated.pooler.yaml`.
+```
