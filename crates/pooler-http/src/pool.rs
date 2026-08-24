@@ -1551,11 +1551,16 @@ impl PoolingCoordinator {
                     .expect("compiled account IDs remain valid")
             });
             return Ok(PoolSelection {
-                upstream_id: Arc::from(
-                    route
-                        .target()
-                        .transport_upstream()
-                        .unwrap_or(&static_upstream),
+                upstream_id: binding_target.as_ref().map_or_else(
+                    || {
+                        Arc::from(
+                            route
+                                .target()
+                                .transport_upstream()
+                                .unwrap_or(&static_upstream),
+                        )
+                    },
+                    |target| Arc::clone(&target.upstream_id),
                 ),
                 upstream_model: static_model.map(Arc::from),
                 profile,
@@ -1717,12 +1722,7 @@ impl PoolingCoordinator {
         );
         let profile = binding_target.profile;
         Ok(PoolSelection {
-            upstream_id: Arc::from(
-                route
-                    .target()
-                    .transport_upstream()
-                    .unwrap_or(binding_target.upstream_id.as_ref()),
-            ),
+            upstream_id: Arc::clone(&binding_target.upstream_id),
             upstream_model: Some(binding_target.upstream_model.clone()),
             profile,
             request_overlay: binding_target.request_overlay.clone(),
@@ -1959,11 +1959,17 @@ impl PoolingCoordinator {
             scope
         });
         PoolSelection {
-            upstream_id: Arc::from(route.target().transport_upstream().unwrap_or_else(|| {
-                binding_target
-                    .as_ref()
-                    .map_or(provider.as_str(), |target| target.upstream_id.as_ref())
-            })),
+            upstream_id: binding_target.as_ref().map_or_else(
+                || {
+                    Arc::from(
+                        route
+                            .target()
+                            .transport_upstream()
+                            .unwrap_or(provider.as_str()),
+                    )
+                },
+                |target| Arc::clone(&target.upstream_id),
+            ),
             upstream_model,
             profile,
             request_overlay: binding_target

@@ -3823,6 +3823,7 @@ mod tests {
     #[tokio::test]
     async fn wasm_inspector_selects_and_wasm_transform_changes_the_request() {
         let (upstream_address, upstream) = spawn_one_shot_upstream(b"ok").await;
+        let model_secret = TestSecret::new("wasm-model-token\n");
         let directory = tempfile::tempdir().expect("WASM fixture directory");
         let selector_path = directory.path().join("selector.wasm");
         let transformer_path = directory.path().join("transformer.wasm");
@@ -3846,15 +3847,15 @@ mod tests {
         .expect("transformer WAT");
         std::fs::write(&selector_path, selector).expect("selector module");
         std::fs::write(&transformer_path, transformer).expect("transformer module");
-        let config = pooler_config::compile_yaml(
-            "wasm-extension.yaml",
-            &format!(
+        let config_source = format!(
                 "version: 2\nextensions:\n  selector:\n    wasm: {}\n    capabilities: [inspect]\n  transformer:\n    wasm: {}\n    capabilities: [transform]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts: {{model-account: {{provider: local, secret: env:POOLER_TEST_MODEL_KEY}}}}\nmodels:\n  - id: provider\n    targets: [{{id: provider-target, provider: local, account: model-account, priority: 1, upstream_model: upstream-provider, capabilities: [text], codecs: [], wire_family: openai}}]\nroutes:\n  - id: wasm\n    listen: local\n    ingress: {{mode: patch, inspectors: [inspect.external.selector]}}\n    request:\n      steps:\n        - use: transform.external.transformer\n          with: {{pointer: /unused, value: null}}\n    response: {{mode: opaque}}\n    target: {{provider: local, model_from: inspected.model}}\n",
                 selector_path.display(),
                 transformer_path.display(),
-            ),
-        )
-        .expect("WASM extension config compiles");
+            );
+        let config_source =
+            config_source.replace("env:POOLER_TEST_MODEL_KEY", &model_secret.reference());
+        let config = pooler_config::compile_yaml("wasm-extension.yaml", &config_source)
+            .expect("WASM extension config compiles");
         let server = HttpProxyServer::bind(config)
             .await
             .expect("WASM extension does not require bwrap");
@@ -4131,14 +4132,16 @@ mod tests {
         let fallback_address = fallback_listener.local_addr().expect("fallback address");
         let (selected_address, selected_upstream) = spawn_one_shot_upstream(b"selected").await;
         let selected_secret = TestSecret::new("selected-token\n");
-        let config = pooler_config::compile_yaml(
-            "model-route.yaml",
-            &format!(
+        let config_source = format!(
                 "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  fallback: {{url: http://{fallback_address}}}\n  selected:\n    url: http://{selected_address}\n    auth: {{secret: {}}}\naccounts:\n  selected-account: {{provider: selected, secret: env:POOLER_SELECTED_MODEL_KEY}}\nmodels:\n  - id: public-model\n    targets:\n      - {{id: public-model-target, provider: selected, account: selected-account, priority: 1, upstream_model: provider-model, capabilities: [text], codecs: [], wire_family: openai}}\nroutes:\n  - id: model-route\n    listen: local\n    match: {{method: POST, path: /model}}\n    ingress: {{mode: patch, inspectors: [inspect.openai.model]}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /model, value: mutated-model}}\n    target: {{provider: fallback, model_from: inspected.model}}\n    response: {{mode: opaque}}\n",
                 selected_secret.reference()
-            ),
-        )
-        .expect("model route compiles");
+            );
+        let config_source = config_source.replace(
+            "env:POOLER_SELECTED_MODEL_KEY",
+            &selected_secret.reference(),
+        );
+        let config = pooler_config::compile_yaml("model-route.yaml", &config_source)
+            .expect("model route compiles");
         let server = HttpProxyServer::bind(config).await.expect("proxy binds");
         let address = listener_address(&server, "local");
         let runner = {
@@ -4569,13 +4572,14 @@ mod tests {
     async fn patch_model_validation_only_runs_for_the_selected_source() {
         let (plain_address, plain_upstream) = spawn_one_shot_upstream(b"plain").await;
         let (selected_address, selected_upstream) = spawn_one_shot_upstream(b"selected").await;
-        let config = pooler_config::compile_yaml(
-            "model-source.yaml",
-            &format!(
+        let model_secret = TestSecret::new("selected-model-token\n");
+        let config_source = format!(
                 "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  plain: {{url: http://{plain_address}}}\n  selected: {{url: http://{selected_address}}}\naccounts: {{model-account: {{provider: selected, secret: env:POOLER_TEST_MODEL_KEY}}}}\nmodels:\n  - id: public\n    targets: [{{id: public-target, provider: selected, account: model-account, priority: 1, upstream_model: private, capabilities: [text], codecs: [], wire_family: openai}}]\nroutes:\n  - id: plain\n    listen: local\n    match: {{method: POST, path: /plain}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /value, value: true}}\n    target: plain\n    response: {{mode: opaque}}\n  - id: request-model\n    listen: local\n    match: {{method: POST, path: /request-model}}\n    ingress: {{mode: patch}}\n    request:\n      steps:\n        - use: transform.json.set\n          with: {{pointer: /model, value: public}}\n    target: {{provider: plain, model_from: request.model}}\n    response: {{mode: opaque}}\n"
-            ),
-        )
-        .expect("model source config");
+            );
+        let config_source =
+            config_source.replace("env:POOLER_TEST_MODEL_KEY", &model_secret.reference());
+        let config = pooler_config::compile_yaml("model-source.yaml", &config_source)
+            .expect("model source config");
         let server = HttpProxyServer::bind(config).await.expect("proxy binds");
         let address = listener_address(&server, "local");
         let runner = {
