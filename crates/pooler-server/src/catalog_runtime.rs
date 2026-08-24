@@ -472,6 +472,7 @@ fn apply_profile_capabilities(
     update_capability(capabilities, Capability::Reasoning, profile.reasoning);
     update_capability(capabilities, Capability::Tools, profile.tools);
     update_capability(capabilities, Capability::FunctionCalling, profile.tools);
+    update_capability(capabilities, Capability::ToolChoice, profile.tools);
     update_capability(
         capabilities,
         Capability::StructuredOutput,

@@ -78,7 +78,8 @@ impl SemanticAdapter for OpenAiSemanticAdapter {
     ) -> Result<SemanticRequestBody, BoxError> {
         let (request_wire, upstream_wire) = route_wires(route)
             .ok_or_else(|| Box::new(OpenAiAdapterError::UnsupportedRoute) as BoxError)?;
-        let request = decode_request(request_wire, body, route.loss_policy())?;
+        let request =
+            decode_request_for_wires(request_wire, upstream_wire, body, route.loss_policy())?;
         let streaming = request_streaming(&request);
         if !streaming
             && matches!(
@@ -88,7 +89,11 @@ impl SemanticAdapter for OpenAiSemanticAdapter {
         {
             return Err(Box::new(OpenAiAdapterError::UnaryCrossProtocolUnsupported));
         }
-        let encoded = encode_upstream_request(upstream_wire, &request, route.loss_policy())?;
+        let encoded = if request_wire_matches_event_wire(request_wire, upstream_wire) {
+            prepare_same_wire_request(body, upstream_wire, streaming)?
+        } else {
+            encode_upstream_request(upstream_wire, &request, route.loss_policy())?
+        };
         let response_mode = if streaming {
             SemanticResponseMode::ServerSentEvents
         } else {
@@ -111,9 +116,10 @@ impl SemanticAdapter for OpenAiSemanticAdapter {
         _headers: &HeaderMap,
         body: &[u8],
     ) -> Result<SelectionContext, BoxError> {
-        let (request_wire, _) = route_wires(route)
+        let (request_wire, upstream_wire) = route_wires(route)
             .ok_or_else(|| Box::new(OpenAiAdapterError::UnsupportedRoute) as BoxError)?;
-        let request = decode_request(request_wire, body, route.loss_policy())?;
+        let request =
+            decode_request_for_wires(request_wire, upstream_wire, body, route.loss_policy())?;
         let mut context = SelectionContext::from_semantic_request(&request);
         if request_streaming(&request) {
             context.require(pooler_core::Capability::Streaming);
@@ -278,6 +284,54 @@ fn decode_request(
             Ok(decoded.request)
         }
     }
+}
+
+fn decode_request_for_wires(
+    request_wire: RequestWire,
+    upstream_wire: EventWire,
+    body: &[u8],
+    policy: LossPolicy,
+) -> Result<SemanticRequest, BoxError> {
+    if !request_wire_matches_event_wire(request_wire, upstream_wire) {
+        return decode_request(request_wire, body, policy);
+    }
+    match request_wire {
+        RequestWire::Responses => OpenAiResponsesCodec::decode_request_with_report(body)
+            .map(|decoded| decoded.request)
+            .map_err(|error| Box::new(error) as BoxError),
+        RequestWire::Chat => {
+            require_streaming(body)?;
+            OpenAiChatCodec::decode_request_with_report(body)
+                .map(|decoded| decoded.request)
+                .map_err(|error| Box::new(error) as BoxError)
+        }
+    }
+}
+
+const fn request_wire_matches_event_wire(request: RequestWire, upstream: EventWire) -> bool {
+    matches!(
+        (request, upstream),
+        (RequestWire::Responses, EventWire::Responses) | (RequestWire::Chat, EventWire::Chat)
+    )
+}
+
+fn prepare_same_wire_request(
+    body: &[u8],
+    wire: EventWire,
+    streaming: bool,
+) -> Result<Vec<u8>, BoxError> {
+    let mut value: Value = serde_json::from_slice(body)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| Box::new(OpenAiAdapterError::EncodedRequestNotObject) as BoxError)?;
+    if matches!(wire, EventWire::Responses) {
+        object.entry("store").or_insert(Value::Bool(false));
+    } else if streaming {
+        object
+            .entry("stream_options")
+            .or_insert_with(|| serde_json::json!({"include_usage": true}));
+    }
+    serde_json::to_vec(&value).map_err(|error| Box::new(error) as BoxError)
 }
 
 fn require_streaming(body: &[u8]) -> Result<(), BoxError> {
@@ -1412,6 +1466,32 @@ mod tests {
             OPENAI_RESPONSES_EVENT_DECODER,
             OPENAI_RESPONSES_EVENT_ENCODER,
         )));
+    }
+
+    #[test]
+    fn same_wire_responses_preserves_provider_fields_under_reject() {
+        let route = route(
+            OPENAI_RESPONSES_REQUEST_DECODER,
+            OPENAI_RESPONSES_EVENT_DECODER,
+            OPENAI_RESPONSES_EVENT_ENCODER,
+        );
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": true,
+            "text": {"format": {"type": "text"}, "verbosity": "low"},
+            "prompt_cache_retention": "24h"
+        }))
+        .expect("request JSON");
+
+        let encoded = OpenAiSemanticAdapter
+            .encode_request(&route, &HeaderMap::new(), &body)
+            .expect("same-wire request");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("encoded JSON");
+
+        assert_eq!(value["text"]["verbosity"], "low");
+        assert_eq!(value["prompt_cache_retention"], "24h");
+        assert_eq!(value["store"], false);
     }
 
     #[test]

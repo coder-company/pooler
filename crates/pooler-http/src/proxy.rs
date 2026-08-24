@@ -2348,7 +2348,9 @@ where
                 matches!(upstream.transport(), "ws" | "wss"),
             ) {
                 (Some(transport), true) => {
-                    match prepared.buffered_bytes_for_attempt(route, &selection, lifecycle) {
+                    match prepared
+                        .buffered_bytes_for_attempt(route, &selection, upstream, lifecycle)
+                    {
                         Ok(bytes) => {
                             self.send_openai_responses_websocket_attempt(
                                 attempt_request,
@@ -2363,7 +2365,7 @@ where
                 _ => {
                     let attempt_body = if force_codex_unary_stream {
                         prepared
-                            .buffered_bytes_for_attempt(route, &selection, lifecycle)
+                            .buffered_bytes_for_attempt(route, &selection, upstream, lifecycle)
                             .and_then(|bytes| force_responses_streaming_request(&bytes, limits))
                             .map(|bytes| {
                                 Full::new(bytes)
@@ -2371,7 +2373,7 @@ where
                                     .boxed()
                             })
                     } else {
-                        prepared.body_for_attempt(route, &selection, lifecycle)
+                        prepared.body_for_attempt(route, &selection, upstream, lifecycle)
                     };
                     match attempt_body {
                         Ok(attempt_body) => self.send_attempt(attempt_request, attempt_body).await,
@@ -2754,6 +2756,17 @@ where
             }
         } else {
             apply_configured_upstream_auth(&mut headers, upstream)?;
+        }
+        if upstream
+            .native()
+            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+            && route.ingress().decoder() == Some("decode.openai.responses")
+        {
+            headers.insert(
+                header::ACCEPT,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            headers.insert(header::CONNECTION, HeaderValue::from_static("Keep-Alive"));
         }
         let body = FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
             .map_err(box_error)
@@ -3331,6 +3344,7 @@ impl PreparedBody {
         &self,
         route: &RoutePlan,
         selection: &PoolSelection,
+        upstream: &UpstreamPlan,
         lifecycle: &RequestLifecycle,
     ) -> Result<Bytes, ProxyError> {
         let Self::Buffered { bytes, patch_model } = self else {
@@ -3340,7 +3354,7 @@ impl PreparedBody {
         };
         if *patch_model {
             if let Some(model) = selection.upstream_model() {
-                return patch_body_for_target(bytes, route, model, selection, lifecycle);
+                return patch_body_for_target(bytes, route, model, selection, upstream, lifecycle);
             }
         }
         Ok(bytes.clone())
@@ -3350,6 +3364,7 @@ impl PreparedBody {
         &mut self,
         route: &RoutePlan,
         selection: &PoolSelection,
+        upstream: &UpstreamPlan,
         lifecycle: &RequestLifecycle,
     ) -> Result<ProxyBody, ProxyError> {
         match self {
@@ -3362,7 +3377,7 @@ impl PreparedBody {
             Self::Buffered { bytes, patch_model } => {
                 let bytes = if *patch_model {
                     if let Some(model) = selection.upstream_model() {
-                        patch_body_for_target(bytes, route, model, selection, lifecycle)?
+                        patch_body_for_target(bytes, route, model, selection, upstream, lifecycle)?
                     } else {
                         bytes.clone()
                     }
@@ -4161,6 +4176,7 @@ fn patch_body_for_target(
     route: &RoutePlan,
     model: &str,
     selection: &PoolSelection,
+    upstream: &UpstreamPlan,
     lifecycle: &RequestLifecycle,
 ) -> Result<Bytes, ProxyError> {
     let profile = selection.profile();
@@ -4263,7 +4279,110 @@ fn patch_body_for_target(
         });
     }
     enforce_output_limit(&mut document, route, model, profile.output_limit)?;
-    Ok(Bytes::from(document.bytes().into_owned()))
+    let bytes = Bytes::from(document.bytes().into_owned());
+    if upstream
+        .native()
+        .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+        && route.ingress().decoder() == Some("decode.openai.responses")
+    {
+        return normalize_codex_responses_request(&bytes);
+    }
+    Ok(bytes)
+}
+
+fn normalize_codex_responses_request(bytes: &Bytes) -> Result<Bytes, ProxyError> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| ProxyError::InvalidPatch(error.to_string()))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        ProxyError::InvalidPatch("OpenAI Responses request is not an object".to_owned())
+    })?;
+
+    if let Some(input) = object.get_mut("input") {
+        if let Some(text) = input.as_str() {
+            *input = serde_json::json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}]
+            }]);
+        }
+        if let Some(items) = input.as_array_mut() {
+            for item in items {
+                let Some(item) = item.as_object_mut() else {
+                    continue;
+                };
+                if item.get("role").and_then(serde_json::Value::as_str) == Some("system") {
+                    item.insert(
+                        "role".to_owned(),
+                        serde_json::Value::String("developer".to_owned()),
+                    );
+                }
+                if let Some(content) = item
+                    .get_mut("content")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for part in content {
+                        if let Some(part) = part.as_object_mut() {
+                            part.remove("prompt_cache_breakpoint");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    object.insert("stream".to_owned(), serde_json::Value::Bool(true));
+    object.insert("store".to_owned(), serde_json::Value::Bool(false));
+    object.insert(
+        "parallel_tool_calls".to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    object.insert(
+        "include".to_owned(),
+        serde_json::json!(["reasoning.encrypted_content"]),
+    );
+    for field in [
+        "max_output_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "top_p",
+        "truncation",
+        "prompt_cache_options",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "user",
+    ] {
+        object.remove(field);
+    }
+    if object
+        .get("service_tier")
+        .and_then(serde_json::Value::as_str)
+        != Some("priority")
+    {
+        object.remove("service_tier");
+    }
+    if let Some(tools) = object
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for tool in tools {
+            let Some(tool) = tool.as_object_mut() else {
+                continue;
+            };
+            if matches!(
+                tool.get("type").and_then(serde_json::Value::as_str),
+                Some("web_search_preview" | "web_search_preview_2025_03_11")
+            ) {
+                tool.insert(
+                    "type".to_owned(),
+                    serde_json::Value::String("web_search".to_owned()),
+                );
+            }
+        }
+    }
+
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| ProxyError::InvalidPatch(error.to_string()))
 }
 
 fn drop_unsupported_parameter(
@@ -6474,6 +6593,39 @@ upstreams: {subscription: {known_provider: openai, native: {kind: codex}}}
             rewritten,
             "https://chatgpt.com/backend-api/codex/models?client_version=99.99.99"
         );
+    }
+
+    #[test]
+    fn codex_responses_normalization_matches_subscription_constraints() {
+        let input = Bytes::from_static(
+            br#"{"model":"gpt-5.4","stream":false,"store":true,"parallel_tool_calls":false,"include":["file_search_call.results"],"max_output_tokens":4096,"temperature":0.2,"service_tier":"standard","truncation":"auto","prompt_cache_retention":"24h","user":"owner","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"hello","prompt_cache_breakpoint":{"type":"ephemeral"}}]}]}"#,
+        );
+
+        let output = normalize_codex_responses_request(&input).expect("Codex request");
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("normalized JSON");
+
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["store"], false);
+        assert_eq!(value["parallel_tool_calls"], true);
+        assert_eq!(
+            value["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        assert_eq!(value["input"][0]["role"], "developer");
+        assert!(value["input"][0]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none());
+        for field in [
+            "max_output_tokens",
+            "temperature",
+            "service_tier",
+            "truncation",
+            "prompt_cache_retention",
+            "safety_identifier",
+            "user",
+        ] {
+            assert!(value.get(field).is_none(), "{field} must be removed");
+        }
     }
 
     #[test]

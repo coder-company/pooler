@@ -3004,6 +3004,9 @@ fn register_catalog_model(
             .map_err(|_| PoolError::Selection)?;
             let registration = registration
                 .with_facts(CandidateFacts::operator_capabilities(target.capabilities()));
+            let registration = registration
+                .with_codecs(catalog_target_codecs(target.profile()))
+                .map_err(|_| PoolError::Selection)?;
             let registration = with_account_quota_project(registration, account)?;
             let registration = match account.max_concurrency() {
                 Some(max) => registration
@@ -3030,6 +3033,20 @@ fn catalog_wire_family(profile: ModelProfile) -> Option<Arc<str>> {
         | pooler_core::ModelRequestTransform::ProtocolDefault => "openai",
     };
     Some(Arc::from(family))
+}
+
+fn catalog_target_codecs(profile: ModelProfile) -> impl Iterator<Item = &'static str> {
+    let variants = profile.endpoint_variants;
+    [
+        variants.responses.then_some("decode.openai.responses"),
+        variants.chat_completions.then_some("decode.openai.chat"),
+        variants.messages.then_some("decode.anthropic.messages"),
+        variants
+            .generate_content
+            .then_some("decode.gemini.generate_content"),
+    ]
+    .into_iter()
+    .flatten()
 }
 
 fn catalog_endpoint_family(profile: ModelProfile) -> Option<Arc<str>> {
