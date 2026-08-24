@@ -20,7 +20,7 @@ use http::{HeaderMap, Uri};
 use pooler_auth::SecretRef as AuthSecretRef;
 use pooler_config::{
     AccountAuthKind, AccountPlan, CompiledConfig, PolicyPlan, RoutePlan, SecretRef,
-    SelectionStrategy as ConfigSelectionStrategy,
+    SelectionStrategy as ConfigSelectionStrategy, UpstreamPlan,
 };
 use pooler_core::{
     Capability, CapabilitySet, ConfigGeneration, CredentialId, ErrorClass, ModelDialect, ModelId,
@@ -527,6 +527,20 @@ impl PoolSelection {
             .upstreams()
             .get(self.upstream_id())
             .ok_or(PoolError::InvalidUpstreamUri)?;
+        self.upstream_uri_for(upstream, route, downstream)
+    }
+
+    /// Build an endpoint from the transport chosen for this attempt.
+    ///
+    /// Semantic routes may select an account through an HTTP provider and then
+    /// use its explicit WebSocket sibling. The binding still owns path and
+    /// query semantics, while the resolved attempt upstream owns the origin.
+    pub(crate) fn upstream_uri_for(
+        &self,
+        upstream: &UpstreamPlan,
+        route: &RoutePlan,
+        downstream: &Uri,
+    ) -> Result<Uri, PoolError> {
         let requested_path = route.target().path().unwrap_or_else(|| downstream.path());
         let endpoint_family = self
             .binding_target

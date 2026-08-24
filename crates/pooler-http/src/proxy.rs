@@ -1692,7 +1692,7 @@ where
         }
 
         let uri = selection
-            .upstream_uri(&self.config, route, &downstream_uri)
+            .upstream_uri_for(upstream, route, &downstream_uri)
             .map_err(pool_error)?
             .to_string();
         let upstream_key = generate_websocket_key()?;
@@ -2325,7 +2325,7 @@ where
                 }
             });
             let selected_upstream_uri = selection
-                .upstream_uri(&self.config, route, &downstream_uri)
+                .upstream_uri_for(upstream, route, &downstream_uri)
                 .map_err(pool_error)?;
             let attempt_started = StdInstant::now();
             let attempt_request = AttemptRequest {

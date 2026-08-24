@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, net::SocketAddr, time::Duration};
+use std::{collections::BTreeSet, io::Write as _, net::SocketAddr, time::Duration};
 
 use adapter_devin::{encode_connect_frame, proto, ConnectDecoder, ConnectLimits};
 use pooler_config::compile_yaml;
@@ -141,13 +141,27 @@ async fn factory_current_fixture_replays_through_http_proxy_server() {
     };
     let upstream_body = scripted_sse_body(&scripted_response.chunks);
     let (upstream_address, upstream_task) = spawn_upstream(upstream_body).await;
-    let config = compile_yaml(
-        "factory-current-runtime.yaml",
-        &format!(
-            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts: {{model-account: {{provider: local, secret: env:POOLER_TEST_MODEL_KEY}}}}\nmodels:\n  - id: gpt-5.6-sol\n    targets:\n      - {{id: gpt-current-target, provider: local, account: model-account, priority: 1, upstream_model: gpt-5.6-sol, capabilities: [text, tools, function_calling, tool_choice, streaming], codecs: [decode.factory.language_model], wire_family: openai}}\nroutes:\n  - id: factory-current\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: local, path: /v1/chat/completions, model_from: request.model}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: degrade\n"
-        ),
-    )
-    .expect("Factory runtime config");
+    let secret_directory = tempfile::tempdir().expect("Factory secret directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            secret_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("Factory secret directory permissions");
+    }
+    let mut secret =
+        tempfile::NamedTempFile::new_in(secret_directory.path()).expect("Factory account secret");
+    secret
+        .write_all(b"factory-current-token\n")
+        .expect("Factory account secret contents");
+    let config_source = format!(
+        "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\naccounts: {{model-account: {{provider: local, secret: 'file:{}'}}}}\nmodels:\n  - id: gpt-5.6-sol\n    targets:\n      - {{id: gpt-current-target, provider: local, account: model-account, priority: 1, upstream_model: gpt-5.6-sol, capabilities: [text, tools, function_calling, tool_choice, streaming], codecs: [decode.factory.language_model], wire_family: openai}}\nroutes:\n  - id: factory-current\n    listen: local\n    match: {{method: POST, path: /v3/ai/language-model, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.factory.language_model}}\n    target: {{provider: local, path: /v1/chat/completions, model_from: request.model}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.factory.events}}\n    loss_policy: degrade\n",
+        secret.path().display()
+    );
+    let config = compile_yaml("factory-current-runtime.yaml", &config_source)
+        .expect("Factory runtime config");
     let running = start_server(config).await;
 
     let response = send_scripted_request(running.address, downstream).await;
