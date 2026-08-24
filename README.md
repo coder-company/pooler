@@ -9,7 +9,7 @@
 # Pooler
 **by Coder Company**
 
-### The protocol runtime and pooling proxy for AI coding agents, subscriptions, and providers.
+### The system-wide protocol daemon and account pooling proxy for AI coding agents.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-black?style=flat-square)](LICENSE)
 [![Built for Agents](https://img.shields.io/badge/agent--native-llms.txt-10B981?style=flat-square)](llms.txt)
@@ -25,22 +25,22 @@
 
 ## What is Pooler?
 
-**Pooler** is a local proxy that connects your AI coding tools (**Cursor**, **Devin**, **Factory Droid**, **Claude Code**, and standard AI SDKs) to your **subscriptions** (ChatGPT / Codex) and **model provider APIs** (OpenAI, Anthropic Claude, Google Gemini, xAI Grok, custom providers).
+**Pooler** is a **system-wide background proxy daemon** that connects your AI coding tools (**Cursor**, **Devin**, **Factory Droid**, **Claude Code**, and terminal SDKs) across all your projects to your **ChatGPT / Codex subscriptions** and **model provider APIs** (OpenAI, Anthropic Claude, Google Gemini, xAI Grok, custom providers).
 
-- **One local endpoint for all tools**: Direct your coding tools to a single local port. Pooler translates request formats and wire protocols automatically.
+- **System-wide local proxy**: Install once on your machine. All your projects, repositories, and tools talk to the same background daemon.
 - **Account pooling & automatic failover**: Connect multiple subscriptions or API keys. When one hits a rate limit or hourly quota, Pooler switches to the next available account instantly.
 - **Brokered OAuth & safe credentials**: Log in with one-click device OAuth or browser PKCE. Credentials stay encrypted in local SQLite (`AES-GCM`) instead of leaking plaintext keys.
-- **Real-time web dashboard**: Inspect live request timelines, time-to-first-token (TTFT), cooldowns, token counts, and cost ledgers on `http://127.0.0.1:18477`.
+- **Real-time web dashboard**: Run `pooler dashboard` to view live request timelines, time-to-first-token (TTFT), cooldowns, token counts, and cost ledgers on `http://127.0.0.1:18477`.
 
 ```
 +---------------------------------------------------------------------------------------+
-|                              Your Coding Tools & Agents                               |
+|                 Your Machine's Coding Tools & Agents (All Repositories)               |
 |        Cursor (:8333) | Devin (:18473) | Factory Droid (:18474) | SDKs (:8400)        |
 +-------------------------------------------+-------------------------------------------+
                                             |
                                             v
 +---------------------------------------------------------------------------------------+
-|                                  Pooler Local Runtime                                 |
+|                           Pooler System-Wide Background Daemon                        |
 |  +------------------------------------+  +-----------------------------------------+  |
 |  | Protocol & Presets Translation     |  | Multi-Account Pooling & Quota Cooldowns |  |
 |  | - JSON Patch (Cursor)              |  | - Fill-first / round-robin selection   |  |
@@ -64,7 +64,7 @@
 
 ## ⚡ Quick Install
 
-Install the standalone Pooler binary via script:
+Install the standalone Pooler binary system-wide:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | bash
@@ -79,25 +79,25 @@ cargo install --git https://github.com/coder-company/pooler.git pooler-cli --bin
 
 ## 🤖 1. Agent-Native Setup (Primary)
 
-Pooler is built agent-native. Copy this prompt into your coding agent (**Cursor**, **Devin**, **Claude Code**, **Codex**, or **Factory Droid**) in any workspace to begin:
+Pooler is built agent-native. Copy this prompt into your coding agent (**Cursor**, **Devin**, **Claude Code**, **Codex**, or **Factory Droid**):
 
 ### Copy-Paste Agent Initiation Prompt:
 
 ```text
-Set up and configure Pooler for this workspace from https://github.com/coder-company/pooler:
+Set up and configure Pooler system-wide on my machine from https://github.com/coder-company/pooler:
 1. First, ask me using your interactive question tool:
-   - Which coding tool/agent I am using (Cursor, Devin, Factory Droid, Claude Code / Codex, or General SDK/Gateway).
+   - Which coding tools/agents I use on this machine (Cursor, Devin, Factory Droid, Claude Code / Codex, or general SDKs).
    - What credentials/subscriptions I want to connect (ChatGPT / Codex subscription via device OAuth, Google Gemini OAuth, Anthropic Claude API key, OpenAI API key, xAI Grok, or Custom).
-   - Whether I want multi-account pooling with automatic rate-limit failover.
+   - Whether I want multi-account pooling with automatic rate-limit failover across my subscriptions.
    - What specific models or reasoning settings I want enabled (e.g. gpt-4o, claude-3-7-sonnet, gemini-2.5-pro, o3-mini with high reasoning).
 2. Fetch documentation and recipes from https://raw.githubusercontent.com/coder-company/pooler/main/llms.txt or inspect the repository at https://github.com/coder-company/pooler.
 3. Install the Pooler binary if not already present:
    `curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | bash`
-4. Initialize the starter workspace using `pooler init --output ./pooler-starter`.
-5. Apply the required preset or configuration with secure secret references (env:, file:, or keyring:).
-6. Guide me through authentication (such as running `pooler auth login openai --method device-code` for Codex subscriptions or setting environment variables).
-7. Run `pooler check` and `pooler preflight` to verify setup without billable inference.
-8. Start the server and confirm the exact local base URL for my coding tool.
+4. Set up the system-wide configuration at ~/.config/pooler/pooler.yaml.
+5. Guide me through authenticating my subscriptions (such as running `pooler auth login openai --method device-code` for Codex subscriptions or setting environment variables).
+6. Run `pooler check` and `pooler preflight` to verify system-wide setup.
+7. Start the system-wide daemon with `pooler serve` and verify with `pooler dashboard`.
+8. Provide the exact local connection URLs for all my coding tools.
 ```
 
 👉 *Detailed autonomous agent protocol and task prompt recipes in [`llms.txt`](llms.txt) and [`docs/agent-native.md`](docs/agent-native.md).*
@@ -108,13 +108,13 @@ Set up and configure Pooler for this workspace from https://github.com/coder-com
 
 ### Option A: ChatGPT / Codex Subscription (Device OAuth)
 ```sh
-pooler --config pooler-starter/pooler.yaml auth login openai --method device-code
+pooler auth login openai --method device-code
 ```
-*Open the verification URL, enter the one-time code, and authorize. Tokens are encrypted in local SQLite.*
+*Open the verification URL, enter the code, and authorize. Tokens are encrypted in local SQLite.*
 
 ### Option B: Google Gemini (Browser PKCE OAuth)
 ```sh
-pooler --config pooler-starter/pooler.yaml auth login google --method oauth
+pooler auth login google --method oauth
 ```
 
 ### Option C: Provider API Keys (Anthropic Claude, OpenAI, xAI Grok)
@@ -124,19 +124,24 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export OPENAI_API_KEY="sk-..."
 export XAI_API_KEY="xai-..."
 ```
-*Pooler resolves secrets securely via `env:`, `file:`, or OS `keyring:` references.*
 
 ### Option D: 1-Click Login via Web Dashboard
-1. Start the proxy: `pooler --config pooler-starter/pooler.yaml serve`
-2. Open the dashboard: `pooler --config pooler-starter/pooler.yaml dashboard`
-3. Go to **Accounts** → **Connect** to authenticate subscriptions or add keys.
+```sh
+pooler serve &
+pooler dashboard
+```
+*Go to **Accounts** → **Connect** in the web UI to authenticate subscriptions or add keys.*
 
 ---
 
 ## 📊 Management Dashboard
 
-Pooler includes an authenticated management web dashboard running on `http://127.0.0.1:18477`:
+Just run:
+```sh
+pooler dashboard
+```
 
+Opens the authenticated management web dashboard on `http://127.0.0.1:18477`:
 - **Overview**: Active configuration generation, listener status, route inventory, and health status.
 - **Live Request Explorer**: Per-request timeline correlating admission, route selection, TTFT, retries, and token usage.
 - **Accounts & Failover**: Manage subscriptions, API keys, OAuth refresh tokens, and pool failover priority.
