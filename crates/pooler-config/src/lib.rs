@@ -551,6 +551,8 @@ pub enum CatalogParserKind {
     /// OpenAI-compatible `data[]` model list.
     #[serde(rename = "openai")]
     OpenAi,
+    /// Native Codex `models[]` subscription catalog.
+    Codex,
     /// Kimi Open Platform model list with documented baseline capabilities.
     Kimi,
     /// Google Gemini `models[]` list.
@@ -567,6 +569,7 @@ impl CatalogParserKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
+            Self::Codex => "codex",
             Self::Kimi => "kimi",
             Self::Gemini => "gemini",
             Self::Vertex => "vertex",
@@ -577,6 +580,7 @@ impl CatalogParserKind {
     const fn default_path(self) -> Option<&'static str> {
         match self {
             Self::OpenAi | Self::Kimi => Some("/v1/models"),
+            Self::Codex => Some("/backend-api/codex/models?client_version=99.99.99"),
             Self::Gemini => Some("/v1beta/models"),
             Self::Vertex => None,
             Self::Antigravity => Some("/v1internal:fetchAvailableModels"),
@@ -5156,6 +5160,7 @@ struct CatalogSourceRuntime {
 fn catalog_parser_kind(value: &str) -> Result<CatalogParserKind, &'static str> {
     match value {
         "openai" => Ok(CatalogParserKind::OpenAi),
+        "codex" => Ok(CatalogParserKind::Codex),
         "kimi" => Ok(CatalogParserKind::Kimi),
         "gemini" => Ok(CatalogParserKind::Gemini),
         "vertex" => Ok(CatalogParserKind::Vertex),
@@ -5187,15 +5192,27 @@ fn compile_catalog(
             let provider = ProviderCatalog::builtin()
                 .get(provider_id)
                 .ok_or_else(|| invalid(&catalog_label, "known provider integration is missing"))?;
-            let Some(parser) = provider
-                .integration
-                .discovery_parser
-                .as_deref()
-                .map(catalog_parser_kind)
-                .transpose()
-                .map_err(|message| invalid(&catalog_label, message))?
-            else {
+            let codex_subscription = upstream
+                .native()
+                .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"));
+            let parser = if codex_subscription {
+                Some(CatalogParserKind::Codex)
+            } else {
+                provider
+                    .integration
+                    .discovery_parser
+                    .as_deref()
+                    .map(catalog_parser_kind)
+                    .transpose()
+                    .map_err(|message| invalid(&catalog_label, message))?
+            };
+            let Some(parser) = parser else {
                 continue;
+            };
+            let discovery_path = if codex_subscription {
+                CatalogParserKind::Codex.default_path().map(str::to_owned)
+            } else {
+                provider.integration.discovery_path.clone()
             };
             let aliases = provider
                 .integration
@@ -5207,16 +5224,41 @@ fn compile_catalog(
                     ..CatalogAliasConfig::default()
                 })
                 .collect();
-            sources.push(ModelCatalogSourceConfig {
-                id: format!("{}.models", upstream.id()),
-                provider: upstream.id().to_owned(),
-                parser: Some(parser),
-                path: provider.integration.discovery_path.clone(),
-                model_facts_provider: Some(provider_id.to_owned()),
-                aliases,
-                excluded_models: provider.integration.model_exclusions.clone(),
-                ..ModelCatalogSourceConfig::default()
-            });
+            let provider_accounts = accounts
+                .values()
+                .filter(|account| account.provider() == upstream.id())
+                .collect::<Vec<_>>();
+            let enabled_accounts = provider_accounts
+                .iter()
+                .copied()
+                .filter(|account| account.enabled())
+                .collect::<Vec<_>>();
+            if provider_accounts.is_empty() {
+                sources.push(ModelCatalogSourceConfig {
+                    id: format!("{}.models", upstream.id()),
+                    provider: upstream.id().to_owned(),
+                    parser: Some(parser),
+                    path: discovery_path,
+                    model_facts_provider: Some(provider_id.to_owned()),
+                    aliases,
+                    excluded_models: provider.integration.model_exclusions.clone(),
+                    ..ModelCatalogSourceConfig::default()
+                });
+            } else {
+                for (ordinal, account) in enabled_accounts.into_iter().enumerate() {
+                    sources.push(ModelCatalogSourceConfig {
+                        id: format!("{}.models.{}", upstream.id(), ordinal + 1),
+                        provider: upstream.id().to_owned(),
+                        account: Some(account.id().to_owned()),
+                        parser: Some(parser),
+                        path: discovery_path.clone(),
+                        model_facts_provider: Some(provider_id.to_owned()),
+                        aliases: aliases.clone(),
+                        excluded_models: provider.integration.model_exclusions.clone(),
+                        ..ModelCatalogSourceConfig::default()
+                    });
+                }
+            }
         }
         (!sources.is_empty()).then_some(ModelCatalogConfig {
             sources,
@@ -7471,6 +7513,35 @@ routes:
             azure.to_string().contains("known_provider `azure`"),
             "{azure}"
         );
+    }
+
+    #[test]
+    fn codex_subscription_discovery_uses_each_enabled_account() {
+        let compiled = compile_yaml(
+            "codex-discovery.yaml",
+            r#"
+version: 2
+upstreams:
+  subscription: {known_provider: openai, native: {kind: codex}}
+accounts:
+  personal: {provider: subscription, auth_kind: oauth}
+  work: {provider: subscription, auth_kind: oauth}
+  paused: {provider: subscription, auth_kind: oauth, enabled: false}
+"#,
+        )
+        .expect("Codex subscription discovery compiles");
+        let catalog = compiled.catalog().expect("automatic catalog");
+        assert_eq!(catalog.sources().len(), 2);
+        assert_eq!(catalog.sources()[0].account(), Some("personal"));
+        assert_eq!(catalog.sources()[1].account(), Some("work"));
+        for source in catalog.sources() {
+            assert_eq!(source.parser(), CatalogParserKind::Codex);
+            assert_eq!(
+                source.path(),
+                "/backend-api/codex/models?client_version=99.99.99"
+            );
+            assert_eq!(source.model_facts_provider(), "openai");
+        }
     }
 
     #[test]

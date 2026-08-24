@@ -130,6 +130,11 @@ def payload(path: str) -> dict:
             **generation,
             "schema_version": 2,
             "configuration": {"generation": 7},
+            "provider_templates": [
+                {"id": "openai-subscription", "name": "OpenAI subscription (ChatGPT)", "base_url": "Managed by Pooler", "known_provider": "openai", "auth_methods": ["oauth"], "native_kind": "codex", "native_config": True, "model_discovery": True},
+                {"id": "openai", "name": "OpenAI", "base_url": "https://api.openai.com/v1", "auth_kind": "bearer_secret", "model_discovery": True, "native_kind": "openai_compatible"},
+                {"id": "anthropic", "name": "Anthropic", "base_url": "https://api.anthropic.com/v1", "auth_kind": "header", "model_discovery": True, "native_kind": "anthropic"},
+            ],
             "providers": [
                 {
                     "id": "openai-upstream",
@@ -149,7 +154,15 @@ def payload(path: str) -> dict:
                     "enabled": True,
                     "health": {"status": "available", "failure_count": 0, "cooldown_until": None},
                     "secret": {"configured": True, "opaque": True},
-                }
+                },
+                {
+                    "id": "backup",
+                    "provider": "openai-upstream",
+                    "auth_kind": "api_key",
+                    "enabled": True,
+                    "health": {"status": "available", "failure_count": 0, "cooldown_until": None},
+                    "secret": {"configured": True, "opaque": True},
+                },
             ],
             "pools": [],
             "models": [
@@ -158,14 +171,29 @@ def payload(path: str) -> dict:
                     "enabled": True,
                     "targets": [
                         {"binding_id": "gpt-test-primary", "provider": "openai-upstream", "account": "primary", "priority": 1, "upstream_model": "gpt-test", "capabilities": ["text", "streaming"]},
-                        {"binding_id": "gpt-test-fallback", "provider": "openai-upstream", "account": "primary", "priority": 2, "upstream_model": "gpt-test-fallback", "capabilities": ["text"]},
+                        {"binding_id": "gpt-test-fallback", "provider": "openai-upstream", "account": "backup", "priority": 2, "upstream_model": "gpt-test-fallback", "capabilities": ["text"]},
                     ],
                 }
             ],
-            "effective_order": [{"model": "gpt-test", "candidates": [{"position": 1, "binding_id": "gpt-test-primary", "provider": "openai-upstream", "account": "primary", "priority": 1}, {"position": 2, "binding_id": "gpt-test-fallback", "provider": "openai-upstream", "account": "primary", "priority": 2}]}],
+            "effective_order": [{"model": "gpt-test", "candidates": [{"position": 1, "binding_id": "gpt-test-primary", "provider": "openai-upstream", "account": "primary", "priority": 1}, {"position": 2, "binding_id": "gpt-test-fallback", "provider": "openai-upstream", "account": "backup", "priority": 2}]}],
             "policies": [{"id": "default", "selection": {"strategy": "ordered_fallback"}, "routing": {"allow": [], "deny": [], "allow_fallbacks": True, "required_parameters": [], "required_capabilities": [], "quantization": []}}],
             "health": {"credentials": [{"account": "primary", "status": "available", "failure_count": 0}], "cooldowns": []},
-            "discovery": {"configured": True, "catalog_generation": 2, "refreshed_at_unix_ms": 2, "sources": [{"id": "openai-models"}], "models": []},
+            "discovery": {
+                "configured": True,
+                "catalog_generation": 2,
+                "refreshed_at_unix_ms": 2,
+                "sources": [{"id": "openai-models"}],
+                "models": [
+                    {
+                        "id": "gpt-test",
+                        "enabled": True,
+                        "targets": [
+                            {"binding": {"binding_id": "gpt-test/openai-primary", "target_id": "openai-primary"}, "provider": "openai-upstream", "account": "primary", "priority": 1, "upstream_model": "gpt-test", "capabilities": ["text", "streaming"], "profile": {"endpoint_variants": {"responses": True}, "request_transform": "openai_chat"}},
+                            {"binding": {"binding_id": "gpt-test/openai-fallback", "target_id": "openai-fallback"}, "provider": "openai-upstream", "account": "backup", "priority": 2, "upstream_model": "gpt-test-fallback", "capabilities": ["text"], "profile": {"endpoint_variants": {"responses": True}, "request_transform": "openai_chat"}},
+                        ],
+                    }
+                ],
+            },
             "quota": [],
         },
         "/management/control-plane/endpoints": {
@@ -180,7 +208,7 @@ def payload(path: str) -> dict:
                 }
             ],
             "management": {"base_urls": ["http://127.0.0.1:18400"], "paths": ["/management/control-plane", "/management/endpoints"], "auth": {"required": True, "scheme": "Bearer"}},
-            "downstream_clients": ["Factory", "Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"],
+            "downstream_clients": ["Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"],
             "connect_tools": {"optional": True, "routing_effect": "none", "requires_confirmation_for_route_draft": True},
         },
         "/management/accounts/primary/oauth-capabilities": {
@@ -277,6 +305,17 @@ def payload(path: str) -> dict:
                         "revoke",
                         "oauth_device",
                     ],
+                    "status": "available",
+                    "failure_count": 0,
+                    "cooldown_until": None,
+                },
+                {
+                    "id": "backup",
+                    "provider": "openai-upstream",
+                    "enabled": True,
+                    "selected": True,
+                    "auth_kind": "api_key",
+                    "available_actions": ["disable"],
                     "status": "available",
                     "failure_count": 0,
                     "cooldown_until": None,
@@ -632,6 +671,19 @@ class Handler(BaseHTTPRequestHandler):
                 "application/json",
             )
             return
+        elif route == "/management/control-plane/drafts/11/validate":
+            self.send_bytes(
+                200,
+                b'{"draft_id":11,"base_generation":7,"etag":"draft-b","status":"validated","semantic_diff":[],"confirmation_token":"confirm-control"}',
+                "application/json",
+            )
+            return
+        elif route == "/management/control-plane/drafts/11/commit":
+            STATE.reload_request_id += 1
+            STATE.reload_status = "succeeded"
+            body = json.dumps({"status": "pending", "request_id": STATE.reload_request_id}).encode()
+            self.send_bytes(202, body, "application/json")
+            return
         elif route.startswith("/management/control-plane/drafts/11/"):
             self.send_bytes(
                 200,
@@ -746,12 +798,12 @@ def run_legacy_browser(playwright) -> None:
             "401 did not expose the session dialog",
         )
         expect(
-            "without the Bearer prefix" in page.locator("#session-copy").inner_text(),
-            "management session copy did not explain that the input excludes the Bearer prefix",
+            "stays in this browser tab" in page.locator("#session-copy").inner_text(),
+            "management key handling was not explained plainly",
         )
         expect(
-            page.get_by_text("Management secret", exact=True).count() == 1,
-            "management session input was still labelled as a bearer token",
+            page.get_by_text("Management key", exact=True).count() == 1,
+            "management input is not labelled as a key",
         )
 
         page.locator("#token-input").fill("wrong-token")
@@ -1649,32 +1701,45 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
             print("PASS: management dashboard browser QA (baseline)")
             return
 
+        expect(page.locator('[data-route="configuration"]').count() == 1, "Configuration page is missing from navigation")
+        page.locator('[data-route="configuration"]').click()
+        page.wait_for_selector(".current-config")
+        current_config = page.locator(".current-config").inner_text()
+        expect('"providers"' in current_config and '"accounts"' in current_config and '"models"' in current_config, "safe current configuration is incomplete")
+        expect("provider-secret-value" not in current_config and "good-token" not in current_config, "configuration view exposed a secret")
+        expect(page.get_by_text("Advanced configuration editor", exact=False).count() == 1, "advanced configuration editor is not available")
+
         page.locator('[data-route="providers"]').click()
         page.wait_for_selector(".view-providers")
-        expect("provider instance" in page.locator(".view-providers").inner_text().lower() or "Configured instances" in page.locator(".view-providers").inner_text(), "provider control surface missing")
+        expect(page.get_by_role("button", name="Add built-in provider", exact=True).count() == 1, "built-in provider action is missing")
+        expect(page.get_by_role("button", name="Add custom provider", exact=True).count() == 1, "custom provider action is missing")
         page.locator('[data-provider-action="show-form"]').click()
-        page.locator('[data-provider-field="id"]').fill("same-origin-second")
+        expect(page.locator('[data-provider-field="template"] option[value="openai"]').count() == 1, "built-in OpenAI provider is missing")
+        expect(page.locator('[data-provider-field="template"] option[value="openai-subscription"]').count() == 1, "built-in OpenAI subscription login is missing")
+        expect("https://api.openai.com/v1" in page.locator(".view-providers").inner_text(), "built-in provider did not show its automatic API address")
+        expect(page.locator('[data-provider-field="origin"]').count() == 0, "built-in provider incorrectly asks for an API URL")
+        expect(page.locator('[data-provider-field="id"]').count() == 0, "provider onboarding exposes an internal instance ID")
+        page.get_by_role("button", name="Add custom provider", exact=True).click()
+        page.locator('[data-provider-field="name"]').fill("same-origin-second")
         page.locator('[data-provider-field="origin"]').fill("https://api.example.com")
+        page.locator('[data-provider-field="modelIds"]').fill("custom-model")
         page.locator('[data-provider-action="create"]').click()
         page.wait_for_selector('[data-account-new-field="id"]')
         expect("client" not in page.locator(".onboarding-panel").inner_text().lower() and "sidecar" not in page.locator(".onboarding-panel").inner_text().lower(), "provider onboarding exposed client or sidecar jargon")
         page.locator('[data-account-new-field="id"]').fill("second-account")
         page.locator('[data-account-new-field="secret"]').fill("one-time-provider-secret")
         page.locator('[data-account-new-action="create"]').click()
-        page.wait_for_selector('[data-onboarding-action="discover"]')
-        page.locator('[data-onboarding-action="discover"]').click()
-        page.get_by_role("button", name="Select all", exact=True).wait_for()
-        expect(page.get_by_role("button", name="Select all", exact=True).count() > 0 and page.get_by_role("button", name="Select none", exact=True).count() > 0, "model exposure select-all/select-none controls missing")
-        page.get_by_role("button", name="Select none", exact=True).click()
-        expect(page.locator('[data-model-selection-id]:checked').count() == 0, "Select none left models exposed")
-        page.get_by_role("button", name="Select all", exact=True).click()
-        expect(page.locator('[data-model-selection-id]:checked').count() > 0, "Select all did not expose verified models")
+        page.wait_for_selector('[data-onboarding-action="save-manual-models"]')
+        expect("does not publish a model list" in page.locator(".onboarding-panel").inner_text(), "custom provider did not explain manual model IDs")
+        page.locator('[data-onboarding-action="save-manual-models"]').click()
+        page.get_by_text("Custom models and standard Pooler endpoints are ready.", exact=True).wait_for()
 
         page.locator('[data-route="accounts"]').click()
         page.wait_for_selector(".view-accounts")
         expect(page.locator('[data-account-action="switch"]').count() == 0, "account Switch action remains")
         page.locator('[data-account-new-field="id"]').fill("one-time-account")
-        page.locator('[data-account-new-field="authKind"]').select_option("api_key")
+        expect(page.locator('[data-account-new-field="authKind"]').count() == 0, "single supported sign-in method was exposed as a pointless choice")
+        expect("API key" in page.locator(".view-accounts").inner_text(), "API-key sign-in method is not explained")
         page.locator('[data-account-new-field="secret"]').fill("provider-secret-value")
         page.locator('[data-account-new-action="create"]').click()
         page.wait_for_timeout(150)
@@ -1690,7 +1755,15 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
 
         page.locator('[data-route="models"]').click()
         page.wait_for_selector(".target-row")
+        page.locator('[data-model-selection="none"]').click()
+        expect(page.locator('[data-model-selection-id]:checked').count() == 0, "Select none left models exposed")
+        page.locator('[data-model-selection="all"]').click()
+        expect(page.locator('[data-model-selection-id]:checked').count() > 0, "Select all did not expose models")
         expect(page.locator(".target-row").count() == 2, "semantic model target rows were not rendered")
+        expect(
+            all(value and value != "undefined" for value in page.locator("[data-target-row]").evaluate_all("rows => rows.map(row => row.dataset.targetId)")),
+            "discovered target rows do not expose stable binding IDs",
+        )
         expect(page.locator("[data-target-priority]").count() == 2, "dense numeric priority controls are missing")
         expect(page.locator("[data-target-move]").count() >= 8, "keyboard and move controls are incomplete")
         page.locator('[data-target-move="down"]').first.click()
@@ -1705,6 +1778,7 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
         priority.press("Tab")
         expect("priority set to 7" in page.locator("#target-announcement").inner_text(), "numeric priority edit was not applied")
         expect(page.locator("[data-target-combine]").count() > 0, "explicit combine-tier action is missing")
+        page.get_by_text("Advanced routing rules", exact=False).click()
         expect(page.locator("[data-policy-field=allow]").count() == 1 and page.locator("[data-policy-field=deny]").count() == 1, "policy allow/deny controls are missing")
         expect(page.locator("[data-policy-field=ranking]").count() == 1, "adaptive ranking preference control is missing")
         page.locator("[data-policy-field=allow]").fill("openai-upstream")
@@ -1718,13 +1792,27 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
 
         page.locator('[data-route="pools"]').click()
         page.wait_for_selector(".view-pools")
-        expect("optional pool" in page.locator(".view-pools").inner_text().lower(), "optional pool surface missing")
+        expect("failover group" in page.locator(".view-pools").inner_text().lower(), "plain-language failover surface missing")
+        page.locator('[data-pool-field="id"]').fill("OpenAI accounts")
+        pool_accounts = page.locator("[data-pool-account]")
+        expect(pool_accounts.count() >= 2, "same-provider accounts are not available for failover")
+        pool_accounts.nth(0).check()
+        pool_accounts.nth(1).check()
+        page.locator('[data-pool-action="create"]').click()
+        page.get_by_text("Failover group saved and connected to matching models.", exact=True).wait_for()
+        expect(
+            any(target.endswith("/pools") for target in STATE.posts)
+            and any("/models/" in target for target in STATE.posts),
+            "failover save did not update both the account group and matching model bindings",
+        )
         page.locator('[data-route="endpoints"]').click()
         page.wait_for_selector(".view-endpoints")
         endpoint_text = page.locator(".view-endpoints").inner_text()
-        for label in ("Factory", "Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"):
+        for label in ("Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"):
             expect(label in endpoint_text, f"optional Connect tools omitted {label}")
-        expect("routing effect none" in endpoint_text.lower() and "client-agnostic" in endpoint_text.lower(), "endpoint inventory did not declare client-agnostic optional tools")
+        connect_labels = page.locator(".connect-tool summary").all_inner_texts()
+        expect("Factory" not in connect_labels, "company/protocol name was exposed as a separate Connect tool")
+        expect("does not change routing" in endpoint_text.lower() and "works with any client" in endpoint_text.lower(), "endpoint page did not explain optional helpers clearly")
         expect(page.locator(".endpoint-json").count() == 1, "machine-readable endpoint inventory missing")
 
         page.set_viewport_size({"width": 320, "height": 700})

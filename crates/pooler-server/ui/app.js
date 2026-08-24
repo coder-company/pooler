@@ -43,7 +43,12 @@
     },
     providerDraft: {
       id: "",
+      name: "",
       origin: "",
+      clientId: "",
+      protocol: "openai",
+      modelIds: "",
+      template: "openai",
       visible: false,
       busy: false,
     },
@@ -71,6 +76,7 @@
       modelsInitialized: false,
     },
     oauthCapabilities: {},
+    oauthCapabilityRequests: {},
     oauthFlow: {
       account: "",
       requestId: null,
@@ -210,6 +216,24 @@
     return state.token ? { Authorization: `Bearer ${state.token}` } : {};
   }
 
+  function apiErrorMessage(detail, response) {
+    const payload = detail?.error;
+    if (typeof payload === "string" && payload.trim()) return payload;
+    if (payload && typeof payload === "object") {
+      if (typeof payload.message === "string" && payload.message.trim()) return payload.message;
+      if (typeof payload.code === "string" && payload.code.trim()) return payload.code.replaceAll("_", " ");
+    }
+    if (typeof detail?.message === "string" && detail.message.trim()) return detail.message;
+    return `${response.status} ${response.statusText}`.trim();
+  }
+
+  function responseError(detail, response) {
+    const error = new Error(apiErrorMessage(detail, response));
+    error.status = response.status;
+    error.code = detail?.error?.code || null;
+    return error;
+  }
+
   async function readJson(path, signal) {
     const response = await fetch(`${BASE}${path}`, {
       headers: requestHeaders(),
@@ -218,13 +242,7 @@
     });
     if (!response.ok) {
       const detail = await response.json().catch(() => null);
-      const message =
-        detail && detail.error
-          ? detail.error
-          : `${response.status} ${response.statusText}`;
-      const error = new Error(message);
-      error.status = response.status;
-      throw error;
+      throw responseError(detail, response);
     }
     return response.json();
   }
@@ -237,13 +255,7 @@
     });
     const detail = await response.json().catch(() => null);
     if (!response.ok) {
-      const message =
-        detail && detail.error
-          ? detail.error
-          : `${response.status} ${response.statusText}`;
-      const error = new Error(message);
-      error.status = response.status;
-      throw error;
+      throw responseError(detail, response);
     }
     return detail || {};
   }
@@ -260,11 +272,7 @@
     });
     const detail = await response.json().catch(() => null);
     if (!response.ok) {
-      const error = new Error(
-        detail?.error || `${response.status} ${response.statusText}`,
-      );
-      error.status = response.status;
-      throw error;
+      throw responseError(detail, response);
     }
     return detail || {};
   }
@@ -281,13 +289,7 @@
     if (sessionGeneration !== state.sessionGeneration) return false;
     if (!response.ok) {
       const detail = await response.json().catch(() => null);
-      const error = new Error(
-        detail && detail.error
-          ? detail.error
-          : `${response.status} ${response.statusText}`,
-      );
-      error.status = response.status;
-      throw error;
+      throw responseError(detail, response);
     }
     const blob = await response.blob();
     if (sessionGeneration !== state.sessionGeneration) return false;
@@ -378,6 +380,7 @@
         conflict: false,
       };
       state.oauthCapabilities = {};
+      state.oauthCapabilityRequests = {};
       state.targetOrders = {};
       state.targetFocus = "";
       state.targetAnnouncement = "";
@@ -459,8 +462,8 @@
     input.value = state.token;
     input.type = "password";
     visibility.innerHTML = ic("eye-empty", 16);
-    visibility.setAttribute("aria-label", "Show management secret");
-    visibility.title = "Show management secret";
+    visibility.setAttribute("aria-label", "Show management key");
+    visibility.title = "Show management key";
     if (!dialog.open) dialog.showModal();
     setTimeout(() => input.focus(), 50);
   }
@@ -838,7 +841,7 @@
       health?.configuration_generation ??
       state.data.routes?.configuration_generation ??
       state.data.models?.configuration_generation;
-    $("#generation-badge").textContent = `gen ${text(generation)}`;
+    $("#generation-badge").textContent = `config ${text(generation)}`;
     const staleCount = (views[state.route]?.endpoints || []).filter(
       (key) => state.errors[key],
     ).length;
@@ -883,15 +886,13 @@
   const views = {
     configuration: {
       title: "Configuration",
-      subtitle:
-        "Edit a bounded typed draft, validate its semantic diff, then explicitly commit it.",
-      endpoints: ["configuration", "reloads"],
+      subtitle: "See what Pooler is using now. Advanced edits are available when you need them.",
+      endpoints: ["configuration", "controlPlane", "endpointInventory", "reloads"],
       render: renderConfiguration,
     },
     providers: {
       title: "Providers",
-      subtitle:
-        "Add a provider instance, connect an account, verify its model catalog, and choose what to expose.",
+      subtitle: "Choose a provider, add an account, and select the models you want to use.",
       endpoints: ["controlPlane"],
       render: renderProviders,
     },
@@ -914,59 +915,69 @@
       title: "Models",
       subtitle:
         "Review verified model discovery and choose the models exposed to every client.",
-      endpoints: ["controlPlane", "models", "catalog"],
+      endpoints: ["controlPlane", "models", "catalog", "accounts"],
       render: renderModels,
     },
     accounts: {
       title: "Accounts",
-      subtitle: "Independent account health, quota, authentication, and actions.",
+      subtitle: "Manage each login or API key separately.",
       endpoints: ["controlPlane", "accounts", "quota"],
       render: renderAccounts,
     },
     pools: {
-      title: "Pools",
-      subtitle:
-        "Optionally group accounts with the same provider for bounded failover and quota-aware routing.",
+      title: "Failover",
+      subtitle: "Group accounts so Pooler can use another one when an account is unavailable or rate-limited.",
       endpoints: ["controlPlane"],
       render: renderPools,
     },
     endpoints: {
       title: "Endpoints",
-      subtitle:
-        "Client-agnostic base URLs, paths, authentication requirements, and machine-readable inventory.",
+      subtitle: "Copy a Pooler address into any compatible app or SDK.",
       endpoints: ["endpointInventory", "controlPlane"],
       render: renderEndpoints,
     },
     usage: {
       title: "Usage",
-      subtitle:
-        "Retained usage, cost provenance, rate-limit windows, and latency by time range.",
+      subtitle: "See tokens, cost estimates, limits, and speed over time.",
       endpoints: ["usageAggregate", "metrics", "quota"],
       render: renderUsage,
     },
     requests: {
       title: "Request explorer",
-      subtitle:
-        "One redacted logical request timeline across selection, attempts, retries, commitment, and completion.",
+      subtitle: "See what happened to each request without exposing its content.",
       endpoints: ["requests"],
       render: renderRequests,
     },
     operations: {
       title: "Operations",
-      subtitle:
-        "Configuration reloads, routing decisions, traces, and the management audit log.",
+      subtitle: "See configuration reloads, provider choices, errors, and change history.",
       endpoints: ["health", "decisions", "traces", "audit", "reloads"],
       render: renderOperations,
     },
     diagnostics: {
       title: "Diagnostics",
-      subtitle: "Redacted export and configuration state for support bundles.",
+      subtitle: "Safe system information for troubleshooting.",
       endpoints: ["health", "catalog", "listeners", "routes"],
       render: renderDiagnostics,
     },
   };
 
   /* ---------------- Typed configuration ---------------- */
+
+  function safeConfigurationSnapshot() {
+    const graph = controlGraph();
+    const inventory = state.data.endpointInventory || graph.endpoints || {};
+    return {
+      version: 2,
+      generation: graph.configuration?.generation ?? state.data.configuration?.configuration_generation ?? null,
+      listeners: (inventory.listeners || []).map((listener) => ({ id: listener.id, address: listener.bind, routes: (listener.routes || []).map((route) => ({ methods: route.methods, path: route.path })) })),
+      providers: (graph.providers || []).map((provider) => ({ name: provider.known_provider || provider.id, connection_id: provider.id, api: provider.base_url, accounts: provider.accounts })),
+      accounts: (graph.accounts || []).map((account) => ({ name: account.id, provider: account.provider, sign_in: account.auth_kind, enabled: account.enabled })),
+      failover_groups: (graph.pools || []).map((pool) => ({ name: pool.id, provider: pool.provider, accounts: pool.accounts, strategy: pool.strategy })),
+      models: (graph.models || []).map((model) => ({ name: model.id, enabled: model.enabled !== false, providers: (model.targets || []).map((target) => ({ provider: target.provider, account: target.account || target.account_pool, priority: target.priority, provider_model: target.upstream_model })) })),
+      routing_rules: graph.policies || [],
+    };
+  }
 
   function renderConfiguration(root) {
     const active = state.data.configuration || {};
@@ -1005,11 +1016,16 @@
       </div>`
       : `
       <div class="panel empty-state"><p class="empty-title">Start from the active configuration</p><p class="empty-description">Pooler renders includes and environment substitution server-side, then creates an expiring draft without returning configuration values to the browser.</p><button class="btn btn-primary" type="button" data-config-action="create"${!enabled || editor.busy ? " disabled" : ""}>Create typed draft</button></div>`;
+    const safeConfiguration = safeConfigurationSnapshot();
+    const providerCount = safeConfiguration.providers.length;
+    const accountCount = safeConfiguration.accounts.length;
+    const modelCount = safeConfiguration.models.length;
     root.innerHTML = `
-      ${viewHeader("Configuration", "Managed edits are durable, owner-only, atomic, and activated only after a successful reload.")}
+      ${viewHeader("Configuration", "See the settings Pooler is using. Secrets are always hidden.")}
       ${enabled ? "" : '<div class="callout callout-warning"><strong>Managed configuration is unavailable.</strong> Start Pooler from a regular local configuration file and connect with management authentication.</div>'}
-      ${form}
-      <div class="panel"><div class="panel-head"><div><h2 class="panel-title">Rollback</h2><p class="muted">Restore the previous managed document and reload it. This requires the current generation ETag and explicit confirmation.</p></div></div><button class="btn btn-outline btn-sm" type="button" data-config-action="rollback"${!enabled || editor.busy ? " disabled" : ""}>Rollback previous commit</button></div>`;
+      <section class="grid-stats grid-stats-4">${statCard("Providers", `<span class="num">${fmtInt(providerCount)}</span>`, "connected services")}${statCard("Accounts", `<span class="num">${fmtInt(accountCount)}</span>`, "separate logins and keys")}${statCard("Models", `<span class="num">${fmtInt(modelCount)}</span>`, "available to clients")}${statCard("Version", `<span class="num">2</span>`, `generation ${esc(safeConfiguration.generation)}`)}</section>
+      <section class="panel"><div class="panel-head"><div><h2 class="panel-title">Current setup</h2><p class="muted">This is the active configuration with secrets removed.</p></div></div><pre class="code-block current-config"><code>${esc(JSON.stringify(safeConfiguration, null, 2))}</code></pre></section>
+      <details class="panel advanced-config"><summary><strong>Advanced configuration editor</strong> <span class="muted">For users who prefer direct configuration changes</span></summary><div class="section">${form}<div class="panel-flat"><div class="panel-head"><div><h2 class="panel-title">Undo the last saved change</h2><p class="muted">Restore the previous configuration only if the latest change caused a problem.</p></div></div><button class="btn btn-outline btn-sm" type="button" data-config-action="rollback"${!enabled || editor.busy ? " disabled" : ""}>Undo last change</button></div></div></details>`;
   }
 
   async function configurationAction(action) {
@@ -1126,7 +1142,23 @@
   }
 
   function graphAccounts() {
-    return controlGraph().accounts || [];
+    const runtime = new Map(
+      (state.data.accounts?.accounts || []).map((account) => [account.id, account]),
+    );
+    return (controlGraph().accounts || []).map((account) => {
+      const live = runtime.get(account.id);
+      if (!live) return account;
+      return {
+        ...account,
+        enabled: live.enabled,
+        health: {
+          ...(account.health || {}),
+          status: live.status || account.health?.status,
+          failure_count: live.failure_count ?? account.health?.failure_count,
+          cooldown_until: live.cooldown_until ?? account.health?.cooldown_until,
+        },
+      };
+    });
   }
 
   function graphPools() {
@@ -1135,18 +1167,20 @@
 
   function graphModels() {
     const discovery = controlGraph().discovery || {};
-    return controlGraph().models || discovery.models || [];
+    if (Array.isArray(discovery.models)) return discovery.models;
+    if (Array.isArray(controlGraph().models)) return controlGraph().models;
+    return state.data.models?.models || [];
   }
 
   function draftBar() {
     const draft = state.controlDraft;
     if (!draft.id) {
-      return `<div class="callout callout-info draft-bar"><strong>Changes are staged safely.</strong> Create a structured draft when you are ready to add a provider, account, pool, or model exposure.</div>`;
+      return `<div class="callout callout-info draft-bar"><strong>Nothing changes until you save.</strong> Pooler lets you review every change first.</div>`;
     }
     const conflict = draft.conflict
-      ? `<div class="callout callout-warning draft-conflict" role="alert"><strong>Draft conflict.</strong> The active generation changed while this draft was open. <button class="btn btn-outline btn-xs" type="button" data-control-action="recover">Reload current state</button> and review the staged values before continuing.</div>`
+      ? `<div class="callout callout-warning draft-conflict" role="alert"><strong>The setup changed in another window.</strong> <button class="btn btn-outline btn-xs" type="button" data-control-action="recover">Reload current setup</button> before saving.</div>`
       : "";
-    return `${conflict}<div class="draft-bar" role="status"><span class="badge ${draft.dirty ? "badge-warning" : "badge-accent"}">${draft.dirty ? "Unsaved draft" : "Draft ready"}</span><span class="mono">${esc(draft.id)}</span><span class="muted">base generation ${esc(draft.baseGeneration)}</span><span class="spacer"></span><button class="btn btn-outline btn-xs" type="button" data-control-action="validate"${draft.busy || draft.conflict ? " disabled" : ""}>Review changes</button>${draft.confirmationToken ? `<button class="btn btn-primary btn-xs" type="button" data-control-action="commit"${draft.busy ? " disabled" : ""}>Commit changes</button>` : ""}<button class="btn btn-ghost btn-xs" type="button" data-control-action="discard"${draft.busy ? " disabled" : ""}>Discard</button></div>`;
+    return `${conflict}<div class="draft-bar" role="status"><span class="badge ${draft.dirty ? "badge-warning" : "badge-accent"}">${draft.dirty ? "Unsaved changes" : "Ready"}</span><span class="spacer"></span><button class="btn btn-outline btn-xs" type="button" data-control-action="validate"${draft.busy || draft.conflict ? " disabled" : ""}>Review</button>${draft.confirmationToken ? `<button class="btn btn-primary btn-xs" type="button" data-control-action="commit"${draft.busy ? " disabled" : ""}>Save changes</button>` : ""}<button class="btn btn-ghost btn-xs" type="button" data-control-action="discard"${draft.busy ? " disabled" : ""}>Discard</button></div>`;
   }
 
   function resetControlDraft() {
@@ -1198,6 +1232,58 @@
     const result = controlMutationQueue.then(operation, operation);
     controlMutationQueue = result.catch(() => undefined);
     return result;
+  }
+
+  async function waitForReload(requestId, failureMessage, timeoutMessage) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const result = await readJson("/reloads");
+      const reload = (result.reloads || []).find((item) => String(item.request_id) === String(requestId));
+      if (reload?.status === "succeeded") return reload;
+      if (["failed", "cancelled"].includes(reload?.status)) {
+        throw new Error(failureMessage);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error(timeoutMessage);
+  }
+
+  function waitForConfigurationReload(requestId) {
+    return waitForReload(
+      requestId,
+      "Pooler could not activate the new setup.",
+      "Pooler is still activating the new setup. Try again in a moment.",
+    );
+  }
+
+  function waitForModelReload(requestId) {
+    return waitForReload(
+      requestId,
+      "Pooler could not read the provider's model list. Check the account login and provider status.",
+      "Pooler is still reading the provider's model list. Try again in a moment.",
+    );
+  }
+
+  async function saveControlChanges() {
+    const draft = state.controlDraft;
+    if (!draft.id) return;
+    const validated = await mutateJson(
+      `/control-plane/drafts/${encodeURIComponent(draft.id)}/validate`,
+      "POST",
+      undefined,
+      draft.etag,
+    );
+    draft.etag = validated.etag || draft.etag;
+    const confirmationToken = validated.confirmation_token;
+    if (!confirmationToken) throw new Error("Pooler could not validate these changes.");
+    const committed = await mutateJson(
+      `/control-plane/drafts/${encodeURIComponent(draft.id)}/commit`,
+      "POST",
+      { confirmation_token: confirmationToken },
+      draft.etag,
+    );
+    await waitForConfigurationReload(committed.request_id);
+    resetControlDraft();
+    await refreshCurrentView();
   }
 
   async function controlDraftAction(action) {
@@ -1275,17 +1361,37 @@
     }
   }
 
-  function providerInstanceForm() {
+  function providerForm() {
     const draft = state.providerDraft;
-    return `<section class="panel" aria-labelledby="provider-instance-title"><div class="panel-head"><div><h2 class="panel-title" id="provider-instance-title">Add provider instance</h2><p class="muted">Each instance keeps its own origin, account health, quota, and pool membership—even when two instances use the same base URL.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Instance ID</span><input data-provider-field="id" value="${esc(draft.id)}" maxlength="128" autocomplete="off" placeholder="team-a"></label><label class="field"><span class="field-label">Base URL</span><input data-provider-field="origin" value="${esc(draft.origin)}" maxlength="2048" inputmode="url" autocomplete="url" placeholder="https://api.example.com"></label></div><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-provider-action="create"${draft.busy ? " disabled aria-busy=\"true\"" : ""}>Add instance</button></div><p class="muted">Only the URL is sent here. Authentication is connected separately to the account.</p></section>`;
+    const templates = controlGraph().provider_templates || [];
+    const templateId = draft.template === "__custom" || templates.some((template) => template.id === draft.template) ? draft.template : templates.find((template) => template.id === "openai")?.id || templates[0]?.id || "__custom";
+    draft.template = templateId;
+    const custom = templateId === "__custom";
+    const selected = templates.find((template) => template.id === templateId);
+    let fields;
+    if (custom) {
+      fields = `<div class="form-grid"><label class="field"><span class="field-label">Provider name</span><input data-provider-field="name" value="${esc(draft.name)}" maxlength="128" autocomplete="off" placeholder="My company gateway"></label><label class="field"><span class="field-label">Provider API URL</span><input data-provider-field="origin" value="${esc(draft.origin)}" maxlength="2048" inputmode="url" autocomplete="url" placeholder="https://api.example.com/v1"></label><label class="field"><span class="field-label">Works like</span><select data-provider-field="protocol"><option value="openai"${draft.protocol === "openai" ? " selected" : ""}>OpenAI Chat Completions</option></select></label><label class="field"><span class="field-label">Model IDs</span><input data-provider-field="modelIds" value="${esc(draft.modelIds)}" maxlength="4096" autocomplete="off" placeholder="model-a, model-b"></label></div><p class="muted">Use the HTTPS address and model IDs supplied by the custom provider—not Pooler’s localhost address.</p>`;
+    } else if (selected?.dynamic_origin) {
+      fields = `<div class="form-grid"><label class="field"><span class="field-label">Foundry enrollment URL</span><input data-provider-field="origin" value="${esc(draft.origin)}" maxlength="2048" inputmode="url" autocomplete="url" placeholder="https://example.palantirfoundry.com"></label><label class="field"><span class="field-label">OAuth client ID</span><input data-provider-field="clientId" value="${esc(draft.clientId)}" maxlength="512" autocomplete="off" placeholder="Provided by your Foundry administrator"></label></div><p class="muted">Pooler derives Palantir’s sign-in endpoints from this enrollment URL.</p>`;
+    } else {
+      fields = `<div class="callout callout-info"><strong>${esc(selected?.name || templateId)}</strong><br><span class="muted">${esc(selected?.base_url || "Official API address supplied by Pooler")}${selected?.model_discovery ? " · automatic model discovery" : ""}</span></div><p class="muted">Nothing else is required here. You will name and authenticate the account on the next step.</p>`;
+    }
+    const heading = custom ? "Add custom provider" : "Connect a built-in provider";
+    const copy = custom ? "Enter the name and API address supplied by the provider." : "Choose a provider. Pooler fills in its API settings.";
+    const providerSelect = custom ? "" : `<label class="field"><span class="field-label">Provider</span><select data-provider-field="template">${templates.map((template) => `<option value="${esc(template.id)}"${template.id === templateId ? " selected" : ""}>${esc(template.name)}</option>`).join("")}</select></label>`;
+    return `<section class="panel" aria-labelledby="provider-connect-title"><div class="panel-head"><div><h2 class="panel-title" id="provider-connect-title">${heading}</h2><p class="muted">${copy}</p></div></div>${providerSelect}${fields}<div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-provider-action="create"${draft.busy ? " disabled aria-busy=\"true\"" : ""}>Continue</button></div></section>`;
   }
 
   function accountForm(providerId = "") {
     const draft = state.accountDraft;
     const providers = graphProviders();
     if (!draft.provider) draft.provider = providerId || providers[0]?.id || "";
+    const provider = providers.find((candidate) => candidate.id === draft.provider)
+      || (state.onboarding.providerDetails?.id === draft.provider ? state.onboarding.providerDetails : null);
+    const authMethods = provider?.auth_methods?.length ? provider.auth_methods : ["api_key"];
+    if (!authMethods.includes(draft.authKind)) draft.authKind = authMethods[0];
     const oauth = draft.authKind === "oauth";
-    return `<section class="panel" aria-labelledby="account-create-title"><div class="panel-head"><div><h2 class="panel-title" id="account-create-title">Add an account</h2><p class="muted">Accounts are isolated within their provider instance. Health, quota, authentication, and actions never spill across accounts.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Provider instance</span><select data-account-new-field="provider"${providerId ? " disabled" : ""}>${providers.map((provider) => `<option value="${esc(provider.id)}"${provider.id === draft.provider ? " selected" : ""}>${esc(provider.id)} · ${esc(provider.origin || provider.base_url || "")}</option>`).join("")}</select></label><label class="field"><span class="field-label">Account ID</span><input data-account-new-field="id" value="${esc(draft.id)}" maxlength="128" autocomplete="off" placeholder="personal"></label><label class="field"><span class="field-label">Authentication</span><select data-account-new-field="authKind"><option value="api_key"${draft.authKind === "api_key" ? " selected" : ""}>API key</option><option value="oauth"${oauth ? " selected" : ""}>OAuth</option></select></label></div>${oauth ? `<p class="callout">Save the account first, then choose a supported browser, device, or client-credentials flow. OAuth secrets stay in Pooler’s encrypted store.</p>` : `<label class="field"><span class="field-label">One-time provider secret</span><input data-account-new-field="secret" type="password" value="${esc(draft.secret)}" autocomplete="new-password" spellcheck="false" placeholder="Cleared immediately after save"></label><p class="muted">The value is sent once to the managed secret endpoint, replaced by an opaque reference, and cleared from this tab immediately.</p>`}<div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-account-new-action="create"${draft.busy || !draft.provider ? " disabled" : ""}>Create account</button></div></section>`;
+    return `<section class="panel" aria-labelledby="account-create-title"><div class="panel-head"><div><h2 class="panel-title" id="account-create-title">Add an account</h2><p class="muted">Each login or API key is an independent account with its own health and limits. Add another account later for automatic failover.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Provider</span><select data-account-new-field="provider"${providerId ? " disabled" : ""}>${providers.map((provider) => `<option value="${esc(provider.id)}"${provider.id === draft.provider ? " selected" : ""}>${esc(provider.id)}</option>`).join("")}</select></label><label class="field"><span class="field-label">Account name</span><input data-account-new-field="id" value="${esc(draft.id)}" maxlength="128" autocomplete="off" placeholder="Personal" aria-describedby="account-name-help"></label>${authMethods.length > 1 ? `<label class="field"><span class="field-label">Sign in with</span><select data-account-new-field="authKind">${authMethods.map((method) => `<option value="${esc(method)}"${method === draft.authKind ? " selected" : ""}>${method === "oauth" ? "Browser or device login" : "API key"}</option>`).join("")}</select></label>` : `<div class="field"><span class="field-label">Sign in with</span><strong>${oauth ? "Browser or device login" : "API key"}</strong></div>`}</div><p class="muted" id="account-name-help">Use a memorable name such as Personal, Work, or Team 2.</p>${oauth ? `<p class="callout">Add the account, then Pooler will show the sign-in methods supported by this provider. Tokens stay encrypted inside Pooler.</p>` : `<label class="field"><span class="field-label">API key</span><input data-account-new-field="secret" type="password" value="${esc(draft.secret)}" autocomplete="new-password" spellcheck="false" placeholder="Paste once; it is cleared immediately"></label><p class="muted">Pooler stores the key encrypted and clears it from this page immediately.</p>`}<div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-account-new-action="create"${draft.busy || !draft.provider ? " disabled" : ""}>Add account</button></div></section>`;
   }
 
   function bindAccountCreate(root) {
@@ -1309,24 +1415,78 @@
 
   function renderProviders(root) {
     const providers = graphProviders();
+    const templates = controlGraph().provider_templates || [];
     const selectedId = state.onboarding.provider;
-    const selected = providers.find((provider) => provider.id === selectedId);
+    const selected = providers.find((provider) => provider.id === selectedId)
+      || (state.onboarding.providerDetails?.id === selectedId ? state.onboarding.providerDetails : null);
     const cards = providers.map((provider) => {
       const accounts = providerAccounts(provider.id);
-      return `<article class="panel provider-instance-card" data-provider-instance="${esc(provider.id)}"><div class="toolbar"><h2 class="panel-title">${providerCell(provider.id, false)}</h2><span class="spacer"></span>${statusBadge(accounts.length ? "connected" : "needs account", accounts.length ? "success" : "warning")}</div><dl class="detail-grid"><div><dt>Instance</dt><dd class="mono">${esc(provider.instance_id || provider.id)}</dd></div><div><dt>Origin</dt><dd class="mono">${esc(provider.origin || provider.base_url)}</dd></div><div><dt>Accounts</dt><dd>${fmtInt(accounts.length)} independent</dd></div><div><dt>Pools</dt><dd>${fmtInt(provider.pools)} optional</dd></div></dl><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-onboarding-provider="${esc(provider.id)}">${accounts.length ? "Add account" : "Connect account"}</button><a class="btn btn-outline btn-sm" href="#/accounts?provider=${encodeURIComponent(provider.id)}">View accounts</a></div></article>`;
+      const template = templates.find((candidate) => candidate.id === provider.id)
+        || templates.find((candidate) => candidate.id === provider.known_provider);
+      const name = template?.name || provider.id;
+      return `<article class="panel provider-card" data-provider="${esc(provider.id)}"><div class="toolbar"><h2 class="panel-title">${providerCell(template?.id || provider.id, false)} ${esc(name)}</h2><span class="spacer"></span>${statusBadge(accounts.length ? "connected" : "add an account", accounts.length ? "success" : "warning")}</div><dl class="detail-grid"><div><dt>Accounts</dt><dd>${fmtInt(accounts.length)}</dd></div><div><dt>Automatic failover groups</dt><dd>${fmtInt(provider.pools)}</dd></div></dl><details><summary>Advanced details</summary><dl class="detail-grid"><div><dt>Connection ID</dt><dd class="mono">${esc(provider.id)}</dd></div><div><dt>Provider API</dt><dd class="mono">${esc(provider.origin || provider.base_url)}</dd></div></dl></details><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-onboarding-provider="${esc(provider.id)}">${accounts.length ? "Add another account" : "Add account"}</button><a class="btn btn-outline btn-sm" href="#/accounts?provider=${encodeURIComponent(provider.id)}">Manage accounts</a></div></article>`;
     }).join("");
     const onboarding = selected
-      ? `<section class="panel onboarding-panel" aria-labelledby="onboarding-title"><div class="toolbar"><h2 class="panel-title" id="onboarding-title">Connect ${providerCell(selected.id, false)}</h2><span class="spacer"></span><button class="btn btn-ghost btn-xs" type="button" data-onboarding-action="close">Close</button></div><ol class="check-list onboarding-steps"><li class="badge badge-success">1 · Provider instance selected</li><li class="${["account", "auth"].includes(state.onboarding.phase) ? "badge-accent" : "badge-neutral"}">2 · Account and authentication</li><li class="${state.onboarding.phase === "models" ? "badge-accent" : "badge-neutral"}">3 · Verified model discovery</li><li class="${state.onboarding.phase === "review" ? "badge-accent" : "badge-neutral"}">4 · Review exposure</li></ol>${state.onboarding.phase === "account" ? accountForm(selected.id) : state.onboarding.phase === "auth" ? onboardingAuthPanel(selected) : state.onboarding.phase === "models" ? discoveryPanel(selected) : state.onboarding.phase === "review" ? modelReviewPanel() : `<p class="muted">Select an account to continue.</p>`}</section>`
+      ? `<section class="panel onboarding-panel" aria-labelledby="onboarding-title"><div class="toolbar"><h2 class="panel-title" id="onboarding-title">Finish connecting ${esc(templates.find((template) => template.id === selected.known_provider)?.name || selected.id)}</h2><span class="spacer"></span><button class="btn btn-ghost btn-xs" type="button" data-onboarding-action="close">Close</button></div><ol class="check-list onboarding-steps"><li class="badge badge-success">1 · Provider</li><li class="${["account", "auth"].includes(state.onboarding.phase) ? "badge-accent" : "badge-neutral"}">2 · Account</li><li class="${state.onboarding.phase === "models" ? "badge-accent" : "badge-neutral"}">3 · Find models</li><li class="${state.onboarding.phase === "review" ? "badge-accent" : "badge-neutral"}">4 · Choose models</li></ol>${state.onboarding.phase === "account" ? accountForm(selected.id) : state.onboarding.phase === "auth" ? onboardingAuthPanel(selected) : state.onboarding.phase === "models" ? discoveryPanel(selected) : state.onboarding.phase === "review" ? modelReviewPanel() : `<p class="muted">Add an account to continue.</p>`}</section>`
       : "";
-    root.innerHTML = `${viewHeader("Providers", views.providers.subtitle, `<button class="btn btn-primary btn-sm" type="button" data-provider-action="show-form">Add provider instance</button>`)}${draftBar()}${state.providerDraft.visible ? providerInstanceForm() : ""}${onboarding}${cards ? `<section class="section"><div class="toolbar"><h2 class="section-title">Configured instances</h2><span class="section-hint">Same-origin instances remain separate by ID.</span></div><div class="grid-2">${cards}</div></section>` : `<div class="panel empty-state"><p class="empty-title">No provider instances yet</p><p class="empty-description">Add the first provider instance to begin account authentication and verified model discovery.</p></div>`}`;
+    root.innerHTML = `${viewHeader("Providers", views.providers.subtitle, `<span class="button-row"><button class="btn btn-primary btn-sm" type="button" data-provider-action="show-form">Add built-in provider</button><button class="btn btn-outline btn-sm" type="button" data-provider-action="show-custom">Add custom provider</button></span>`)}${draftBar()}<div class="callout callout-info"><strong>Protocol support is automatic.</strong> Choose a provider; Pooler uses the correct API format. There are no adapters to enable.</div>${state.providerDraft.visible ? providerForm() : ""}${onboarding}${cards ? `<section class="section"><div class="toolbar"><h2 class="section-title">Your providers</h2><span class="section-hint">Add more accounts to increase capacity or provide failover.</span></div><div class="grid-2">${cards}</div></section>` : `<div class="panel empty-state"><p class="empty-title">No providers connected</p><p class="empty-description">Choose a built-in provider or add a custom provider.</p></div>`}`;
     bindAccountCreate(root);
   }
 
   function discoveryPanel(provider) {
+    const details = state.onboarding.providerDetails?.id === provider.id
+      ? state.onboarding.providerDetails
+      : provider;
+    if (details.model_discovery === false || (!details.known_provider && details.native?.kind === "openai_compatible")) {
+      return manualModelPanel(provider);
+    }
     const discovered = graphModels();
     const matching = discovered.filter((model) => (model.targets || []).some((target) => target.provider === provider.id));
     const models = matching.length || !state.onboarding.providerDetails ? matching : discovered;
-    return `<section class="panel" aria-labelledby="discovery-title"><h2 class="panel-title" id="discovery-title">Verified model discovery</h2><p class="muted">After account authentication, Pooler reads the provider’s bounded model list. No inference request is sent.</p><p class="callout">${models.length ? `${fmtInt(models.length)} verified model${models.length === 1 ? "" : "s"} available.` : "No verified models are available yet."}</p><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-onboarding-action="discover"${state.onboarding.discoveryBusy ? " disabled aria-busy=\"true\"" : ""}>${state.onboarding.discoveryBusy ? "Discovering…" : "Discover verified models"}</button>${models.length ? `<button class="btn btn-outline btn-sm" type="button" data-onboarding-action="review">Review models</button>` : ""}</div></section>`;
+    return `<section class="panel" aria-labelledby="discovery-title"><h2 class="panel-title" id="discovery-title">Verified model discovery</h2><p class="muted">After account authentication, Pooler reads the provider’s bounded model list. No inference request is sent.</p><p class="callout">${models.length ? `${fmtInt(models.length)} verified model${models.length === 1 ? "" : "s"} available.` : "No verified models are available yet."}</p><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-onboarding-action="discover"${state.onboarding.discoveryBusy ? " disabled aria-busy=\"true\"" : ""}>${state.onboarding.discoveryBusy ? "Discovering…" : "Find models"}</button>${models.length ? `<button class="btn btn-outline btn-sm" type="button" data-onboarding-action="review">Review models</button>` : ""}</div></section>`;
+  }
+
+  function manualModelPanel(provider) {
+    return `<section class="panel" aria-labelledby="manual-model-title"><h2 class="panel-title" id="manual-model-title">Add the provider’s models</h2><p class="muted">This custom provider does not publish a model list Pooler can verify. Enter the exact model IDs from the provider.</p><label class="field"><span class="field-label">Model IDs</span><input data-provider-field="modelIds" value="${esc(state.providerDraft.modelIds)}" maxlength="4096" autocomplete="off" placeholder="model-a, model-b"></label><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-onboarding-action="save-manual-models">Create models and endpoints</button></div><details><summary>Advanced details</summary><p class="mono">Provider: ${esc(provider.id)} · account: ${esc(state.onboarding.account)}</p></details></section>`;
+  }
+
+  async function saveManualModels() {
+    const provider = state.onboarding.provider;
+    const account = state.onboarding.account;
+    const models = csvValues(state.providerDraft.modelIds);
+    if (!provider || !account || !models.length || models.length > 256) {
+      notify("error", "Enter at least one valid model ID.");
+      return;
+    }
+    if (models.some((model) => model.length > 256 || /\s|[\u0000-\u001f\u007f]/u.test(model))) {
+      notify("error", "Model IDs cannot contain spaces or control characters.");
+      return;
+    }
+    try {
+      for (const [index, model] of [...new Set(models)].entries()) {
+        await applyControlResource("models", {
+          id: model,
+          targets: [{
+            id: `manual-target-${index + 1}`,
+            provider,
+            account,
+            priority: 1,
+            upstream_model: model,
+            capabilities: ["text", "streaming"],
+            codecs: ["openai"],
+            wire_family: "openai",
+          }],
+        });
+      }
+      await ensureStandardRoutes(provider);
+      await saveControlChanges();
+      state.providerDraft.modelIds = "";
+      state.onboarding.phase = "review";
+      notify("success", "Custom models and standard Pooler endpoints are ready.");
+    } catch (error) {
+      if (error.status === 401) authRequired();
+      else if (error.status !== 409) notify("error", error.message);
+    }
   }
 
   function onboardingAuthPanel(provider) {
@@ -1334,6 +1494,47 @@
     const panel = accountOAuthPanel(account);
     if (!state.oauthCapabilities[account.id]) loadOAuthCapabilities(account.id).then(() => renderCurrentViewIfVisible());
     return `${panel}<div class="button-row"><button class="btn btn-outline btn-sm" type="button" data-onboarding-action="continue-models">Continue to verified model discovery</button></div>`;
+  }
+
+  function normalizedId(label, fallback) {
+    return String(label || fallback)
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[^a-z0-9]+/gu, "-")
+      .replace(/^-+|-+$/gu, "")
+      .slice(0, 112) || fallback;
+  }
+
+  function availableId(label, fallback, used) {
+    const base = normalizedId(label, fallback);
+    if (!used.has(base)) return base;
+    for (let suffix = 2; suffix < 10_000; suffix += 1) {
+      const candidate = `${base}-${suffix}`;
+      if (!used.has(candidate)) return candidate;
+    }
+    return `${base}-${Date.now()}`;
+  }
+
+  function availableProviderId(label) {
+    return availableId(
+      label,
+      "provider",
+      new Set(graphProviders().map((provider) => provider.id)),
+    );
+  }
+
+  function availablePoolId(label) {
+    return availableId(
+      label,
+      "failover-group",
+      new Set(graphPools().map((pool) => pool.id)),
+    );
+  }
+
+  function browserOAuthCallback() {
+    const managementBase = (state.data.endpointInventory || controlGraph().endpoints || {}).management?.base_urls?.[0];
+    const base = managementBase || window.location.origin;
+    return new URL("/management/oauth/browser/callback", base).toString();
   }
 
   function ensureSelectedModels(models) {
@@ -1349,26 +1550,47 @@
   function modelReviewPanel() {
     const models = graphModels();
     ensureSelectedModels(models);
-    return `<section class="panel" aria-labelledby="model-review-title"><div class="toolbar"><div><h2 class="panel-title" id="model-review-title">Review verified models</h2><p class="muted">Models are initially exposed. Exclude only the ones this dashboard should hide.</p></div><span class="spacer"></span><button class="btn btn-outline btn-xs" type="button" data-model-selection="all">Select all</button><button class="btn btn-outline btn-xs" type="button" data-model-selection="none">Select none</button></div><div class="model-review-list">${models.map((model) => `<label class="model-review-row"><input type="checkbox" data-model-selection-id="${esc(model.id)}"${state.onboarding.selectedModels.has(model.id) ? " checked" : ""}><span class="mono">${esc(model.id)}</span><span class="muted">${fmtInt((model.targets || []).length)} target${(model.targets || []).length === 1 ? "" : "s"}</span></label>`).join("") || `<div class="empty-state"><p class="empty-title">No verified models</p><p class="empty-description">Run discovery after connecting the account.</p></div>`}</div><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-onboarding-action="save-models"${!models.length ? " disabled" : ""}>Save model exposure</button></div></section>`;
+    return `<section class="panel" aria-labelledby="model-review-title"><div class="toolbar"><div><h2 class="panel-title" id="model-review-title">Choose models</h2><p class="muted">Selected models will be available to your apps.</p></div><span class="spacer"></span><button class="btn btn-outline btn-xs" type="button" data-model-selection="all">Select all</button><button class="btn btn-outline btn-xs" type="button" data-model-selection="none">Select none</button></div><div class="model-review-list">${models.map((model) => `<label class="model-review-row"><input type="checkbox" data-model-selection-id="${esc(model.id)}"${state.onboarding.selectedModels.has(model.id) ? " checked" : ""}><span class="mono">${esc(model.id)}</span><span class="muted">${fmtInt((model.targets || []).length)} provider${(model.targets || []).length === 1 ? "" : "s"}</span></label>`).join("") || `<div class="empty-state"><p class="empty-title">No models found</p><p class="empty-description">Try finding models again after signing in.</p></div>`}</div><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-onboarding-action="save-models"${!models.length ? " disabled" : ""}>Save models</button></div></section>`;
   }
 
-  async function createProviderInstance() {
+  async function createProvider() {
     const draft = state.providerDraft;
-    if (!draft.id.trim() || !/^https?:\/\/[^\s]+$/u.test(draft.origin.trim())) {
-      notify("error", "Enter an instance ID and a valid http(s) base URL.");
+    const templates = controlGraph().provider_templates || [];
+    const custom = draft.template === "__custom";
+    const selected = templates.find((template) => template.id === draft.template);
+    if (!custom && !selected) {
+      notify("error", "Choose a provider.");
       return;
     }
+    if (custom && (!draft.name.trim() || !/^https?:\/\/[^\s]+$/u.test(draft.origin.trim()))) {
+      notify("error", "Enter a provider name and its valid HTTPS API URL.");
+      return;
+    }
+    if (selected?.dynamic_origin && (!/^https:\/\/[^\s]+$/u.test(draft.origin.trim()) || !draft.clientId.trim())) {
+      notify("error", "Enter the Foundry enrollment URL and OAuth client ID.");
+      return;
+    }
+    const id = availableProviderId(custom ? draft.name : selected.id);
+    const resource = custom
+      ? { id, url: draft.origin.trim(), native: { kind: "openai_compatible" } }
+      : selected.dynamic_origin
+        ? { id, url: draft.origin.trim(), native: { kind: selected.native_kind }, oauth: { client_id: draft.clientId.trim(), scopes: ["api:use-language-models-execute", "offline_access"], callback: browserOAuthCallback() } }
+        : { id, known_provider: selected.known_provider || selected.id, ...(selected.native_config ? { native: { kind: selected.native_kind } } : {}) };
     draft.busy = true;
     try {
-      await applyControlResource("providers", { id: draft.id.trim(), url: draft.origin.trim() });
-      state.onboarding.provider = draft.id.trim();
-      state.onboarding.providerDetails = { id: draft.id.trim(), instance_id: draft.id.trim(), origin: draft.origin.trim(), base_url: draft.origin.trim(), accounts: 0, pools: 0 };
+      await applyControlResource("providers", resource);
+      state.onboarding.provider = id;
+      const origin = custom || selected.dynamic_origin ? draft.origin.trim() : selected.base_url;
+      state.onboarding.providerDetails = { id, instance_id: id, known_provider: custom ? null : selected.known_provider || selected.id, origin, base_url: origin, auth_methods: custom ? ["api_key"] : selected.auth_methods, accounts: 0, pools: 0, model_discovery: custom ? false : selected.model_discovery, endpoint_families: custom ? ["models", "chat_completions"] : selected.endpoint_families };
       state.onboarding.phase = "account";
       state.providerDraft.visible = false;
       draft.id = "";
+      draft.name = "";
       draft.origin = "";
+      draft.clientId = "";
+      draft.modelIds = custom ? draft.modelIds : "";
       draft.busy = false;
-      notify("success", "Provider instance staged. Add its first account, then review the draft before committing.");
+      notify("success", `${custom ? "Custom provider" : selected.name} is staged. Add an account to continue.`);
       renderProviders($("#view"));
     } catch (error) {
       draft.busy = false;
@@ -1380,7 +1602,7 @@
   async function createStructuredAccount(oneTimeSecret = "") {
     const draft = state.accountDraft;
     if (!draft.id.trim() || !draft.provider) {
-      notify("error", "Choose a provider instance and enter an account ID.");
+      notify("error", "Choose a provider and enter an account name.");
       return;
     }
     draft.busy = true;
@@ -1393,6 +1615,7 @@
         if (!managedReference) throw new Error("Managed secret storage did not return an opaque reference.");
       }
       await applyControlResource("accounts", { id: draft.id.trim(), provider: draft.provider, auth_kind: draft.authKind, ...(managedReference ? { secret: managedReference } : {}) });
+      await saveControlChanges();
       state.onboarding.account = draft.id.trim();
       state.onboarding.phase = draft.authKind === "oauth" ? "auth" : "models";
       draft.id = "";
@@ -1413,10 +1636,12 @@
     if (state.onboarding.discoveryBusy) return;
     state.onboarding.discoveryBusy = true;
     try {
-      await mutate("/models/reload");
+      const result = await mutate("/models/reload");
+      await waitForModelReload(result.request_id);
       await refreshCurrentView();
       state.onboarding.phase = "review";
       renderProviders($("#view"));
+      notify("success", "Models found. Choose which ones Pooler should make available.");
     } catch (error) {
       if (error.status === 401) authRequired();
       else notify("error", `Model discovery failed: ${error.message}`);
@@ -1430,7 +1655,27 @@
     if (!models.length) return;
     try {
       const discovery = controlGraph().discovery || {};
-      const sources = discovery.sources || state.data.catalog?.sources || [];
+      const sources = (discovery.sources || state.data.catalog?.sources || []).map((source) => {
+        const config = {};
+        for (const key of [
+          "id",
+          "provider",
+          "account",
+          "account_pool",
+          "parser",
+          "path",
+          "max_response_bytes",
+          "model_facts_provider",
+          "prefix",
+          "priority",
+          "aliases",
+          "included_models",
+          "excluded_models",
+        ]) {
+          if (source[key] !== undefined && source[key] !== null) config[key] = source[key];
+        }
+        return config;
+      });
       const overrides = models
         .filter((model) => !state.onboarding.selectedModels.has(model.id))
         .map((model) => ({ model: model.id, disabled: true }));
@@ -1443,8 +1688,13 @@
       );
       draft.etag = result.etag || draft.etag;
       draft.dirty = true;
-      notify("success", "Model exposure is staged in the structured draft.");
-      await refreshCurrentView();
+      const providerId = state.onboarding.provider
+        || models.flatMap((model) => model.targets || []).find((target) => target.provider)?.provider
+        || "";
+      await ensureStandardRoutes(providerId);
+      await saveControlChanges();
+      state.onboarding.phase = "review";
+      notify("success", "Models and standard Pooler endpoints are ready.");
     } catch (error) {
       if (error.status === 401) authRequired();
       else if (error.status === 409) {
@@ -1452,6 +1702,134 @@
         notify("warning", "The model exposure draft is out of date. Reload current state before retrying.", { sticky: true });
       }
       else if (error.status !== 409) notify("error", error.message);
+    }
+  }
+
+  async function ensureStandardRoutes(providerId) {
+    const graph = controlGraph();
+    const provider = graphProviders().find((item) => item.id === providerId)
+      || (state.onboarding.providerDetails?.id === providerId ? state.onboarding.providerDetails : null);
+    if (!provider) return;
+    const templates = graph.provider_templates || [];
+    const template = templates.find((item) => item.id === provider.id)
+      || templates.find((item) => item.id === provider.known_provider)
+      || (state.onboarding.providerDetails?.id === provider.id ? state.onboarding.providerDetails : null);
+    const families = new Set(template?.endpoint_families || []);
+    if (!families.size) return;
+    if (!(graph.policies || []).some((policy) => policy.id === "default")) {
+      await applyControlResource("policies", {
+        id: "default",
+        selection: { strategy: "ordered_fallback" },
+        retry: {
+          maximum_attempts: 3,
+          maximum_credentials: 3,
+          maximum_upstreams: 3,
+          statuses: [408, 429, 500, 502, 503, 504],
+          before_commit_only: true,
+          base_delay: "25ms",
+          maximum_delay: "250ms",
+          maximum_total_delay: "2s",
+        },
+        routing: { allow_fallbacks: true },
+      });
+    }
+    const routeIds = new Set((graph.routes || []).map((route) => route.id));
+    const jsonLimits = {
+      max_request_body_bytes: 8_388_608,
+      max_response_body_bytes: 8_388_608,
+      max_frame_bytes: 2_097_152,
+      max_event_bytes: 2_097_152,
+      max_queue_bytes: 4_194_304,
+      max_queue_items: 256,
+      request_timeout: "10m",
+      connect_timeout: "10s",
+    };
+    const patchIngress = { mode: "patch", inspectors: ["inspect.openai.model"] };
+    if (!routeIds.has("standard-models")) {
+      await applyControlResource("routes", {
+        id: "standard-models",
+        listen: "inference",
+        match: { methods: ["GET"], path: "/v1/models" },
+        limits: { max_request_body_bytes: 65_536 },
+        serve: "model_catalog",
+        ingress: { mode: "opaque" },
+        target: { provider: providerId, endpoint_family: "models" },
+        response: { mode: "opaque" },
+      });
+    }
+    if (families.has("chat_completions") && !routeIds.has("standard-chat-completions")) {
+      await applyControlResource("routes", {
+        id: "standard-chat-completions",
+        listen: "inference",
+        match: {
+          methods: ["POST"],
+          path: "/v1/chat/completions",
+          content_types: ["application/json"],
+        },
+        limits: jsonLimits,
+        ingress: patchIngress,
+        target: {
+          provider: providerId,
+          model_from: "request.model",
+          policy: "default",
+          endpoint_family: "chat_completions",
+        },
+        response: { mode: "opaque" },
+      });
+    }
+    if (families.has("responses") && !routeIds.has("standard-responses")) {
+      const route = {
+        id: "standard-responses",
+        listen: "inference",
+        match: {
+          methods: ["POST"],
+          path: "/v1/responses",
+          content_types: ["application/json"],
+        },
+        limits: jsonLimits,
+        ingress: patchIngress,
+        target: {
+          provider: providerId,
+          model_from: "request.model",
+          policy: "default",
+          endpoint_family: "responses",
+        },
+        response: { mode: "opaque" },
+      };
+      if (provider.native?.kind === "codex") {
+        route.ingress = {
+          mode: "semantic",
+          decoder: "decode.openai.responses",
+          encoder: "encode.openai.responses",
+        };
+        route.response = {
+          mode: "semantic",
+          decoder: "decode.openai.responses.events",
+          encoder: "encode.openai.responses.events",
+        };
+        route.loss_policy = "reject";
+      }
+      await applyControlResource("routes", route);
+    }
+    if (families.has("messages") && !routeIds.has("standard-messages")) {
+      await applyControlResource("routes", {
+        id: "standard-messages",
+        listen: "inference",
+        match: {
+          methods: ["POST"],
+          path: "/v1/messages",
+          content_types: ["application/json"],
+        },
+        limits: jsonLimits,
+        ingress: patchIngress,
+        target: {
+          provider: providerId,
+          model_from: "request.model",
+          policy: "default",
+          endpoint_family: "messages",
+        },
+        response: { mode: "opaque" },
+      });
     }
   }
 
@@ -1624,263 +2002,6 @@
     return `<button class="switch" type="button" role="switch" aria-checked="${enabled}" aria-label="${enabled ? "Hide" : "Expose"} model ${esc(model.id)} from clients" aria-busy="${pending}" data-model-action="${action}" data-model-id="${esc(model.id)}" title="${enabled ? "Exposed to clients" : "Hidden from clients"} — ${esc(model.id)}"${pending ? " disabled" : ""}><span class="switch-thumb"></span></button>`;
   }
 
-  function renderModels(root) {
-    const payload = state.data.models || {};
-    const mutationCapable =
-      payload.mutation_capable === true && !state.errors.models;
-    const catalog = state.data.catalog || {};
-    const allModels = payload.models || [];
-    let models = allModels;
-    const sources = payload.catalog_sources || catalog.sources || [];
-    const overrides = payload.model_overrides || {};
-
-    const providerCounts = new Map();
-    for (const model of allModels) {
-      for (const target of model.targets || []) {
-        providerCounts.set(
-          target.provider,
-          (providerCounts.get(target.provider) || 0) + 1,
-        );
-      }
-    }
-    const railProviders = [...providerCounts.entries()].sort(
-      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
-    );
-
-    if (state.modelsProvider) {
-      models = models.filter((m) =>
-        (m.targets || []).some((t) => t.provider === state.modelsProvider),
-      );
-    }
-
-    if (state.filter) {
-      const needle = state.filter.toLowerCase();
-      models = models.filter(
-        (m) =>
-          String(m.id).toLowerCase().includes(needle) ||
-          (m.targets || []).some((t) =>
-            `${t.provider} ${t.upstream_model}`.toLowerCase().includes(needle),
-          ),
-      );
-    }
-
-    const configured = (payload.models || []).filter(
-      (m) => m.selection_origin === "configured",
-    ).length;
-    const discovered = (payload.models || []).length - configured;
-
-    const stats = [
-      statCard(
-        "Published",
-        `<span class="num">${fmtInt((payload.models || []).length)}</span>`,
-        "Merged model view",
-      ),
-      statCard(
-        "Configured",
-        `<span class="num">${fmtInt(configured)}</span>`,
-        "Declared in config",
-      ),
-      statCard(
-        "Discovered",
-        `<span class="num">${fmtInt(discovered)}</span>`,
-        "From catalog sources",
-      ),
-      statCard(
-        "Catalog sources",
-        `<span class="num">${fmtInt(sources.length)}</span>`,
-        catalog.catalog_generation
-          ? `catalog gen ${esc(catalog.catalog_generation)}`
-          : "No catalog runtime",
-      ),
-    ].join("");
-
-    const modelTable = tableWrap(
-      [
-        {
-          label: "Exposed",
-          render: (m) => modelExposureSwitch(m, mutationCapable),
-        },
-        {
-          label: "Model",
-          mono: true,
-          nowrap: false,
-          render: (m) => providerCell(m.id),
-        },
-        {
-          label: "Targets",
-          nowrap: false,
-          render: (m) =>
-            (m.targets || [])
-              .map(
-                (t) =>
-                  `<div class="inline-meta target-row">${providerCell(t.provider)}<span class="muted">→</span><span class="mono">${esc(text(t.upstream_model))}</span></div>`,
-              )
-              .join("") || "—",
-        },
-        {
-          label: "Capabilities",
-          nowrap: false,
-          render: (m) => {
-            const caps = [
-              ...new Set(
-                (m.targets || []).flatMap((t) => t.capabilities || []),
-              ),
-            ];
-            return caps.length
-              ? caps.map((c) => `<span class="chip">${esc(c)}</span>`).join(" ")
-              : "—";
-          },
-        },
-        {
-          label: "Origin",
-          render: (m) =>
-            `<span class="badge ${m.selection_origin === "configured" ? "badge-accent" : "badge-neutral"}">${esc(text(m.selection_origin || "discovered"))}</span>`,
-        },
-      ],
-      models,
-      {
-        loading: state.loading && !state.data.models,
-        error: endpointError("models"),
-        emptyTitle:
-          state.filter || state.modelsProvider
-            ? "No models match the current filters"
-            : "No published models",
-        emptyDescription:
-          state.filter || state.modelsProvider
-            ? ""
-            : "Configure models or catalog sources, then reload.",
-      },
-    );
-
-    const sourceTable = tableWrap(
-      [
-        { label: "Source", mono: true, render: (s) => esc(s.id) },
-        {
-          label: "Provider",
-          mono: true,
-          render: (s) => providerCell(s.provider),
-        },
-        { label: "Parser", render: (s) => esc(text(s.parser)) },
-        { label: "Prefix", mono: true, render: (s) => esc(text(s.prefix)) },
-        {
-          label: "Priority",
-          align: "right",
-          render: (s) => `<span class="num">${fmtInt(s.priority)}</span>`,
-        },
-        {
-          label: "Aliases",
-          align: "right",
-          render: (s) =>
-            `<span class="num">${fmtInt((s.aliases || []).length)}</span>`,
-        },
-        {
-          label: "State",
-          nowrap: false,
-          render: (s) => renderSourceState(s.state),
-        },
-      ],
-      sources,
-      {
-        loading: state.loading && !state.data.models,
-        error: endpointError("catalog"),
-        emptyTitle: "No catalog sources",
-        emptyDescription:
-          "Discovery sources appear here when a model catalog is configured.",
-      },
-    );
-
-    const aliasRows = sources.flatMap((s) =>
-      (s.aliases || []).map((a) => ({ ...a, source: s.id })),
-    );
-    const aliasTable = aliasRows.length
-      ? tableWrap(
-          [
-            {
-              label: "Upstream ID",
-              mono: true,
-              nowrap: false,
-              render: (a) => esc(a.name),
-            },
-            {
-              label: "Public alias",
-              mono: true,
-              nowrap: false,
-              render: (a) => esc(a.alias),
-            },
-            { label: "Display name", render: (a) => esc(text(a.display_name)) },
-            { label: "Source", mono: true, render: (a) => esc(a.source) },
-            {
-              label: "Fork",
-              render: (a) => (a.fork ? `<span class="chip">fork</span>` : "—"),
-            },
-          ],
-          aliasRows,
-          {},
-        )
-      : "";
-
-    const disabledOverrides = overrides.disabled_models || [];
-    const unmatchedOverrides = overrides.unmatched_models || [];
-    const overrideBlock =
-      disabledOverrides.length || unmatchedOverrides.length
-        ? `
-      <div class="panel">
-        <div class="toolbar"><h2 class="section-title">Catalog overrides</h2></div>
-        ${disabledOverrides.length ? `<p class="section-hint spaced-top-sm">Disabled by override</p><div class="inline-meta">${disabledOverrides.map((m) => `<span class="chip mono">${esc(m)}</span>`).join("")}</div>` : ""}
-        ${unmatchedOverrides.length ? `<p class="section-hint spaced-top-sm">Unmatched overrides</p><div class="inline-meta">${unmatchedOverrides.map((m) => `<span class="chip mono">${esc(m)}</span>`).join("")}</div>` : ""}
-      </div>`
-        : "";
-
-    const exposedCount = allModels.filter((m) => m.enabled !== false).length;
-    const railItem = (provider, label, count, logo) => {
-      const active = state.modelsProvider === provider;
-      return `<button class="rail-item${active ? " active" : ""}" type="button" data-models-provider="${esc(provider)}"${active ? ' aria-current="true"' : ""}>${logo}<span class="rail-label">${esc(label)}</span><span class="rail-count num">${fmtInt(count)}</span></button>`;
-    };
-    const rail = `
-      <nav class="model-rail" aria-label="Filter models by provider">
-        ${railItem("", "All models", allModels.length, ic("list", 15))}
-        ${railProviders
-          .map(([provider, count]) =>
-            railItem(provider, provider, count, brand(provider, 15)),
-          )
-          .join("")}
-      </nav>`;
-
-    const modelsHeading = state.modelsProvider
-      ? `Models · ${state.modelsProvider}`
-      : "Published models";
-    const modelsHint = mutationCapable
-      ? `${fmtInt(exposedCount)} of ${fmtInt(allModels.length)} exposed to clients. Toggling a model off hides it from every listener immediately; durable policy belongs in catalog overrides.`
-      : "Enablement is a runtime control; durable policy belongs in catalog overrides.";
-
-    root.innerHTML = `
-      ${viewHeader(
-        "Models",
-        views.models.subtitle,
-        `
-        <input id="model-filter" class="filter-input" type="search" placeholder="Filter models" value="${esc(state.filter)}" aria-label="Filter models">
-        ${mutationCapable ? `<button class="btn btn-outline btn-sm" type="button" data-action="reload-models" title="Refresh configured catalog sources"${state.pending.has("/models/reload") ? ` disabled aria-busy="true"` : ""}>${ic("refresh-double", 15)} Reload catalog</button>` : `<span class="section-hint">Authenticated mutations are unavailable.</span>`}`,
-      )}
-      <section class="grid-stats grid-stats-4">${stats}</section>
-      <div class="models-layout">
-        ${rail}
-        ${section(modelsHeading, modelTable, modelsHint)}
-      </div>
-      ${section("Catalog sources", sourceTable)}
-      ${aliasTable ? section("Aliases", aliasTable) : ""}
-      ${overrideBlock}`;
-
-    const filter = $("#model-filter", root);
-    filter.addEventListener("input", () => {
-      state.filter = filter.value;
-      const pos = filter.selectionStart;
-      renderModels(root);
-      const again = $("#model-filter", root);
-      again.focus();
-      again.setSelectionRange(pos, pos);
-    });
-  }
-
   function renderSourceState(sourceState) {
     if (!sourceState) return `<span class="muted">—</span>`;
     if (typeof sourceState === "string") return statusBadge(sourceState);
@@ -1894,7 +2015,7 @@
 
   function renderModels(root) {
     const graph = controlGraph();
-    const models = graph.models || state.data.models?.models || [];
+    const models = graphModels();
     const discovery = graph.discovery || {};
     const selected = new Set(state.onboarding.selectedModels);
     if (!state.onboarding.modelsInitialized && models.length) {
@@ -1902,11 +2023,24 @@
       state.onboarding.selectedModels = selected;
       state.onboarding.modelsInitialized = true;
     }
-    const ordered = graph.effective_order || [];
-    const rows = models.map((model) => `<div class="model-review-row"><label><input type="checkbox" data-model-selection-id="${esc(model.id)}"${selected.has(model.id) ? " checked" : ""}><span class="mono">${esc(model.id)}</span></label><span class="muted">${fmtInt((model.targets || []).length)} target${(model.targets || []).length === 1 ? "" : "s"}</span><span class="spacer"></span><span class="badge ${selected.has(model.id) ? "badge-success" : "badge-neutral"}">${selected.has(model.id) ? "exposed" : "hidden"}</span></div>`).join("");
-    const targetSections = models.map((model) => `<section class="panel target-model-panel" data-target-model-panel="${esc(model.id)}"><div class="toolbar"><div><h2 class="panel-title mono">${esc(model.id)}</h2><p class="muted">Provider, account or pool, upstream model, capabilities, health, quota, and numeric priority are all visible. Lower tiers fail over only before commitment.</p></div><span class="spacer"></span><span class="badge badge-neutral">${fmtInt((model.targets || []).length)} targets</span></div>${renderTargetRows(model)}</section>`).join("");
-    const effectivePreview = ordered.map((entry) => `<section class="panel-flat"><h3 class="section-title mono">${esc(entry.model)}</h3><p class="muted">${(entry.candidates || []).map((candidate) => `${esc(candidate.provider)} · tier ${esc(candidate.priority)}${candidate.account ? ` · ${esc(candidate.account)}` : candidate.account_pool ? ` · pool ${esc(candidate.account_pool)}` : ""}`).join(" → ")}</p></section>`).join("");
-    root.innerHTML = `${viewHeader("Models", views.models.subtitle, `<button class="btn btn-outline btn-sm" type="button" data-model-action="discover"${state.pending.has("/models/reload") ? " disabled aria-busy=\"true\"" : ""}>${ic("refresh-double", 15)} Discover verified models</button>`)}${draftBar()}<p id="target-announcement" class="sr-only" aria-live="polite">${esc(state.targetAnnouncement)}</p><section class="grid-stats grid-stats-4">${statCard("Verified", `<span class="num">${fmtInt(models.length)}</span>`, discovery.refreshed_at_unix_ms ? `updated ${esc(relTime(discovery.refreshed_at_unix_ms))}` : "No catalog refresh yet")}${statCard("Exposed", `<span class="num">${fmtInt([...selected].length)}</span>`, "Initially all verified models")}${statCard("Sources", `<span class="num">${fmtInt((discovery.sources || []).length)}</span>`, "Provider model lists")}${statCard("Priority sets", `<span class="num">${fmtInt(ordered.length)}</span>`, "Cross-provider order")}</section><section class="panel" aria-labelledby="model-exposure-title"><div class="toolbar"><div><h2 class="panel-title" id="model-exposure-title">Review exposure</h2><p class="muted">Choose which verified models are exposed. Changes remain in the owned draft until committed.</p></div><span class="spacer"></span><button class="btn btn-outline btn-xs" type="button" data-model-selection="all">Select all</button><button class="btn btn-outline btn-xs" type="button" data-model-selection="none">Select none</button></div><div class="model-review-list">${rows || `<div class="empty-state"><p class="empty-title">No verified models discovered</p><p class="empty-description">Connect an account from Providers, then refresh discovery.</p></div>`}</div><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-model-selection="save"${models.length ? "" : " disabled"}>Save exposure</button></div></section><section class="section" aria-labelledby="target-order-title"><div class="toolbar"><div><h2 class="section-title" id="target-order-title">Ordered targets</h2><span class="section-hint">Drag a row, use numeric priority, move buttons, or Alt+Arrow/Home/End. Combine is an explicit tie only.</span></div><a class="btn btn-outline btn-sm" href="#/pools">Manage optional pools</a></div>${targetSections || `<div class="panel empty-state"><p class="empty-title">No target bindings are configured</p></div>`}</section><section class="panel" aria-labelledby="effective-order-title"><div class="toolbar"><h2 class="panel-title" id="effective-order-title">Effective order preview</h2><span class="badge badge-neutral">runtime evidence</span></div>${effectivePreview || `<p class="empty-description">No effective order is available.</p>`}</section>${renderPolicyControls()}`;
+    const configuredOrder = new Map(
+      (graph.effective_order || []).map((entry) => [entry.model, entry]),
+    );
+    const ordered = models
+      .map((model) => configuredOrder.get(model.id) || {
+        model: model.id,
+        candidates: modelTargets(model).map((target, index) => ({
+          provider: target.provider,
+          account: target.account,
+          account_pool: target.account_pool,
+          priority: Number(target.priority) || index + 1,
+        })),
+      })
+      .filter((entry) => entry.candidates.length);
+    const rows = models.map((model) => `<div class="model-review-row"><label><input type="checkbox" data-model-selection-id="${esc(model.id)}"${selected.has(model.id) ? " checked" : ""}><span class="mono">${esc(model.id)}</span></label><span class="muted">${fmtInt((model.targets || []).length)} provider${(model.targets || []).length === 1 ? "" : "s"}</span><span class="spacer"></span><span class="badge ${selected.has(model.id) ? "badge-success" : "badge-neutral"}">${selected.has(model.id) ? "On" : "Off"}</span></div>`).join("");
+    const targetSections = models.map((model) => `<section class="panel target-model-panel" data-target-model-panel="${esc(model.id)}"><div class="toolbar"><div><h2 class="panel-title mono">${esc(model.id)}</h2><p class="muted">Drag providers into the order Pooler should try them. Providers with the same priority can share traffic.</p></div><span class="spacer"></span><span class="badge badge-neutral">${fmtInt((model.targets || []).length)} providers</span></div>${renderTargetRows(model)}</section>`).join("");
+    const effectivePreview = ordered.map((entry) => `<section class="panel-flat"><h3 class="section-title mono">${esc(entry.model)}</h3><p class="muted">${(entry.candidates || []).map((candidate) => `${esc(candidate.provider)} · priority ${esc(candidate.priority)}${candidate.account ? ` · ${esc(candidate.account)}` : candidate.account_pool ? ` · failover group ${esc(candidate.account_pool)}` : ""}`).join(" → ")}</p></section>`).join("");
+    root.innerHTML = `${viewHeader("Models", views.models.subtitle, `<button class="btn btn-outline btn-sm" type="button" data-model-action="discover"${state.pending.has("/models/reload") ? " disabled aria-busy=\"true\"" : ""}>${ic("refresh-double", 15)} Find models</button>`)}${draftBar()}<p id="target-announcement" class="sr-only" aria-live="polite">${esc(state.targetAnnouncement)}</p><section class="grid-stats grid-stats-4">${statCard("Found", `<span class="num">${fmtInt(models.length)}</span>`, discovery.refreshed_at_unix_ms ? `updated ${esc(relTime(discovery.refreshed_at_unix_ms))}` : "Not checked yet")}${statCard("On", `<span class="num">${fmtInt([...selected].length)}</span>`, "available to apps")}${statCard("Providers", `<span class="num">${fmtInt((discovery.sources || []).length)}</span>`, "providers checked for models")}${statCard("Routing orders", `<span class="num">${fmtInt(ordered.length)}</span>`, "Provider order")}</section><section class="panel" aria-labelledby="model-exposure-title"><div class="toolbar"><div><h2 class="panel-title" id="model-exposure-title">Models available to clients</h2><p class="muted">Turn models on or off. Your changes are reviewed before they are saved.</p></div><span class="spacer"></span><button class="btn btn-outline btn-xs" type="button" data-model-selection="all">Select all</button><button class="btn btn-outline btn-xs" type="button" data-model-selection="none">Select none</button></div><div class="model-review-list">${rows || `<div class="empty-state"><p class="empty-title">No models found</p><p class="empty-description">Add and sign in to a provider, then find models.</p></div>`}</div><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-model-selection="save"${models.length ? "" : " disabled"}>Save model choices</button></div></section><section class="section" aria-labelledby="target-order-title"><div class="toolbar"><div><h2 class="section-title" id="target-order-title">Ordered providers</h2><span class="section-hint">Drag providers into the order you want. Use the same priority when providers should share traffic.</span></div><a class="btn btn-outline btn-sm" href="#/pools">Manage failover</a></div>${targetSections || `<div class="panel empty-state"><p class="empty-title">No providers are assigned to this model</p></div>`}</section><section class="panel" aria-labelledby="effective-order-title"><div class="toolbar"><h2 class="panel-title" id="effective-order-title">What Pooler will try</h2><span class="badge badge-neutral">current order</span></div>${effectivePreview || `<p class="empty-description">No provider order is available.</p>`}</section><details class="panel"><summary><strong>Advanced routing rules</strong> <span class="muted">Filters, privacy, price, and adaptive ranking</span></summary><div class="section">${renderPolicyControls()}</div></details>`;
     root.querySelectorAll("[data-target-row]").forEach((row) => {
       row.addEventListener("dragstart", () => {
         const model = graphModels().find((item) => item.id === row.dataset.targetModel);
@@ -1934,46 +2068,120 @@
     const providers = graphProviders();
     const draft = state.poolDraft;
     const selectedProvider = draft.provider || providers[0]?.id || "";
+    if (!draft.provider) draft.provider = selectedProvider;
     const providerAccountsList = accounts.filter((account) => account.provider === selectedProvider);
-    const poolRows = pools.map((pool) => `<article class="panel"><div class="toolbar"><h2 class="panel-title">${esc(pool.id)}</h2><span class="spacer"></span>${statusBadge(pool.homogeneous ? "homogeneous" : "mixed", pool.homogeneous ? "success" : "warning")}</div><dl class="detail-grid"><div><dt>Provider</dt><dd class="mono">${esc(pool.provider)}</dd></div><div><dt>Strategy</dt><dd>${esc(pool.strategy)}</dd></div><div><dt>Accounts</dt><dd>${(pool.accounts || []).map((id) => `<span class="chip mono">${esc(id)}</span>`).join(" ") || "—"}</dd></div><div><dt>Failover</dt><dd>bounded and before commitment</dd></div></dl></article>`).join("");
-    root.innerHTML = `${viewHeader("Pools", views.pools.subtitle)}${draftBar()}<section class="panel" aria-labelledby="pool-create-title"><div class="panel-head"><div><h2 class="panel-title" id="pool-create-title">Create an optional pool</h2><p class="muted">Pools are homogeneous by provider. Accounts retain independent health and quota state inside the pool.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Pool ID</span><input data-pool-field="id" value="${esc(draft.id)}" maxlength="128" placeholder="production-pool" autocomplete="off"></label><label class="field"><span class="field-label">Provider instance</span><select data-pool-field="provider">${providers.map((provider) => `<option value="${esc(provider.id)}"${provider.id === selectedProvider ? " selected" : ""}>${esc(provider.id)}</option>`).join("")}</select></label><label class="field"><span class="field-label">Selection strategy</span><select data-pool-field="strategy"><option value="ordered_fallback"${draft.strategy === "ordered_fallback" ? " selected" : ""}>Ordered fallback</option><option value="health_weighted"${draft.strategy === "health_weighted" ? " selected" : ""}>Health weighted</option></select></label></div><fieldset class="field-group"><legend class="field-label">Accounts in pool</legend><div class="model-review-list">${providerAccountsList.map((account) => `<label class="model-review-row"><input type="checkbox" data-pool-account="${esc(account.id)}"${draft.accounts.includes(account.id) ? " checked" : ""}><span class="mono">${esc(account.id)}</span><span class="muted">${esc(account.health?.status || "unknown")} · ${account.enabled === false ? "disabled" : "enabled"}</span></label>`).join("") || `<p class="empty-description">Add two or more accounts for a homogeneous pool.</p>`}</div></fieldset><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-pool-action="create"${draft.busy || !providerAccountsList.length ? " disabled" : ""}>Stage pool</button></div></section>${poolRows ? `<section class="section"><div class="toolbar"><h2 class="section-title">Configured pools</h2><span class="section-hint">No pool is required for a single account.</span></div><div class="grid-2">${poolRows}</div></section>` : `<div class="panel empty-state"><p class="empty-title">No optional pools</p><p class="empty-description">Routing can use an individual account directly.</p></div>`}`;
+    const poolRows = pools.map((pool) => `<article class="panel"><div class="toolbar"><h2 class="panel-title">${esc(pool.id)}</h2><span class="spacer"></span>${statusBadge(pool.homogeneous ? "ready" : "needs attention", pool.homogeneous ? "success" : "warning")}</div><dl class="detail-grid"><div><dt>Provider</dt><dd>${esc(pool.provider)}</dd></div><div><dt>Account order</dt><dd>${pool.strategy === "health_weighted" ? "Prefer healthier accounts" : "Use accounts in order"}</dd></div><div><dt>Accounts</dt><dd>${(pool.accounts || []).map((id) => `<span class="chip">${esc(id)}</span>`).join(" ") || "—"}</dd></div><div><dt>When Pooler switches</dt><dd>Before a provider starts its response</dd></div></dl></article>`).join("");
+    root.innerHTML = `${viewHeader("Failover", views.pools.subtitle)}${draftBar()}<section class="panel" aria-labelledby="pool-create-title"><div class="panel-head"><div><h2 class="panel-title" id="pool-create-title">Create a failover group</h2><p class="muted">Choose two or more accounts from the same provider.</p></div></div><div class="form-grid"><label class="field"><span class="field-label">Group name</span><input data-pool-field="id" value="${esc(draft.id)}" maxlength="128" placeholder="OpenAI accounts" autocomplete="off"></label><label class="field"><span class="field-label">Provider</span><select data-pool-field="provider">${providers.map((provider) => `<option value="${esc(provider.id)}"${provider.id === selectedProvider ? " selected" : ""}>${esc(provider.id)}</option>`).join("")}</select></label><label class="field"><span class="field-label">How Pooler should choose</span><select data-pool-field="strategy"><option value="ordered_fallback"${draft.strategy === "ordered_fallback" ? " selected" : ""}>Use accounts in order</option><option value="health_weighted"${draft.strategy === "health_weighted" ? " selected" : ""}>Prefer healthier accounts</option></select></label></div><fieldset class="field-group"><legend class="field-label">Accounts</legend><div class="model-review-list">${providerAccountsList.map((account) => `<label class="model-review-row"><input type="checkbox" data-pool-account="${esc(account.id)}"${draft.accounts.includes(account.id) ? " checked" : ""}><span>${esc(account.id)}</span><span class="muted">${esc(account.health?.status || "unknown")} · ${account.enabled === false ? "disabled" : "enabled"}</span></label>`).join("") || `<p class="empty-description">Add at least two accounts for this provider first.</p>`}</div></fieldset><div class="button-row"><button class="btn btn-primary btn-sm" type="button" data-pool-action="create"${draft.busy || !providerAccountsList.length ? " disabled" : ""}>Save failover group</button></div></section>${poolRows ? `<section class="section"><div class="toolbar"><h2 class="section-title">Failover groups</h2><span class="section-hint">A single account works without a group.</span></div><div class="grid-2">${poolRows}</div></section>` : `<div class="panel empty-state"><p class="empty-title">No failover groups</p><p class="empty-description">Create one after adding multiple accounts for the same provider.</p></div>`}`;
+  }
+
+  async function createFailoverGroup() {
+    const draft = state.poolDraft;
+    if (!draft.id.trim() || !draft.provider || draft.accounts.length < 2) {
+      notify("error", "Enter a group name and select at least two accounts.");
+      return;
+    }
+    const id = availablePoolId(draft.id);
+    draft.busy = true;
+    try {
+      await applyControlResource("pools", {
+        id,
+        provider: draft.provider,
+        accounts: draft.accounts,
+        strategy: draft.strategy,
+      });
+      const selected = new Set(draft.accounts);
+      for (const model of graphModels()) {
+        const targets = modelTargets(model);
+        const matching = targets.filter((target) =>
+          target.provider === draft.provider && target.account && selected.has(target.account));
+        if (!matching.length) continue;
+        const first = matching[0];
+        const poolTarget = targetConfig(first, targets.length);
+        poolTarget.id = `pool-target-${id}`.slice(0, 128);
+        delete poolTarget.account;
+        poolTarget.account_pool = id;
+        poolTarget.priority = Math.min(...matching.map((target) => Number(target.priority) || 1));
+        const retained = targets
+          .filter((target) => !matching.includes(target))
+          .map((target, index) => targetConfig(target, index));
+        await applyControlResource(
+          "models",
+          { id: model.id, targets: [...retained, poolTarget] },
+          model.id,
+        );
+      }
+      await saveControlChanges();
+      draft.id = "";
+      draft.accounts = [];
+      draft.busy = false;
+      notify("success", "Failover group saved and connected to matching models.");
+    } catch (error) {
+      draft.busy = false;
+      if (error.status === 401) authRequired();
+      else if (error.status !== 409) notify("error", error.message);
+    }
   }
 
   function renderEndpoints(root) {
     const inventory = state.data.endpointInventory || {};
     const listeners = inventory.listeners || [];
     const management = inventory.management;
-    const clientLabels = inventory.downstream_clients || ["Factory", "Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"];
-    const listenerSections = listeners.map((listener) => `<article class="panel endpoint-card"><div class="toolbar"><h2 class="panel-title">${esc(listener.id)}</h2><span class="spacer"></span><span class="badge badge-accent">client-agnostic</span></div><p class="mono endpoint-base">${(listener.base_urls || []).map((url) => esc(url)).join(" · ") || esc(listener.bind || "local socket")}</p>${(listener.routes || []).map((route) => `<div class="endpoint-route"><div class="toolbar"><span class="badge badge-neutral">${(route.methods || []).join(", ")}</span><code class="mono">${esc(route.path)}</code><span class="spacer"></span><span class="muted">${esc(route.protocol || "http")}</span></div><p class="muted">Authentication: ${route.downstream_auth?.required ? `${esc(route.downstream_auth.kind || "required")} ${route.downstream_auth.header ? `in ${esc(route.downstream_auth.header)}` : ""}` : "not required"}</p></div>`).join("")}</article>`).join("");
-    const tools = clientLabels.map((label) => `<details class="connect-tool"><summary>${esc(label)}</summary><p>Use any listed base URL and path with this client. Pooler does not select a client, add an allowlist, or route implicitly.</p><button class="btn btn-outline btn-xs" type="button" data-connect-tool="${esc(label)}">Prepare explicit route draft</button></details>`).join("");
-    root.innerHTML = `${viewHeader("Endpoints", views.endpoints.subtitle, `<button class="btn btn-outline btn-sm" type="button" data-endpoints-copy>${ic("copy", 15)} Copy JSON</button>`)}<section class="callout callout-info"><strong>Client-agnostic inventory.</strong> Configure any client or custom route directly with these base URLs and paths. Authentication requirements are shown per endpoint; no secret is returned.</section>${management ? `<section class="panel endpoint-card"><div class="toolbar"><h2 class="panel-title">Management API</h2><span class="spacer"></span>${statusBadge(management.auth?.required ? "Bearer required" : "loopback read-only", management.auth?.required ? "warning" : "success")}</div><p class="mono endpoint-base">${(management.base_urls || []).map((url) => esc(url)).join(" · ")}</p><p class="muted">Paths: ${(management.paths || []).map((path) => `<code class="mono">${esc(path)}</code>`).join(" · ")}</p></section>` : ""}<section class="section"><div class="toolbar"><h2 class="section-title">Serving endpoints</h2><span class="section-hint">Base URL, path, protocol, and auth are explicit.</span></div><div class="grid-2">${listenerSections || `<div class="panel empty-state"><p class="empty-title">No serving listeners</p></div>`}</div></section><section class="panel" aria-labelledby="connect-tools-title"><div class="toolbar"><div><h2 class="panel-title" id="connect-tools-title">Optional Connect tools</h2><p class="muted">Convenience instructions only. They never become required, an allowlist, or an implicit route.</p></div><span class="badge badge-neutral">optional · routing effect none</span></div><div class="connect-tool-list">${tools}</div></section><pre class="code-block endpoint-json" id="endpoint-json"><code>${esc(JSON.stringify(inventory, null, 2))}</code></pre>`;
+    const clientLabels = inventory.downstream_clients || ["Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"];
+    const listenerSections = listeners.map((listener) => `<article class="panel endpoint-card"><div class="toolbar"><h2 class="panel-title">${esc(listener.id)}</h2><span class="spacer"></span><span class="badge badge-accent">works with any client</span></div><p class="mono endpoint-base">${(listener.base_urls || []).map((url) => esc(url)).join(" · ") || esc(listener.bind || "local socket")}</p>${(listener.routes || []).map((route) => `<div class="endpoint-route"><div class="toolbar"><span class="badge badge-neutral">${(route.methods || []).join(", ")}</span><code class="mono">${esc(route.path)}</code></div><p class="muted">App authentication: ${route.downstream_auth?.required ? "required" : "none"}</p></div>`).join("")}</article>`).join("");
+    const tools = clientLabels.map((label) => `<details class="connect-tool"><summary>${esc(label)}</summary><p>Use the Pooler address shown above in ${esc(label)}. This helper does not change routing.</p><button class="btn btn-outline btn-xs" type="button" data-connect-tool="${esc(label)}">Prepare setup</button></details>`).join("");
+    root.innerHTML = `${viewHeader("Endpoints", views.endpoints.subtitle, `<button class="btn btn-outline btn-sm" type="button" data-endpoints-copy>${ic("copy", 15)} Copy details</button>`)}<section class="callout callout-info"><strong>Use Pooler from any app.</strong> These are Pooler’s local addresses—not provider API URLs.</section>${management ? `<details class="panel endpoint-card"><summary><strong>Dashboard API</strong></summary><p class="mono endpoint-base">${(management.base_urls || []).map((url) => esc(url)).join(" · ")}</p><p class="muted">Management key required: ${management.auth?.required ? "yes" : "no"}</p></details>` : ""}<section class="section"><div class="toolbar"><h2 class="section-title">Addresses for your apps</h2><span class="section-hint">Choose the path supported by your app.</span></div><div class="grid-2">${listenerSections || `<div class="panel empty-state"><p class="empty-title">No app endpoints yet</p></div>`}</div></section><section class="panel" aria-labelledby="connect-tools-title"><div class="toolbar"><div><h2 class="panel-title" id="connect-tools-title">Setup helpers</h2><p class="muted">Optional instructions for common apps.</p></div><span class="badge badge-neutral">does not change routing</span></div><div class="connect-tool-list">${tools}</div></section><details class="panel"><summary><strong>Advanced endpoint JSON</strong></summary><pre class="code-block endpoint-json" id="endpoint-json"><code>${esc(JSON.stringify(inventory, null, 2))}</code></pre></details>`;
   }
 
   function modelTargets(model) {
     const targets = [...(model?.targets || [])];
-    const byId = new Map(targets.map((target) => [target.binding_id || target.id, target]));
+    const byId = new Map(targets.map((target) => [targetBindingId(target), target]));
     const saved = state.targetOrders[model?.id];
     if (!saved) {
       return targets.sort((left, right) => {
         const priority = (Number(left.priority) || 1) - (Number(right.priority) || 1);
-        return priority || String(left.binding_id || left.id).localeCompare(String(right.binding_id || right.id));
+        return priority || targetBindingId(left).localeCompare(targetBindingId(right));
       });
     }
     const ordered = saved.map((id) => byId.get(id)).filter(Boolean);
     targets.forEach((target) => {
-      if (!saved.includes(target.binding_id || target.id)) ordered.push(target);
+      if (!saved.includes(targetBindingId(target))) ordered.push(target);
     });
     return ordered;
   }
 
+  function targetBindingId(target) {
+    return target?.binding_id
+      || target?.binding?.binding_id
+      || target?.id
+      || target?.binding?.target_id
+      || "";
+  }
+
+  function targetConfigId(target, position) {
+    return target?.id
+      || target?.binding?.target_id
+      || target?.binding_id?.split("/").at(-1)
+      || `target-${position + 1}`;
+  }
+
   function targetConfig(target, position) {
+    const transform = target.profile?.request_transform || "";
+    const wireFamily = target.wire_family
+      || ({ anthropic_messages: "anthropic", gemini_generate_content: "gemini", xai_chat: "xai", kimi_chat: "kimi" }[transform])
+      || "openai";
+    const codecs = target.codecs?.length
+      ? target.codecs
+      : target.profile?.endpoint_variants?.responses
+        ? ["decode.openai.responses"]
+        : [];
     const value = {
-      id: target.binding_id || target.id || `target-${position + 1}`,
+      id: targetConfigId(target, position),
       provider: target.provider,
       priority: Number(target.priority) > 0 ? Number(target.priority) : position + 1,
       upstream_model: target.upstream_model,
       capabilities: target.capabilities || [],
-      codecs: target.codecs || [],
+      codecs,
+      wire_family: wireFamily,
     };
     for (const key of ["account", "account_pool", "wire_family", "parameters", "context_window", "quantization", "privacy", "zdr", "data_policy", "region", "price", "weight"]) {
       if (target[key] !== undefined && target[key] !== null && target[key] !== "") value[key] = target[key];
@@ -1991,20 +2199,25 @@
     const accounts = new Set(targetAccounts(target));
     const credentials = controlGraph().health?.credentials || [];
     const health = credentials.filter((entry) => accounts.has(entry.account));
+    const liveAccounts = (state.data.accounts?.accounts || []).filter((entry) => accounts.has(entry.id));
     const quota = (controlGraph().quota || []).filter((entry) => accounts.has(entry.identity?.credential || entry.account));
-    const healthText = health.length ? health.map((entry) => entry.status).join(", ") : "unknown health";
+    const healthText = health.length
+      ? health.map((entry) => entry.status).join(", ")
+      : liveAccounts.length
+        ? liveAccounts.map((entry) => entry.status).join(", ")
+        : "unknown health";
     const quotaText = quota.length ? quota.map((entry) => entry.state || entry.remaining === undefined ? "quota observed" : `quota ${entry.remaining} remaining`).join(", ") : "unknown quota";
     const provider = graphProviders().find((entry) => entry.id === target.provider);
     return {
       healthText,
       quotaText,
       providerText: provider ? "provider configured" : "provider unknown",
-      unknown: !health.length || !quota.length,
+      unknown: (!health.length && !liveAccounts.length) || !quota.length,
     };
   }
 
   function orderedTargetIds(model) {
-    return modelTargets(model).map((target) => target.binding_id || target.id);
+    return modelTargets(model).map(targetBindingId);
   }
 
   async function stageModelTargets(model, targets) {
@@ -2029,7 +2242,7 @@
     const model = graphModels().find((item) => item.id === modelId);
     if (!model) return;
     const targets = modelTargets(model);
-    const sourceIndex = targets.findIndex((target) => (target.binding_id || target.id) === targetId);
+    const sourceIndex = targets.findIndex((target) => targetBindingId(target) === targetId);
     if (sourceIndex < 0) return;
     const boundedIndex = Math.max(0, Math.min(destinationIndex, targets.length - 1));
     if (sourceIndex === boundedIndex) return;
@@ -2049,10 +2262,10 @@
     const value = Number(priority);
     if (!model || !Number.isSafeInteger(value) || value < 1 || value > 2 ** 31 - 1) return;
     const targets = modelTargets(model);
-    const target = targets.find((item) => (item.binding_id || item.id) === targetId);
+    const target = targets.find((item) => targetBindingId(item) === targetId);
     if (!target) return;
     target.priority = value;
-    targets.sort((left, right) => (Number(left.priority) || 1) - (Number(right.priority) || 1) || String(left.binding_id || left.id).localeCompare(String(right.binding_id || right.id)));
+    targets.sort((left, right) => (Number(left.priority) || 1) - (Number(right.priority) || 1) || targetBindingId(left).localeCompare(targetBindingId(right)));
     state.targetOrders[modelId] = orderedTargetIds({ ...model, targets });
     announceTarget(`${targetId} priority set to ${value}.`, targetId);
     stageModelTargets(model, targets);
@@ -2061,8 +2274,8 @@
   function combineTarget(modelId, targetId, withTargetId) {
     const model = graphModels().find((item) => item.id === modelId);
     const targets = model ? modelTargets(model) : [];
-    const target = targets.find((item) => (item.binding_id || item.id) === targetId);
-    const peer = targets.find((item) => (item.binding_id || item.id) === withTargetId);
+    const target = targets.find((item) => targetBindingId(item) === targetId);
+    const peer = targets.find((item) => targetBindingId(item) === withTargetId);
     if (!model || !target || !peer) return;
     target.priority = peer.priority;
     state.targetOrders[modelId] = orderedTargetIds({ ...model, targets });
@@ -2072,11 +2285,12 @@
 
   function renderTargetRows(model) {
     const targets = modelTargets(model);
-    return `<ol class="target-order" data-target-model="${esc(model.id)}" aria-label="Ordered targets for ${esc(model.id)}">${targets.map((target, index) => {
-      const targetId = target.binding_id || target.id;
+    return `<ol class="target-order" data-target-model="${esc(model.id)}" aria-label="Provider priority for ${esc(model.id)}">${targets.map((target, index) => {
+      const targetId = targetBindingId(target);
       const evidence = targetEvidence(target);
       const capabilities = (target.capabilities || []).slice(0, 6).map((capability) => `<span class="chip">${esc(capability)}</span>`).join(" ");
-      return `<li class="target-row" draggable="true" tabindex="0" data-target-row data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" data-target-index="${index}" aria-label="${esc(targetId)}, priority ${esc(target.priority || index + 1)}"><span class="drag-handle" aria-hidden="true">⋮⋮</span><span class="target-position num">${index + 1}</span>${providerCell(target.provider, false)}${target.account ? `<span class="chip mono">account ${esc(target.account)}</span>` : ""}${target.account_pool ? `<span class="chip mono">pool ${esc(target.account_pool)}</span>` : ""}<span class="target-upstream mono">${esc(text(target.upstream_model))}</span><span class="target-capabilities">${capabilities || `<span class="muted">unknown capabilities</span>`}</span><span class="target-evidence"><span class="badge ${evidence.unknown ? "badge-warning" : "badge-success"}">${esc(evidence.healthText)}</span><span class="badge ${evidence.unknown ? "badge-warning" : "badge-neutral"}">${esc(evidence.quotaText)}</span><span class="muted">${esc(evidence.providerText)}</span></span><label class="target-priority"><span class="sr-only">Numeric priority for ${esc(targetId)}</span><input type="number" min="1" max="2147483647" step="1" value="${esc(target.priority || index + 1)}" data-target-priority data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}"></label><span class="target-actions"><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="up" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(targetId)} up"${index === 0 ? " disabled" : ""}>↑</button><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="down" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(targetId)} down"${index === targets.length - 1 ? " disabled" : ""}>↓</button><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="home" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(targetId)} to first"${index === 0 ? " disabled" : ""}>Home</button><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="end" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(targetId)} to last"${index === targets.length - 1 ? " disabled" : ""}>End</button>${index > 0 ? `<button class="btn btn-outline btn-xs target-combine" type="button" data-target-combine="${esc(targets[index - 1].binding_id || targets[index - 1].id)}" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}">Combine tier</button>` : ""}</span></li>`;
+      const account = target.account || target.account_pool;
+      return `<li class="target-row" draggable="true" tabindex="0" data-target-row data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" data-target-index="${index}" aria-label="${esc(target.provider)}, priority ${esc(target.priority || index + 1)}"><span class="drag-handle" aria-hidden="true">⋮⋮</span><span class="target-position num">${index + 1}</span>${providerCell(target.provider, false)}${account ? `<span class="chip">${esc(account)}</span>` : ""}<span class="badge ${evidence.unknown ? "badge-warning" : "badge-success"}">${esc(evidence.healthText)}</span><label class="target-priority"><span>Priority</span><input type="number" min="1" max="2147483647" step="1" value="${esc(target.priority || index + 1)}" data-target-priority data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}"></label><span class="target-actions"><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="up" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(target.provider)} up"${index === 0 ? " disabled" : ""}>↑</button><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="down" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(target.provider)} down"${index === targets.length - 1 ? " disabled" : ""}>↓</button><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="home" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(target.provider)} first"${index === 0 ? " disabled" : ""}>First</button><button class="btn btn-ghost btn-xs target-move" type="button" data-target-move="end" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}" aria-label="Move ${esc(target.provider)} last"${index === targets.length - 1 ? " disabled" : ""}>Last</button>${index > 0 ? `<button class="btn btn-outline btn-xs target-combine" type="button" data-target-combine="${esc(targetBindingId(targets[index - 1]))}" data-target-model="${esc(model.id)}" data-target-id="${esc(targetId)}">Same priority</button>` : ""}</span><details><summary>Advanced details</summary><dl class="detail-grid"><div><dt>Provider model</dt><dd class="mono">${esc(text(target.upstream_model))}</dd></div><div><dt>Connection ID</dt><dd class="mono">${esc(targetId)}</dd></div><div><dt>Limits</dt><dd>${esc(evidence.quotaText)}</dd></div><div><dt>Evidence</dt><dd>${esc(evidence.providerText)}</dd></div></dl><div class="target-capabilities">${capabilities || `<span class="muted">Capabilities not verified</span>`}</div></details></li>`;
     }).join("")}</ol>`;
   }
 
@@ -2110,6 +2324,13 @@
       minSamples: preference.min_samples ?? "",
       staleAfter: preference.stale_after_ms ?? "",
     };
+  }
+
+  function updatePolicyPreview() {
+    const editor = state.policyEditor;
+    const preview = $(".policy-preview .muted");
+    if (!preview) return;
+    preview.textContent = `allow ${editor.allow || "any"} · deny ${editor.deny || "none"} · ${editor.allowFallbacks ? "fallbacks enabled" : "fallbacks disabled"} · ${editor.ranking === "adaptive" ? "adaptive observations" : "deterministic facts"}`;
   }
 
   function csvValues(value) {
@@ -2180,15 +2401,22 @@
 
   async function loadOAuthCapabilities(account) {
     if (state.oauthCapabilities[account]) return state.oauthCapabilities[account];
-    try {
-      const result = await readJson(`/accounts/${encodeURIComponent(account)}/oauth-capabilities`);
-      state.oauthCapabilities[account] = result;
-      return result;
-    } catch (error) {
-      if (error.status === 401) authRequired();
-      else notify("error", `Authentication options unavailable: ${error.message}`);
-      return null;
-    }
+    if (state.oauthCapabilityRequests[account]) return state.oauthCapabilityRequests[account];
+    const request = readJson(`/accounts/${encodeURIComponent(account)}/oauth-capabilities`)
+      .then((result) => {
+        state.oauthCapabilities[account] = result;
+        return result;
+      })
+      .catch((error) => {
+        if (error.status === 401) authRequired();
+        else notify("error", `Could not load sign-in methods: ${error.message}`);
+        return null;
+      })
+      .finally(() => {
+        delete state.oauthCapabilityRequests[account];
+      });
+    state.oauthCapabilityRequests[account] = request;
+    return request;
   }
 
   async function startOAuthFlow(account, method) {
@@ -2251,21 +2479,30 @@
     return `${Math.ceil(remaining / 1000)}s remaining`;
   }
 
+  function oauthMethodLabel(method) {
+    return {
+      browser_pkce: "Browser login",
+      authorization_code_pkce: "Browser login",
+      device_code: "Device code",
+      client_credentials: "Service account",
+    }[method] || String(method).replaceAll("_", " ");
+  }
+
   function accountOAuthPanel(account) {
     if (!account || account.auth_kind !== "oauth") return "";
     const capabilities = state.oauthCapabilities[account.id];
     const methods = capabilities?.methods || [];
     const flow = state.oauthFlow.account === account.id ? state.oauthFlow : null;
-    return `<section class="panel oauth-panel" aria-labelledby="oauth-title"><div class="toolbar"><h2 class="panel-title" id="oauth-title">Authenticate ${esc(account.id)}</h2><span class="spacer"></span>${flow ? statusBadge(flow.status || "starting") : ""}</div><p class="muted">Choose one supported flow. The callback uses one-time state; this dashboard never receives a token or secret.</p><div class="button-row">${methods.map((method) => `<button class="btn btn-outline btn-sm" type="button" data-oauth-start="${esc(method.method)}" data-oauth-account="${esc(account.id)}"${flow?.busy ? " disabled" : ""}>${esc(method.method.replaceAll("_", " "))}</button>`).join("") || `<span class="muted">Loading supported authentication methods…</span>`}</div>${flow ? `<div class="callout" role="status">${flow.authorizationUrl ? `<a class="btn btn-primary btn-sm" href="${esc(flow.authorizationUrl)}" target="_blank" rel="noreferrer">Open authorization page</a>` : ""}${flow.verificationUri ? `<p>Device URL: <a href="${esc(flow.verificationUri)}" target="_blank" rel="noreferrer">${esc(flow.verificationUri)}</a></p>` : ""}${flow.userCode ? `<p>Device code: <code class="mono">${esc(flow.userCode)}</code></p>` : ""}<p>${esc(oauthCountdown())}</p>${flow.requestId && !["succeeded", "failed", "cancelled", "expired"].includes(flow.status) ? `<button class="btn btn-ghost btn-xs" type="button" data-oauth-cancel="${esc(flow.requestId)}">Cancel</button>` : ""}</div>` : ""}</section>`;
+    return `<section class="panel oauth-panel" aria-labelledby="oauth-title"><div class="toolbar"><h2 class="panel-title" id="oauth-title">Sign in to ${esc(account.id)}</h2><span class="spacer"></span>${flow ? statusBadge(flow.status || "starting") : ""}</div><p class="muted">Choose a sign-in method supported by this provider.</p><div class="button-row">${methods.map((method) => `<button class="btn btn-outline btn-sm" type="button" data-oauth-start="${esc(method.method)}" data-oauth-account="${esc(account.id)}"${flow?.busy ? " disabled" : ""}>${esc(oauthMethodLabel(method.method))}</button>`).join("") || `<span class="muted">Loading sign-in methods…</span>`}</div>${flow ? `<div class="callout" role="status">${flow.authorizationUrl ? `<a class="btn btn-primary btn-sm" href="${esc(flow.authorizationUrl)}" target="_blank" rel="noreferrer">Open sign-in page</a>` : ""}${flow.verificationUri ? `<p>Open <a href="${esc(flow.verificationUri)}" target="_blank" rel="noreferrer">${esc(flow.verificationUri)}</a></p>` : ""}${flow.userCode ? `<p>Enter code <code class="mono">${esc(flow.userCode)}</code></p>` : ""}<p>${esc(oauthCountdown())}</p>${flow.requestId && !["succeeded", "failed", "cancelled", "expired"].includes(flow.status) ? `<button class="btn btn-ghost btn-xs" type="button" data-oauth-cancel="${esc(flow.requestId)}">Cancel</button>` : ""}</div>` : ""}</section>`;
   }
 
   function renderAccounts(root) {
     const accounts = graphAccounts();
     const connectionAccount = accounts.find((account) => account.id === state.connectionAccount);
-    const grouped = accounts.map((account) => `<article class="panel account-card"><div class="toolbar"><h2 class="panel-title mono">${esc(account.id)}</h2><span class="spacer"></span>${statusBadge(account.health?.status || "unknown")}</div><p class="muted">Provider instance <code class="mono">${esc(account.provider)}</code></p><dl class="detail-grid"><div><dt>Authentication</dt><dd>${esc(account.auth_kind)}</dd></div><div><dt>Enabled</dt><dd>${account.enabled === false ? "disabled" : "enabled"}</dd></div><div><dt>Failures</dt><dd>${fmtInt(account.health?.failure_count)}</dd></div><div><dt>Cooldown</dt><dd>${account.health?.cooldown_until ? esc(relTime(account.health.cooldown_until)) : "—"}</dd></div></dl><div class="button-row"><button class="btn btn-primary btn-xs" type="button" data-account-connect="${esc(account.id)}">${account.auth_kind === "oauth" ? "Authenticate" : "View account"}</button>${account.enabled === false ? `<button class="btn btn-outline btn-xs" type="button" data-account-action="enable" data-account-id="${esc(account.id)}">Enable</button>` : `<button class="btn btn-outline btn-xs" type="button" data-account-action="disable" data-account-id="${esc(account.id)}">Disable</button>`}<button class="btn btn-ghost btn-xs" type="button" data-account-action="refresh" data-account-id="${esc(account.id)}">Refresh status</button><button class="btn btn-ghost btn-xs" type="button" data-account-action="revoke" data-account-id="${esc(account.id)}">Revoke local credential</button></div></article>`).join("");
+    const grouped = accounts.map((account) => `<article class="panel account-card"><div class="toolbar"><h2 class="panel-title">${esc(account.id)}</h2><span class="spacer"></span>${statusBadge(account.health?.status || "unknown")}</div><p class="muted">Provider: ${esc(account.provider)}</p><dl class="detail-grid"><div><dt>Sign-in method</dt><dd>${account.auth_kind === "oauth" ? "OAuth" : "API key"}</dd></div><div><dt>Status</dt><dd>${account.enabled === false ? "Disabled" : "Enabled"}</dd></div><div><dt>Recent failures</dt><dd>${fmtInt(account.health?.failure_count)}</dd></div><div><dt>Available again</dt><dd>${account.health?.cooldown_until ? esc(relTime(account.health.cooldown_until)) : "Now"}</dd></div></dl><div class="button-row"><button class="btn btn-primary btn-xs" type="button" data-account-connect="${esc(account.id)}">${account.auth_kind === "oauth" ? "Sign in" : "View"}</button>${account.enabled === false ? `<button class="btn btn-outline btn-xs" type="button" data-account-action="enable" data-account-id="${esc(account.id)}">Enable</button>` : `<button class="btn btn-outline btn-xs" type="button" data-account-action="disable" data-account-id="${esc(account.id)}">Disable</button>`}<button class="btn btn-ghost btn-xs" type="button" data-account-action="refresh" data-account-id="${esc(account.id)}">Refresh</button><button class="btn btn-ghost btn-xs" type="button" data-account-action="revoke" data-account-id="${esc(account.id)}">Sign out</button></div></article>`).join("");
     const quotaRowsSource = (controlGraph().quota || []).length ? controlGraph().quota : (state.data.quota?.windows || []);
     const quotaRows = quotaRowsSource.filter((row) => !connectionAccount || row.identity?.credential === connectionAccount.id || row.account === connectionAccount.id).map((row) => `<li><span class="mono">${esc(row.identity?.credential || row.account || "account")}</span><span class="muted">${esc(row.state || row.unit || "quota")}</span><span class="spacer"></span>${row.remaining === undefined ? "—" : esc(fmtInt(row.remaining))}</li>`).join("");
-    root.innerHTML = `${viewHeader("Accounts", views.accounts.subtitle)}${draftBar()}${accountForm()}${grouped ? `<section class="section"><div class="toolbar"><h2 class="section-title">Configured accounts</h2><span class="section-hint">Every row has independent health and quota state.</span></div><div class="grid-2">${grouped}</div></section>` : `<div class="panel empty-state"><p class="empty-title">No accounts configured</p><p class="empty-description">Add a provider instance first.</p></div>`}${connectionAccount ? accountOAuthPanel(connectionAccount) : ""}${quotaRows ? `<section class="panel"><h2 class="panel-title">Account quota</h2><ul class="check-list">${quotaRows}</ul></section>` : ""}`;
+    root.innerHTML = `${viewHeader("Accounts", views.accounts.subtitle)}${draftBar()}${accountForm()}${grouped ? `<section class="section"><div class="toolbar"><h2 class="section-title">Your accounts</h2><span class="section-hint">Each account keeps its own limits and status.</span></div><div class="grid-2">${grouped}</div></section>` : `<div class="panel empty-state"><p class="empty-title">No accounts</p><p class="empty-description">Add a provider first.</p></div>`}${connectionAccount ? accountOAuthPanel(connectionAccount) : ""}${quotaRows ? `<section class="panel"><h2 class="panel-title">Account limits</h2><ul class="check-list">${quotaRows}</ul></section>` : ""}`;
     bindAccountCreate(root);
     if (connectionAccount && connectionAccount.auth_kind === "oauth" && !state.oauthCapabilities[connectionAccount.id]) loadOAuthCapabilities(connectionAccount.id).then(() => renderCurrentViewIfVisible());
   }
@@ -3207,7 +3444,7 @@
 
   async function runMutation(
     path,
-    { confirm, successMessage, queuedMessage },
+    { confirm, successMessage, queuedMessage, waitForResult },
     trigger,
   ) {
     if (state.pending.has(path)) return;
@@ -3224,6 +3461,8 @@
         if (!accepted || sessionGeneration !== state.sessionGeneration) return;
       }
       const result = await mutate(path);
+      if (sessionGeneration !== state.sessionGeneration) return;
+      if (waitForResult) await waitForResult(result);
       if (sessionGeneration !== state.sessionGeneration) return;
       changed = true;
       if (
@@ -3399,7 +3638,7 @@
     $("#session-dialog [data-close]").innerHTML = ic("cancel", 16);
     $("#confirm-dialog [data-close]").innerHTML = ic("cancel", 16);
     $("#token-visibility").innerHTML = ic("eye-empty", 16);
-    $("#token-visibility").title = "Show management secret";
+    $("#token-visibility").title = "Show management key";
 
     document.addEventListener("click", (event) => {
       document
@@ -3497,11 +3736,11 @@
       $("#token-visibility").innerHTML = ic(show ? "eye-off" : "eye-empty", 16);
       $("#token-visibility").setAttribute(
         "aria-label",
-        show ? "Hide management secret" : "Show management secret",
+        show ? "Hide management key" : "Show management key",
       );
       $("#token-visibility").title = show
-        ? "Hide management secret"
-        : "Show management secret";
+        ? "Hide management key"
+        : "Show management key";
       input.focus();
     });
 
@@ -3522,9 +3761,24 @@
       if (providerAction) {
         if (providerAction.dataset.providerAction === "show-form") {
           state.providerDraft.visible = true;
+          state.providerDraft.template = "openai";
+          state.providerDraft.name = "";
+          state.providerDraft.origin = "";
+          state.providerDraft.clientId = "";
+          state.providerDraft.protocol = "openai";
+          state.providerDraft.modelIds = "";
+          renderProviders($("#view"));
+        } else if (providerAction.dataset.providerAction === "show-custom") {
+          state.providerDraft.visible = true;
+          state.providerDraft.template = "__custom";
+          state.providerDraft.name = "";
+          state.providerDraft.origin = "";
+          state.providerDraft.clientId = "";
+          state.providerDraft.protocol = "openai";
+          state.providerDraft.modelIds = "";
           renderProviders($("#view"));
         } else if (providerAction.dataset.providerAction === "create") {
-          createProviderInstance();
+          createProvider();
         }
         return;
       }
@@ -3557,6 +3811,9 @@
         } else if (action === "save-models") {
           saveModelExposure();
           return;
+        } else if (action === "save-manual-models") {
+          saveManualModels();
+          return;
         }
         renderProviders($("#view"));
         return;
@@ -3566,7 +3823,7 @@
       if (targetMove) {
         const model = graphModels().find((item) => item.id === targetMove.dataset.targetModel);
         const targets = model ? modelTargets(model) : [];
-        const index = targets.findIndex((target) => (target.binding_id || target.id) === targetMove.dataset.targetId);
+        const index = targets.findIndex((target) => targetBindingId(target) === targetMove.dataset.targetId);
         if (index >= 0) {
           const destination = { up: index - 1, down: index + 1, home: 0, end: targets.length - 1 }[targetMove.dataset.targetMove];
           moveTarget(targetMove.dataset.targetModel, targetMove.dataset.targetId, destination);
@@ -3604,24 +3861,7 @@
 
       const poolAction = event.target.closest("[data-pool-action]");
       if (poolAction && poolAction.dataset.poolAction === "create") {
-        const draft = state.poolDraft;
-        if (!draft.id.trim() || !draft.provider || draft.accounts.length === 0) {
-          notify("error", "Enter a pool ID and select at least one account.");
-          return;
-        }
-        draft.busy = true;
-        applyControlResource("pools", { id: draft.id.trim(), provider: draft.provider, accounts: draft.accounts, strategy: draft.strategy })
-          .then(() => {
-            draft.busy = false;
-            notify("success", "Pool staged in the structured draft.");
-            refreshCurrentView();
-          })
-          .catch((error) => {
-            draft.busy = false;
-            if (error.status === 401) authRequired();
-            else if (error.status !== 409) notify("error", error.message);
-            renderCurrentViewIfVisible();
-          });
+        createFailoverGroup();
         return;
       }
 
@@ -3717,7 +3957,14 @@
       const modelButton = event.target.closest("[data-model-action]");
       if (modelButton) {
         if (modelButton.dataset.modelAction === "discover") {
-          runMutation("/models/reload", { queuedMessage: (result) => `Model discovery request ${result.request_id} accepted.` }, modelButton);
+          runMutation(
+            "/models/reload",
+            {
+              waitForResult: (result) => waitForModelReload(result.request_id),
+              successMessage: () => "Models updated.",
+            },
+            modelButton,
+          );
           return;
         }
         modelAction(
@@ -3754,7 +4001,7 @@
         const field = policyField.dataset.policyField;
         state.policyEditor[field] = policyField.type === "checkbox" ? policyField.checked : policyField.value;
         state.policyEditor.dirty = true;
-        if (field === "ranking" || field === "allowFallbacks") renderModels($("#view"));
+        updatePolicyPreview();
         return;
       }
       const providerField = event.target.closest("[data-provider-field]");
@@ -3763,8 +4010,11 @@
         return;
       }
       const accountNewField = event.target.closest("[data-account-new-field]");
-      if (accountNewField && state.route === "accounts" || accountNewField && state.route === "providers") {
+      if (accountNewField && (state.route === "accounts" || state.route === "providers")) {
         state.accountDraft[accountNewField.dataset.accountNewField] = accountNewField.value;
+        if (["provider", "authKind"].includes(accountNewField.dataset.accountNewField)) {
+          renderCurrentViewIfVisible();
+        }
         return;
       }
       const poolField = event.target.closest("[data-pool-field]");
@@ -3805,6 +4055,17 @@
       }
     });
     $("#view").addEventListener("change", (event) => {
+      const providerField = event.target.closest("[data-provider-field]");
+      if (providerField && state.route === "providers") {
+        state.providerDraft[providerField.dataset.providerField] = providerField.value;
+        if (providerField.dataset.providerField === "template") {
+          state.providerDraft.name = "";
+          state.providerDraft.origin = "";
+          state.providerDraft.clientId = "";
+          renderProviders($("#view"));
+        }
+        return;
+      }
       const targetPriority = event.target.closest("[data-target-priority]");
       if (targetPriority) {
         setTargetPriority(targetPriority.dataset.targetModel, targetPriority.dataset.targetId, targetPriority.value);
@@ -3875,7 +4136,7 @@
       if (!row || !event.altKey) return;
       const model = graphModels().find((item) => item.id === row.dataset.targetModel);
       const targets = model ? modelTargets(model) : [];
-      const index = targets.findIndex((target) => (target.binding_id || target.id) === row.dataset.targetId);
+      const index = targets.findIndex((target) => targetBindingId(target) === row.dataset.targetId);
       if (index < 0) return;
       const destination = event.key === "ArrowUp" ? index - 1 : event.key === "ArrowDown" ? index + 1 : event.key === "Home" ? 0 : event.key === "End" ? targets.length - 1 : null;
       if (destination === null) return;

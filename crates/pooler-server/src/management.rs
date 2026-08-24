@@ -81,6 +81,7 @@ const MAX_BROWSER_OAUTH_RECORDS: usize = 32;
 const MAX_ACTIVE_CLIENT_CREDENTIALS: usize = 8;
 const MAX_ACTIVE_OAUTH_FLOWS: usize = 8;
 const BROWSER_OAUTH_SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+const DEVICE_OAUTH_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_OAUTH_CALLBACK_QUERY_BYTES: usize = 8 * 1024;
 const MAX_MANAGEMENT_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_MUTATION_BODY_BYTES: usize = 256 * 1024;
@@ -2710,22 +2711,34 @@ impl ManagementApi {
         configuration_generation: u64,
         catalog_generation: Option<u64>,
     ) {
-        let restoration_failed = self
-            .config_management
+        let kind = self
+            .reload
+            .state
             .lock()
-            .expect("configuration management lock poisoned")
-            .as_ref()
-            .is_some_and(|manager| {
-                let succeeded = matches!(outcome, "succeeded" | "unchanged");
-                let result = if succeeded {
-                    manager
-                        .promote_commit(request_id)
-                        .and_then(|()| manager.complete_commit(request_id, true))
-                } else {
-                    manager.complete_commit(request_id, false)
-                };
-                result.is_err()
-            });
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records
+            .iter()
+            .find(|record| record["request_id"] == request_id)
+            .and_then(|record| record["kind"].as_str())
+            .unwrap_or("configuration")
+            .to_owned();
+        let restoration_failed = kind == "configuration"
+            && self
+                .config_management
+                .lock()
+                .expect("configuration management lock poisoned")
+                .as_ref()
+                .is_some_and(|manager| {
+                    let succeeded = matches!(outcome, "succeeded" | "unchanged");
+                    let result = if succeeded {
+                        manager
+                            .promote_commit(request_id)
+                            .and_then(|()| manager.complete_commit(request_id, true))
+                    } else {
+                        manager.complete_commit(request_id, false)
+                    };
+                    result.is_err()
+                });
         let outcome = if restoration_failed {
             "restoration_failed"
         } else {
@@ -2742,7 +2755,7 @@ impl ManagementApi {
             )),
             _ => None,
         };
-        let kind = {
+        {
             let mut state = self
                 .reload
                 .state
@@ -2777,11 +2790,7 @@ impl ManagementApi {
             } else if let Some(object) = record.as_object_mut() {
                 object.remove("error");
             }
-            record["kind"]
-                .as_str()
-                .unwrap_or("configuration")
-                .to_owned()
-        };
+        }
         let durable_id = self
             .reload
             .state
@@ -2876,7 +2885,8 @@ impl ManagementApi {
             configuration_generation,
             "pending",
             unix_timestamp_ms(),
-        );
+        )
+        .with_kind(kind.as_str());
         durable_record.etag = Some(request.id.to_string());
         let durable = self.management_state.append_reload(durable_record);
         let Ok(durable) = durable else {
@@ -2948,7 +2958,7 @@ impl ManagementApi {
                             .unwrap_or(record.id);
                         json!({
                             "request_id": request_id,
-                            "kind": "configuration",
+                            "kind": record.kind,
                             "status": record.status,
                             "requested_at_ms": record.started_at,
                             "accepted_configuration_generation": record.generation,
@@ -3152,7 +3162,7 @@ impl ManagementApi {
                     "status": "starting",
                     "created_at_ms": unix_timestamp_ms(),
                     "expires_at_ms": unix_timestamp_ms().saturating_add(
-                        u64::try_from(BROWSER_OAUTH_SESSION_TTL.as_millis()).unwrap_or(u64::MAX),
+                        u64::try_from(DEVICE_OAUTH_SESSION_TTL.as_millis()).unwrap_or(u64::MAX),
                     ),
                 }));
                 while records.len() > MAX_OAUTH_DEVICE_RECORDS {
@@ -3186,7 +3196,7 @@ impl ManagementApi {
                     .unwrap_or_else(|| "device".to_owned()),
                     unix_timestamp_ms(),
                     unix_timestamp_ms().saturating_add(
-                        u64::try_from(BROWSER_OAUTH_SESSION_TTL.as_millis()).unwrap_or(u64::MAX),
+                        u64::try_from(DEVICE_OAUTH_SESSION_TTL.as_millis()).unwrap_or(u64::MAX),
                     ),
                 );
                 if self
@@ -3430,6 +3440,9 @@ impl ManagementApi {
         expected_etag: Option<&str>,
         current_etag: Option<&str>,
     ) -> ManagementResponse {
+        if let ConfigManagementError::Invalid(detail) = &error {
+            tracing::warn!(error = %detail, "managed configuration candidate is invalid");
+        }
         let (code, message, retry_after) = match error {
             ConfigManagementError::NotFound => (
                 ManagementErrorCode::NotFound,
@@ -3792,7 +3805,7 @@ impl ManagementApi {
                 (section, (!id.is_empty()).then_some(id))
             });
         let section = match section {
-            "providers" | "accounts" | "pools" | "policies" | "models" | "bindings"
+            "providers" | "accounts" | "pools" | "policies" | "routes" | "models" | "bindings"
             | "effective-order" | "effective_order" | "health" | "quota" | "discovery"
             | "endpoints" => section,
             _ => {
@@ -6629,6 +6642,28 @@ routes:
         let value: Value = serde_json::from_slice(&response.body).expect("control-plane JSON");
         assert_eq!(value["schema_version"], 2);
         assert!(value["providers"].is_array());
+        assert!(value["provider_templates"].is_array());
+        assert!(value["provider_templates"]
+            .as_array()
+            .is_some_and(|templates| templates.iter().any(|template| {
+                template["id"] == "openai"
+                    && template["name"] == "OpenAI"
+                    && template["base_url"] == "https://api.openai.com/v1"
+            })));
+        assert!(value["provider_templates"]
+            .as_array()
+            .is_some_and(|templates| templates.iter().any(|template| {
+                template["id"] == "openai-subscription"
+                    && template["auth_methods"] == json!(["oauth"])
+                    && template["native_kind"] == "codex"
+            })));
+        assert!(value["provider_templates"]
+            .as_array()
+            .is_some_and(|templates| templates.iter().any(|template| {
+                template["id"] == "palantir-aip"
+                    && template["dynamic_origin"] == true
+                    && template["requires_client_id"] == true
+            })));
         assert!(value["accounts"].is_array());
         assert!(value["pools"].is_array());
         assert!(value["models"].is_array());
@@ -7099,6 +7134,18 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         let catalog_request = api.next_reload_request().await;
         assert_eq!(catalog_request.kind, ManagementReloadKind::Catalog);
         api.complete_reload(catalog_request.id, "unchanged", 2, Some(1));
+        let reloads = api.handle(&Method::GET, "/reloads", &headers);
+        let reloads: Value = serde_json::from_slice(&reloads.body).expect("reloads json");
+        let catalog_record = reloads["reloads"]
+            .as_array()
+            .and_then(|records| {
+                records
+                    .iter()
+                    .find(|record| record["request_id"] == catalog_request.id)
+            })
+            .expect("catalog reload record");
+        assert_eq!(catalog_record["kind"], "catalog");
+        assert_eq!(catalog_record["status"], "unchanged");
         api.traces.record(
             pooler_observe::TraceRecord::new(pooler_observe::TraceStage::Attempt)
                 .route("route")

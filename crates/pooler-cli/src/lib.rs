@@ -2,14 +2,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use pooler_auth::MemoryOAuthTokenStore;
 use pooler_config::{Config, ConfigCandidate, ConfigWatcher};
 use pooler_http::{NativeRuntime, PoolingCoordinator};
-use pooler_store::{SqliteOAuthTokenStore, SqliteStore};
+use pooler_store::{ReloadRecord, SqliteOAuthTokenStore, SqliteStore};
 
 mod auth;
 mod bootstrap;
@@ -440,6 +440,32 @@ fn serve(
     let watcher = ConfigWatcher::new(&config_source)?;
     let config = watcher.active().compile()?;
     let resources = runtime_resources(&config, explicit_store_path, credential_key_ref)?;
+    let config = if let Some(store) = &resources.management_store {
+        let generation = store
+            .reload_records()
+            .context("could not restore the durable configuration generation")?
+            .into_iter()
+            .map(|record| record.completed_generation.unwrap_or(record.generation))
+            .max()
+            .map_or(config.generation(), |generation| {
+                generation.saturating_add(1)
+            });
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            });
+        let mut startup =
+            ReloadRecord::new(None, generation, "succeeded", now).with_kind("startup");
+        startup.completed_generation = Some(generation);
+        startup.completed_at = Some(now);
+        store
+            .append_reload_record(startup)
+            .context("could not persist the startup configuration generation")?;
+        config.with_generation(generation)
+    } else {
+        config
+    };
     pooler_observe::init_tracing().context("failed to initialize structured logging")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -16,10 +16,10 @@ use std::cell::Cell;
 
 use adapter_anthropic::AnthropicSemanticAdapter;
 use adapter_devin::DevinSemanticAdapter;
-use adapter_droid::DroidOpenAiSemanticAdapter;
 use adapter_factory::FactorySemanticAdapter;
 use adapter_fx::FxSemanticAdapter;
 use adapter_gemini::GeminiSemanticAdapter;
+use adapter_openai::OpenAiSemanticAdapter;
 use adapter_xai::XaiSemanticAdapter;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -132,7 +132,7 @@ struct RuntimeSemanticAdapter;
 
 impl SemanticAdapter for RuntimeSemanticAdapter {
     fn supports(&self, route: &pooler_config::RoutePlan) -> bool {
-        DroidOpenAiSemanticAdapter.supports(route)
+        OpenAiSemanticAdapter.supports(route)
             || XaiSemanticAdapter.supports(route)
             || MediaSemanticAdapter::default().supports(route)
             || AnthropicSemanticAdapter.supports(route)
@@ -148,8 +148,8 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         headers: &http::HeaderMap,
         body: &[u8],
     ) -> Result<SemanticRequestBody, BoxError> {
-        if DroidOpenAiSemanticAdapter.supports(route) {
-            DroidOpenAiSemanticAdapter.encode_request(route, headers, body)
+        if OpenAiSemanticAdapter.supports(route) {
+            OpenAiSemanticAdapter.encode_request(route, headers, body)
         } else if XaiSemanticAdapter.supports(route) {
             XaiSemanticAdapter.encode_request(route, headers, body)
         } else if MediaSemanticAdapter::default().supports(route) {
@@ -189,8 +189,8 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         headers: &http::HeaderMap,
         body: &[u8],
     ) -> Result<SelectionContext, BoxError> {
-        if DroidOpenAiSemanticAdapter.supports(route) {
-            DroidOpenAiSemanticAdapter.selection_context(route, headers, body)
+        if OpenAiSemanticAdapter.supports(route) {
+            OpenAiSemanticAdapter.selection_context(route, headers, body)
         } else if XaiSemanticAdapter.supports(route) {
             XaiSemanticAdapter.selection_context(route, headers, body)
         } else if MediaSemanticAdapter::default().supports(route) {
@@ -236,8 +236,8 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         &self,
         route: &pooler_config::RoutePlan,
     ) -> Option<SemanticWebSocketTransport> {
-        if DroidOpenAiSemanticAdapter.supports(route) {
-            DroidOpenAiSemanticAdapter.websocket_transport(route)
+        if OpenAiSemanticAdapter.supports(route) {
+            OpenAiSemanticAdapter.websocket_transport(route)
         } else if XaiSemanticAdapter.supports(route) {
             XaiSemanticAdapter.websocket_transport(route)
         } else {
@@ -265,7 +265,7 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
     }
 
     fn sanitize_request_headers(&self, headers: &mut http::HeaderMap) {
-        DroidOpenAiSemanticAdapter.sanitize_request_headers(headers);
+        OpenAiSemanticAdapter.sanitize_request_headers(headers);
         XaiSemanticAdapter.sanitize_request_headers(headers);
         MediaSemanticAdapter::default().sanitize_request_headers(headers);
         AnthropicSemanticAdapter.sanitize_request_headers(headers);
@@ -281,8 +281,8 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         body: ProxyBody,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
-        if DroidOpenAiSemanticAdapter.supports(route) {
-            DroidOpenAiSemanticAdapter.decode_response(route, body, cancellation)
+        if OpenAiSemanticAdapter.supports(route) {
+            OpenAiSemanticAdapter.decode_response(route, body, cancellation)
         } else if XaiSemanticAdapter.supports(route) {
             XaiSemanticAdapter.decode_response(route, body, cancellation)
         } else if AnthropicSemanticAdapter.supports(route) {
@@ -307,8 +307,8 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         request_headers: &http::HeaderMap,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
-        if DroidOpenAiSemanticAdapter.supports(route) {
-            DroidOpenAiSemanticAdapter.decode_response_with_request_headers(
+        if OpenAiSemanticAdapter.supports(route) {
+            OpenAiSemanticAdapter.decode_response_with_request_headers(
                 route,
                 body,
                 request_headers,
@@ -369,8 +369,8 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         hint: &SemanticResponseHint,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
-        if DroidOpenAiSemanticAdapter.supports(route) {
-            DroidOpenAiSemanticAdapter.decode_response_with_hint(
+        if OpenAiSemanticAdapter.supports(route) {
+            OpenAiSemanticAdapter.decode_response_with_hint(
                 route,
                 body,
                 request_headers,
@@ -1500,7 +1500,7 @@ impl HttpProxyServer {
         if !same_listener_bindings(&current.config, &candidate) {
             return Err(HttpProxyServerError::ListenerSetChanged);
         }
-        if current.config.management() != candidate.management() {
+        if !same_management_binding(&current.config, &candidate) {
             return Err(HttpProxyServerError::ListenerSetChanged);
         }
         activation_stage(RuntimeActivationStage::Candidate)?;
@@ -1929,7 +1929,9 @@ async fn prepare_catalog(
 ) -> Result<Option<Arc<CatalogRuntime>>, HttpProxyServerError> {
     let catalog = CatalogRuntime::from_config(config, native)?;
     if let Some(catalog) = &catalog {
-        catalog.refresh().await?;
+        if let Err(error) = catalog.refresh().await {
+            tracing::warn!(%error, "model discovery is unavailable; continuing with the last complete catalog");
+        }
     }
     Ok(catalog)
 }
@@ -1941,6 +1943,18 @@ fn same_listener_bindings(current: &CompiledConfig, candidate: &CompiledConfig) 
                 other.bind() == plan.bind() && other.protocol() == plan.protocol()
             })
         })
+}
+
+fn same_management_binding(current: &CompiledConfig, candidate: &CompiledConfig) -> bool {
+    match (current.management(), candidate.management()) {
+        (None, None) => true,
+        (Some(current), Some(candidate)) => {
+            current.bind() == candidate.bind()
+                && current.remote() == candidate.remote()
+                && current.auth() == candidate.auth()
+        }
+        _ => false,
+    }
 }
 
 fn prepare_tls_map(
@@ -2413,6 +2427,22 @@ mod tests {
             http::HeaderValue::from_static("localhost"),
         );
         headers
+    }
+
+    #[test]
+    fn management_reload_compares_runtime_binding_not_source_label() {
+        let source = "version: 2\nmanagement: {bind: 127.0.0.1:18401, auth: {secret: env:POOLER_TEST_MANAGEMENT_KEY}}\nlisteners: {inference: {bind: 127.0.0.1:18400}}\n";
+        let current = pooler_config::compile_yaml("original.yaml", source).expect("current config");
+        let candidate = pooler_config::compile_yaml("dashboard-generated.yaml", source)
+            .expect("dashboard config");
+        assert!(same_management_binding(&current, &candidate));
+
+        let changed = pooler_config::compile_yaml(
+            "changed.yaml",
+            &source.replace("127.0.0.1:18401", "127.0.0.1:18402"),
+        )
+        .expect("changed config");
+        assert!(!same_management_binding(&current, &changed));
     }
 
     struct TestSecret {

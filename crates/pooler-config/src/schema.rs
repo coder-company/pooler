@@ -397,7 +397,7 @@ fn catalog_source_schema() -> Value {
             ("account_pool", optional(id_schema())),
             (
                 "parser",
-                string_enum(["openai", "kimi", "gemini", "vertex", "antigravity"]),
+                string_enum(["openai", "codex", "kimi", "gemini", "vertex", "antigravity"]),
             ),
             ("path", optional(string_schema())),
             (

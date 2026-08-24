@@ -10,7 +10,7 @@ description = "Pooler process lifecycle, immutable configuration generations, an
 [dependencies]
 adapter-anthropic = { path = "../adapter-anthropic" }
 adapter-devin = { path = "../adapter-devin" }
-adapter-droid = { path = "../adapter-droid" }
+adapter-openai = { path = "../adapter-openai" }
 adapter-factory = { path = "../adapter-factory" }
 adapter-fx = { path = "../adapter-fx" }
 adapter-gemini = { path = "../adapter-gemini" }

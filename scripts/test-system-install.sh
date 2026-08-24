@@ -99,20 +99,20 @@ assert_common_topology() {
 
     assert_mode "$binary" 755
     assert_mode "$unit" 644
-    assert_mode "$root/etc/pooler" 770
-    assert_mode "$config" 660
-    assert_mode "$store_key" 640
-    assert_mode "$management_key" 640
+    assert_mode "$root/etc/pooler" 700
+    assert_mode "$config" 600
+    assert_mode "$store_key" 600
+    assert_mode "$management_key" 600
     assert_mode "$root/var/lib/pooler" 700
     assert_mode "$store" 600
 
     if [[ "$root" = / ]]; then
         assert_owner "$binary" root:root
         assert_owner "$unit" root:root
-        assert_owner "$root/etc/pooler" root:pooler
-        assert_owner "$config" root:pooler
-        assert_owner "$store_key" root:pooler
-        assert_owner "$management_key" root:pooler
+        assert_owner "$root/etc/pooler" pooler:pooler
+        assert_owner "$config" pooler:pooler
+        assert_owner "$store_key" pooler:pooler
+        assert_owner "$management_key" pooler:pooler
         assert_owner "$root/var/lib/pooler" pooler:pooler
         assert_owner "$store" pooler:pooler
     fi
@@ -131,7 +131,13 @@ assert_common_topology() {
         die 'obsolete key, template, keyring, example, or remote bind detected'
     fi
 
-    sidecar_count=$(find "$root" -type f \( -name '*.managed.yaml' -o -name 'upstream.key' -o -name 'downstream.key' \) -print | wc -l | tr -d ' ')
+    sidecar_count=$(find \
+        "$root/etc/pooler" \
+        "$root/var/lib/pooler" \
+        "$root/etc/systemd/system" \
+        -maxdepth 2 -type f \
+        \( -name '*.managed.yaml' -o -name 'upstream.key' -o -name 'downstream.key' \) \
+        -print | wc -l | tr -d ' ')
     [[ "$sidecar_count" = 0 ]] || die 'obsolete sidecar file detected'
 
     backup_manifest=$(find "$root/var/backups/pooler" -type f -name manifest.json -print | sort | tail -n 1)

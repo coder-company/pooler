@@ -407,6 +407,7 @@
         "parser": {
           "enum": [
             "openai",
+            "codex",
             "kimi",
             "gemini",
             "vertex",

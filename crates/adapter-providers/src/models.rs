@@ -127,6 +127,35 @@ impl ProviderModelParser {
             .collect()
     }
 
+    /// Parse the native Codex `models[]` response used by ChatGPT subscriptions.
+    pub fn parse_codex_list(
+        &self,
+        body: &[u8],
+    ) -> Result<Vec<DiscoveredModel>, ModelDiscoveryError> {
+        let value = self.parse_json(body)?;
+        let models = value
+            .get("models")
+            .and_then(Value::as_array)
+            .ok_or(ModelDiscoveryError::InvalidShape)?;
+        self.check_model_count(models.len())?;
+        models
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| {
+                let object = value.as_object();
+                object
+                    .and_then(|object| object.get("supported_in_api"))
+                    .and_then(Value::as_bool)
+                    != Some(false)
+                    && object
+                        .and_then(|object| object.get("visibility"))
+                        .and_then(Value::as_str)
+                        != Some("hide")
+            })
+            .map(|(index, value)| self.parse_codex_model(index, value))
+            .collect()
+    }
+
     /// Parse the Kimi Open Platform list and attach capabilities established
     /// by Kimi's Chat Completions surface in addition to per-model extensions.
     pub fn parse_kimi_list(
@@ -339,6 +368,55 @@ impl ProviderModelParser {
         })
     }
 
+    fn parse_codex_model(
+        &self,
+        index: usize,
+        value: &Value,
+    ) -> Result<DiscoveredModel, ModelDiscoveryError> {
+        let object = value
+            .as_object()
+            .ok_or(ModelDiscoveryError::InvalidModel { index })?;
+        let id = object
+            .get("slug")
+            .and_then(Value::as_str)
+            .and_then(|value| self.bounded_identifier(value))
+            .ok_or(ModelDiscoveryError::InvalidModel { index })?
+            .to_owned();
+        let display_name = self.optional_bounded_string(object.get("display_name"), index)?;
+        let context_length = object.get("context_window").and_then(Value::as_u64);
+        let mut capabilities = CapabilitySet::new();
+        capabilities.insert(Capability::Text);
+        capabilities.insert(Capability::Streaming);
+        if object
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .is_some_and(|levels| !levels.is_empty())
+        {
+            capabilities.insert(Capability::Reasoning);
+        }
+        if object
+            .get("supports_parallel_tool_calls")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            capabilities.insert(Capability::Tools);
+            capabilities.insert(Capability::FunctionCalling);
+        }
+        let mut attributes = BTreeMap::new();
+        if let Some(supported) = object.get("supported_in_api").and_then(Value::as_bool) {
+            attributes.insert("supported_in_api".to_owned(), supported.to_string());
+        }
+        Ok(DiscoveredModel {
+            id,
+            display_name,
+            owned_by: Some("openai".to_owned()),
+            created: None,
+            context_length,
+            capabilities,
+            attributes,
+        })
+    }
+
     fn parse_vertex_model(
         &self,
         index: usize,
@@ -472,5 +550,29 @@ mod tests {
         assert!(models[0].capabilities.contains(Capability::Text));
         assert!(models[0].capabilities.contains(Capability::Streaming));
         assert!(models[0].capabilities.contains(Capability::Embeddings));
+    }
+
+    #[test]
+    fn codex_models_use_slug_and_native_capability_fields() {
+        let models = ProviderModelParser::default()
+            .parse_codex_list(
+                br#"{"models":[{"slug":"gpt-test","display_name":"GPT Test","context_window":272000,"supported_in_api":true,"visibility":"list","supported_reasoning_levels":[{"effort":"low"}],"supports_parallel_tool_calls":true},{"slug":"internal","supported_in_api":false},{"slug":"hidden","supported_in_api":true,"visibility":"hide"}]}"#,
+            )
+            .expect("Codex model list");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-test");
+        assert_eq!(models[0].display_name.as_deref(), Some("GPT Test"));
+        assert_eq!(models[0].context_length, Some(272_000));
+        assert!(models[0].capabilities.contains(Capability::Text));
+        assert!(models[0].capabilities.contains(Capability::Streaming));
+        assert!(models[0].capabilities.contains(Capability::Reasoning));
+        assert!(models[0].capabilities.contains(Capability::Tools));
+        assert_eq!(
+            models[0]
+                .attributes
+                .get("supported_in_api")
+                .map(String::as_str),
+            Some("true")
+        );
     }
 }

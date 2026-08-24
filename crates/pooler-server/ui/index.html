@@ -54,8 +54,8 @@
           <span
             id="generation-badge"
             class="chip chip-mono"
-            title="Active configuration generation"
-            >gen —</span
+            title="Current configuration version"
+            >config —</span
           >
           <button
             id="refresh-now"
@@ -86,6 +86,9 @@
           <a href="#/providers" data-route="providers" class="nav-link"
             ><span class="nav-icon" data-icon="server"></span>Providers</a
           >
+          <a href="#/configuration" data-route="configuration" class="nav-link"
+            ><span class="nav-icon" data-icon="settings"></span>Configuration</a
+          >
           <a href="#/models" data-route="models" class="nav-link"
             ><span class="nav-icon" data-icon="cpu"></span>Models</a
           >
@@ -93,7 +96,7 @@
             ><span class="nav-icon" data-icon="key-alt"></span>Accounts</a
           >
           <a href="#/pools" data-route="pools" class="nav-link"
-            ><span class="nav-icon" data-icon="database-rounded"></span>Pools</a
+            ><span class="nav-icon" data-icon="database-rounded"></span>Failover</a
           >
           <a href="#/endpoints" data-route="endpoints" class="nav-link"
             ><span class="nav-icon" data-icon="globe"></span>Endpoints</a
@@ -131,7 +134,7 @@
       aria-describedby="session-copy"
     >
       <div class="dialog-head">
-        <h2 class="dialog-title" id="session-title">Management session</h2>
+        <h2 class="dialog-title" id="session-title">Connect to Pooler</h2>
         <button
           class="btn btn-ghost btn-icon"
           type="button"
@@ -140,30 +143,24 @@
         ></button>
       </div>
       <p class="dialog-copy" id="session-copy">
-        Enter the management secret configured under
-        <code class="mono">management.auth.secret</code>. Pooler adds the
-        <code class="mono">Bearer</code> scheme when it sends the
-        <code class="mono">Authorization</code> header, so enter only the
-        secret value, without the <code class="mono">Bearer</code> prefix. The
-        secret is held in memory for this tab only and is never stored or sent
-        anywhere except this listener. Leave it empty when this loopback
-        listener permits anonymous read-only access.
+        Enter your management key. It stays in this browser tab and is sent
+        only to this local Pooler service.
       </p>
       <label class="field">
-        <span class="field-label">Management secret</span>
+        <span class="field-label">Management key</span>
         <span class="field-control">
           <input
             id="token-input"
             type="password"
             autocomplete="off"
             spellcheck="false"
-            placeholder="Secret value (without Bearer prefix; optional on loopback)"
+            placeholder="Paste management key"
           />
           <button
             id="token-visibility"
             class="btn btn-ghost btn-icon"
             type="button"
-            aria-label="Show management secret"
+            aria-label="Show management key"
           ></button>
         </span>
       </label>

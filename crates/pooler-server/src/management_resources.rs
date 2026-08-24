@@ -11,8 +11,12 @@ use http::Method;
 use ring::digest::{digest, SHA256};
 use serde_json::{json, Map, Value};
 
+use adapter_providers::{AuthPlacement, OpenAiCompatibleAdapter, ProviderOperation};
 use pooler_config::{CompiledConfig, ModelPlan, ModelTargetPlan};
+use pooler_core::ModelId;
 use pooler_http::PoolingCoordinator;
+use pooler_model_catalog::ProviderCatalog;
+use url::Url;
 
 use crate::config_management::TypedConfigPatch;
 use crate::{merged_model_catalog_value, CatalogRuntime, ConfigSnapshot};
@@ -26,6 +30,7 @@ const RESOURCE_SECTIONS: &[(&str, &str, bool)] = &[
     ("accounts", "accounts", false),
     ("pools", "account_pools", false),
     ("policies", "policies", false),
+    ("routes", "routes", true),
     ("models", "models", true),
     ("bindings", "models", true),
 ];
@@ -56,6 +61,7 @@ pub(crate) fn is_control_plane_path(path: &str) -> bool {
         || path.starts_with("/control-plane/accounts")
         || path.starts_with("/control-plane/pools")
         || path.starts_with("/control-plane/policies")
+        || path.starts_with("/control-plane/routes")
         || path.starts_with("/control-plane/models")
         || path.starts_with("/control-plane/bindings")
         || path.starts_with("/control-plane/connect-tools")
@@ -161,13 +167,19 @@ pub(crate) fn resource_patch(
             .or_else(|| object.get("id").and_then(Value::as_str).map(str::to_owned))
             .ok_or(ResourceMutationError::Invalid)?
     };
-    validate_component(&id)?;
+    if matches!(resource, "models" | "bindings") {
+        ModelId::new(id.clone()).map_err(|_| ResourceMutationError::Invalid)?;
+    } else {
+        validate_component(&id)?;
+    }
     if list_section {
         let current_id = object.get("id").and_then(Value::as_str);
         if current_id.is_some() && current_id != Some(id.as_str()) {
             return Err(ResourceMutationError::Invalid);
         }
         object.insert("id".to_owned(), Value::String(id.clone()));
+    } else {
+        object.remove("id");
     }
 
     match resource {
@@ -175,6 +187,7 @@ pub(crate) fn resource_patch(
         "accounts" => normalize_account(object)?,
         "pools" => normalize_pool(object)?,
         "policies" => normalize_policy(object)?,
+        "routes" => normalize_route(object)?,
         "models" => normalize_model(object)?,
         "bindings" => {}
         _ => return Err(ResourceMutationError::Unsupported),
@@ -291,14 +304,19 @@ pub(crate) fn convenience_patch(
             ("pools", id, Value::Object(object.clone()))
         }
         "discover_models" | "select_all_models" | "select_none_models" => {
-            let object = value.as_object().ok_or(ResourceMutationError::Invalid)?;
+            let mut object = value
+                .as_object()
+                .cloned()
+                .ok_or(ResourceMutationError::Invalid)?;
             let id = object
                 .get("id")
                 .and_then(Value::as_str)
                 .or_else(|| object.get("source_id").and_then(Value::as_str))
                 .unwrap_or("catalog")
                 .to_owned();
-            ("catalog", id, Value::Object(object.clone()))
+            object.remove("id");
+            object.remove("source_id");
+            ("catalog", id, Value::Object(object))
         }
         _ => unreachable!(),
     };
@@ -385,6 +403,10 @@ pub(crate) fn control_plane_graph(
                 .values()
                 .filter(|pool| pool.provider() == id.as_ref())
                 .count();
+            let oauth_capable = provider.oauth().is_some()
+                || provider
+                    .native()
+                    .is_some_and(|native| matches!(native.kind(), "codex" | "palantir_aip"));
             let value = json!({
                 "id": id.as_ref(),
                 "instance_id": id.as_ref(),
@@ -393,6 +415,7 @@ pub(crate) fn control_plane_graph(
                 "base_url": provider.url().as_str(),
                 "transport": provider.transport(),
                 "known_provider": provider.known_provider(),
+                "auth_methods": if oauth_capable { vec!["oauth"] } else { vec!["api_key"] },
                 "auth": provider.auth().map(|auth| json!({
                     "required": true,
                     "kind": auth.kind(),
@@ -549,6 +572,54 @@ pub(crate) fn control_plane_graph(
         "sources": catalog_value["catalog_sources"],
         "models": catalog_value["models"],
     });
+    let mut provider_templates = vec![
+        json!({
+            "id": "openai-subscription",
+            "name": "OpenAI subscription (ChatGPT)",
+            "base_url": "Managed by Pooler",
+            "known_provider": "openai",
+            "auth_methods": ["oauth"],
+            "native_kind": "codex",
+            "native_config": true,
+            "model_discovery": true,
+            "request_dialect": "openai_responses",
+            "endpoint_families": ["models", "responses"],
+        }),
+        json!({
+            "id": "palantir-aip",
+            "name": "Palantir AIP",
+            "base_url": "Your Foundry enrollment",
+            "auth_methods": ["oauth"],
+            "native_kind": "palantir_aip",
+            "dynamic_origin": true,
+            "requires_client_id": true,
+            "model_discovery": false,
+            "request_dialect": "multi_protocol",
+            "endpoint_families": ["chat_completions", "responses", "messages"],
+        }),
+    ];
+    provider_templates.extend(ProviderCatalog::builtin().iter().map(|(id, provider)| {
+        json!({
+            "id": id,
+            "name": provider.name.as_str(),
+            "base_url": provider.base_url.as_str(),
+            "known_provider": id,
+            "auth_methods": ["api_key"],
+            "auth_kind": provider.integration.auth_kind.as_str(),
+            "model_discovery": provider.integration.discovery_parser.is_some(),
+            "request_dialect": provider.integration.request_dialect.as_str(),
+            "endpoint_families": provider.integration.endpoint_families,
+            "native_kind": provider.integration.native_kind.as_str(),
+            "native_config": false,
+        })
+    }));
+    let endpoints = endpoint_inventory(config);
+    let routes = endpoints["listeners"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|listener| listener["routes"].as_array().into_iter().flatten().cloned())
+        .collect::<Vec<_>>();
 
     json!({
         "schema_version": CONTROL_PLANE_SCHEMA_VERSION,
@@ -557,9 +628,11 @@ pub(crate) fn control_plane_graph(
             "active": active_status,
         },
         "providers": providers,
+        "provider_templates": provider_templates,
         "accounts": accounts,
         "pools": pools,
         "policies": policies,
+        "routes": routes,
         "models": models,
         "bindings": bindings,
         "effective_order": effective_order,
@@ -575,7 +648,7 @@ pub(crate) fn control_plane_graph(
         },
         "quota": quotas,
         "recent_failover_and_rebind": decisions,
-        "endpoints": endpoint_inventory(config),
+        "endpoints": endpoints,
     })
 }
 
@@ -632,7 +705,7 @@ pub(crate) fn endpoint_inventory(config: &CompiledConfig) -> Value {
         "listeners": listeners,
         "management": management,
         "downstream_clients": [
-            "Factory", "Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"
+            "Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"
         ],
         "custom_provider_origins": config.upstreams().values().map(|provider| provider.url().origin().ascii_serialization()).collect::<BTreeSet<_>>(),
         "connect_tools": {
@@ -716,6 +789,7 @@ fn resource_exists(config: &CompiledConfig, section: &str, id: &str) -> bool {
         "accounts" => config.accounts().contains_key(id),
         "pools" => config.account_pools().contains_key(id),
         "policies" => config.policies().contains_key(id),
+        "routes" => config.route(id).is_some(),
         "models" | "bindings" => config.models().contains_key(id),
         _ => false,
     }
@@ -734,6 +808,26 @@ fn normalize_provider(object: &mut Map<String, Value>) -> Result<(), ResourceMut
             .is_none()
     {
         return Err(ResourceMutationError::Invalid);
+    }
+    let openai_compatible = object
+        .get("native")
+        .and_then(Value::as_object)
+        .and_then(|native| native.get("kind"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("openai_compatible"));
+    if openai_compatible {
+        let url = object
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(|value| Url::parse(value).ok())
+            .ok_or(ResourceMutationError::Invalid)?;
+        OpenAiCompatibleAdapter::new(
+            "custom",
+            url,
+            AuthPlacement::Bearer,
+            [ProviderOperation::ChatCompletions],
+        )
+        .map_err(|_| ResourceMutationError::Invalid)?;
     }
     Ok(())
 }
@@ -783,6 +877,16 @@ fn normalize_policy(object: &mut Map<String, Value>) -> Result<(), ResourceMutat
     if !object.contains_key("selection")
         && !object.contains_key("retry")
         && !object.contains_key("routing")
+    {
+        return Err(ResourceMutationError::Invalid);
+    }
+    Ok(())
+}
+
+fn normalize_route(object: &mut Map<String, Value>) -> Result<(), ResourceMutationError> {
+    if object.get("listen").and_then(Value::as_str).is_none()
+        || object.get("match").and_then(Value::as_object).is_none()
+        || object.get("target").is_none()
     {
         return Err(ResourceMutationError::Invalid);
     }
@@ -875,4 +979,83 @@ fn revision(kind: &str, id: &str, generation: u64, value: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn active() -> CompiledConfig {
+        pooler_config::compile_yaml(
+            "resource-test.yaml",
+            "version: 2\nlisteners: {inference: {bind: 127.0.0.1:0}}\nupstreams: {anchor: {url: https://api.example.com/v1}}\n",
+        )
+        .expect("active config")
+    }
+
+    #[test]
+    fn route_resources_are_typed_and_catalog_operations_drop_transport_ids() {
+        let (_, route) = resource_patch(
+            &Method::POST,
+            "/control-plane/drafts/1/routes",
+            br#"{"id":"standard-models","listen":"inference","match":{"methods":["GET"],"path":"/v1/models"},"serve":"model_catalog","ingress":{"mode":"opaque"},"target":{"provider":"anchor"},"response":{"mode":"opaque"}}"#,
+            &active(),
+        )
+        .expect("route patch");
+        assert!(matches!(
+            route,
+            TypedConfigPatch::Upsert { ref section, ref id, .. }
+                if section == "routes" && id == "standard-models"
+        ));
+
+        let (_, catalog) = convenience_patch(
+            &Method::POST,
+            "/control-plane/drafts/1/models/select_all_models",
+            br#"{"id":"catalog","sources":[],"overrides":[]}"#,
+            &active(),
+        )
+        .expect("catalog patch");
+        let TypedConfigPatch::Replace { section, value } = catalog else {
+            panic!("catalog replace patch");
+        };
+        assert_eq!(section, "catalog");
+        assert!(value.get("id").is_none());
+
+        let (_, model) = resource_patch(
+            &Method::POST,
+            "/control-plane/drafts/1/models",
+            br#"{"id":"anthropic/claude-test","targets":[]}"#,
+            &active(),
+        )
+        .expect("namespaced model patch");
+        assert!(matches!(
+            model,
+            TypedConfigPatch::Upsert { ref section, ref id, .. }
+                if section == "models" && id == "anthropic/claude-test"
+        ));
+    }
+
+    #[test]
+    fn custom_provider_urls_require_https_or_explicit_loopback_http() {
+        let active = active();
+        let rejected = resource_patch(
+            &Method::POST,
+            "/control-plane/drafts/1/providers",
+            br#"{"id":"custom","url":"http://example.com/v1","native":{"kind":"openai_compatible"}}"#,
+            &active,
+        );
+        assert!(matches!(rejected, Err(ResourceMutationError::Invalid)));
+        for url in ["https://example.com/v1", "http://127.0.0.1:9000/v1"] {
+            let body = format!(
+                r#"{{"id":"custom","url":"{url}","native":{{"kind":"openai_compatible"}}}}"#
+            );
+            resource_patch(
+                &Method::POST,
+                "/control-plane/drafts/1/providers",
+                body.as_bytes(),
+                &active,
+            )
+            .expect("safe custom provider");
+        }
+    }
 }

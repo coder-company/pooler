@@ -241,16 +241,16 @@ etc_pooler=$(root_path /etc/pooler)
 state_directory=$(root_path /var/lib/pooler)
 binary_directory=$(root_path /usr/local/bin)
 unit_directory=$(root_path /etc/systemd/system)
-make_directory "$etc_pooler" 0770 root:pooler
+make_directory "$etc_pooler" 0700 pooler:pooler
 make_directory "$state_directory" 0700 pooler:pooler
 make_directory "$binary_directory" 0755 root:root
 make_directory "$unit_directory" 0755 root:root
 
 install_file_mode "$BINARY" "$canonical_binary" 0755 root:root
-install_file_mode "$CONFIG" "$canonical_config" 0660 pooler:pooler
+install_file_mode "$CONFIG" "$canonical_config" 0600 pooler:pooler
 install_file_mode "$STORE" "$canonical_store" 0600 pooler:pooler
-install_file_mode "$STORE_KEY" "$canonical_store_key" 0640 root:pooler
-install_file_mode "$MANAGEMENT_KEY" "$canonical_management_key" 0640 root:pooler
+install_file_mode "$STORE_KEY" "$canonical_store_key" 0600 pooler:pooler
+install_file_mode "$MANAGEMENT_KEY" "$canonical_management_key" 0600 pooler:pooler
 install_file_mode "$UNIT" "$canonical_unit" 0644 root:root
 
 for sidecar in wal shm; do

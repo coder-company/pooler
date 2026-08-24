@@ -72,24 +72,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "adapter-droid"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "http",
- "http-body",
- "http-body-util",
- "pooler-config",
- "pooler-core",
- "pooler-http",
- "pooler-protocol",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "adapter-factory"
 version = "0.1.0"
 dependencies = [
@@ -143,6 +125,24 @@ dependencies = [
  "pooler-protocol",
  "serde_json",
  "thiserror",
+ "tokio-util",
+]
+
+[[package]]
+name = "adapter-openai"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "pooler-config",
+ "pooler-core",
+ "pooler-http",
+ "pooler-protocol",
+ "serde_json",
+ "thiserror",
+ "tokio",
  "tokio-util",
 ]
 
@@ -1657,10 +1657,10 @@ version = "0.1.0"
 dependencies = [
  "adapter-anthropic",
  "adapter-devin",
- "adapter-droid",
  "adapter-factory",
  "adapter-fx",
  "adapter-gemini",
+ "adapter-openai",
  "adapter-providers",
  "adapter-xai",
  "arc-swap",

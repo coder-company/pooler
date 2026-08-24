@@ -795,6 +795,7 @@ impl AuditRecord {
 pub struct ReloadRecord {
     pub id: u64,
     pub owner_id: Option<String>,
+    pub kind: String,
     pub generation: u64,
     pub completed_generation: Option<u64>,
     pub status: String,
@@ -816,6 +817,7 @@ impl ReloadRecord {
         Self {
             id: 0,
             owner_id,
+            kind: "configuration".to_owned(),
             generation,
             completed_generation: None,
             status: status.into(),
@@ -825,6 +827,12 @@ impl ReloadRecord {
             completed_at: None,
             revision: 0,
         }
+    }
+
+    #[must_use]
+    pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
+        self.kind = kind.into();
+        self
     }
 }
 

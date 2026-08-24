@@ -387,6 +387,48 @@ catalog:
 }
 
 #[tokio::test]
+async fn codex_subscription_catalog_is_verified_and_bound_to_the_oauth_account() {
+    let config = pooler_config::compile_yaml(
+        "catalog-codex-subscription.yaml",
+        r#"
+version: 2
+management: {bind: 127.0.0.1:0}
+upstreams:
+  subscription: {known_provider: openai, native: {kind: codex}}
+accounts:
+  personal: {provider: subscription, auth_kind: oauth}
+"#,
+    )
+    .expect("Codex subscription config");
+    let source = config.catalog().expect("automatic catalog").sources()[0]
+        .source()
+        .id()
+        .to_string();
+    let provider = Arc::new(FakeProvider::new([Ok(FetchedCatalog::new(
+        br#"{"models":[{"slug":"gpt-test","display_name":"GPT Test","supported_in_api":true}]}"#
+            .as_slice(),
+        None,
+    ))]));
+    let runtime = CatalogRuntime::with_fetchers(
+        config.catalog().expect("catalog plan").clone(),
+        vec![CatalogFetcherRegistration::new(source, provider).expect("registration")],
+    )
+    .expect("runtime");
+    runtime.refresh().await.expect("refresh");
+
+    let view = pooler_server::merged_model_catalog_value(&config, Some(&runtime));
+    let source = &view["catalog_sources"][0];
+    assert_eq!(source["discovery"]["state"], "verified");
+    assert_eq!(source["parser"], "codex");
+    assert_eq!(
+        source["path"],
+        "/backend-api/codex/models?client_version=99.99.99"
+    );
+    assert_eq!(source["account"], "personal");
+    assert_eq!(view["models"][0]["targets"][0]["account"], "personal");
+}
+
+#[tokio::test]
 async fn vendored_request_facts_reach_discovered_targets_and_the_model_view() {
     let config = pooler_config::compile_yaml(
         "catalog-model-facts.yaml",

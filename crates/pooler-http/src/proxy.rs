@@ -4377,12 +4377,17 @@ fn rewrite_native_upstream_uri(
     if native.kind().eq_ignore_ascii_case("codex") {
         let path = match downstream.path() {
             "/v1/responses" => adapter_codex::CODEX_RESPONSES_PATH,
-            "/v1/models" => adapter_codex::CODEX_MODELS_PATH,
+            "/v1/models" => adapter_codex::CODEX_MODELS_PATH_AND_QUERY,
             _ => return Ok(upstream_uri),
         };
         let mut target =
             url::Url::parse(&upstream_uri.to_string()).map_err(|_| ProxyError::InvalidUri)?;
-        target.set_path(path);
+        if let Some((path, query)) = path.split_once('?') {
+            target.set_path(path);
+            target.set_query(Some(query));
+        } else {
+            target.set_path(path);
+        }
         return target.as_str().parse().map_err(|_| ProxyError::InvalidUri);
     }
     if !native.kind().eq_ignore_ascii_case("vertex") {
@@ -6445,6 +6450,29 @@ routes:
         assert_eq!(
             uri,
             "ws://127.0.0.1:8319/v1/socket?tenant=pooler&stream=true"
+        );
+    }
+
+    #[test]
+    fn codex_models_rewrite_includes_the_required_client_version() {
+        let config = compile_yaml(
+            "codex-models.yaml",
+            r#"
+version: 2
+upstreams: {subscription: {known_provider: openai, native: {kind: codex}}}
+"#,
+        )
+        .expect("Codex config");
+        let upstream = &config.upstreams()["subscription"];
+        let downstream: Uri = "/v1/models".parse().expect("downstream URI");
+        let upstream_uri: Uri = "https://chatgpt.com/v1/models"
+            .parse()
+            .expect("upstream URI");
+        let rewritten = rewrite_native_upstream_uri(upstream, &downstream, None, upstream_uri)
+            .expect("rewritten Codex URI");
+        assert_eq!(
+            rewritten,
+            "https://chatgpt.com/backend-api/codex/models?client_version=99.99.99"
         );
     }
 

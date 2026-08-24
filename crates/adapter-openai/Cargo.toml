@@ -1,6 +1,6 @@
 [package]
-name = "adapter-droid"
-description = "Factory Droid OpenAI Responses and Chat semantic routes"
+name = "adapter-openai"
+description = "Generic OpenAI Responses and Chat semantic routes"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

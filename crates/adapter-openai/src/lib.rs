@@ -1,11 +1,9 @@
 #![forbid(unsafe_code)]
-#![doc = "Semantic HTTP adapter for Factory Droid's OpenAI-compatible wires.
+#![doc = "Generic semantic HTTP adapter for OpenAI Responses and Chat wires.
 
-Factory Droid is a separate product from Factory's `fx` CLI. Droid custom
-models marked as `openai` use the OpenAI Responses endpoint in the installed
-0.149.0 client. This adapter also supports streaming Chat Completions routes
-for OpenAI-compatible providers without routing either wire through the
-Factory LanguageModel adapter."]
+Any compatible client can use these routes. Product-specific clients are
+compatibility consumers, not architectural adapters. The Factory LanguageModel
+protocol remains isolated in `adapter-factory`."]
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -51,9 +49,9 @@ pub const OPENAI_CHAT_EVENT_DECODER: &str = "decode.openai.chat.events";
 /// Semantic encoder for OpenAI Chat Completions SSE data chunks.
 pub const OPENAI_CHAT_EVENT_ENCODER: &str = "encode.openai.chat.events";
 
-/// Runtime adapter for Droid's OpenAI Responses and compatible Chat routes.
+/// Runtime adapter for OpenAI Responses and compatible Chat routes.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct DroidOpenAiSemanticAdapter;
+pub struct OpenAiSemanticAdapter;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RequestWire {
@@ -67,7 +65,7 @@ enum EventWire {
     Chat,
 }
 
-impl SemanticAdapter for DroidOpenAiSemanticAdapter {
+impl SemanticAdapter for OpenAiSemanticAdapter {
     fn supports(&self, route: &RoutePlan) -> bool {
         route_wires(route).is_some()
     }
@@ -79,7 +77,7 @@ impl SemanticAdapter for DroidOpenAiSemanticAdapter {
         body: &[u8],
     ) -> Result<SemanticRequestBody, BoxError> {
         let (request_wire, upstream_wire) = route_wires(route)
-            .ok_or_else(|| Box::new(DroidAdapterError::UnsupportedRoute) as BoxError)?;
+            .ok_or_else(|| Box::new(OpenAiAdapterError::UnsupportedRoute) as BoxError)?;
         let request = decode_request(request_wire, body, route.loss_policy())?;
         let streaming = request_streaming(&request);
         if !streaming
@@ -88,7 +86,7 @@ impl SemanticAdapter for DroidOpenAiSemanticAdapter {
                 (RequestWire::Responses, EventWire::Chat)
             )
         {
-            return Err(Box::new(DroidAdapterError::UnaryCrossProtocolUnsupported));
+            return Err(Box::new(OpenAiAdapterError::UnaryCrossProtocolUnsupported));
         }
         let encoded = encode_upstream_request(upstream_wire, &request, route.loss_policy())?;
         let response_mode = if streaming {
@@ -114,7 +112,7 @@ impl SemanticAdapter for DroidOpenAiSemanticAdapter {
         body: &[u8],
     ) -> Result<SelectionContext, BoxError> {
         let (request_wire, _) = route_wires(route)
-            .ok_or_else(|| Box::new(DroidAdapterError::UnsupportedRoute) as BoxError)?;
+            .ok_or_else(|| Box::new(OpenAiAdapterError::UnsupportedRoute) as BoxError)?;
         let request = decode_request(request_wire, body, route.loss_policy())?;
         let mut context = SelectionContext::from_semantic_request(&request);
         if request_streaming(&request) {
@@ -141,7 +139,7 @@ impl SemanticAdapter for DroidOpenAiSemanticAdapter {
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
         let (request_wire, upstream_wire) = route_wires(route)
-            .ok_or_else(|| Box::new(DroidAdapterError::UnsupportedRoute) as BoxError)?;
+            .ok_or_else(|| Box::new(OpenAiAdapterError::UnsupportedRoute) as BoxError)?;
         let downstream_wire = match request_wire {
             RequestWire::Responses => EventWire::Responses,
             RequestWire::Chat => EventWire::Chat,
@@ -154,7 +152,7 @@ impl SemanticAdapter for DroidOpenAiSemanticAdapter {
         let max_queue_bytes = usize_limit(route.limits().max_queue_bytes);
         let stream =
             if upstream_wire == EventWire::Responses && downstream_wire == EventWire::Responses {
-                DroidResponseBody::responses_passthrough(
+                OpenAiResponseBody::responses_passthrough(
                     body,
                     limits,
                     max_queue_items,
@@ -162,7 +160,7 @@ impl SemanticAdapter for DroidOpenAiSemanticAdapter {
                     cancellation,
                 )
             } else {
-                DroidResponseBody::transform(
+                OpenAiResponseBody::transform(
                     body,
                     upstream_wire,
                     downstream_wire,
@@ -191,9 +189,9 @@ impl SemanticAdapter for DroidOpenAiSemanticAdapter {
             return self.decode_response(route, body, cancellation);
         }
         let (_, upstream_wire) = route_wires(route)
-            .ok_or_else(|| Box::new(DroidAdapterError::UnsupportedRoute) as BoxError)?;
+            .ok_or_else(|| Box::new(OpenAiAdapterError::UnsupportedRoute) as BoxError)?;
         if upstream_wire == EventWire::Chat {
-            return Err(Box::new(DroidAdapterError::UnaryCrossProtocolUnsupported));
+            return Err(Box::new(OpenAiAdapterError::UnaryCrossProtocolUnsupported));
         }
         let limit = usize_limit(route.limits().max_response_body_bytes);
         let unary = if hint.upstream_mode == SemanticResponseMode::ServerSentEvents {
@@ -201,7 +199,7 @@ impl SemanticAdapter for DroidOpenAiSemanticAdapter {
                 usize_limit(route.limits().max_frame_bytes),
                 usize_limit(route.limits().max_event_bytes),
             );
-            DroidStreamingUnaryResponseBody::new(
+            OpenAiStreamingUnaryResponseBody::new(
                 body,
                 upstream_wire,
                 route.loss_policy(),
@@ -211,7 +209,7 @@ impl SemanticAdapter for DroidOpenAiSemanticAdapter {
             )
             .boxed()
         } else {
-            DroidUnaryResponseBody::new(body, limit, cancellation).boxed()
+            OpenAiUnaryResponseBody::new(body, limit, cancellation).boxed()
         };
         Ok(SemanticResponseBody {
             body: unary,
@@ -290,7 +288,7 @@ fn require_streaming(body: &[u8]) -> Result<(), BoxError> {
         .and_then(Value::as_bool);
     match stream {
         Some(true) => Ok(()),
-        Some(false) | None => Err(Box::new(DroidAdapterError::StreamingRequired)),
+        Some(false) | None => Err(Box::new(OpenAiAdapterError::StreamingRequired)),
     }
 }
 
@@ -337,7 +335,7 @@ fn encode_upstream_request(
     let mut value: Value = serde_json::from_slice(&body)?;
     let object = value
         .as_object_mut()
-        .ok_or_else(|| Box::new(DroidAdapterError::EncodedRequestNotObject) as BoxError)?;
+        .ok_or_else(|| Box::new(OpenAiAdapterError::EncodedRequestNotObject) as BoxError)?;
     for (key, value) in passthrough {
         object.entry(key).or_insert(value);
     }
@@ -378,7 +376,7 @@ fn prepare_request_for_wire(
     let value: Value = serde_json::from_slice(extension.as_bytes())?;
     let fields = value
         .as_object()
-        .ok_or_else(|| Box::new(DroidAdapterError::InvalidTransportExtension) as BoxError)?;
+        .ok_or_else(|| Box::new(OpenAiAdapterError::InvalidTransportExtension) as BoxError)?;
     let mut passthrough = serde_json::Map::new();
     for (field, value) in fields {
         match field.as_str() {
@@ -391,7 +389,7 @@ fn prepare_request_for_wire(
             }
             _ if policy.allows_degradation() => {}
             _ => {
-                return Err(Box::new(DroidAdapterError::UnsupportedCrossProtocolField(
+                return Err(Box::new(OpenAiAdapterError::UnsupportedCrossProtocolField(
                     field.clone(),
                 )));
             }
@@ -401,10 +399,10 @@ fn prepare_request_for_wire(
 }
 
 #[derive(Debug, Error)]
-enum DroidAdapterError {
-    #[error("route is not a supported Droid OpenAI semantic route")]
+enum OpenAiAdapterError {
+    #[error("route is not a supported OpenAI semantic route")]
     UnsupportedRoute,
-    #[error("Droid OpenAI Chat semantic routes require stream=true")]
+    #[error("OpenAI Chat semantic routes require stream=true")]
     StreamingRequired,
     #[error("encoded OpenAI request is not a JSON object")]
     EncodedRequestNotObject,
@@ -481,7 +479,7 @@ impl DownstreamEncoder {
                     encoder
                         .encode(
                             &SseEvent::new(String::from_utf8(encoded.body).map_err(|_| {
-                                Box::new(DroidStreamError::InvalidJsonUtf8) as BoxError
+                                Box::new(OpenAiStreamError::InvalidJsonUtf8) as BoxError
                             })?)
                             .with_event(encoded.event),
                         )
@@ -498,7 +496,7 @@ impl DownstreamEncoder {
                     output.push(Bytes::from(
                         encoder
                             .encode(&SseEvent::new(String::from_utf8(encoded.body).map_err(
-                                |_| Box::new(DroidStreamError::InvalidJsonUtf8) as BoxError,
+                                |_| Box::new(OpenAiStreamError::InvalidJsonUtf8) as BoxError,
                             )?))
                             .map_err(|error| Box::new(error) as BoxError)?,
                     ));
@@ -516,7 +514,7 @@ impl DownstreamEncoder {
     }
 }
 
-struct DroidUnaryResponseBody {
+struct OpenAiUnaryResponseBody {
     inner: Pin<Box<ProxyBody>>,
     limit: usize,
     cancellation_wait: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
@@ -526,7 +524,7 @@ struct DroidUnaryResponseBody {
     error: Option<BoxError>,
 }
 
-impl DroidUnaryResponseBody {
+impl OpenAiUnaryResponseBody {
     fn new(body: ProxyBody, limit: usize, cancellation: CancellationToken) -> Self {
         let cancellation_wait = Box::pin(cancellation.cancelled_owned());
         Self {
@@ -542,13 +540,13 @@ impl DroidUnaryResponseBody {
 
     fn finish(&mut self) -> Result<(), BoxError> {
         let value: Value = serde_json::from_slice(&self.buffer)
-            .map_err(|_| Box::new(DroidStreamError::InvalidJsonResponse) as BoxError)?;
+            .map_err(|_| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
         if !value.is_object() {
-            return Err(Box::new(DroidStreamError::InvalidJsonResponse));
+            return Err(Box::new(OpenAiStreamError::InvalidJsonResponse));
         }
         let output = self.buffer.clone();
         if output.len() > self.limit {
-            return Err(Box::new(DroidStreamError::UnaryBodyTooLarge {
+            return Err(Box::new(OpenAiStreamError::UnaryBodyTooLarge {
                 observed: output.len(),
                 limit: self.limit,
             }));
@@ -559,7 +557,7 @@ impl DroidUnaryResponseBody {
     }
 }
 
-impl Body for DroidUnaryResponseBody {
+impl Body for OpenAiUnaryResponseBody {
     type Data = Bytes;
     type Error = BoxError;
 
@@ -571,7 +569,7 @@ impl Body for DroidUnaryResponseBody {
         loop {
             if this.cancellation_wait.as_mut().poll(context).is_ready() {
                 this.ended = true;
-                return Poll::Ready(Some(Err(Box::new(DroidStreamError::Cancelled))));
+                return Poll::Ready(Some(Err(Box::new(OpenAiStreamError::Cancelled))));
             }
             if let Some(output) = this.output.take() {
                 return Poll::Ready(Some(Ok(Frame::data(output))));
@@ -595,7 +593,7 @@ impl Body for DroidUnaryResponseBody {
                     Ok(data) => {
                         let observed = this.buffer.len().saturating_add(data.len());
                         if observed > this.limit {
-                            this.error = Some(Box::new(DroidStreamError::UnaryBodyTooLarge {
+                            this.error = Some(Box::new(OpenAiStreamError::UnaryBodyTooLarge {
                                 observed,
                                 limit: this.limit,
                             }));
@@ -605,7 +603,7 @@ impl Body for DroidUnaryResponseBody {
                     }
                     Err(frame) => {
                         if frame.into_trailers().is_err() {
-                            this.error = Some(Box::new(DroidStreamError::InvalidFrame));
+                            this.error = Some(Box::new(OpenAiStreamError::InvalidFrame));
                         }
                     }
                 },
@@ -622,7 +620,7 @@ impl Body for DroidUnaryResponseBody {
     }
 }
 
-struct DroidStreamingUnaryResponseBody {
+struct OpenAiStreamingUnaryResponseBody {
     inner: Pin<Box<ProxyBody>>,
     parser: SseParser,
     decoder: UpstreamDecoder,
@@ -640,7 +638,7 @@ struct DroidStreamingUnaryResponseBody {
     error: Option<BoxError>,
 }
 
-impl DroidStreamingUnaryResponseBody {
+impl OpenAiStreamingUnaryResponseBody {
     fn new(
         body: ProxyBody,
         upstream: EventWire,
@@ -672,7 +670,7 @@ impl DroidStreamingUnaryResponseBody {
     fn process_chunk(&mut self, chunk: &[u8]) -> Result<(), BoxError> {
         self.observed_bytes = self.observed_bytes.saturating_add(chunk.len());
         if self.observed_bytes > self.limit {
-            return Err(Box::new(DroidStreamError::UnaryBodyTooLarge {
+            return Err(Box::new(OpenAiStreamError::UnaryBodyTooLarge {
                 observed: self.observed_bytes,
                 limit: self.limit,
             }));
@@ -702,17 +700,17 @@ impl DroidStreamingUnaryResponseBody {
             return Ok(());
         }
         let value: Value = serde_json::from_slice(event.data.as_bytes())
-            .map_err(|_| Box::new(DroidStreamError::InvalidJsonResponse) as BoxError)?;
+            .map_err(|_| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
         let object = value
             .as_object()
-            .ok_or_else(|| Box::new(DroidStreamError::InvalidJsonResponse) as BoxError)?;
+            .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
         match object.get("type").and_then(Value::as_str) {
             Some("response.output_item.done") => {
                 let item = object
                     .get("item")
                     .filter(|item| item.is_object())
                     .cloned()
-                    .ok_or_else(|| Box::new(DroidStreamError::InvalidJsonResponse) as BoxError)?;
+                    .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
                 if let Some(index) = object.get("output_index").and_then(Value::as_u64) {
                     self.raw_output_items.insert(index, item);
                 } else {
@@ -724,9 +722,9 @@ impl DroidStreamingUnaryResponseBody {
                     .get("response")
                     .filter(|response| response.is_object())
                     .cloned()
-                    .ok_or_else(|| Box::new(DroidStreamError::InvalidJsonResponse) as BoxError)?;
+                    .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
                 if self.raw_terminal_response.replace(response).is_some() {
-                    return Err(Box::new(DroidStreamError::MultipleUnaryTerminals));
+                    return Err(Box::new(OpenAiStreamError::MultipleUnaryTerminals));
                 }
             }
             _ => {}
@@ -743,7 +741,7 @@ impl DroidStreamingUnaryResponseBody {
             if is_terminal_response_event(&encoded.event)
                 && self.encoded_terminal.replace(encoded.body).is_some()
             {
-                return Err(Box::new(DroidStreamError::MultipleUnaryTerminals));
+                return Err(Box::new(OpenAiStreamError::MultipleUnaryTerminals));
             }
         }
         Ok(())
@@ -766,13 +764,13 @@ impl DroidStreamingUnaryResponseBody {
             let terminal = self
                 .encoded_terminal
                 .take()
-                .ok_or_else(|| Box::new(DroidStreamError::MissingUnaryTerminal) as BoxError)?;
+                .ok_or_else(|| Box::new(OpenAiStreamError::MissingUnaryTerminal) as BoxError)?;
             let terminal: Value = serde_json::from_slice(&terminal)
-                .map_err(|_| Box::new(DroidStreamError::InvalidJsonResponse) as BoxError)?;
+                .map_err(|_| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
             terminal
                 .get("response")
                 .cloned()
-                .ok_or_else(|| Box::new(DroidStreamError::InvalidJsonResponse) as BoxError)?
+                .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?
         };
         hydrate_raw_terminal_output(
             &mut response,
@@ -781,7 +779,7 @@ impl DroidStreamingUnaryResponseBody {
         )?;
         let output = serde_json::to_vec(&response)?;
         if output.len() > self.limit {
-            return Err(Box::new(DroidStreamError::UnaryBodyTooLarge {
+            return Err(Box::new(OpenAiStreamError::UnaryBodyTooLarge {
                 observed: output.len(),
                 limit: self.limit,
             }));
@@ -835,7 +833,7 @@ fn hydrate_raw_terminal_output(
 ) -> Result<(), BoxError> {
     let object = response
         .as_object_mut()
-        .ok_or_else(|| Box::new(DroidStreamError::InvalidJsonResponse) as BoxError)?;
+        .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
     if let Some(output) = object.get_mut("output").and_then(Value::as_array_mut) {
         if !output.is_empty() {
             for (index, item) in output.iter_mut().enumerate() {
@@ -895,18 +893,18 @@ fn preserve_raw_item_annotations(output: &mut Value, raw: &Value) -> Result<(), 
     let output_content = output
         .get_mut("content")
         .and_then(Value::as_array_mut)
-        .ok_or_else(|| Box::new(DroidStreamError::RawAnnotationMismatch) as BoxError)?;
+        .ok_or_else(|| Box::new(OpenAiStreamError::RawAnnotationMismatch) as BoxError)?;
     for (index, annotations) in annotated {
         let part = output_content
             .get_mut(index)
             .and_then(Value::as_object_mut)
-            .ok_or_else(|| Box::new(DroidStreamError::RawAnnotationMismatch) as BoxError)?;
+            .ok_or_else(|| Box::new(OpenAiStreamError::RawAnnotationMismatch) as BoxError)?;
         part.insert("annotations".to_owned(), Value::Array(annotations));
     }
     Ok(())
 }
 
-impl Body for DroidStreamingUnaryResponseBody {
+impl Body for OpenAiStreamingUnaryResponseBody {
     type Data = Bytes;
     type Error = BoxError;
 
@@ -918,7 +916,7 @@ impl Body for DroidStreamingUnaryResponseBody {
         loop {
             if this.cancellation_wait.as_mut().poll(context).is_ready() {
                 this.ended = true;
-                return Poll::Ready(Some(Err(Box::new(DroidStreamError::Cancelled))));
+                return Poll::Ready(Some(Err(Box::new(OpenAiStreamError::Cancelled))));
             }
             if let Some(output) = this.output.take() {
                 return Poll::Ready(Some(Ok(Frame::data(output))));
@@ -946,7 +944,7 @@ impl Body for DroidStreamingUnaryResponseBody {
                     }
                     Err(frame) => {
                         if frame.into_trailers().is_err() {
-                            this.error = Some(Box::new(DroidStreamError::InvalidFrame));
+                            this.error = Some(Box::new(OpenAiStreamError::InvalidFrame));
                         }
                     }
                 },
@@ -970,7 +968,7 @@ fn is_terminal_response_event(event: &str) -> bool {
     )
 }
 
-enum DroidResponsePipeline {
+enum OpenAiResponsePipeline {
     ResponsesPassthrough(Box<OpenAiResponsesEventDecoder>),
     Transform {
         decoder: Box<UpstreamDecoder>,
@@ -979,7 +977,7 @@ enum DroidResponsePipeline {
     },
 }
 
-impl DroidResponsePipeline {
+impl OpenAiResponsePipeline {
     fn process_event(
         &mut self,
         event: &SseEvent,
@@ -1034,10 +1032,10 @@ impl DroidResponsePipeline {
     }
 }
 
-struct DroidResponseBody {
+struct OpenAiResponseBody {
     inner: Pin<Box<ProxyBody>>,
     parser: SseParser,
-    pipeline: DroidResponsePipeline,
+    pipeline: OpenAiResponsePipeline,
     limits: SseLimits,
     queue: VecDeque<Bytes>,
     queued_bytes: usize,
@@ -1048,7 +1046,7 @@ struct DroidResponseBody {
     error: Option<BoxError>,
 }
 
-impl DroidResponseBody {
+impl OpenAiResponseBody {
     fn responses_passthrough(
         body: ProxyBody,
         limits: SseLimits,
@@ -1058,7 +1056,7 @@ impl DroidResponseBody {
     ) -> Self {
         Self::new(
             body,
-            DroidResponsePipeline::ResponsesPassthrough(Box::new(
+            OpenAiResponsePipeline::ResponsesPassthrough(Box::new(
                 OpenAiResponsesEventDecoder::new(),
             )),
             limits,
@@ -1081,7 +1079,7 @@ impl DroidResponseBody {
     ) -> Self {
         Self::new(
             body,
-            DroidResponsePipeline::Transform {
+            OpenAiResponsePipeline::Transform {
                 decoder: Box::new(UpstreamDecoder::new(upstream)),
                 encoder: Box::new(DownstreamEncoder::new(downstream)),
                 policy,
@@ -1095,7 +1093,7 @@ impl DroidResponseBody {
 
     fn new(
         body: ProxyBody,
-        pipeline: DroidResponsePipeline,
+        pipeline: OpenAiResponsePipeline,
         limits: SseLimits,
         max_queue_items: usize,
         max_queue_bytes: usize,
@@ -1154,7 +1152,7 @@ impl DroidResponseBody {
         let items = self.queue.len().saturating_add(1);
         let bytes_total = self.queued_bytes.saturating_add(bytes.len());
         if items > self.max_queue_items || bytes_total > self.max_queue_bytes {
-            return Err(Box::new(DroidStreamError::QueueLimit {
+            return Err(Box::new(OpenAiStreamError::QueueLimit {
                 items,
                 bytes: bytes_total,
             }));
@@ -1171,7 +1169,7 @@ impl DroidResponseBody {
     }
 }
 
-impl Body for DroidResponseBody {
+impl Body for OpenAiResponseBody {
     type Data = Bytes;
     type Error = BoxError;
 
@@ -1183,7 +1181,7 @@ impl Body for DroidResponseBody {
         loop {
             if this.cancellation_wait.as_mut().poll(context).is_ready() {
                 this.ended = true;
-                return Poll::Ready(Some(Err(Box::new(DroidStreamError::Cancelled))));
+                return Poll::Ready(Some(Err(Box::new(OpenAiStreamError::Cancelled))));
             }
             if let Some(bytes) = this.queue.pop_front() {
                 this.queued_bytes = this.queued_bytes.saturating_sub(bytes.len());
@@ -1212,7 +1210,7 @@ impl Body for DroidResponseBody {
                     }
                     Err(frame) => {
                         if frame.into_trailers().is_err() {
-                            this.set_error(Box::new(DroidStreamError::InvalidFrame));
+                            this.set_error(Box::new(OpenAiStreamError::InvalidFrame));
                         }
                     }
                 },
@@ -1230,24 +1228,24 @@ impl Body for DroidResponseBody {
 }
 
 #[derive(Debug, Error)]
-enum DroidStreamError {
-    #[error("Droid semantic response JSON was not UTF-8")]
+enum OpenAiStreamError {
+    #[error("OpenAI semantic response JSON was not UTF-8")]
     InvalidJsonUtf8,
-    #[error("Droid semantic response was not a JSON object")]
+    #[error("OpenAI semantic response was not a JSON object")]
     InvalidJsonResponse,
-    #[error("Droid semantic response did not contain a terminal event")]
+    #[error("OpenAI semantic response did not contain a terminal event")]
     MissingUnaryTerminal,
-    #[error("Droid semantic response contained more than one terminal event")]
+    #[error("OpenAI semantic response contained more than one terminal event")]
     MultipleUnaryTerminals,
     #[error("terminal output cannot preserve raw response annotations")]
     RawAnnotationMismatch,
-    #[error("Droid unary semantic response exceeded {observed} bytes (limit {limit})")]
+    #[error("OpenAI unary semantic response exceeded {observed} bytes (limit {limit})")]
     UnaryBodyTooLarge { observed: usize, limit: usize },
-    #[error("Droid semantic response queue exceeded {items} items or {bytes} bytes")]
+    #[error("OpenAI semantic response queue exceeded {items} items or {bytes} bytes")]
     QueueLimit { items: usize, bytes: usize },
-    #[error("Droid semantic response contained an invalid body frame")]
+    #[error("OpenAI semantic response contained an invalid body frame")]
     InvalidFrame,
-    #[error("Droid semantic response canceled")]
+    #[error("OpenAI semantic response canceled")]
     Cancelled,
 }
 
@@ -1273,7 +1271,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        hydrate_raw_terminal_output, DroidOpenAiSemanticAdapter, OPENAI_CHAT_EVENT_DECODER,
+        hydrate_raw_terminal_output, OpenAiSemanticAdapter, OPENAI_CHAT_EVENT_DECODER,
         OPENAI_CHAT_EVENT_ENCODER, OPENAI_CHAT_REQUEST_DECODER, OPENAI_CHAT_REQUEST_ENCODER,
         OPENAI_RESPONSES_EVENT_DECODER, OPENAI_RESPONSES_EVENT_ENCODER,
         OPENAI_RESPONSES_REQUEST_DECODER, OPENAI_RESPONSES_REQUEST_ENCODER,
@@ -1317,9 +1315,9 @@ mod tests {
             .map(|value| format!("    limits: {{max_response_body_bytes: {value}}}\n"))
             .unwrap_or_default();
         let source = format!(
-            "version: 2\nlisteners: {{droid: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://127.0.0.1:9}}}}\nroutes:\n  - id: droid\n    listen: droid\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: {ingress}}}\n    target: {{provider: local, path: /v1/responses}}\n{limits}    response: {{mode: semantic, decoder: {decoder}, encoder: {encoder}}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{openai: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://127.0.0.1:9}}}}\nroutes:\n  - id: openai\n    listen: openai\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: {ingress}}}\n    target: {{provider: local, path: /v1/responses}}\n{limits}    response: {{mode: semantic, decoder: {decoder}, encoder: {encoder}}}\n    loss_policy: reject\n"
         );
-        Config::from_yaml("droid.yaml", &source)
+        Config::from_yaml("openai.yaml", &source)
             .expect("config parses")
             .compile()
             .expect("config compiles")
@@ -1334,9 +1332,9 @@ mod tests {
         encoder: &str,
     ) -> pooler_config::RoutePlan {
         let source = format!(
-            "version: 2\nlisteners: {{droid: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://127.0.0.1:9}}}}\nroutes:\n  - id: droid\n    listen: droid\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: {ingress}, encoder: {request_encoder}}}\n    target: {{provider: local, path: /v1/responses}}\n    response: {{mode: semantic, decoder: {decoder}, encoder: {encoder}}}\n    loss_policy: reject\n"
+            "version: 2\nlisteners: {{openai: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://127.0.0.1:9}}}}\nroutes:\n  - id: openai\n    listen: openai\n    match: {{method: POST, path: /v1/responses}}\n    ingress: {{mode: semantic, decoder: {ingress}, encoder: {request_encoder}}}\n    target: {{provider: local, path: /v1/responses}}\n    response: {{mode: semantic, decoder: {decoder}, encoder: {encoder}}}\n    loss_policy: reject\n"
         );
-        Config::from_yaml("droid-request-encoder.yaml", &source)
+        Config::from_yaml("openai-request-encoder.yaml", &source)
             .expect("config parses")
             .compile()
             .expect("config compiles")
@@ -1357,7 +1355,7 @@ mod tests {
         let body = Full::new(Bytes::from(source))
             .map_err(|never| match never {})
             .boxed();
-        let response = DroidOpenAiSemanticAdapter
+        let response = OpenAiSemanticAdapter
             .decode_response_with_hint(
                 &route,
                 body,
@@ -1365,7 +1363,7 @@ mod tests {
                 &SemanticResponseHint {
                     mode: SemanticResponseMode::Json,
                     upstream_mode: SemanticResponseMode::ServerSentEvents,
-                    requested_model: Some("droid-model".to_owned()),
+                    requested_model: Some("openai-model".to_owned()),
                 },
                 CancellationToken::new(),
             )
@@ -1381,7 +1379,7 @@ mod tests {
 
     #[test]
     fn supports_responses_and_chat_without_factory_route_identity() {
-        let adapter = DroidOpenAiSemanticAdapter;
+        let adapter = OpenAiSemanticAdapter;
         assert!(adapter.supports(&route(
             OPENAI_RESPONSES_REQUEST_DECODER,
             OPENAI_RESPONSES_EVENT_DECODER,
@@ -1417,14 +1415,14 @@ mod tests {
     }
 
     #[test]
-    fn installed_droid_shape_encodes_as_streaming_responses() {
+    fn installed_openai_shape_encodes_as_streaming_responses() {
         let route = route(
             OPENAI_RESPONSES_REQUEST_DECODER,
             OPENAI_RESPONSES_EVENT_DECODER,
             OPENAI_RESPONSES_EVENT_ENCODER,
         );
         let request = json!({
-            "model":"droid-model",
+            "model":"openai-model",
             "input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
             "tools":[{
                 "type":"function","name":"Read","description":"read",
@@ -1438,13 +1436,13 @@ mod tests {
             "store":false,
             "stream":true
         });
-        let encoded = DroidOpenAiSemanticAdapter
+        let encoded = OpenAiSemanticAdapter
             .encode_request(
                 &route,
                 &HeaderMap::new(),
                 &serde_json::to_vec(&request).expect("request JSON"),
             )
-            .expect("Droid request encodes");
+            .expect("OpenAI request encodes");
         assert_eq!(
             encoded.content_type,
             HeaderValue::from_static("application/json")
@@ -1464,7 +1462,7 @@ mod tests {
             OPENAI_RESPONSES_EVENT_ENCODER,
         );
         let request = json!({
-            "model":"droid-model",
+            "model":"openai-model",
             "input":[
                 {"role":"user","content":[{"type":"input_text","text":"read"}]},
                 {"type":"function_call","call_id":"call_1","name":"Read","arguments":"{}"},
@@ -1473,7 +1471,7 @@ mod tests {
             "stream":true,
             "store":false
         });
-        let encoded = DroidOpenAiSemanticAdapter
+        let encoded = OpenAiSemanticAdapter
             .encode_request(
                 &route,
                 &HeaderMap::new(),
@@ -1503,7 +1501,7 @@ mod tests {
         let body = Full::new(Bytes::from_static(source.as_bytes()))
             .map_err(|never| match never {})
             .boxed();
-        let response = DroidOpenAiSemanticAdapter
+        let response = OpenAiSemanticAdapter
             .decode_response(&route, body, CancellationToken::new())
             .expect("response transformer");
         let bytes = response
@@ -1532,8 +1530,8 @@ mod tests {
             OPENAI_RESPONSES_EVENT_DECODER,
             OPENAI_RESPONSES_EVENT_ENCODER,
         );
-        let request = json!({"model":"droid-model","input":"hello","stream":false});
-        let encoded = DroidOpenAiSemanticAdapter
+        let request = json!({"model":"openai-model","input":"hello","stream":false});
+        let encoded = OpenAiSemanticAdapter
             .encode_request(
                 &route,
                 &HeaderMap::new(),
@@ -1545,7 +1543,7 @@ mod tests {
         assert_eq!(encoded.response_hint.mode, SemanticResponseMode::Json);
         assert_eq!(
             encoded.response_hint.requested_model.as_deref(),
-            Some("droid-model")
+            Some("openai-model")
         );
     }
 
@@ -1556,9 +1554,9 @@ mod tests {
             OPENAI_CHAT_EVENT_DECODER,
             OPENAI_RESPONSES_EVENT_ENCODER,
         );
-        let request = json!({"model":"droid-model","input":"hello","stream":false});
+        let request = json!({"model":"openai-model","input":"hello","stream":false});
         let body = serde_json::to_vec(&request).expect("request JSON");
-        let error = DroidOpenAiSemanticAdapter
+        let error = OpenAiSemanticAdapter
             .encode_request(&reject, &HeaderMap::new(), &body)
             .expect_err("unary cross-protocol route must fail before upstream");
         assert!(error.to_string().contains("not supported"));
@@ -1575,7 +1573,7 @@ mod tests {
             "id":"resp_1",
             "object":"response",
             "status":"completed",
-            "model":"droid-model",
+            "model":"openai-model",
             "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"DROID_JSON_OK","annotations":[]}]}],
             "usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}
         });
@@ -1583,14 +1581,14 @@ mod tests {
         let body = Full::new(Bytes::from(source_bytes.clone()))
             .map_err(|never| match never {})
             .boxed();
-        let response = DroidOpenAiSemanticAdapter
+        let response = OpenAiSemanticAdapter
             .decode_response_with_hint(
                 &route,
                 body,
                 &HeaderMap::new(),
                 &SemanticResponseHint {
                     mode: SemanticResponseMode::Json,
-                    requested_model: Some("droid-model".to_owned()),
+                    requested_model: Some("openai-model".to_owned()),
                     ..SemanticResponseHint::default()
                 },
                 CancellationToken::new(),
@@ -1618,13 +1616,13 @@ mod tests {
         );
         let incomplete = concat!(
             "data: {\"type\":\"response.created\",\"response\":{",
-            "\"id\":\"resp_incomplete\",\"model\":\"droid-model\",",
+            "\"id\":\"resp_incomplete\",\"model\":\"openai-model\",",
             "\"status\":\"in_progress\"}}\n\n"
         );
         let body = Full::new(Bytes::from_static(incomplete.as_bytes()))
             .map_err(|never| match never {})
             .boxed();
-        let response = DroidOpenAiSemanticAdapter
+        let response = OpenAiSemanticAdapter
             .decode_response_with_hint(
                 &route,
                 body,
@@ -1632,7 +1630,7 @@ mod tests {
                 &SemanticResponseHint {
                     mode: SemanticResponseMode::Json,
                     upstream_mode: SemanticResponseMode::ServerSentEvents,
-                    requested_model: Some("droid-model".to_owned()),
+                    requested_model: Some("openai-model".to_owned()),
                 },
                 CancellationToken::new(),
             )
@@ -1653,7 +1651,7 @@ mod tests {
         let body = Full::new(Bytes::from_static(incomplete.as_bytes()))
             .map_err(|never| match never {})
             .boxed();
-        let response = DroidOpenAiSemanticAdapter
+        let response = OpenAiSemanticAdapter
             .decode_response_with_hint(
                 &limited_route,
                 body,
@@ -1661,7 +1659,7 @@ mod tests {
                 &SemanticResponseHint {
                     mode: SemanticResponseMode::Json,
                     upstream_mode: SemanticResponseMode::ServerSentEvents,
-                    requested_model: Some("droid-model".to_owned()),
+                    requested_model: Some("openai-model".to_owned()),
                 },
                 CancellationToken::new(),
             )
@@ -1678,7 +1676,7 @@ mod tests {
         let body = Full::new(Bytes::from_static(incomplete.as_bytes()))
             .map_err(|never| match never {})
             .boxed();
-        let response = DroidOpenAiSemanticAdapter
+        let response = OpenAiSemanticAdapter
             .decode_response_with_hint(
                 &route,
                 body,
@@ -1686,7 +1684,7 @@ mod tests {
                 &SemanticResponseHint {
                     mode: SemanticResponseMode::Json,
                     upstream_mode: SemanticResponseMode::ServerSentEvents,
-                    requested_model: Some("droid-model".to_owned()),
+                    requested_model: Some("openai-model".to_owned()),
                 },
                 cancellation,
             )
@@ -1734,14 +1732,14 @@ mod tests {
         });
         let refusal_terminal = json!({
             "id":"resp_refusal","object":"response","created_at":1_777_777_778_u64,
-            "model":"droid-model","status":"completed","service_tier":"priority",
+            "model":"openai-model","status":"completed","service_tier":"priority",
             "output":[],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4},
             "metadata":{"case":"refusal-lifecycle"}
         });
         let refusal = reduce_responses_sse_to_unary(&[
             json!({
                 "type":"response.created",
-                "response":{"id":"resp_refusal","model":"droid-model","status":"in_progress"}
+                "response":{"id":"resp_refusal","model":"openai-model","status":"in_progress"}
             }),
             json!({
                 "type":"response.output_item.added","output_index":0,
@@ -1778,7 +1776,7 @@ mod tests {
 
         let terminal_only = json!({
             "id":"resp_terminal_only","object":"response","created_at":1_777_777_779_u64,
-            "model":"droid-model","status":"completed","service_tier":"default",
+            "model":"openai-model","status":"completed","service_tier":"default",
             "output":[{
                 "id":"msg_terminal_only","type":"message","status":"completed",
                 "role":"assistant","content":[{"type":"refusal","refusal":"terminal only"}]
@@ -1789,7 +1787,7 @@ mod tests {
         let terminal = reduce_responses_sse_to_unary(&[
             json!({
                 "type":"response.created",
-                "response":{"id":"resp_terminal_only","model":"droid-model","status":"in_progress"}
+                "response":{"id":"resp_terminal_only","model":"openai-model","status":"in_progress"}
             }),
             json!({"type":"response.completed","response":terminal_only.clone()}),
         ])
@@ -1806,13 +1804,13 @@ mod tests {
         );
         let terminal = json!({
             "id":"resp_many_frames","object":"response","created_at":1_777_777_780_u64,
-            "model":"droid-model","status":"completed","output":[],
+            "model":"openai-model","status":"completed","output":[],
             "metadata":{"case":"many-ready-frames"}
         });
         let source = [
             json!({
                 "type":"response.created",
-                "response":{"id":"resp_many_frames","model":"droid-model","status":"in_progress"}
+                "response":{"id":"resp_many_frames","model":"openai-model","status":"in_progress"}
             }),
             json!({"type":"response.completed","response":terminal.clone()}),
         ]
@@ -1823,7 +1821,7 @@ mod tests {
             .collect::<VecDeque<_>>();
         frames.extend(source.bytes().map(|byte| Bytes::copy_from_slice(&[byte])));
         let body = ImmediatelyReadyFrames { frames }.boxed();
-        let response = DroidOpenAiSemanticAdapter
+        let response = OpenAiSemanticAdapter
             .decode_response_with_hint(
                 &route,
                 body,
@@ -1831,7 +1829,7 @@ mod tests {
                 &SemanticResponseHint {
                     mode: SemanticResponseMode::Json,
                     upstream_mode: SemanticResponseMode::ServerSentEvents,
-                    requested_model: Some("droid-model".to_owned()),
+                    requested_model: Some("openai-model".to_owned()),
                 },
                 CancellationToken::new(),
             )

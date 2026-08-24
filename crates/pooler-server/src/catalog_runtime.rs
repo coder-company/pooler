@@ -370,6 +370,7 @@ impl ParsedProviderDiscovery {
         }
         let models = match self.parser_kind {
             CatalogParserKind::OpenAi => self.parser.parse_openai_list(fetched.body()),
+            CatalogParserKind::Codex => self.parser.parse_codex_list(fetched.body()),
             CatalogParserKind::Kimi => self.parser.parse_kimi_list(fetched.body()),
             CatalogParserKind::Gemini => self.parser.parse_gemini_list(fetched.body()),
             CatalogParserKind::Vertex => self.parser.parse_vertex_catalog(fetched.body()),
@@ -713,6 +714,10 @@ async fn read_provider_response(
         .filter(|value| value.len() <= pooler_model_catalog::MAX_REVISION_BYTES)
         .map(str::to_owned);
     if !status.is_success() {
+        tracing::warn!(
+            status = status.as_u16(),
+            "provider model discovery returned a non-success status"
+        );
         return Err(DiscoveryFailure::from_kind(
             if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
                 DiscoveryFailureKind::Authentication
@@ -806,7 +811,7 @@ pub fn merged_model_catalog_value(
                     .service()
                     .selection_state(source.source().id().as_str())
                     .ok();
-                catalog_source_value(source, snapshot, selection.as_ref())
+                catalog_source_value(config, source, snapshot, selection.as_ref())
             })
             .collect()
     });
@@ -874,19 +879,41 @@ fn discovered_model_value(model: &pooler_model_catalog::CatalogModel) -> Value {
 }
 
 fn catalog_source_value(
+    config: &CompiledConfig,
     plan: &ModelCatalogSourcePlan,
     snapshot: &CatalogSnapshot,
     selection: Option<&pooler_model_catalog::ModelSelectionState>,
 ) -> Value {
     let source = plan.source();
-    let verified_discovery = ProviderCatalog::builtin()
+    let verified_discovery = config
+        .upstreams()
         .get(source.provider().as_str())
-        .and_then(|provider| {
-            provider
-                .integration
-                .discovery_parser
-                .as_deref()
-                .zip(provider.integration.discovery_path.as_deref())
+        .and_then(|upstream| {
+            upstream
+                .known_provider()
+                .map(|provider| (upstream, provider))
+        })
+        .filter(|(_, provider)| *provider == plan.model_facts_provider())
+        .and_then(|(upstream, provider)| {
+            ProviderCatalog::builtin()
+                .get(provider)
+                .map(|contract| (upstream, contract))
+        })
+        .and_then(|(upstream, provider)| {
+            let codex_subscription = upstream
+                .native()
+                .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"));
+            let parser = if codex_subscription {
+                "codex"
+            } else {
+                provider.integration.discovery_parser.as_deref()?
+            };
+            let path = if codex_subscription {
+                "/backend-api/codex/models?client_version=99.99.99"
+            } else {
+                provider.integration.discovery_path.as_deref()?
+            };
+            Some((parser, path))
         })
         .is_some_and(|(parser, path)| parser == plan.parser().as_str() && path == plan.path());
     let aliases = source
@@ -913,6 +940,7 @@ fn catalog_source_value(
             "automatic": verified_discovery,
         },
         "max_response_bytes": plan.max_response_bytes(),
+        "model_facts_provider": plan.model_facts_provider(),
         "account": source.account().or_else(|| plan.account()),
         "account_pool": source.account_pool().or_else(|| plan.account_pool()),
         "account_configured": source.account().is_some()

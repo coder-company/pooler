@@ -25,7 +25,7 @@ use crate::{
 };
 
 const MAX_COOLDOWNS: usize = 4_096;
-const LATEST_SCHEMA_VERSION: i64 = 9;
+const LATEST_SCHEMA_VERSION: i64 = 10;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/001_initial.sql")),
     (2, include_str!("migrations/002_health_and_cooldowns.sql")),
@@ -39,6 +39,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         9,
         include_str!("migrations/009_reload_completion_generation.sql"),
     ),
+    (10, include_str!("migrations/010_reload_kind.sql")),
 ];
 
 /// A transactional, WAL-backed SQLite [`Store`].
@@ -1743,11 +1744,12 @@ impl SqliteStore {
             transaction
                 .execute(
                     "INSERT INTO management_reload_records
-                     (owner_id, generation, completed_generation, status, etag, error_code,
+                     (owner_id, kind, generation, completed_generation, status, etag, error_code,
                       started_at, completed_at, revision)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
                     params![
                         &record.owner_id,
+                        &record.kind,
                         i64::try_from(record.generation).unwrap_or(i64::MAX),
                         record
                             .completed_generation
@@ -1789,7 +1791,7 @@ impl SqliteStore {
         self.with_immediate_transaction(|transaction| {
             let current = transaction
                 .query_row(
-                    "SELECT id, owner_id, generation, completed_generation, status, etag, error_code,
+                    "SELECT id, owner_id, kind, generation, completed_generation, status, etag, error_code,
                             started_at, completed_at, revision
                      FROM management_reload_records WHERE id = ?1",
                     [i64::try_from(record_id).unwrap_or(i64::MAX)],
@@ -1837,7 +1839,7 @@ impl SqliteStore {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT id, owner_id, generation, completed_generation, status, etag, error_code,
+                "SELECT id, owner_id, kind, generation, completed_generation, status, etag, error_code,
                         started_at, completed_at, revision
                  FROM management_reload_records ORDER BY id ASC",
             )
@@ -3143,6 +3145,7 @@ fn validate_reload_record(record: &ReloadRecord) -> StoreResult<()> {
     if let Some(owner_id) = &record.owner_id {
         validate_control_text("owner_id", owner_id, 256)?;
     }
+    validate_control_text("kind", &record.kind, 64)?;
     validate_control_text("status", &record.status, 128)?;
     if let Some(etag) = &record.etag {
         validate_control_text("etag", etag, 256)?;
@@ -3239,16 +3242,17 @@ fn reload_from_row(row: &Row<'_>) -> rusqlite::Result<ReloadRecord> {
     Ok(ReloadRecord {
         id: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(u64::MAX),
         owner_id: row.get(1)?,
-        generation: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(u64::MAX),
+        kind: row.get(2)?,
+        generation: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(u64::MAX),
         completed_generation: row
-            .get::<_, Option<i64>>(3)?
+            .get::<_, Option<i64>>(4)?
             .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
-        status: row.get(4)?,
-        etag: row.get(5)?,
-        error_code: row.get(6)?,
-        started_at: row.get(7)?,
-        completed_at: row.get(8)?,
-        revision: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(u64::MAX),
+        status: row.get(5)?,
+        etag: row.get(6)?,
+        error_code: row.get(7)?,
+        started_at: row.get(8)?,
+        completed_at: row.get(9)?,
+        revision: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(u64::MAX),
     })
 }
 
@@ -6520,12 +6524,10 @@ mod tests {
             ))
             .expect("audit");
         let reload = store
-            .append_reload_record(ReloadRecord::new(
-                Some("session-a".to_owned()),
-                8,
-                "queued",
-                3,
-            ))
+            .append_reload_record(
+                ReloadRecord::new(Some("session-a".to_owned()), 8, "queued", 3)
+                    .with_kind("catalog"),
+            )
             .expect("reload");
         let flow = store
             .begin_oauth_flow(

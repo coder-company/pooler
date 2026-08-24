@@ -44,6 +44,10 @@ pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/res
 pub const CODEX_RESPONSES_PATH: &str = "/backend-api/codex/responses";
 /// Native model discovery endpoint used by the Codex bridge.
 pub const CODEX_MODELS_PATH: &str = "/backend-api/codex/models";
+/// Catalog-manager version used to request every currently available model.
+pub const CODEX_CATALOG_CLIENT_VERSION: &str = "99.99.99";
+/// Native model discovery endpoint used for Pooler's complete catalog view.
+pub const CODEX_MODELS_PATH_AND_QUERY: &str = "/backend-api/codex/models?client_version=99.99.99";
 /// Native usage endpoint used by the Codex bridge.
 pub const CODEX_USAGE_PATH: &str = "/wham/usage";
 /// Header carrying the ChatGPT account identifier.
