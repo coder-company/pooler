@@ -4391,6 +4391,19 @@ fn patch_body_for_target<S: SemanticAdapter>(
             model: model.to_owned(),
         });
     }
+    if upstream
+        .native()
+        .is_some_and(|native| native.kind().eq_ignore_ascii_case("palantir_aip"))
+    {
+        drop_unsupported_parameter(
+            &mut document,
+            lifecycle,
+            route,
+            model,
+            "/context_management",
+            "context_management",
+        )?;
+    }
     enforce_output_limit(&mut document, route, model, profile.output_limit)?;
     let mut bytes = Bytes::from(document.bytes().into_owned());
     if route.ingress().mode() == BodyMode::Semantic {
@@ -4645,6 +4658,7 @@ fn rewrite_native_upstream_uri(
             "/v1/models" | adapter_codex::CODEX_MODELS_PATH => {
                 adapter_codex::CODEX_MODELS_PATH_AND_QUERY
             }
+            "/v1/images/generations" => "/backend-api/codex/images/generations",
             _ => return Ok(upstream_uri),
         };
         let mut target =

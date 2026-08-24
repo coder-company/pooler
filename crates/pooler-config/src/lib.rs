@@ -6476,14 +6476,7 @@ fn validate_model_targets_against_routes(
                     .capabilities()
                     .contains_all(route.target().capabilities())
                 {
-                    return Err(invalid(
-                        route.source(),
-                        &format!(
-                            "model target `{}` does not satisfy route `{}` capabilities",
-                            target.id(),
-                            route.id()
-                        ),
-                    ));
+                    continue;
                 }
                 if route
                     .target()
@@ -6491,21 +6484,24 @@ fn validate_model_targets_against_routes(
                     .iter()
                     .any(|codec| !target.codecs().iter().any(|value| value == codec))
                 {
-                    return Err(invalid(
-                        route.source(),
-                        &format!(
-                            "model target `{}` does not provide every codec required by route `{}`",
-                            target.id(),
-                            route.id()
-                        ),
-                    ));
+                    continue;
                 }
                 if let Some(family) = family {
                     let palantir = upstreams
                         .get(target.provider())
                         .and_then(UpstreamPlan::native)
                         .is_some_and(|native| native.kind().eq_ignore_ascii_case("palantir_aip"));
-                    if !palantir && !wire_supports_endpoint(target.wire_family(), family) {
+                    let semantic_bridge = route.ingress().mode() == BodyMode::Semantic
+                        && route.ingress().decoder().is_some_and(|decoder| {
+                            target
+                                .codecs()
+                                .iter()
+                                .any(|codec| codec.as_ref() == decoder)
+                        });
+                    if !palantir
+                        && !semantic_bridge
+                        && !wire_supports_endpoint(target.wire_family(), family)
+                    {
                         return Err(invalid(
                             route.source(),
                             &format!(
@@ -8338,6 +8334,72 @@ routes:
             config.routes()[0].target().model_source(),
             Some(ModelSource::Request)
         );
+    }
+
+    #[test]
+    fn heterogeneous_model_catalog_routes_only_eligible_capabilities() {
+        let text = r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {provider: {url: http://127.0.0.1:8319}}
+accounts: {account: {provider: provider, secret: managed:account}}
+models:
+  - id: text-model
+    targets: [{id: text, provider: provider, account: account, priority: 1, upstream_model: text-model, capabilities: [text], codecs: [], wire_family: openai}]
+  - id: image-model
+    targets: [{id: image, provider: provider, account: account, priority: 1, upstream_model: image-model, capabilities: [image_generation], codecs: [], wire_family: openai}]
+routes:
+  - id: text
+    listen: local
+    match: {method: POST, path: /v1/responses}
+    ingress: {mode: patch, inspectors: [inspect.openai.model]}
+    target: {provider: provider, model_from: request.model, capabilities: [text]}
+    response: {mode: opaque}
+  - id: images
+    listen: local
+    match: {method: POST, path: /v1/images/generations}
+    ingress: {mode: patch, inspectors: [inspect.openai.model]}
+    target: {provider: provider, model_from: request.model, capabilities: [image_generation]}
+    response: {mode: opaque}
+"#;
+        let config = compile_yaml("heterogeneous-models.yaml", text)
+            .expect("ineligible model targets are skipped per route");
+        assert_eq!(config.models().len(), 2);
+        assert_eq!(config.routes().len(), 2);
+    }
+
+    #[test]
+    fn semantic_route_accepts_an_explicit_cross_wire_codec() {
+        let text = r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams:
+  openai: {known_provider: openai}
+  anthropic: {known_provider: anthropic}
+accounts: {account: {provider: anthropic, secret: managed:account}}
+policies: {default: {selection: {strategy: ordered_fallback}}}
+models:
+  - id: shared-model
+    targets:
+      - id: anthropic-shared
+        provider: anthropic
+        account: account
+        priority: 1
+        upstream_model: shared-model
+        capabilities: [text]
+        codecs: [decode.openai.responses]
+        wire_family: anthropic
+routes:
+  - id: responses
+    listen: local
+    match: {method: POST, path: /v1/responses}
+    ingress: {mode: semantic, decoder: decode.openai.responses, encoder: encode.openai.responses}
+    target: {provider: openai, model_from: request.model, endpoint_family: responses, capabilities: [text], policy: default}
+    response: {mode: semantic, decoder: decode.openai.responses.events, encoder: encode.openai.responses.events}
+"#;
+
+        compile_yaml("cross-wire-semantic.yaml", text)
+            .expect("semantic adapter bridges the declared ingress codec to Anthropic");
     }
 
     #[test]

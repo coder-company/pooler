@@ -1804,6 +1804,7 @@
           model_from: "request.model",
           policy: "default",
           endpoint_family: "chat_completions",
+          capabilities: ["text"],
         },
         response: {
           mode: "semantic",
@@ -1829,6 +1830,7 @@
           model_from: "request.model",
           policy: "default",
           endpoint_family: "responses",
+          capabilities: ["text"],
         },
         response: { mode: "opaque" },
       };
@@ -1844,6 +1846,32 @@
       };
       route.loss_policy = "degrade";
       await applyControlResource("routes", route);
+    }
+    if (families.has("image_generations") && !routeIds.has("standard-image-generations")) {
+      await applyControlResource("routes", {
+        id: "standard-image-generations",
+        listen: "inference",
+        match: {
+          methods: ["POST"],
+          path: "/v1/images/generations",
+          content_types: ["application/json"],
+        },
+        limits: {
+          ...jsonLimits,
+          max_request_body_bytes: 33_554_432,
+          max_response_body_bytes: 67_108_864,
+          max_frame_bytes: 67_108_864,
+        },
+        ingress: { mode: "patch", inspectors: ["inspect.openai.model"] },
+        target: {
+          provider: providerId,
+          model_from: "request.model",
+          policy: "default",
+          endpoint_family: "image_generations",
+          capabilities: ["image_generation"],
+        },
+        response: { mode: "opaque" },
+      });
     }
     if (families.has("messages") && !routeIds.has("standard-messages")) {
       await applyControlResource("routes", {
@@ -1865,6 +1893,7 @@
           model_from: "request.model",
           policy: "default",
           endpoint_family: "messages",
+          capabilities: ["text"],
         },
         response: {
           mode: "semantic",
@@ -2145,14 +2174,14 @@
           target.provider === draft.provider && target.account && selected.has(target.account));
         if (!matching.length) continue;
         const first = matching[0];
-        const poolTarget = targetConfig(first, targets.length);
+        const poolTarget = targetConfig(first, targets.length, model.id);
         poolTarget.id = `pool-target-${id}`.slice(0, 128);
         delete poolTarget.account;
         poolTarget.account_pool = id;
         poolTarget.priority = Math.min(...matching.map((target) => Number(target.priority) || 1));
         const retained = targets
           .filter((target) => !matching.includes(target))
-          .map((target, index) => targetConfig(target, index));
+          .map((target, index) => targetConfig(target, index, model.id));
         await applyControlResource(
           "models",
           { id: model.id, targets: [...retained, poolTarget] },
@@ -2206,25 +2235,35 @@
       || "";
   }
 
-  function targetConfigId(target, position) {
-    return target?.id
-      || target?.binding?.target_id
+  function targetConfigId(target, position, modelId) {
+    if (target?.id) return target.id;
+    const source = target?.binding?.target_id
       || target?.binding_id?.split("/").at(-1)
+      || target?.provider
       || `target-${position + 1}`;
+    return normalizedId(`${modelId}-${source}`, `target-${position + 1}`);
   }
 
-  function targetConfig(target, position) {
+  function targetConfig(target, position, modelId) {
     const transform = target.profile?.request_transform || "";
     const wireFamily = target.wire_family
       || ({ anthropic_messages: "anthropic", gemini_generate_content: "gemini", xai_chat: "xai", kimi_chat: "kimi" }[transform])
       || "openai";
+    const variants = target.profile?.endpoint_variants || {};
+    const standardTextBridge = (target.capabilities || []).includes("text")
+      && ["openai", "anthropic"].includes(wireFamily);
     const codecs = target.codecs?.length
       ? target.codecs
-      : target.profile?.endpoint_variants?.responses
-        ? ["decode.openai.responses"]
-        : [];
+      : standardTextBridge
+        ? ["decode.openai.responses", "decode.openai.chat", "decode.anthropic.messages"]
+        : [
+          variants.responses && "decode.openai.responses",
+          variants.chat_completions && "decode.openai.chat",
+          variants.messages && "decode.anthropic.messages",
+          variants.generate_content && "decode.gemini.generate_content",
+        ].filter(Boolean);
     const value = {
-      id: targetConfigId(target, position),
+      id: targetConfigId(target, position, modelId),
       provider: target.provider,
       priority: Number(target.priority) > 0 ? Number(target.priority) : position + 1,
       upstream_model: target.upstream_model,
@@ -2270,7 +2309,7 @@
   }
 
   async function stageModelTargets(model, targets) {
-    const value = { id: model.id, targets: targets.map((target, index) => targetConfig(target, index)) };
+    const value = { id: model.id, targets: targets.map((target, index) => targetConfig(target, index, model.id)) };
     try {
       await applyControlResource("models", value, model.id);
       notify("success", `Target order staged for ${model.id}.`);

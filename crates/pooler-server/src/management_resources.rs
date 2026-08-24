@@ -583,7 +583,7 @@ pub(crate) fn control_plane_graph(
             "native_config": true,
             "model_discovery": true,
             "request_dialect": "openai_responses",
-            "endpoint_families": ["models", "responses"],
+            "endpoint_families": ["models", "responses", "image_generations"],
         }),
         json!({
             "id": "palantir-aip",

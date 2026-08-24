@@ -220,6 +220,8 @@ fn parse_message(
     let role = match required_string(object, "role", &format!("{field}.role"))? {
         "user" => Role::User,
         "assistant" => Role::Assistant,
+        "system" => Role::System,
+        "developer" => Role::Developer,
         other => {
             return Err(invalid_value(
                 format!("{field}.role"),
@@ -1437,6 +1439,37 @@ mod tests {
     use serde_json::Value;
 
     use super::AnthropicMessagesCodec;
+
+    #[test]
+    fn system_and_developer_messages_are_lifted_to_the_anthropic_system_field() {
+        let body = br#"{
+          "model":"claude-test",
+          "max_tokens":64,
+          "messages":[
+            {"role":"system","content":"System instruction"},
+            {"role":"developer","content":"Developer instruction"},
+            {"role":"user","content":"Hello"}
+          ]
+        }"#;
+
+        let decoded = AnthropicMessagesCodec::decode_request(body).expect("decode messages");
+        assert!(matches!(
+            &decoded.input[0],
+            InputItem::Message(message) if message.role == Role::System
+        ));
+        assert!(matches!(
+            &decoded.input[1],
+            InputItem::Message(message) if message.role == Role::Developer
+        ));
+
+        let encoded = AnthropicMessagesCodec::encode_request(&decoded, LossPolicy::Degrade)
+            .expect("re-encode system instructions");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("json");
+        assert_eq!(value["system"][0]["text"], "System instruction");
+        assert_eq!(value["system"][1]["text"], "Developer instruction");
+        assert_eq!(value["messages"].as_array().expect("messages").len(), 1);
+        assert_eq!(value["messages"][0]["role"], "user");
+    }
 
     #[test]
     fn droid_request_normalizes_thinking_tools_and_results() {

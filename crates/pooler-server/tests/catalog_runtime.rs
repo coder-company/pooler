@@ -52,6 +52,9 @@ models:
   - id: configured-only
     targets:
       - {id: configured-only-target, provider: provider-a, account: catalog-account, priority: 1, upstream_model: configured-upstream, capabilities: [text], codecs: [], wire_family: openai}
+  - id: best
+    targets:
+      - {id: configured-best-target, provider: provider-a, account: catalog-account, priority: 2, upstream_model: configured-best, capabilities: [text], codecs: [], wire_family: openai}
 catalog:
   # The timeout is deliberately generous: these tests assert catalog shaping,
   # not refresh deadlines, and a tight budget only measures machine load.
@@ -61,7 +64,6 @@ catalog:
       provider: provider-a
       parser: kimi
       account: catalog-account
-      prefix: team
       included_models: ['model-*']
       excluded_models: ['*-old']
       aliases:
@@ -274,13 +276,10 @@ async fn fake_provider_snapshot_drives_cli_management_shape_and_retains_last_goo
     runtime.refresh().await.expect("first refresh");
     let first = runtime.snapshot();
     assert_eq!(first.generation(), 1);
-    assert!(first.get("team/best").is_some());
-    assert!(
-        first.get("team/model-live").is_none(),
-        "rename is not a fork"
-    );
-    assert!(first.get("team/model-old").is_none(), "exclusion applies");
-    assert!(first.get("team/internal").is_none(), "allow-list applies");
+    assert!(first.get("best").is_some());
+    assert!(first.get("model-live").is_none(), "rename is not a fork");
+    assert!(first.get("model-old").is_none(), "exclusion applies");
+    assert!(first.get("internal").is_none(), "allow-list applies");
 
     let error = runtime.refresh().await.expect_err("second refresh fails");
     assert_eq!(
@@ -316,19 +315,23 @@ async fn fake_provider_snapshot_drives_cli_management_shape_and_retains_last_goo
         .as_array()
         .expect("model array")
         .iter()
-        .find(|model| model["id"] == "team/best")
+        .find(|model| model["id"] == "best")
         .expect("discovered alias");
-    assert_eq!(discovered["selection_origin"], "discovered");
-    assert_eq!(discovered["targets"][0]["account"], "catalog-account");
-    assert_eq!(
-        discovered["targets"][0]["binding"]["provider"],
-        "provider-a"
-    );
-    assert!(discovered["targets"][0]["binding"]["binding_id"]
+    assert_eq!(discovered["selection_origin"], "configured_and_discovered");
+    assert_eq!(discovered["targets"].as_array().expect("targets").len(), 2);
+    let discovered_target = discovered["targets"]
+        .as_array()
+        .expect("targets")
+        .iter()
+        .find(|target| target.get("binding").is_some())
+        .expect("discovered target");
+    assert_eq!(discovered_target["account"], "catalog-account");
+    assert_eq!(discovered_target["binding"]["provider"], "provider-a");
+    assert!(discovered_target["binding"]["binding_id"]
         .as_str()
-        .is_some_and(|binding| binding.contains("team/best/provider-a.primary")));
+        .is_some_and(|binding| binding.contains("best/provider-a.primary")));
     assert_eq!(
-        discovered["targets"][0]["provenance"][0]["revision"],
+        discovered_target["provenance"][0]["revision"],
         "fixture-revision"
     );
 
@@ -337,7 +340,6 @@ async fn fake_provider_snapshot_drives_cli_management_shape_and_retains_last_goo
     let catalog_text = String::from_utf8(catalog.body).expect("catalog UTF-8");
     let catalog_value: serde_json::Value =
         serde_json::from_str(&catalog_text).expect("catalog JSON");
-    assert!(catalog_text.contains("\"prefix\":\"team\""));
     assert!(catalog_text.contains("\"alias\":\"best\""));
     assert!(catalog_text.contains("\"account\":\"catalog-account\""));
     assert!(catalog_text.contains("\"included_models\":[\"model-*\"]"));

@@ -796,10 +796,32 @@ pub fn merged_model_catalog_value(
             let mut discovered = discovered_model_value(model);
             discovered["enabled"] = json!(!disabled.contains(model.id().as_str()));
             if let Some(configured) = models.get_mut(model.id().as_str()) {
-                configured
+                let discovered_targets = discovered
                     .as_object_mut()
-                    .expect("configured model view is an object")
-                    .insert("discovery".to_owned(), discovered);
+                    .and_then(|object| object.remove("targets"))
+                    .and_then(|targets| targets.as_array().cloned())
+                    .unwrap_or_default();
+                let configured = configured
+                    .as_object_mut()
+                    .expect("configured model view is an object");
+                let configured_targets = configured
+                    .get_mut("targets")
+                    .and_then(Value::as_array_mut)
+                    .expect("configured model targets are an array");
+                let configured_bindings = configured_targets
+                    .iter()
+                    .filter_map(target_view_identity)
+                    .collect::<BTreeSet<_>>();
+                configured_targets.extend(discovered_targets.into_iter().filter(|target| {
+                    target_view_identity(target)
+                        .is_none_or(|identity| !configured_bindings.contains(&identity))
+                }));
+                configured.insert(
+                    "selection_origin".to_owned(),
+                    Value::String("configured_and_discovered".to_owned()),
+                );
+                configured.insert("enabled".to_owned(), discovered["enabled"].clone());
+                configured.insert("discovery".to_owned(), discovered);
             } else {
                 models.insert(model.id().to_string(), discovered);
             }
@@ -836,6 +858,17 @@ pub fn merged_model_catalog_value(
             |snapshot| json!(snapshot.overrides()),
         ),
     })
+}
+
+fn target_view_identity(target: &Value) -> Option<String> {
+    let provider = target.get("provider")?.as_str()?;
+    let account = target
+        .get("account")
+        .and_then(Value::as_str)
+        .or_else(|| target.get("account_pool").and_then(Value::as_str))
+        .unwrap_or_default();
+    let upstream_model = target.get("upstream_model")?.as_str()?;
+    Some(format!("{provider}\0{account}\0{upstream_model}"))
 }
 
 /// List the public model IDs from the same merged snapshot used by selection.
@@ -963,4 +996,32 @@ fn catalog_source_value(
         "selection": selection,
         "state": snapshot.sources().get(source.id()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::target_view_identity;
+
+    #[test]
+    fn configured_and_discovered_target_views_share_one_routing_identity() {
+        let configured = json!({
+            "binding_id":"model/configured-target",
+            "provider":"anthropic",
+            "account":"personal",
+            "upstream_model":"model"
+        });
+        let discovered = json!({
+            "binding":{"binding_id":"model/provider.primary"},
+            "provider":"anthropic",
+            "account":"personal",
+            "upstream_model":"model"
+        });
+
+        assert_eq!(
+            target_view_identity(&configured),
+            target_view_identity(&discovered)
+        );
+    }
 }

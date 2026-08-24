@@ -37,11 +37,12 @@ pub enum Capability {
     WebSocket,
     ConnectRpc,
     Protobuf,
+    ImageGeneration,
 }
 
 impl Capability {
     /// Every capability known by this version of Pooler.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::Text,
         Self::Images,
         Self::Audio,
@@ -70,6 +71,7 @@ impl Capability {
         Self::WebSocket,
         Self::ConnectRpc,
         Self::Protobuf,
+        Self::ImageGeneration,
     ];
 
     const fn bit(self) -> u64 {
@@ -108,6 +110,7 @@ impl Capability {
             Self::WebSocket => "web_socket",
             Self::ConnectRpc => "connect_rpc",
             Self::Protobuf => "protobuf",
+            Self::ImageGeneration => "image_generation",
         }
     }
 }
@@ -362,5 +365,15 @@ mod tests {
     fn unknown_raw_bits_are_rejected() {
         assert!(CapabilitySet::try_from_bits(1u64 << 63).is_err());
         assert_eq!(CapabilitySet::all().len(), Capability::ALL.len() as u32);
+    }
+
+    #[test]
+    fn vision_input_does_not_imply_image_generation() {
+        let vision = CapabilitySet::from(Capability::Images);
+        assert!(!vision.contains(Capability::ImageGeneration));
+        assert_eq!(
+            serde_json::to_string(&CapabilitySet::from(Capability::ImageGeneration)).unwrap(),
+            "[\"image_generation\"]"
+        );
     }
 }

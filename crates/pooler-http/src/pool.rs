@@ -546,7 +546,10 @@ impl PoolSelection {
             .native()
             .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
         {
-            Some("responses")
+            match route.target().endpoint_family() {
+                Some("image_generations") => Some("image_generations"),
+                _ => Some("responses"),
+            }
         } else {
             self.endpoint_family_for(route)
         };
@@ -808,6 +811,7 @@ fn normalize_endpoint_family(value: &str) -> Option<&'static str> {
         "chat" | "chat_completions" | "openai_chat" => Some("chat_completions"),
         "responses" | "openai_responses" => Some("responses"),
         "messages" | "anthropic_messages" => Some("messages"),
+        "images" | "image_generations" => Some("image_generations"),
         _ => None,
     }
 }
@@ -817,6 +821,7 @@ fn endpoint_family_path(family: &str) -> &'static str {
         "chat_completions" => "/v1/chat/completions",
         "responses" => "/v1/responses",
         "messages" => "/v1/messages",
+        "image_generations" => "/v1/images/generations",
         _ => unreachable!("endpoint family is normalized before path selection"),
     }
 }
@@ -2827,7 +2832,7 @@ fn register_model_accounts(
                 capabilities: target.capabilities(),
                 facts: target_routing_facts(target),
                 wire_family: Some(Arc::from(target.wire_family())),
-                endpoint_family: None,
+                endpoint_family: static_endpoint_family(target.wire_family()).map(Arc::from),
                 profile: ModelProfile::DEFAULT,
                 request_overlay: RequestOverlay::default(),
             });
@@ -2870,6 +2875,13 @@ fn register_model_accounts(
         }
     }
     Ok(())
+}
+
+fn static_endpoint_family(wire_family: &str) -> Option<&'static str> {
+    match wire_family {
+        "anthropic" | "anthropic_messages" => Some("messages"),
+        _ => None,
+    }
 }
 
 fn register_route_accounts(

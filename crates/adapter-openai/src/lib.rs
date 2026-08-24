@@ -513,7 +513,13 @@ fn encode_anthropic_request(
         if let Some(value) = fields.get("stream").and_then(Value::as_bool) {
             stream = value;
         }
-        for field in fields.keys().filter(|field| field.as_str() != "stream") {
+        for (field, value) in fields
+            .iter()
+            .filter(|(field, _)| field.as_str() != "stream")
+        {
+            if field == "store" && value == &Value::Bool(false) {
+                continue;
+            }
             if !policy.allows_degradation() {
                 return Err(Box::new(OpenAiAdapterError::UnsupportedCrossProtocolField(
                     field.clone(),
@@ -2247,6 +2253,33 @@ mod tests {
         );
         assert_eq!(response["choices"][0]["finish_reason"], "stop");
         assert_eq!(response["usage"]["prompt_tokens"], 3);
+    }
+
+    #[test]
+    fn responses_to_anthropic_accepts_only_the_safe_store_false_transport_hint() {
+        let route = route(
+            OPENAI_RESPONSES_REQUEST_DECODER,
+            OPENAI_RESPONSES_EVENT_DECODER,
+            OPENAI_RESPONSES_EVENT_ENCODER,
+        );
+        let request = |store| {
+            serde_json::to_vec(&json!({
+                "model":"claude-test","input":"hello","max_output_tokens":32,
+                "stream":false,"store":store
+            }))
+            .expect("Responses request JSON")
+        };
+        let encoded = OpenAiSemanticAdapter
+            .reencode_request_for_wire(&route, &request(false), SemanticWire::AnthropicMessages)
+            .expect("store=false is safe to omit for Anthropic");
+        let encoded: Value = serde_json::from_slice(&encoded).expect("Messages request JSON");
+        assert_eq!(encoded["stream"], false);
+        assert!(encoded.get("store").is_none());
+
+        let error = OpenAiSemanticAdapter
+            .reencode_request_for_wire(&route, &request(true), SemanticWire::AnthropicMessages)
+            .expect_err("store=true must not be silently dropped");
+        assert!(error.to_string().contains("store"));
     }
 
     #[tokio::test]
