@@ -742,8 +742,26 @@ fn provider_endpoint_path(
 
     // A Palantir route can be reused by another target only after its
     // enrollment prefix is removed. This is the important anti-anchor fence:
-    // a selected generic provider never receives another provider's path.
-    Ok(canonical.to_owned())
+    // a selected generic provider never receives another provider's path. Its
+    // own configured API base path is still authoritative.
+    Ok(provider_api_base_path(upstream.url().path(), canonical))
+}
+
+fn provider_api_base_path(base_path: &str, canonical: &str) -> String {
+    let Some(suffix) = canonical
+        .strip_prefix("/v1")
+        .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+    else {
+        return canonical.to_owned();
+    };
+    let base = base_path.trim_end_matches('/');
+    if base.is_empty() {
+        return canonical.to_owned();
+    }
+    if suffix.is_empty() || base.ends_with(suffix) {
+        return base.to_owned();
+    }
+    format!("{base}{suffix}")
 }
 
 fn canonical_provider_path(path: &str) -> &str {
@@ -1025,6 +1043,7 @@ impl PoolingCoordinator {
     #[must_use]
     pub fn with_catalog(mut self, catalog: Arc<CatalogService>) -> Self {
         self.catalog = Some(catalog);
+        self.catalog_generation.store(u64::MAX, Ordering::Release);
         let _ = self.sync_catalog_snapshot();
         self
     }
@@ -1034,6 +1053,11 @@ impl PoolingCoordinator {
     pub fn with_optional_catalog(mut self, catalog: Option<Arc<CatalogService>>) -> Self {
         self.catalog = catalog;
         if self.catalog.is_some() {
+            // A configuration reload creates a new catalog service whose first
+            // snapshot can have the same generation number as the retired
+            // service. Force one rebuild so generation equality across two
+            // distinct services never leaves stale model bindings installed.
+            self.catalog_generation.store(u64::MAX, Ordering::Release);
             let _ = self.sync_catalog_snapshot();
         } else {
             self.catalog_generation.store(0, Ordering::Release);
@@ -3758,9 +3782,135 @@ mod tests {
     use super::*;
     use http::HeaderValue;
     use pooler_config::compile_yaml;
+    use pooler_model_catalog::{
+        CatalogSourceConfig, DiscoveredModel, DiscoveryFuture, DiscoveryResponse, ModelDiscovery,
+        RefreshConfig, RegisteredSource,
+    };
     use pooler_store::SqliteStore;
     use std::io::Write;
     use tempfile::{tempdir, NamedTempFile};
+
+    #[derive(Debug)]
+    struct FixedCatalogModel(&'static str);
+
+    impl ModelDiscovery for FixedCatalogModel {
+        fn discover(&self) -> DiscoveryFuture<'_> {
+            let model = DiscoveredModel::new(
+                ModelId::new(self.0).expect("test model ID"),
+                CapabilitySet::from(Capability::Text),
+            );
+            Box::pin(std::future::ready(Ok(DiscoveryResponse::new(vec![model]))))
+        }
+    }
+
+    async fn one_model_catalog(
+        source_id: &str,
+        provider: &str,
+        account: &str,
+        model: &'static str,
+    ) -> Arc<CatalogService> {
+        let source = CatalogSourceConfig {
+            id: source_id.to_owned(),
+            provider: provider.to_owned(),
+            account: Some(account.to_owned()),
+            ..CatalogSourceConfig::default()
+        }
+        .compile()
+        .expect("catalog source");
+        let service = Arc::new(
+            CatalogService::new(
+                vec![RegisteredSource::new(
+                    source,
+                    Arc::new(FixedCatalogModel(model)),
+                )],
+                RefreshConfig::default().compile().expect("refresh limits"),
+            )
+            .expect("catalog service"),
+        );
+        service.select_all(source_id).expect("select all models");
+        service.refresh(1).await.expect("catalog refresh");
+        service
+    }
+
+    #[tokio::test]
+    async fn replacing_catalog_service_rebuilds_same_generation_bindings() {
+        let config = compile_yaml(
+            "catalog-replacement.yaml",
+            r#"
+version: 2
+upstreams:
+  first: {url: https://first.example/v1}
+  second: {url: https://second.example/v1}
+accounts:
+  first-account: {provider: first, secret: env:FIRST_KEY}
+  second-account: {provider: second, secret: env:SECOND_KEY}
+"#,
+        )
+        .expect("catalog replacement config");
+        let first = one_model_catalog("first.models", "first", "first-account", "old-model").await;
+        let second =
+            one_model_catalog("second.models", "second", "second-account", "new-model").await;
+        assert_eq!(
+            first.snapshot().generation(),
+            second.snapshot().generation()
+        );
+
+        let coordinator = PoolingCoordinator::new(&config)
+            .expect("coordinator")
+            .with_catalog(first);
+        let reconfigured = coordinator
+            .reconfigure(&config)
+            .expect("reconfigured coordinator")
+            .with_optional_catalog(Some(second));
+        let registries = reconfigured.registries.read().expect("registries");
+
+        assert!(!registries.contains_key("old-model"));
+        assert!(registries.contains_key("new-model"));
+    }
+
+    #[test]
+    fn provider_routes_keep_their_configured_api_base_path() {
+        let config = compile_yaml(
+            "provider-endpoints.yaml",
+            r#"
+version: 2
+upstreams:
+  fireworks: {known_provider: fireworks-ai}
+  openrouter: {known_provider: openrouter}
+  zai: {known_provider: zai}
+"#,
+        )
+        .expect("provider config");
+
+        assert_eq!(
+            provider_endpoint_path(
+                &config.upstreams()["fireworks"],
+                "/v1/chat/completions",
+                Some("chat_completions")
+            )
+            .expect("Fireworks chat endpoint"),
+            "/inference/v1/chat/completions"
+        );
+        assert_eq!(
+            provider_endpoint_path(&config.upstreams()["openrouter"], "/v1/models", None)
+                .expect("OpenRouter models endpoint"),
+            "/api/v1/models"
+        );
+        assert_eq!(
+            provider_endpoint_path(
+                &config.upstreams()["zai"],
+                "/v1/chat/completions",
+                Some("chat_completions")
+            )
+            .expect("Z.AI chat endpoint"),
+            "/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            provider_endpoint_path(&config.upstreams()["fireworks"], "/v1/models", None)
+                .expect("Fireworks models endpoint"),
+            "/inference/v1/models"
+        );
+    }
 
     #[test]
     fn account_secret_preserves_custom_header_placement() {

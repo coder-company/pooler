@@ -1716,6 +1716,11 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
         page.locator('[data-provider-action="show-form"]').click()
         expect(page.locator('[data-provider-field="template"] option[value="openai"]').count() == 1, "built-in OpenAI provider is missing")
         expect(page.locator('[data-provider-field="template"] option[value="openai-subscription"]').count() == 1, "built-in OpenAI subscription login is missing")
+        provider_labels = page.locator('[data-provider-field="template"] option').all_inner_texts()
+        expect(
+            provider_labels == sorted(provider_labels, key=str.casefold),
+            "built-in provider choices are not alphabetized by display name",
+        )
         expect("https://api.openai.com/v1" in page.locator(".view-providers").inner_text(), "built-in provider did not show its automatic API address")
         expect(page.locator('[data-provider-field="origin"]').count() == 0, "built-in provider incorrectly asks for an API URL")
         expect(page.locator('[data-provider-field="id"]').count() == 0, "provider onboarding exposes an internal instance ID")

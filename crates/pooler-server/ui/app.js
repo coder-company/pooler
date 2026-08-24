@@ -1363,7 +1363,12 @@
 
   function providerForm() {
     const draft = state.providerDraft;
-    const templates = controlGraph().provider_templates || [];
+    const templates = [...(controlGraph().provider_templates || [])].sort((left, right) =>
+      String(left.name || left.id).localeCompare(
+        String(right.name || right.id),
+        undefined,
+        { sensitivity: "base" },
+      ));
     const templateId = draft.template === "__custom" || templates.some((template) => template.id === draft.template) ? draft.template : templates.find((template) => template.id === "openai")?.id || templates[0]?.id || "__custom";
     draft.template = templateId;
     const custom = templateId === "__custom";
