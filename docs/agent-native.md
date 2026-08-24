@@ -234,9 +234,19 @@ The installer validates its inputs before copying anything and is inert with res
 
 The service binds inference on `127.0.0.1:18400` and management on `127.0.0.1:18401`. These differ from the `pooler init` starter, which uses `18477` for management. The installer rejects a configuration that does not bind those two ports or that references anything other than `file:/etc/pooler/management.key`.
 
-### Step 8: Report the exact connection settings
+### Step 8: Report the exact connection settings and client prerequisites
 
-Finish by telling the user what to paste where, for the tools they actually named:
+A base URL is often not sufficient. Each preset matches specific methods, paths, content types, and headers, and Pooler refuses a request that does not match rather than guessing. Read [client prerequisites](adapters-and-presets.md#client-prerequisites) and tell the user every client-side change their tools need, not just the address.
+
+The ones that most often block a working setup:
+
+- **Devin** must use Connect with protobuf, not gRPC, gRPC-Web, or Connect+JSON, and must send its auth, seat, and analytics calls to the same base address as chat.
+- **Factory Droid** must enable streaming and send `ai-language-model-id`; specification version `4` additionally requires `ai-gateway-protocol-version: 0.0.1`.
+- **Any client** must accept a plain `http://` loopback base URL, and may need a non-secret placeholder in its API-key field.
+
+Do not invent a client's setting names. They differ between clients and versions, so read that client's documentation and confirm the names with the user. State plainly which prerequisites you verified and which the user must apply themselves.
+
+Then tell the user what to paste where, for the tools they actually named:
 
 | Tool | Setting |
 | :--- | :--- |
@@ -315,3 +325,4 @@ Apply these to every task on this page.
 4. Never overwrite an existing configuration or starter directory. Write to a new path and tell the user what changed.
 5. Read `pooler auth providers` before offering a login method. Do not invent OAuth support for a provider that only accepts API keys.
 6. Confirm the listening ports with `pooler routes` or `pooler endpoint-inventory` before reporting a base URL.
+7. Report every client-side prerequisite the user's tools need, not just the address. Do not invent a client's setting names; read that client's documentation and confirm them with the user.

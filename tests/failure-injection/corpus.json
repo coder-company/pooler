@@ -54,7 +54,7 @@
       "outcome": "response",
       "status": 401,
       "commitment": "before",
-      "expected_attempts": 2,
+      "expected_attempts": 3,
       "expected_health_mutation": "none"
     },
     {

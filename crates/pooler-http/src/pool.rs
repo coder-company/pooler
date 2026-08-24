@@ -541,7 +541,6 @@ impl PoolSelection {
         route: &RoutePlan,
         downstream: &Uri,
     ) -> Result<Uri, PoolError> {
-        let requested_path = route.target().path().unwrap_or_else(|| downstream.path());
         let endpoint_family = if upstream
             .native()
             .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
@@ -553,7 +552,12 @@ impl PoolSelection {
         } else {
             self.endpoint_family_for(route)
         };
-        let path = provider_endpoint_path(upstream, requested_path, endpoint_family)?;
+        let path = provider_endpoint_path(
+            upstream,
+            route.target().path(),
+            downstream.path(),
+            endpoint_family,
+        )?;
         let mut url = upstream.url().clone();
         url.set_path(&path);
         merge_downstream_query(&mut url, downstream.query());
@@ -571,7 +575,13 @@ impl PoolSelection {
         let Some(target) = self.binding_target.as_ref() else {
             return requested;
         };
-        if requested.is_some_and(|family| endpoint_family_supported(target.profile, family)) {
+        // Substituting the target's family rewrites the request onto a
+        // different upstream surface, so it is only correct when the profile
+        // positively reports the requested family as unavailable. A family the
+        // profile does not model leaves the route's declaration authoritative.
+        if requested
+            .is_some_and(|family| endpoint_family_supported(target.profile, family).unwrap_or(true))
+        {
             return requested;
         }
         target.endpoint_family.as_deref().or(requested)
@@ -719,15 +729,22 @@ impl PoolSelection {
     }
 }
 
-fn endpoint_family_supported(profile: ModelProfile, family: &str) -> bool {
+/// Whether a model profile supports an endpoint family.
+///
+/// `None` means the profile records no variant for this family and so has no
+/// opinion about it. That is distinct from `Some(false)`, which is positive
+/// evidence that the family is unavailable, and callers must not conflate the
+/// two: most families a route can name, such as `responses_compact`,
+/// `embeddings`, or `models`, are not modelled as variants at all.
+fn endpoint_family_supported(profile: ModelProfile, family: &str) -> Option<bool> {
     let variants = profile.endpoint_variants;
     match family {
-        "responses" => variants.responses,
-        "chat_completions" => variants.chat_completions,
-        "messages" => variants.messages,
-        "generate_content" => variants.generate_content,
-        "realtime" => variants.realtime,
-        _ => false,
+        "responses" => Some(variants.responses),
+        "chat_completions" => Some(variants.chat_completions),
+        "messages" => Some(variants.messages),
+        "generate_content" => Some(variants.generate_content),
+        "realtime" => Some(variants.realtime),
+        _ => None,
     }
 }
 
@@ -736,14 +753,23 @@ const PALANTIR_ANTHROPIC_PROXY_PREFIX: &str = "/api/v2/llm/proxy/anthropic";
 
 fn provider_endpoint_path(
     upstream: &pooler_config::UpstreamPlan,
-    requested_path: &str,
+    route_path: Option<&str>,
+    downstream_path: &str,
     endpoint_family: Option<&str>,
 ) -> Result<String, PoolError> {
+    let requested_path = route_path.unwrap_or(downstream_path);
     let requested_canonical = canonical_provider_path(requested_path);
-    let canonical = endpoint_family
-        .and_then(normalize_endpoint_family)
-        .map(endpoint_family_path)
-        .unwrap_or(requested_canonical);
+    // A route that names its upstream path states the operator's contract with
+    // this provider, including a non-standard one. The endpoint family only
+    // supplies the conventional path when the route leaves it unset.
+    let canonical = if route_path.is_some() {
+        requested_canonical
+    } else {
+        endpoint_family
+            .and_then(normalize_endpoint_family)
+            .map(endpoint_family_path)
+            .unwrap_or(requested_canonical)
+    };
     if upstream
         .native()
         .is_some_and(|native| native.kind().eq_ignore_ascii_case("palantir_aip"))
@@ -3972,6 +3998,7 @@ upstreams:
         assert_eq!(
             provider_endpoint_path(
                 &config.upstreams()["fireworks"],
+                None,
                 "/v1/chat/completions",
                 Some("chat_completions")
             )
@@ -3979,13 +4006,14 @@ upstreams:
             "/inference/v1/chat/completions"
         );
         assert_eq!(
-            provider_endpoint_path(&config.upstreams()["openrouter"], "/v1/models", None)
+            provider_endpoint_path(&config.upstreams()["openrouter"], None, "/v1/models", None)
                 .expect("OpenRouter models endpoint"),
             "/api/v1/models"
         );
         assert_eq!(
             provider_endpoint_path(
                 &config.upstreams()["zai"],
+                None,
                 "/v1/chat/completions",
                 Some("chat_completions")
             )
@@ -3993,7 +4021,7 @@ upstreams:
             "/api/paas/v4/chat/completions"
         );
         assert_eq!(
-            provider_endpoint_path(&config.upstreams()["fireworks"], "/v1/models", None)
+            provider_endpoint_path(&config.upstreams()["fireworks"], None, "/v1/models", None)
                 .expect("Fireworks models endpoint"),
             "/inference/v1/models"
         );

@@ -4472,23 +4472,38 @@ fn selected_semantic_wire(
         Some("chat_completions") => Some(SemanticWire::OpenAiChat),
         Some("messages") => Some(SemanticWire::AnthropicMessages),
         Some("generate_content") => Some(SemanticWire::GeminiGenerateContent),
-        Some(_) => None,
-        None => route_semantic_wire(route),
+        // A family outside the semantic set, such as `models` or
+        // `responses_compact`, names a path rather than a wire, so the route's
+        // own codecs decide.
+        _ => route_semantic_wire(route),
     }
 }
 
-/// Upstream wire implied by a semantic route's own response contract.
+/// Upstream wire implied by a semantic route's own codecs.
 ///
-/// A target that declares only the OpenAI wire does not say which OpenAI
-/// surface to use, and a route is not required to name an endpoint family. The
-/// route's response decoder resolves it, because it names the upstream event
-/// shape the route was built to read.
+/// A route need not name an endpoint family, and the families it can name do
+/// not all correspond to a wire. A translating route names the upstream event
+/// shape in its response decoder; a same-wire route names it only on ingress.
+///
+/// A route whose ingress already speaks OpenAI Responses is excluded. Moving
+/// such a route onto a different OpenAI surface changes the caller's protocol,
+/// so it has to be declared rather than inferred here.
 fn route_semantic_wire(route: &RoutePlan) -> Option<SemanticWire> {
-    match route.response().decoder()? {
-        "decode.openai.chat.events" => Some(SemanticWire::OpenAiChat),
+    if route.ingress().decoder() == Some("decode.openai.responses") {
+        return None;
+    }
+    decoder_semantic_wire(route.response().decoder())
+        .or_else(|| decoder_semantic_wire(route.ingress().decoder()))
+}
+
+fn decoder_semantic_wire(decoder: Option<&str>) -> Option<SemanticWire> {
+    match decoder? {
+        "decode.openai.chat" | "decode.openai.chat.events" => Some(SemanticWire::OpenAiChat),
         "decode.openai.responses" | "decode.openai.responses.events" => {
             Some(SemanticWire::OpenAiResponses)
         }
+        "decode.anthropic.messages" => Some(SemanticWire::AnthropicMessages),
+        "decode.gemini.generate_content" => Some(SemanticWire::GeminiGenerateContent),
         _ => None,
     }
 }
