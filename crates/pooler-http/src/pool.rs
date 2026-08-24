@@ -3101,10 +3101,12 @@ fn catalog_wire_family(profile: ModelProfile) -> Option<Arc<str>> {
 
 fn catalog_target_codecs(profile: ModelProfile) -> impl Iterator<Item = &'static str> {
     let variants = profile.endpoint_variants;
+    let text = variants.responses || variants.chat_completions || variants.messages;
     [
         variants.responses.then_some("decode.openai.responses"),
         variants.chat_completions.then_some("decode.openai.chat"),
         variants.messages.then_some("decode.anthropic.messages"),
+        text.then_some("decode.fx.language_model"),
         variants
             .generate_content
             .then_some("decode.gemini.generate_content"),

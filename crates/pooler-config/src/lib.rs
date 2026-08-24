@@ -3587,16 +3587,16 @@ fn compile_config(
         } else {
             LossPolicy::Reject
         };
-        // A served route answers from Pooler itself. It still declares a
-        // target, which scopes the answer, but it never reaches an upstream, so
-        // a body-converting ingress would describe work that never happens.
+        // A served route answers from Pooler itself. A semantic declaration is
+        // allowed only as a complete request/response pair so a client adapter
+        // can encode the local resource without creating a self-proxy hop.
         let served = match declaration.serve.as_deref().map(str::trim) {
             None => None,
             Some("model_catalog") => {
-                if ingress.mode().is_semantic() || response.mode().is_semantic() {
+                if ingress.mode().is_semantic() != response.mode().is_semantic() {
                     return Err(invalid(
                         &label,
-                        "a served route cannot declare semantic ingress or response",
+                        "a served route must declare both semantic ingress and response, or neither",
                     ));
                 }
                 Some(ServedResource::ModelCatalog)
@@ -8400,6 +8400,26 @@ routes:
 
         compile_yaml("cross-wire-semantic.yaml", text)
             .expect("semantic adapter bridges the declared ingress codec to Anthropic");
+    }
+
+    #[test]
+    fn served_model_catalog_allows_a_complete_semantic_client_shape() {
+        let text = r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:8400}}
+upstreams: {local: {url: http://127.0.0.1:9}}
+routes:
+  - id: fx-models
+    listen: local
+    match: {method: GET, path: /coding-agent/v1/models}
+    ingress: {mode: semantic, decoder: decode.fx.models.request}
+    target: {provider: local}
+    response: {mode: semantic, decoder: decode.openai.models, encoder: encode.fx.models}
+    serve: model_catalog
+"#;
+
+        compile_yaml("served-fx-models.yaml", text)
+            .expect("served model catalog uses the client response encoder without self-proxying");
     }
 
     #[test]

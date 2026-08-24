@@ -1346,12 +1346,28 @@ where
         let body = Full::new(bytes)
             .map_err(|never: Infallible| match never {})
             .boxed();
+        let (body, content_type) = if route.response().mode() == BodyMode::Semantic {
+            match self
+                .semantic
+                .decode_response(route, body, CancellationToken::new())
+            {
+                Ok(transformed) => (transformed.body, transformed.content_type),
+                Err(_) => {
+                    return openai_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "model view encoding failed",
+                        "internal_error",
+                    );
+                }
+            }
+        } else {
+            (body, HeaderValue::from_static("application/json"))
+        };
         let mut response = Response::new(body);
         *response.status_mut() = StatusCode::OK;
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, content_type);
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

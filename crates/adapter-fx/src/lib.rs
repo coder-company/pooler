@@ -7,6 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use adapter_anthropic::{AnthropicEventDecoder, AnthropicMessagesCodec};
 use adapter_factory::{
     FactoryDecodeOptions, FactoryFilePolicy, FactoryLanguageModelDecoder, GATEWAY_PROTOCOL_VERSION,
     GATEWAY_PROTOCOL_VERSION_HEADER, MODEL_ID_HEADER, SPECIFICATION_VERSION_HEADER,
@@ -19,12 +20,13 @@ use http_body_util::BodyExt;
 use pooler_config::RoutePlan;
 use pooler_http::{
     BoxError, ProxyBody, SelectionContext, SemanticAdapter, SemanticRequestBody,
-    SemanticResponseBody, SemanticResponseHint, SseEncoder, SseError, SseEvent, SseLimits,
-    SseParser,
+    SemanticResponseBody, SemanticResponseHint, SemanticWire, SseEncoder, SseError, SseEvent,
+    SseLimits, SseParser,
 };
 use pooler_protocol::{
     ContentPart, ConversionError, ConversionReport, Extensions, FinishReason, InputItem,
-    LossPolicy, OpenAiChatEventDecoder, Role, StreamError, StreamEvent, StreamEventKind, Usage,
+    LossPolicy, OpenAiChatCodec, OpenAiChatEventDecoder, OpenAiResponsesCodec,
+    OpenAiResponsesEventDecoder, Role, StreamError, StreamEvent, StreamEventKind, Usage,
 };
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -60,6 +62,10 @@ pub struct FxSemanticAdapter;
 impl SemanticAdapter for FxSemanticAdapter {
     fn supports(&self, route: &RoutePlan) -> bool {
         is_language_model_route(route) || is_models_route(route)
+    }
+
+    fn model_in_request_body(&self, route: &RoutePlan) -> bool {
+        is_language_model_route(route)
     }
 
     fn encode_request(
@@ -127,6 +133,53 @@ impl SemanticAdapter for FxSemanticAdapter {
         Ok(context)
     }
 
+    fn reencode_request_for_wire(
+        &self,
+        route: &RoutePlan,
+        body: &[u8],
+        wire: SemanticWire,
+    ) -> Result<Vec<u8>, BoxError> {
+        if wire == SemanticWire::OpenAiChat {
+            return Ok(body.to_vec());
+        }
+        let mut chat: Value = serde_json::from_slice(body)?;
+        let chat = chat
+            .as_object_mut()
+            .ok_or_else(|| Box::new(FxAdapterError::EncodedRequestNotObject) as BoxError)?;
+        chat.remove("stream");
+        chat.remove("stream_options");
+        let chat = serde_json::to_vec(chat)?;
+        let decoded = OpenAiChatCodec::decode_request_with_report(&chat)
+            .map_err(|error| Box::new(error) as BoxError)?;
+        decoded
+            .report
+            .validate(route.loss_policy())
+            .map_err(|error| Box::new(error) as BoxError)?;
+        let body = match wire {
+            SemanticWire::OpenAiResponses => {
+                OpenAiResponsesCodec::encode_request(&decoded.request, route.loss_policy())
+                    .map_err(|error| Box::new(error) as BoxError)?
+                    .body
+            }
+            SemanticWire::AnthropicMessages => {
+                AnthropicMessagesCodec::encode_request(&decoded.request, route.loss_policy())
+                    .map_err(|error| Box::new(error) as BoxError)?
+                    .body
+            }
+            SemanticWire::OpenAiChat => unreachable!(),
+            SemanticWire::GeminiGenerateContent => return Err(unsupported_route(route)),
+        };
+        let mut value: Value = serde_json::from_slice(&body)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| Box::new(FxAdapterError::EncodedRequestNotObject) as BoxError)?;
+        object.insert("stream".to_owned(), Value::Bool(true));
+        if wire == SemanticWire::OpenAiResponses {
+            object.insert("store".to_owned(), Value::Bool(false));
+        }
+        serde_json::to_vec(&value).map_err(|error| Box::new(error) as BoxError)
+    }
+
     fn sanitize_request_headers(&self, headers: &mut HeaderMap) {
         headers.remove(SPECIFICATION_VERSION_HEADER);
         headers.remove(MODEL_ID_HEADER);
@@ -140,7 +193,7 @@ impl SemanticAdapter for FxSemanticAdapter {
         body: ProxyBody,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
-        decode_response(route, body, None, cancellation)
+        decode_response(route, body, None, SemanticWire::OpenAiChat, cancellation)
     }
 
     fn decode_response_with_request_headers(
@@ -151,7 +204,13 @@ impl SemanticAdapter for FxSemanticAdapter {
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
         let requested_model = requested_model_header(request_headers);
-        decode_response(route, body, requested_model, cancellation)
+        decode_response(
+            route,
+            body,
+            requested_model,
+            SemanticWire::OpenAiChat,
+            cancellation,
+        )
     }
 
     fn decode_response_with_hint(
@@ -166,7 +225,13 @@ impl SemanticAdapter for FxSemanticAdapter {
             .requested_model
             .clone()
             .or_else(|| requested_model_header(request_headers));
-        decode_response(route, body, requested_model, cancellation)
+        decode_response(
+            route,
+            body,
+            requested_model,
+            hint.upstream_wire.unwrap_or(SemanticWire::OpenAiChat),
+            cancellation,
+        )
     }
 }
 
@@ -396,6 +461,7 @@ fn decode_response(
     route: &RoutePlan,
     body: ProxyBody,
     requested_model: Option<String>,
+    upstream_wire: SemanticWire,
     cancellation: CancellationToken,
 ) -> Result<SemanticResponseBody, BoxError> {
     if is_models_route(route) {
@@ -418,6 +484,7 @@ fn decode_response(
         usize_limit(u64::from(route.limits().max_queue_items)),
         usize_limit(route.limits().max_queue_bytes),
         requested_model,
+        upstream_wire,
         cancellation,
     )?;
     Ok(SemanticResponseBody {
@@ -450,6 +517,8 @@ enum FxAdapterError {
     UnexpectedModelsBody,
     #[error("fx tool messages may only contain tool-result parts")]
     InvalidToolMessageContent,
+    #[error("fx does not support the selected upstream wire")]
+    UnsupportedWire,
 }
 
 #[derive(Clone, Debug)]
@@ -774,11 +843,57 @@ enum FxEncodeError {
     UnsupportedEvent(&'static str),
 }
 
+enum FxUpstreamDecoder {
+    Chat(OpenAiChatEventDecoder),
+    Responses(OpenAiResponsesEventDecoder),
+    Anthropic(AnthropicEventDecoder),
+}
+
+impl FxUpstreamDecoder {
+    fn new(wire: SemanticWire) -> Result<Self, BoxError> {
+        match wire {
+            SemanticWire::OpenAiChat => Ok(Self::Chat(OpenAiChatEventDecoder::new())),
+            SemanticWire::OpenAiResponses => {
+                Ok(Self::Responses(OpenAiResponsesEventDecoder::new()))
+            }
+            SemanticWire::AnthropicMessages => Ok(Self::Anthropic(AnthropicEventDecoder::new())),
+            SemanticWire::GeminiGenerateContent => Err(Box::new(FxAdapterError::UnsupportedWire)),
+        }
+    }
+
+    fn decode(&mut self, event: &SseEvent) -> Result<Vec<StreamEvent>, BoxError> {
+        match self {
+            Self::Chat(decoder) => decoder
+                .decode_data(event.data.as_bytes())
+                .map_err(|error| Box::new(error) as BoxError),
+            Self::Responses(decoder) => decoder
+                .decode_event(event.event.as_deref(), event.data.as_bytes())
+                .map_err(|error| Box::new(error) as BoxError),
+            Self::Anthropic(decoder) => decoder
+                .decode_sse_event(event)
+                .map_err(|error| Box::new(error) as BoxError),
+        }
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, BoxError> {
+        match self {
+            Self::Chat(decoder) => decoder
+                .finish()
+                .map_err(|error| Box::new(error) as BoxError),
+            Self::Responses(decoder) => decoder
+                .finish()
+                .map_err(|error| Box::new(error) as BoxError),
+            Self::Anthropic(decoder) if decoder.is_finished() => Ok(Vec::new()),
+            Self::Anthropic(_) => Err(Box::new(FxStreamError::MissingDone)),
+        }
+    }
+}
+
 struct FxStreamBody {
     inner: Pin<Box<ProxyBody>>,
     parser: SseParser,
     limits: SseLimits,
-    decoder: OpenAiChatEventDecoder,
+    decoder: FxUpstreamDecoder,
     encoder: FxEventEncoder,
     policy: LossPolicy,
     queue: VecDeque<Bytes>,
@@ -800,6 +915,7 @@ impl FxStreamBody {
         max_queue_items: usize,
         max_queue_bytes: usize,
         requested_model: Option<String>,
+        upstream_wire: SemanticWire,
         cancellation: CancellationToken,
     ) -> Result<Self, BoxError> {
         let mut encoder = FxEventEncoder::new(requested_model);
@@ -820,7 +936,7 @@ impl FxStreamBody {
             inner: Box::pin(body),
             parser: SseParser::with_limits(limits),
             limits,
-            decoder: OpenAiChatEventDecoder::new(),
+            decoder: FxUpstreamDecoder::new(upstream_wire)?,
             encoder,
             policy,
             queue,
@@ -849,7 +965,7 @@ impl FxStreamBody {
             }
             self.done_seen = true;
         }
-        let events = self.decoder.decode_data(event.data.as_bytes())?;
+        let events = self.decoder.decode(event)?;
         for event in events {
             let values = self.encoder.encode(&event, self.policy)?;
             for value in values {
@@ -882,8 +998,17 @@ impl FxStreamBody {
         for event in events {
             self.process_sse_event(&event)?;
         }
+        let events = self.decoder.finish()?;
+        for event in events {
+            let values = self.encoder.encode(&event, self.policy)?;
+            for value in values {
+                let bytes = frame_value(&value, self.limits)?;
+                self.enqueue(bytes)?;
+            }
+        }
         if !self.done_seen {
-            return Err(Box::new(FxStreamError::MissingDone));
+            self.enqueue(done_bytes(self.limits)?)?;
+            self.done_seen = true;
         }
         self.ended = true;
         Ok(())
@@ -922,49 +1047,43 @@ impl Body for FxStreamBody {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.as_mut().get_mut();
-        if this.cancellation.is_cancelled() {
-            this.ended = true;
-            return Poll::Ready(Some(Err(Box::new(FxStreamError::Cancelled))));
-        }
-        if let Some(bytes) = this.queue.pop_front() {
-            this.queued_bytes = this.queued_bytes.saturating_sub(bytes.len());
-            return Poll::Ready(Some(Ok(Frame::data(bytes))));
-        }
-        if let Some(error) = this.error.take() {
-            this.ended = true;
-            return Poll::Ready(Some(Err(error)));
-        }
-        if this.ended {
-            return Poll::Ready(None);
-        }
-        match this.inner.as_mut().poll_frame(context) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => {
-                if let Err(error) = this.finish_upstream() {
-                    this.set_error(error);
-                    return Pin::new(this).poll_frame(context);
-                }
-                Pin::new(this).poll_frame(context)
+        loop {
+            if this.cancellation.is_cancelled() {
+                this.ended = true;
+                return Poll::Ready(Some(Err(Box::new(FxStreamError::Cancelled))));
             }
-            Poll::Ready(Some(Err(error))) => {
-                this.set_error(error);
-                Pin::new(this).poll_frame(context)
+            if let Some(bytes) = this.queue.pop_front() {
+                this.queued_bytes = this.queued_bytes.saturating_sub(bytes.len());
+                return Poll::Ready(Some(Ok(Frame::data(bytes))));
             }
-            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                Ok(data) => {
-                    if let Err(error) = this.process_chunk(&data) {
+            if let Some(error) = this.error.take() {
+                this.ended = true;
+                return Poll::Ready(Some(Err(error)));
+            }
+            if this.ended {
+                return Poll::Ready(None);
+            }
+            match this.inner.as_mut().poll_frame(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    if let Err(error) = this.finish_upstream() {
                         this.set_error(error);
                     }
-                    Pin::new(this).poll_frame(context)
                 }
-                Err(frame) => match frame.into_trailers() {
-                    Ok(_) => Pin::new(this).poll_frame(context),
-                    Err(_) => {
-                        this.set_error(Box::new(FxStreamError::InvalidFrame));
-                        Pin::new(this).poll_frame(context)
+                Poll::Ready(Some(Err(error))) => this.set_error(error),
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(data) => {
+                        if let Err(error) = this.process_chunk(&data) {
+                            this.set_error(error);
+                        }
+                    }
+                    Err(frame) => {
+                        if frame.into_trailers().is_err() {
+                            this.set_error(Box::new(FxStreamError::InvalidFrame));
+                        }
                     }
                 },
-            },
+            }
         }
     }
 
@@ -1134,6 +1253,37 @@ fn usize_limit(value: u64) -> usize {
 mod tests {
     use super::*;
     use pooler_protocol::StreamEvent;
+
+    #[test]
+    fn selected_responses_wire_reencodes_the_fx_chat_request() {
+        let config = pooler_config::compile_yaml(
+            "fx-responses-wire.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: http://127.0.0.1:9}}
+routes:
+  - id: fx
+    listen: local
+    match: {method: POST, path: /v3/ai/language-model}
+    ingress: {mode: semantic, decoder: decode.fx.language_model}
+    target: {provider: local, path: /v1/chat/completions}
+    response: {mode: semantic, decoder: decode.openai.chat.events, encoder: encode.fx.events}
+    loss_policy: degrade
+"#,
+        )
+        .expect("fx route");
+        let body = br#"{"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"include_usage":true}}"#;
+
+        let encoded = FxSemanticAdapter
+            .reencode_request_for_wire(&config.routes()[0], body, SemanticWire::OpenAiResponses)
+            .expect("Responses request");
+        let value: Value = serde_json::from_slice(&encoded).expect("Responses JSON");
+        assert_eq!(value["model"], "gpt-test");
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["store"], false);
+        assert_eq!(value["input"][0]["role"], "user");
+    }
 
     #[test]
     fn current_fx_reasoning_effort_string_normalizes_to_v4_shape() {

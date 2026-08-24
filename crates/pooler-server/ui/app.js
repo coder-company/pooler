@@ -2255,7 +2255,7 @@
     const codecs = target.codecs?.length
       ? target.codecs
       : standardTextBridge
-        ? ["decode.openai.responses", "decode.openai.chat", "decode.anthropic.messages"]
+        ? ["decode.openai.responses", "decode.openai.chat", "decode.anthropic.messages", "decode.fx.language_model"]
         : [
           variants.responses && "decode.openai.responses",
           variants.chat_completions && "decode.openai.chat",

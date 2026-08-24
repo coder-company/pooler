@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+adapter-anthropic = { path = "../adapter-anthropic" }
 adapter-factory = { path = "../adapter-factory" }
 bytes.workspace = true
 http.workspace = true

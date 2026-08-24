@@ -193,6 +193,8 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
             OpenAiSemanticAdapter.reencode_request_for_wire(route, body, wire)
         } else if AnthropicSemanticAdapter.supports(route) {
             AnthropicSemanticAdapter.reencode_request_for_wire(route, body, wire)
+        } else if FxSemanticAdapter.supports(route) {
+            FxSemanticAdapter.reencode_request_for_wire(route, body, wire)
         } else {
             Ok(body.to_vec())
         }

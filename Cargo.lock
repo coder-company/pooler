@@ -95,6 +95,7 @@ dependencies = [
 name = "adapter-fx"
 version = "0.1.0"
 dependencies = [
+ "adapter-anthropic",
  "adapter-factory",
  "bytes",
  "http",
