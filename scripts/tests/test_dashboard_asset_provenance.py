@@ -315,7 +315,14 @@ class DashboardAssetProvenanceTests(unittest.TestCase):
             (root / "deploy" / "pooler.example.yaml").write_text("version: 1\n")
             (root / "deploy" / "pooler.service").write_text("[Unit]\n")
             (root / "docs" / "deployment.md").write_text("# Deployment\n")
-            (root / "scripts" / "check-deployment-config.py").write_text("# check\n")
+            for script in (
+                "check-deployment-config.py",
+                "install-system-pooler.sh",
+                "test-system-install.sh",
+                "check-staged-secrets.sh",
+                "release.sh",
+            ):
+                (root / "scripts" / script).write_text("# check\n")
             (root / ".dockerignore").write_text("target\n")
             (root / "Dockerfile").write_text("FROM scratch\n")
             (root / "docker-compose.example.yml").write_text("services: {}\n")
@@ -332,6 +339,10 @@ class DashboardAssetProvenanceTests(unittest.TestCase):
                 "deploy/pooler.service",
                 "docs/deployment.md",
                 "scripts/check-deployment-config.py",
+                "scripts/install-system-pooler.sh",
+                "scripts/test-system-install.sh",
+                "scripts/check-staged-secrets.sh",
+                "scripts/release.sh",
             ):
                 self.assertTrue((stage / relative_path).is_file(), relative_path)
             self.assertFalse((stage / "deploy/config").exists())

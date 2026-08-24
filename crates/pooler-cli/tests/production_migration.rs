@@ -22,6 +22,12 @@ fn fixture(
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture directory mode");
+    }
     let config = directory.path().join("v1.yaml");
     let store = directory.path().join("v1.sqlite3");
     let key = directory.path().join("v1.key");
