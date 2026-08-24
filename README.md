@@ -1,90 +1,101 @@
-# pooler
+# Pooler
 
-Pooler is a production-oriented protocol runtime for AI clients and providers.
-One binary serves composable OpenAI, Anthropic, Gemini, xAI, Factory, fx, and
-ConnectRPC routes with opaque forwarding or bounded semantic translation. It
-adds model-aware account pooling, brokered OAuth, encrypted persistence,
-commit-safe retries, hot configuration, a secured management dashboard, and
-release-ready deployment tooling. Compatibility remains explicit: unsupported
-protocol behavior is rejected rather than silently advertised or discarded.
+Pooler is a local proxy that connects your AI coding tools (Cursor, Devin, Factory Droid, Claude Code, and standard AI SDKs) to AI model providers (OpenAI, Anthropic Claude, Google Gemini, xAI Grok).
 
-Validate the example configuration with:
+It gives you one local endpoint that translates request formats, rotates across multiple accounts when you hit rate limits, handles OAuth logins safely, and gives you a local web dashboard to monitor requests and costs.
 
-```sh
-cargo run -p pooler-cli -- check --config config/pooler.example.yaml
+```
++-----------------------------------------------------------------------+
+|  Your Coding Tools & Agents                                           |
+|  Cursor (8333) | Devin (18473) | Factory Droid (18474) | SDKs (8400)  |
++-----------------------------------+-----------------------------------+
+                                    |
+                                    v
++-----------------------------------------------------------------------+
+|  Pooler (Local Proxy)                                                 |
+|  - Translates protocols (ConnectRPC, Factory, OpenAI, Claude, Gemini)  |
+|  - Pools multiple accounts & handles rate limits automatically        |
+|  - Stores credentials safely in encrypted SQLite                      |
+|  - Shows live requests & token usage in a local web dashboard         |
++-----------------------------------+-----------------------------------+
+                                    |
+                                    v
++-----------------------------------------------------------------------+
+|  AI Providers                                                         |
+|  OpenAI | Anthropic Claude | Google Gemini | xAI Grok | Custom        |
++-----------------------------------------------------------------------+
 ```
 
-Render a fully expanded configuration, including imports and presets, with:
+---
 
+## 3-Minute quickstart
+
+### 1. Initialize starter configuration
 ```sh
-cargo run -p pooler-cli -- --config config/cursor.example.yaml config render
+pooler init --output pooler-starter
 ```
 
-Mount the endpoint families a general OpenAI, Anthropic, or Gemini client
-expects, without hand-authoring a route plan, with the
-[`gateway` preset](docs/gateway.md):
-
+### 2. Add your provider API key
 ```sh
-POOLER_GATEWAY_KEY=... cargo run -p pooler-cli -- serve --config config/gateway.example.yaml
+echo "sk-your-actual-api-key-here" > pooler-starter/provider.key
+chmod 0600 pooler-starter/provider.key
+```
+*(Or log in via OAuth: `pooler --config pooler-starter/pooler.yaml auth login openai --method device-code`)*
+
+### 3. Check configuration & network
+```sh
+pooler check --config pooler-starter/pooler.yaml
+pooler --config pooler-starter/pooler.yaml preflight
 ```
 
-Run the native Vercel Labs fx adapter, including model discovery, streaming,
-and tool-result continuation, with the [`fx` preset](docs/fx.md). Factory Droid
-is a separate client and does not use this adapter.
-
-Run the opaque proxy with:
-
+### 4. Start the server
 ```sh
-POOLER_UPSTREAM_KEY=... cargo run -p pooler-cli -- serve --config config/pooler.example.yaml
+pooler --config pooler-starter/pooler.yaml \
+  --credential-key-ref file:$(pwd)/pooler-starter/store.key \
+  serve
 ```
 
-Create an owner-private first deployment with `pooler init`, run non-billable
-provider checks with `pooler preflight`, launch the dashboard with `pooler
-dashboard`, or use the management-API-backed `pooler tui`. Secure bootstrap,
-typed account creation, brokered device OAuth, client instructions, migration,
-and provider verification are documented in [onboarding](docs/onboarding.md).
-
-Inspect provider login support, aliases, and API-key guidance with `pooler auth
-providers`; the secure profile, OAuth override, device-flow, and status UX is
-documented in [provider login](docs/provider-login.md). The authenticated account controls,
-runtime model controls, reload trigger, traces, audit log, usage/cost views, and redacted
-diagnostic export are documented in [operational management](docs/management.md).
-
-Verify every declared compatibility fixture through its adapter or runtime
-boundary:
-
+### 5. Open the dashboard
+In another terminal, run:
 ```sh
-./scripts/verify-compatibility-fixtures.py
+pooler --config pooler-starter/pooler.yaml dashboard
 ```
 
-Generate and check the strict source-configuration schema:
+---
 
-```sh
-./scripts/check-config-schema.sh
-```
+## Agent-native setup
 
-Capture a structured fixture to an owner-private file. Bodies are omitted by
-default; retaining bounded, recursively redacted JSON bodies requires the
-explicit flag:
+Instead of configuring things manually, copy these prompts into your coding agent:
 
-```sh
-cargo run -p pooler-cli -- fixture capture input.json capture.json --include-bodies
-```
+- **Full Prompt Library**: See [Agent Native Prompts](docs/agent-native.md) and [`llms.txt`](llms.txt).
+- **Cursor Setup**: *"Configure Pooler with the Cursor preset on port 8333 with high reasoning effort."*
+- **Devin Setup**: *"Configure Pooler to translate Devin ConnectRPC requests on port 18473 to OpenAI."*
+- **Factory Droid Setup**: *"Configure Pooler for Factory Droid language-model routes on port 18474."*
+- **Multi-Account Pooling**: *"Set up account pooling across 3 OpenAI accounts with automatic failover."*
 
-Build reproducible release archives, checksums, and SBOMs for the four supported
-release targets with:
+---
 
-```sh
-SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) scripts/release.sh --output dist
-```
+## Adapters and presets
 
-The archive layout and signing/provenance hooks are documented in
-[docs/release.md](docs/release.md).
+| Preset | Tool / Agent | Port | What it does |
+| :--- | :--- | :--- | :--- |
+| [`cursor`](docs/adapters-and-presets.md#1-cursor-preset-cursor) | Cursor IDE | `8333` | Rewrites model prefixes and injects reasoning parameters. |
+| [`devin`](docs/adapters-and-presets.md#2-devin-connectrpc-preset-devin) | Devin | `18473` | Translates Devin ConnectRPC protobuf requests to OpenAI Chat. |
+| [`factory`](docs/adapters-and-presets.md#3-factory-droid-preset-factory) | Factory Droid | `18474` | Translates Factory `/v3/ai` and `/v4/ai` requests to OpenAI Chat. |
+| [`gateway`](docs/gateway.md) | Multi-provider | `8400` | Unified OpenAI, Anthropic, and Gemini endpoint. |
+| [`fx`](docs/fx.md) | Vercel Labs fx | `18475` | Vercel Labs fx tool continuation and streaming runtime. |
+| [`xai`](docs/adapters-and-presets.md#6-xai-grok-preset-xai) | xAI Grok | `18476` | Grok model routing with live search and reasoning support. |
 
-Container and systemd production deployment, owner-private state setup, and
-deployment lint/smoke checks are documented in [docs/deployment.md](docs/deployment.md).
+---
 
-See the [gateway architecture](docs/gateway.md),
-[compatibility matrix](docs/compatibility-report.md),
-[operations guide](docs/deployment.md), and
-[release acceptance criteria](docs/release-acceptance.md).
+## Documentation
+
+- [Overview](docs/index.md): Architecture, features, and how it works.
+- [Quickstart](docs/quickstart.md): 3-minute setup guide.
+- [Agent Native Guide](docs/agent-native.md): Copy-paste prompt cookbook for AI agents.
+- [CLI Reference](docs/cli-reference.md): All commands, options, and flags.
+- [Adapters & Presets](docs/adapters-and-presets.md): Presets for Cursor, Devin, Factory, and gateways.
+- [Provider Login & Auth](docs/provider-login.md): Device OAuth, browser PKCE, and encrypted credentials.
+- [Management & Dashboard](docs/management.md): Web dashboard, request timeline, and usage ledger.
+- [Troubleshooting & Doctor](docs/troubleshooting.md): Diagnosis checks and preflight network tests.
+- [Deployment Guide](docs/deployment.md): Run with Docker, docker-compose, and systemd.

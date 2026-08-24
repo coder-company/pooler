@@ -1,0 +1,65 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "Pooler",
+  "logo": {
+    "dark": "/logo/dark.svg",
+    "light": "/logo/light.svg"
+  },
+  "favicon": "/favicon.svg",
+  "colors": {
+    "primary": "#10B981",
+    "light": "#34D399",
+    "dark": "#059669"
+  },
+  "topbarLinks": [
+    {
+      "name": "llms.txt",
+      "url": "/llms.txt"
+    }
+  ],
+  "navigation": [
+    {
+      "group": "Getting Started",
+      "pages": [
+        "docs/index",
+        "docs/quickstart",
+        "docs/onboarding"
+      ]
+    },
+    {
+      "group": "Agent Native",
+      "pages": [
+        "docs/agent-native"
+      ]
+    },
+    {
+      "group": "Adapters & Presets",
+      "pages": [
+        "docs/adapters-and-presets",
+        "docs/gateway",
+        "docs/fx",
+        "docs/provider-catalog",
+        "docs/compatibility-report"
+      ]
+    },
+    {
+      "group": "Configuration & Auth",
+      "pages": [
+        "docs/provider-login",
+        "docs/configuration-management"
+      ]
+    },
+    {
+      "group": "Management & Operations",
+      "pages": [
+        "docs/management",
+        "docs/deployment",
+        "docs/cli-reference",
+        "docs/troubleshooting",
+        "docs/benchmarks",
+        "docs/release",
+        "docs/release-acceptance"
+      ]
+    }
+  ]
+}

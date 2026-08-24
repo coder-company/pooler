@@ -1,0 +1,34 @@
+# Pooler
+
+> Pooler is a local proxy that connects AI coding tools (Cursor, Devin, Factory Droid, Claude Code, and AI SDKs) to model providers (OpenAI, Anthropic Claude, Google Gemini, xAI Grok). It translates request formats, pools multiple accounts to bypass rate limits, stores credentials in encrypted SQLite, and provides a local web dashboard for monitoring requests.
+
+Pooler is configured using YAML with safe secret references (`env:`, `file:`, `keyring:`) and provides built-in presets for coding agents.
+
+## Agent Prompts (Task Recipes)
+
+Give these prompts to any AI coding agent to automate setup and configuration:
+
+- [Agent Native Prompts](docs/agent-native.md): Ready-to-use prompt cookbook for coding agents.
+- [Bootstrap Starter](docs/agent-native.md#bootstrap-starter-deployment): "Initialize a new secure Pooler deployment in ./pooler-starter, generate secrets, and verify configuration."
+- [Configure Cursor Adapter](docs/agent-native.md#configure-cursor-adapter): "Configure Pooler with the Cursor preset on port 8333 with gpt- prefix routing and high reasoning effort."
+- [Configure Devin ConnectRPC](docs/agent-native.md#configure-devin-connectrpc-adapter): "Configure Pooler for Devin ConnectRPC translation on port 18473 translating to OpenAI upstream."
+- [Configure Factory Droid](docs/agent-native.md#configure-factory-droid-adapter): "Configure Pooler for Factory Droid language-model routes on port 18474."
+- [Configure OpenAI/Claude/Gemini Gateway](docs/agent-native.md#configure-multi-provider-gateway): "Configure Pooler multi-provider gateway on port 8400 with model routing and pooling."
+- [Add & Authenticate Provider Account](docs/agent-native.md#authenticate-provider-account): "Log into provider via OAuth device flow or browser loopback and store credentials in encrypted SQLite."
+- [Migrate from CLIProxyAPI](docs/agent-native.md#migrate-from-cliproxyapi): "Perform dry-run migration of legacy CLIProxyAPI YAML to validated Pooler configuration."
+- [Run System Diagnostics](docs/agent-native.md#run-system-diagnostics): "Run pooler doctor and pooler preflight to inspect DNS, TLS, listener ports, and credentials."
+
+## Core Documentation
+
+- [Overview](docs/index.md): Architecture, supported protocols, core capabilities, and security boundaries.
+- [Quickstart](docs/quickstart.md): 3-minute setup from `pooler init` to live inference proxy.
+- [Onboarding Guide](docs/onboarding.md): Owner-private bootstrap, dashboard setup, preflight checks, and client connection strings.
+- [CLI Reference](docs/cli-reference.md): Complete reference for all CLI subcommands, arguments, flags, and exit codes.
+- [Adapters & Presets](docs/adapters-and-presets.md): Presets for Cursor, Devin, Factory Droid, Vercel fx, xAI, Media, and Gateway.
+- [Gateway Architecture](docs/gateway.md): Comprehensive routing, endpoint families, streaming, fallbacks, and model translation.
+- [Provider Login & Auth](docs/provider-login.md): Device authorization, browser PKCE OAuth, OpenAI Codex profiles, and API key safety.
+- [Management & Dashboard](docs/management.md): Authenticated REST management API, request timeline explorer, usage ledger, price books, and web dashboard.
+- [Configuration Management](docs/configuration-management.md): Schema validation, imports, overrides, atomic writes, ETag validation, and hot reload.
+- [Deployment & Operations](docs/deployment.md): Docker, docker-compose, systemd units, Prometheus metrics, and OTLP export.
+- [Troubleshooting & Doctor](docs/troubleshooting.md): Diagnosis checks, preflight rules, error codes, and audit trail analysis.
+- [Compatibility Matrix](docs/compatibility-report.md): Verified provider fixture compatibility across all endpoints.

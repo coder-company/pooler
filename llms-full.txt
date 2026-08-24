@@ -1,0 +1,175 @@
+# Pooler: Complete Agent Reference (llms-full.txt)
+
+Pooler is a production-grade AI protocol runtime and gateway. It provides unified endpoints, account pooling, encrypted credential storage, brokered OAuth, semantic protocol translation, and an authenticated management dashboard.
+
+---
+
+## 1. Quick Agent Prompts
+
+Copy and provide these prompts to coding agents to execute Pooler operations:
+
+### Bootstrap New Instance
+```text
+Initialize a new secure Pooler deployment:
+1. Run `pooler init --output ./pooler-starter`
+2. Inspect the generated pooler-starter/pooler.yaml
+3. Run `pooler check --config pooler-starter/pooler.yaml`
+4. Set POOLER_STORE_KEY from pooler-starter/store.key
+5. Start the server with `pooler --config pooler-starter/pooler.yaml --credential-key-ref file:pooler-starter/store.key serve`
+```
+
+### Setup Cursor Preset
+```text
+Configure Pooler to proxy Cursor traffic with gpt- reasoning effort set to high:
+1. Create cursor.yaml with:
+   imports:
+     - preset: cursor
+       as: cursor-high
+       with:
+         bind: 127.0.0.1:8333
+         reasoning_effort: high
+         model_prefix: gpt-
+         upstream_url: https://api.openai.com
+         secret: env:OPENAI_API_KEY
+   version: 2
+2. Run `pooler check --config cursor.yaml`
+3. Point Cursor base URL to `http://127.0.0.1:8333`
+```
+
+### Setup Devin ConnectRPC Preset
+```text
+Configure Pooler to bridge Devin ConnectRPC protobuf requests to OpenAI:
+1. Create devin.yaml with:
+   imports:
+     - preset: devin
+       as: devin-bridge
+       with:
+         bind: 127.0.0.1:18473
+         upstream_url: https://api.openai.com
+         secret: env:OPENAI_API_KEY
+   version: 2
+2. Verify with `pooler check --config devin.yaml`
+3. Point Devin service URL to `http://127.0.0.1:18473`
+```
+
+### Setup Factory Droid Preset
+```text
+Configure Pooler for Factory Droid language-model translation:
+1. Create factory.yaml with:
+   imports:
+     - preset: factory
+       as: factory-gateway
+       with:
+         bind: 127.0.0.1:18474
+         upstream_url: https://api.openai.com
+         secret: env:OPENAI_API_KEY
+   version: 2
+2. Point Factory Droid to `http://127.0.0.1:18474`
+```
+
+---
+
+## 2. Core Architecture & Ports
+
+| Component | Default Host/Port | Protocol | Purpose |
+| :--- | :--- | :--- | :--- |
+| **OpenAI/Anthropic Gateway** | `127.0.0.1:8400` or `:8319` | HTTP/1.1 & HTTP/2 | Unified AI API endpoint with model routing and pooling |
+| **Cursor Preset** | `127.0.0.1:8333` | HTTP JSON | Ingress JSON patching for Cursor requests |
+| **Devin Preset** | `127.0.0.1:18473` | ConnectRPC / Protobuf | Devin protobuf to OpenAI chat completion bridge |
+| **Factory Droid Preset** | `127.0.0.1:18474` | HTTP JSON (`/v3/ai`, `/v4/ai`) | Factory language model protocol translation |
+| **Management API & Web UI** | `127.0.0.1:18477` | HTTP REST / Web UI | Authenticated dashboard, metrics, traces, usage ledger |
+| **OAuth Callback Listener** | `127.0.0.1:14555` | HTTP loopback | Local browser PKCE OAuth redirect receiver |
+
+---
+
+## 3. CLI Command Reference
+
+### Root Options
+- `--config <PATH>`: Configuration file path (defaults to `./pooler.yaml` or `$XDG_CONFIG_HOME/pooler/pooler.yaml`).
+- `--credential-store <PATH>`: SQLite credential store path.
+- `--credential-key-ref <REF>`: Secret reference for SQLite encryption key (`env:VAR`, `file:/path`, or `keyring:service/account`).
+- `--watch`: Watch root configuration and imports for changes and trigger debounced reload.
+
+### Commands
+- `pooler init [--output <DIR>] [--json]`: Creates an owner-private starter deployment (`0700` dir, `0600` files).
+- `pooler check`: Validates syntax, schemas, route compilation, and presets without starting server.
+- `pooler serve`: Starts proxy listeners and management services.
+- `pooler doctor`: Runs read-only diagnostics for ports, config, stores, and crypto. Returns JSON report.
+- `pooler preflight`: Probes upstream DNS, TLS, authentication, and discovery without sending billable inference.
+- `pooler dashboard [--no-open] [--url <URL>]`: Prints or opens authenticated browser management interface.
+- `pooler tui --token-ref <REF> [--endpoint <URL>] [--once]`: Starts terminal UI connected to management API.
+- `pooler routes`: Displays compiled routes, method matching, and target upstreams in precedence order.
+- `pooler models [--json]`: Lists public models, merged targets, source policy, and catalog provenance.
+- `pooler providers [--search <QUERY>] [--json]`: Lists supported provider endpoints and login profiles.
+- `pooler config render`: Expands imports, presets, and defaults into a single validated configuration.
+- `pooler auth login <PROVIDER> [--profile <ID>] [--account <ID>] [--method oauth|device-code]`: Initiates browser or device OAuth flow.
+- `pooler auth status [--provider <ID>]`: Shows redacted credential status and expiration for configured accounts.
+- `pooler auth switch --account <ID>`: Activates target account and disables sibling accounts for that provider.
+- `pooler auth refresh --account <ID>`: Triggers OAuth token refresh for specified account.
+- `pooler auth revoke --account <ID>`: Removes local stored tokens for account and marks it disabled.
+- `pooler migrate cliproxy <INPUT> [--dry-run] [--output <PATH>]`: Converts legacy CLIProxyAPI configuration.
+- `pooler fixture replay <PATH>`: Replays sanitized compatibility fixtures against local runtime.
+
+---
+
+## 4. Configuration Schema (`pooler.yaml`)
+
+```yaml
+version: 2
+
+# Optional presets / imports
+imports:
+  - preset: gateway
+    as: default-gw
+    with:
+      bind: 127.0.0.1:8400
+      upstream_url: https://api.openai.com
+      secret: env:OPENAI_API_KEY
+
+listeners:
+  main:
+    bind: 127.0.0.1:8319
+
+management:
+  bind: 127.0.0.1:18477
+  auth:
+    secret: env:POOLER_MANAGEMENT_TOKEN
+
+upstreams:
+  openai-direct:
+    transport:
+      kind: http
+      base_url: https://api.openai.com
+    auth:
+      kind: bearer_secret
+      secret: env:OPENAI_API_KEY
+
+  anthropic-direct:
+    transport:
+      kind: http
+      base_url: https://api.anthropic.com
+    auth:
+      kind: header_secret
+      header_name: x-api-key
+      secret: env:ANTHROPIC_API_KEY
+
+routes:
+  - id: openai-chat
+    listen: main
+    match:
+      methods: [POST]
+      path: /v1/chat/completions
+      content_types: [application/json]
+    target:
+      provider: openai-direct
+    response:
+      mode: opaque
+```
+
+---
+
+## 5. Secret References
+Pooler strictly rejects plaintext secrets in YAML. Secrets must use one of these schemes:
+- `env:VARIABLE_NAME`: Read from environment variable.
+- `file:/absolute/path/to/secret`: Read from owner-private file (mode `0600`).
+- `keyring:service/account`: Read from operating system keyring (SecretService/Keychain).
