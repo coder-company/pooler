@@ -5397,38 +5397,41 @@ mod tests {
         let upstream_address = upstream_listener
             .local_addr()
             .expect("upstream address available");
+        // A codex `/responses` upstream is tried over WebSocket first. The
+        // handshake is rejected with 401, which is an authentication signal
+        // rather than evidence that the upstream cannot speak WebSocket, so the
+        // runtime must spend its one permitted pre-commit refresh and retry the
+        // same transport with the rotated token. Only a second, non-401
+        // rejection may downgrade the request to HTTP.
         let upstream = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for index in 0..2 {
+            let mut handshakes = Vec::new();
+            for reply in [
+                &b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+                &b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+            ] {
                 let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
-                let request = read_request(&mut stream).await.expect("request bytes");
-                let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
-                if index == 0 {
-                    assert!(request_text.contains("authorization: bearer old-access"));
-                    assert!(request_text.contains("chatgpt-account-id: chatgpt-account-a"));
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        )
-                        .await
-                        .expect("401 response");
-                } else {
-                    assert!(request_text.contains("authorization: bearer new-access"));
-                    assert!(request_text.contains("chatgpt-account-id: chatgpt-account-a"));
-                    let body = b"ok";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    stream
-                        .write_all(response.as_bytes())
-                        .await
-                        .expect("200 headers");
-                    stream.write_all(body).await.expect("200 body");
-                }
-                requests.push(request);
+                let handshake = read_headers(&mut stream).await.expect("handshake request");
+                handshakes.push(String::from_utf8_lossy(&handshake).to_ascii_lowercase());
+                stream.write_all(reply).await.expect("handshake rejection");
+                drop(stream);
             }
-            requests
+
+            let (mut stream, _) = upstream_listener.accept().await.expect("upstream accepts");
+            let request = read_request(&mut stream).await.expect("request bytes");
+            let body = b"ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("200 headers");
+            stream.write_all(body).await.expect("200 body");
+            (
+                handshakes,
+                String::from_utf8_lossy(&request).to_ascii_lowercase(),
+            )
         });
 
         let config = pooler_config::compile_yaml(
@@ -5480,7 +5483,16 @@ mod tests {
             rotated.tokens().access_token().expose_secret(),
             "new-access"
         );
-        upstream.await.expect("upstream task");
+        let (handshakes, http_request) = upstream.await.expect("upstream task");
+        // The rejected handshake carried the stale token; the retry stayed on
+        // WebSocket and carried the rotated one.
+        assert!(handshakes[0].contains("authorization: bearer old-access"));
+        assert!(handshakes[0].contains("chatgpt-account-id: chatgpt-account-a"));
+        assert!(handshakes[1].contains("authorization: bearer new-access"));
+        assert!(handshakes[1].contains("chatgpt-account-id: chatgpt-account-a"));
+        // Only the second, non-401 rejection downgraded the request to HTTP.
+        assert!(http_request.contains("authorization: bearer new-access"));
+        assert!(http_request.contains("chatgpt-account-id: chatgpt-account-a"));
         stop_server(&server, runner).await;
     }
 
@@ -5493,6 +5505,25 @@ mod tests {
             .local_addr()
             .expect("subscription upstream address");
         let subscription_upstream = tokio::spawn(async move {
+            // The codex subscription upstream is tried over WebSocket first.
+            // Rejecting that handshake with a non-401 status downgrades the
+            // request to HTTP without spending the pre-commit refresh, leaving
+            // the policy retry budget available for the quota failover below.
+            let (mut handshake_stream, _) = subscription_listener
+                .accept()
+                .await
+                .expect("subscription upstream accepts handshake");
+            read_headers(&mut handshake_stream)
+                .await
+                .expect("subscription handshake request");
+            handshake_stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("subscription handshake rejection");
+            drop(handshake_stream);
+
             let (mut stream, _) = subscription_listener
                 .accept()
                 .await

@@ -2509,26 +2509,16 @@ where
             let mut response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    if websocket_attempt
-                        && !websocket_http_fallback_attempted
-                        && websocket_http_fallback_safe(&error)
-                    {
-                        websocket_http_fallback_attempted = true;
-                        lifecycle.retry(
-                            attempt,
-                            "responses_websocket_http_fallback",
-                            Duration::ZERO,
-                            None,
-                            None,
-                        );
-                        forced_selection = Some(selection);
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
                     let failure_status = match &error {
                         ProxyError::WebSocketHandshakeStatus(status) => Some(*status),
                         _ => None,
                     };
+                    // A rejected handshake is only evidence that the upstream
+                    // will not speak WebSocket once its credential is known to
+                    // be current. A 401 is an authentication signal, so the one
+                    // permitted pre-commit refresh is evaluated first and the
+                    // retry keeps the same transport. Downgrading here instead
+                    // would replay the request over HTTP with the stale token.
                     if failure_status == Some(401)
                         && is_buffered
                         && native_profile
@@ -2563,6 +2553,29 @@ where
                             }
                             Err(_) => {}
                         }
+                    }
+                    // Downgrading this request from WebSocket to HTTP keeps the
+                    // same selection, credential, and upstream, so it is one
+                    // logical attempt carried over a second transport rather
+                    // than a retry. Counting it against the policy would spend
+                    // a retry the operator budgeted for a different credential
+                    // or upstream, and can exhaust the budget before any
+                    // failover is possible. It can only happen once per
+                    // request.
+                    if websocket_attempt
+                        && !websocket_http_fallback_attempted
+                        && websocket_http_fallback_safe(&error)
+                    {
+                        websocket_http_fallback_attempted = true;
+                        lifecycle.retry(
+                            attempt,
+                            "responses_websocket_http_fallback",
+                            Duration::ZERO,
+                            None,
+                            None,
+                        );
+                        forced_selection = Some(selection);
+                        continue;
                     }
                     if is_buffered && selection.has_policy() {
                         let mut failure =
