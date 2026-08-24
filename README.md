@@ -17,7 +17,7 @@
 [![Mintlify](https://img.shields.io/badge/docs-Mintlify-059669?style=flat-square)](mint.json)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue?style=flat-square)](docs/deployment.md)
 
-[**Quick Install**](#-quick-install) · [**Agent Prompts**](#-1-agent-native-setup-primary) · [**Connect Accounts & Subscriptions**](#-2-connect-subscriptions--provider-apis) · [**Dashboard**](#-management-dashboard) · [**Adapters**](#-adapters--presets) · [**llms.txt**](llms.txt)
+[**Quick Install**](#-quick-install) · [**Agent Initiation Prompt**](#-1-agent-native-setup-primary) · [**Subscriptions & APIs**](#-2-connect-subscriptions--provider-apis) · [**Dashboard**](#-management-dashboard) · [**Adapters**](#-adapters--presets) · [**llms.txt**](llms.txt)
 
 ---
 
@@ -79,21 +79,26 @@ cargo install --git https://github.com/coder-company/pooler.git pooler-cli --bin
 
 ## 🤖 1. Agent-Native Setup (Primary)
 
-Pooler is built agent-native. Copy any prompt below and give it directly to your coding agent (**Cursor**, **Devin**, **Claude Code**, **Codex**, or **Factory Droid**):
+Pooler is built agent-native. Copy this prompt into your coding agent (**Cursor**, **Devin**, **Claude Code**, **Codex**, or **Factory Droid**) to begin:
 
-| Goal | Copy-Paste Agent Prompt |
-| :--- | :--- |
-| **Setup Codex Subscription** | `"Initialize Pooler with 'pooler init', run device login for my OpenAI Codex subscription via 'pooler auth login openai --method device-code', and start the proxy."` |
-| **Setup Google Gemini OAuth** | `"Authenticate Google Gemini in Pooler via browser PKCE OAuth using 'pooler auth login google --method oauth' and verify credentials."` |
-| **Configure Cursor Preset** | `"Configure Pooler for Cursor on port 8333 routing to my accounts with reasoning_effort set to high. Verify with pooler check."` |
-| **Configure Devin Preset** | `"Configure Pooler with the Devin ConnectRPC preset on port 18473 translating to my pooled provider accounts."` |
-| **Configure Factory Droid** | `"Configure Pooler with the Factory preset on port 18474 to bridge /v3/ai and /v4/ai language model requests."` |
-| **Multi-Account Pooling & Failover** | `"Configure Pooler to pool multiple subscriptions and API keys with automatic failover on rate limits and quota cooldowns."` |
-| **Configure Universal Gateway** | `"Set up a universal gateway on port 8400 routing OpenAI, Claude, and Gemini requests with account pooling."` |
-| **Migrate from CLIProxyAPI** | `"Run 'pooler migrate cliproxy config.yaml --dry-run' and output the validated configuration to migrated.pooler.yaml."` |
-| **Run System Diagnostics** | `"Run 'pooler doctor' and 'pooler preflight' to verify listener ports, TLS handshakes, and credential stores."` |
+### Copy-Paste Agent Initiation Prompt:
 
-👉 *Full agent prompt cookbook available in [`llms.txt`](llms.txt) and [`docs/agent-native.md`](docs/agent-native.md).*
+```text
+Set up and configure Pooler for this workspace:
+1. First, ask me using your interactive question tool:
+   - Which coding tool/agent I am using (Cursor, Devin, Factory Droid, Claude Code / Codex, or General SDK/Gateway).
+   - What credentials/subscriptions I want to connect (ChatGPT / Codex subscription via device OAuth, Google Gemini OAuth, Anthropic Claude API key, OpenAI API key, xAI Grok, or Custom).
+   - Whether I want multi-account pooling with automatic rate-limit failover.
+   - What specific models or reasoning settings I want enabled (e.g. gpt-4o, claude-3-7-sonnet, gemini-2.5-pro, o3-mini with high reasoning).
+2. Read llms.txt or docs/agent-native.md to load the exact configuration recipes and ports.
+3. Initialize the starter workspace using `pooler init --output ./pooler-starter`.
+4. Apply the required preset or configuration with secure secret references (env:, file:, or keyring:).
+5. Guide me through authentication (such as running `pooler auth login openai --method device-code` for Codex subscriptions or setting environment variables).
+6. Run `pooler check` and `pooler preflight` to verify setup without billable inference.
+7. Start the server and confirm the exact local base URL for my coding tool.
+```
+
+👉 *Detailed autonomous agent protocol and task prompt recipes in [`llms.txt`](llms.txt) and [`docs/agent-native.md`](docs/agent-native.md).*
 
 ---
 
@@ -155,8 +160,8 @@ Pooler includes an authenticated management web dashboard running on `http://127
 
 | Resource | Description |
 | :--- | :--- |
+| [**Agent Native Setup Guide**](docs/agent-native.md) | Complete prompt cookbook and autonomous protocol for AI coding agents. |
 | [**Overview**](docs/index.md) | Architectural deep-dive, security boundaries, and data flow. |
-| [**Agent Native Guide**](docs/agent-native.md) | Complete prompt cookbook for AI coding agents. |
 | [**Quickstart**](docs/quickstart.md) | 3-minute starter guide with subscription and API key login. |
 | [**CLI Reference**](docs/cli-reference.md) | Complete reference for all subcommands, arguments, and flags. |
 | [**Adapters & Presets**](docs/adapters-and-presets.md) | Presets for Cursor, Devin, Factory Droid, and Gateways. |

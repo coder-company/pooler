@@ -1,31 +1,43 @@
 # Pooler
 
-> Pooler is a local proxy that connects AI coding tools (Cursor, Devin, Factory Droid, Claude Code, and AI SDKs) to AI subscriptions (ChatGPT / Codex) and model providers (OpenAI, Anthropic Claude, Google Gemini, xAI Grok). It translates request formats, pools multiple accounts to bypass rate limits, stores credentials in encrypted SQLite, and provides a local web dashboard for monitoring requests.
+> Pooler is a local protocol runtime and pooling proxy by Coder Company. It connects AI coding tools (Cursor, Devin, Factory Droid, Claude Code, and AI SDKs) to AI subscriptions (ChatGPT / Codex) and model providers (OpenAI, Anthropic Claude, Google Gemini, xAI Grok). It translates request formats, pools multiple accounts to bypass rate limits, stores credentials in encrypted SQLite, and provides a local web dashboard for monitoring requests.
 
-Pooler is configured using YAML with safe secret references (`env:`, `file:`, `keyring:`) and provides built-in presets for coding agents.
+Pooler is built agent-native. Follow the prompts below to automate setup with any AI coding agent.
 
-## Agent Prompts (Task Recipes)
+## Agent Initiation Prompt (Give This to Your Agent)
 
-Give these prompts to any AI coding agent to automate setup and configuration:
+Paste this prompt into your coding agent (Cursor, Devin, Claude Code, Factory Droid) to start autonomous setup:
 
-- [Agent Native Prompts Cookbook](docs/agent-native.md): Ready-to-use task recipes for coding agents.
-- [Bootstrap Starter](docs/agent-native.md#bootstrap-starter-deployment): "Initialize a new secure Pooler deployment in ./pooler-starter, generate secrets, and verify configuration."
-- [Connect Codex Subscription](docs/agent-native.md#connect-chatgpt--codex-subscription-via-device-flow): "Authenticate an OpenAI / ChatGPT / Codex subscription via device code flow and verify encrypted storage."
-- [Import Local Codex Credentials](docs/agent-native.md#import-local-codex-cli-credentials): "Import local Codex CLI credentials from ~/.codex/credentials.json into Pooler's encrypted store."
-- [Connect Google Gemini](docs/agent-native.md#connect-google-gemini-via-browser-pkce-oauth): "Authenticate Google Gemini via browser PKCE OAuth and verify account status."
-- [Configure Multi-Account Failover](docs/agent-native.md#pool-multiple-codex-subscriptions--api-keys-with-automatic-failover): "Configure account pooling across multiple subscriptions and API keys with automatic rate-limit failover."
-- [Configure Cursor Adapter](docs/agent-native.md#configure-cursor-ide-adapter): "Configure Pooler with the Cursor preset on port 8333 with gpt- prefix routing and high reasoning effort."
-- [Configure Devin ConnectRPC](docs/agent-native.md#configure-devin-connectrpc-bridge): "Configure Pooler for Devin ConnectRPC translation on port 18473 translating to OpenAI upstream."
-- [Configure Factory Droid](docs/agent-native.md#configure-factory-droid-adapter): "Configure Pooler for Factory Droid language-model routes on port 18474."
-- [Configure Multi-Provider Gateway](docs/agent-native.md#configure-universal-multi-provider-gateway): "Configure Pooler universal gateway on port 8400 supporting OpenAI, Anthropic, and Gemini SDKs."
-- [Migrate from CLIProxyAPI](docs/agent-native.md#migrate-legacy-cliproxyapi-configuration): "Perform dry-run migration of legacy CLIProxyAPI YAML to validated Pooler configuration."
-- [Run System Diagnostics](docs/agent-native.md#run-system-diagnostics--health-checks): "Run pooler doctor and pooler preflight to inspect DNS, TLS, listener ports, and credentials."
+```text
+Set up and configure Pooler for this workspace:
+1. First, ask me using your interactive question tool:
+   - Which coding tool/agent I am using (Cursor, Devin, Factory Droid, Claude Code / Codex, or General SDK/Gateway).
+   - What credentials/subscriptions I want to connect (ChatGPT / Codex subscription via device OAuth, Google Gemini OAuth, Anthropic Claude API key, OpenAI API key, xAI Grok, or Custom).
+   - Whether I want multi-account pooling with automatic rate-limit failover.
+   - What specific models or reasoning settings I want enabled (e.g. gpt-4o, claude-3-7-sonnet, gemini-2.5-pro, o3-mini with high reasoning).
+2. Read llms.txt or docs/agent-native.md to load the exact configuration recipes and ports.
+3. Initialize the starter workspace using `pooler init --output ./pooler-starter`.
+4. Apply the required preset or configuration with secure secret references (env:, file:, or keyring:).
+5. Guide me through authentication (such as running `pooler auth login openai --method device-code` for Codex subscriptions or setting environment variables).
+6. Run `pooler check` and `pooler preflight` to verify setup without billable inference.
+7. Start the server and confirm the exact local base URL for my coding tool.
+```
+
+## Agent Protocol & Task Recipes
+
+- [Agent-Native Setup Guide](docs/agent-native.md): Detailed 6-step autonomous protocol for agents.
+- [Connect Codex Subscription](docs/agent-native.md#step-4-authentication--credential-storage): Authenticate ChatGPT / Codex subscription via device code OAuth.
+- [Import Local Codex Credentials](docs/agent-native.md#step-4-authentication--credential-storage): Import local Codex CLI credentials from `~/.codex/credentials.json`.
+- [Configure Multi-Account Pooling](docs/agent-native.md#pool-multiple-subscriptions-for-zero-downtime-rate-limits): Set up multiple subscriptions with automatic failover on rate limits.
+- [Configure Cursor Adapter](docs/agent-native.md#step-3-initialization--configuration-generation): Ingress model rewriting and reasoning effort injection on port 8333.
+- [Configure Devin Bridge](docs/agent-native.md#step-3-initialization--configuration-generation): ConnectRPC protobuf bridge to OpenAI on port 18473.
+- [Configure Factory Droid](docs/agent-native.md#step-3-initialization--configuration-generation): Factory language-model translation on port 18474.
+- [Configure Multi-Provider Gateway](docs/agent-native.md#step-3-initialization--configuration-generation): Universal gateway on port 8400 for OpenAI, Claude, and Gemini SDKs.
 
 ## Core Documentation
 
 - [Overview](docs/index.md): Architecture, supported protocols, core capabilities, and security boundaries.
 - [Quickstart](docs/quickstart.md): 3-minute setup from `pooler init` to live inference proxy.
-- [Onboarding Guide](docs/onboarding.md): Owner-private bootstrap, dashboard setup, preflight checks, and client connection strings.
 - [CLI Reference](docs/cli-reference.md): Complete reference for all CLI subcommands, arguments, flags, and exit codes.
 - [Adapters & Presets](docs/adapters-and-presets.md): Presets for Cursor, Devin, Factory Droid, Vercel fx, xAI, Media, and Gateway.
 - [Gateway Architecture](docs/gateway.md): Comprehensive routing, endpoint families, streaming, fallbacks, and model translation.

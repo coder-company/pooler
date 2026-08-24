@@ -1,172 +1,179 @@
-# Agent-native prompts cookbook
+# Agent-Native Setup Guide
 
-Agent-native documentation empowers AI coding agents (such as Cursor, Devin, Factory Droid, Claude Code, and Codex) to autonomously bootstrap, configure, authenticate, and manage Pooler.
+This guide provides the complete **Agent-Native** onboarding architecture for Pooler.
 
-Instead of manually crafting YAML or running terminal sequences, pass any of the task prompts below to your coding agent.
+Instead of reading lengthy documentation and hand-crafting configurations, users give an **Initiation Prompt** to their AI coding agent (Cursor, Devin, Claude Code, Factory Droid, Codex). The agent then executes the **Autonomous Setup Protocol**, using interactive user tools to discover needs, configure subscriptions, set up presets, and start the proxy.
 
 ---
 
-## 1. Subscriptions & OAuth authentication prompts
+## 1. What the User Pastes to Their Agent (Initiation Prompt)
 
-### Connect ChatGPT / Codex subscription via device flow
-```text
-Task: Authenticate an OpenAI / ChatGPT / Codex subscription account in Pooler.
-1. Run the device code login command:
-   pooler --credential-key-ref env:POOLER_STORE_KEY auth login openai --method device-code
-2. Display the official verification URL and the one-time user code to the operator.
-3. Once authorized, verify the stored credential with:
-   pooler --credential-key-ref env:POOLER_STORE_KEY auth status --provider openai
-4. Report that the subscription token is active in the encrypted SQLite store.
-```
+Copy and paste this prompt into your AI coding agent's chat box:
 
-### Import local Codex CLI credentials
 ```text
-Task: Import local OpenAI Codex CLI subscription tokens into Pooler.
-1. Check that ~/.codex/credentials.json exists and contains valid subscription tokens.
-2. Import the credentials into Pooler's encrypted store:
-   pooler --credential-key-ref env:POOLER_STORE_KEY auth import codex-sub --profile codex --from-file ~/.codex/credentials.json
-3. Verify the imported account status:
-   pooler --credential-key-ref env:POOLER_STORE_KEY auth status --provider codex
-```
-
-### Connect Google Gemini via browser PKCE OAuth
-```text
-Task: Authenticate a Google Gemini subscription or OAuth account.
-1. Run browser PKCE login:
-   pooler --credential-key-ref env:POOLER_STORE_KEY auth login google --method oauth
-2. If non-interactive, print the local loopback callback redirect URL.
-3. Confirm that the refresh token is stored securely using `pooler auth status --provider google`.
-```
-
-### Connect Anthropic, xAI, or custom API keys
-```text
-Task: Configure an Anthropic Claude or xAI Grok provider key using safe secret references.
-1. Never put the literal API key in YAML or CLI arguments.
-2. In pooler.yaml under upstreams, set the secret reference:
-   upstreams:
-     anthropic-upstream:
-       known_provider: anthropic
-       auth:
-         secret: env:ANTHROPIC_API_KEY
-3. Verify the configuration with `pooler check --config pooler.yaml`.
-4. Run `pooler --config pooler.yaml preflight` to confirm connectivity without billable inference.
+Set up and configure Pooler for this workspace:
+1. First, ask me using your interactive question tool:
+   - Which coding tool/agent I am using (Cursor, Devin, Factory Droid, Claude Code / Codex, or General SDK/Gateway).
+   - What credentials/subscriptions I want to connect (ChatGPT / Codex subscription via device OAuth, Google Gemini OAuth, Anthropic Claude API key, OpenAI API key, xAI Grok, or Custom).
+   - Whether I want multi-account pooling with automatic rate-limit failover.
+   - What specific models or reasoning settings I want enabled (e.g. gpt-4o, claude-3-7-sonnet, gemini-2.5-pro, o3-mini with high reasoning).
+2. Read llms.txt or docs/agent-native.md to load the exact configuration recipes and ports.
+3. Initialize the starter workspace using `pooler init --output ./pooler-starter`.
+4. Apply the required preset or configuration with secure secret references (env:, file:, or keyring:).
+5. Guide me through authentication (such as running `pooler auth login openai --method device-code` for Codex subscriptions or setting environment variables).
+6. Run `pooler check` and `pooler preflight` to verify setup without billable inference.
+7. Start the server and confirm the exact local base URL for my coding tool.
 ```
 
 ---
 
-## 2. Multi-account pooling & failover prompts
+## 2. Agent Execution System Prompt (Instructions for Agents)
 
-### Pool multiple Codex subscriptions + API keys with automatic failover
-```text
-Task: Configure multi-account pooling across 2 Codex subscriptions and 1 backup API key.
-1. In pooler.yaml, configure the account pool with the fill_first strategy:
-   account_pools:
-     main-pool:
-       provider: openai
-       accounts: [codex-sub-1, codex-sub-2, openai-api-backup]
-   policies:
-     openai-policy:
-       selection:
-         strategy: fill_first
-       retry:
-         maximum_attempts: 3
-         statuses: [429, 500, 503]
-         before_commit_only: true
-2. Validate with `pooler check --config pooler.yaml`.
-3. Check route bindings with `pooler routes --config pooler.yaml`.
+When an AI agent receives the initiation prompt, it must execute the following structured protocol:
+
+```markdown
+### Agent Protocol for Pooler Setup
+
+You are an autonomous setup agent for Pooler by Coder Company. Your objective is to configure a production-grade local proxy runtime tailored to the user's workflow.
+
+#### Step 1: Interactive User Inquiry (Mandatory)
+Before writing any configuration files or running long commands, interactively prompt the user (using structured selection tools like AskQuestion when available):
+1. **Target Agent & Preset**:
+   - Cursor IDE (port 8333)
+   - Devin ConnectRPC (port 18473)
+   - Factory Droid (port 18474)
+   - Universal Gateway for Claude Code / Python / Node SDKs (port 8400)
+2. **Authentication Method**:
+   - ChatGPT / Codex Subscription (OAuth Device Flow)
+   - Google Gemini (Browser PKCE OAuth)
+   - Provider API Key (Anthropic, OpenAI, xAI, OpenRouter)
+   - Multi-account / Multi-subscription Pooling
+3. **Model & Parameter Preferences**:
+   - Reasoning effort (e.g., `high` for o3/gpt models)
+   - Fallback order and cooldown policies
+
+#### Step 2: Context & Workspace Discovery
+1. Inspect the workspace for existing configuration files (`pooler.yaml`, `~/.codex/credentials.json`, environment variables like `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`).
+2. Read `llms.txt` and `docs/adapters-and-presets.md` to reference exact preset syntax.
+
+#### Step 3: Initialization & Configuration Generation
+1. If no deployment exists, run:
+   ```sh
+   pooler init --output ./pooler-starter
+   ```
+2. Generate the appropriate configuration in `config/<agent-name>.yaml` or `pooler-starter/pooler.yaml`.
+   - **Cursor Preset**:
+     ```yaml
+     imports:
+       - preset: cursor
+         as: cursor-adapter
+         with:
+           bind: 127.0.0.1:8333
+           upstream_url: https://api.openai.com
+           reasoning_effort: high
+           secret: env:OPENAI_API_KEY
+     version: 2
+     ```
+   - **Devin Preset**:
+     ```yaml
+     imports:
+       - preset: devin
+         as: devin-bridge
+         with:
+           bind: 127.0.0.1:18473
+           upstream_url: https://api.openai.com
+           secret: env:OPENAI_API_KEY
+     version: 2
+     ```
+   - **Factory Droid Preset**:
+     ```yaml
+     imports:
+       - preset: factory
+         as: factory-adapter
+         with:
+           bind: 127.0.0.1:18474
+           upstream_url: https://api.openai.com
+           secret: env:OPENAI_API_KEY
+     version: 2
+     ```
+   - **Universal Gateway Preset**:
+     ```yaml
+     imports:
+       - preset: gateway
+         as: gateway
+         with:
+           bind: 127.0.0.1:8400
+           upstream_url: https://api.openai.com
+           secret: env:POOLER_GATEWAY_KEY
+     version: 2
+     ```
+
+#### Step 4: Authentication & Credential Storage
+- For **ChatGPT / Codex Subscriptions**:
+  Run:
+  ```sh
+  pooler --config pooler-starter/pooler.yaml auth login openai --method device-code
+  ```
+  Provide the verification URL and user code to the operator, wait for completion, and verify with `pooler auth status --provider openai`.
+- For **Importing Existing Codex CLI Credentials**:
+  Run:
+  ```sh
+  pooler --config pooler-starter/pooler.yaml auth import my-codex --profile codex --from-file ~/.codex/credentials.json
+  ```
+- For **Google Gemini OAuth**:
+  Run:
+  ```sh
+  pooler --config pooler-starter/pooler.yaml auth login google --method oauth
+  ```
+- For **API Keys**:
+  Instruct the user to export the environment variable or save the key in `pooler-starter/provider.key` (`chmod 0600`). Never print or write literal keys to YAML.
+
+#### Step 5: Validation & Preflight
+Run:
+```sh
+pooler check --config <CONFIG_PATH>
+pooler --config <CONFIG_PATH> preflight
+```
+Ensure zero failing checks and verify DNS/TLS reachability.
+
+#### Step 6: Serve & Provide Exact Connection Instructions
+1. Instruct the user on running:
+   ```sh
+   pooler --config <CONFIG_PATH> --credential-key-ref file:<STORE_KEY_PATH> serve
+   ```
+2. Give clear, copy-paste connection parameters for their chosen tool:
+   - **Cursor**: Set Base URL to `http://127.0.0.1:8333` in Cursor Settings → Models → OpenAI API Key / Base URL.
+   - **Devin**: Set service endpoint to `http://127.0.0.1:18473`.
+   - **Factory Droid**: Set base URL to `http://127.0.0.1:18474`.
+   - **Claude Code / AI SDKs**: Set `OPENAI_BASE_URL="http://127.0.0.1:8400/v1"` or `ANTHROPIC_BASE_URL="http://127.0.0.1:8400"`.
+3. Provide the management dashboard link: `http://127.0.0.1:18477`.
 ```
 
 ---
 
-## 3. Coding agent adapter presets
+## 3. Specific Action Prompts for Agents
 
-### Configure Cursor IDE adapter
+Once initial setup is complete, users can give these direct task prompts to their agents:
+
+### Pool Multiple Subscriptions for Zero-Downtime Rate Limits
 ```text
-Task: Configure Pooler for Cursor on port 8333 with reasoning parameter injection.
-1. Create config/cursor.yaml with:
-   imports:
-     - preset: cursor
-       as: cursor-adapter
-       with:
-         bind: 127.0.0.1:8333
-         reasoning_effort: high
-         model_prefix: gpt-
-         upstream_url: https://api.openai.com
-         secret: env:OPENAI_API_KEY
-   version: 2
-2. Validate: `pooler check --config config/cursor.yaml`.
-3. Inform the operator to set Cursor's OpenAI Base URL to http://127.0.0.1:8333.
+Task: Update my Pooler configuration to pool multiple ChatGPT / Codex subscriptions and API keys:
+1. Add an account pool named `dev-pool` in pooler.yaml with strategy `fill_first`.
+2. Configure automatic retry with `maximum_attempts: 3` on HTTP 429 and 503 errors.
+3. Validate the configuration using `pooler check` and render the compiled routes.
 ```
 
-### Configure Devin ConnectRPC bridge
+### Switch Active Account or Refresh Tokens
 ```text
-Task: Bridge Devin protobuf ConnectRPC requests to upstream OpenAI / Codex subscriptions.
-1. Create config/devin.yaml:
-   imports:
-     - preset: devin
-       as: devin-bridge
-       with:
-         bind: 127.0.0.1:18473
-         upstream_url: https://api.openai.com
-         secret: env:OPENAI_API_KEY
-   version: 2
-2. Validate with `pooler check --config config/devin.yaml`.
-3. Verify compiled routes with `pooler --config config/devin.yaml routes`.
-4. Provide the Devin endpoint address http://127.0.0.1:18473.
+Task: Switch my active provider account in Pooler:
+1. Run `pooler auth status` to inspect configured accounts.
+2. Run `pooler auth switch --account <ACCOUNT_ID>` to make it the primary active account.
+3. Confirm with `pooler auth status`.
 ```
 
-### Configure Factory Droid adapter
+### Inspect Live Request Traces and Token Usage
 ```text
-Task: Configure Pooler to translate Factory Droid language-model endpoints.
-1. Create config/factory.yaml:
-   imports:
-     - preset: factory
-       as: factory-adapter
-       with:
-         bind: 127.0.0.1:18474
-         upstream_url: https://api.openai.com
-         secret: env:OPENAI_API_KEY
-   version: 2
-2. Validate with `pooler check --config config/factory.yaml`.
-3. Point Factory Droid to http://127.0.0.1:18474.
-```
-
-### Configure universal multi-provider gateway
-```text
-Task: Mount a universal gateway on port 8400 supporting OpenAI, Anthropic, and Gemini SDKs.
-1. Create config/gateway.yaml:
-   imports:
-     - preset: gateway
-       as: gateway
-       with:
-         bind: 127.0.0.1:8400
-         upstream_url: https://api.openai.com
-         websocket_url: wss://api.openai.com
-         secret: env:POOLER_GATEWAY_KEY
-   version: 2
-2. Validate with `pooler check --config config/gateway.yaml`.
-3. Run non-billable preflight: `pooler --config config/gateway.yaml preflight`.
-```
-
----
-
-## 4. Diagnostics, migration & operations
-
-### Run system diagnostics & health checks
-```text
-Task: Run complete diagnostics on the Pooler environment.
-1. Run `pooler doctor --config pooler.yaml` to verify port availability, store encryption keys, and file permissions.
-2. Run `pooler --config pooler.yaml preflight` to verify upstream TLS, DNS, and reachability.
-3. Report any warnings or failing checks.
-```
-
-### Migrate legacy CLIProxyAPI configuration
-```text
-Task: Convert a legacy CLIProxyAPI configuration into a native Pooler configuration.
-1. Run a dry-run migration:
-   pooler migrate cliproxy /path/to/cliproxy.yaml --dry-run
-2. Verify that no raw credentials are exposed in the output.
-3. Save the migrated configuration to config/migrated.pooler.yaml:
-   pooler migrate cliproxy /path/to/cliproxy.yaml --output config/migrated.pooler.yaml
-4. Verify with `pooler check --config config/migrated.pooler.yaml`.
+Task: Check recent request latency and token usage in Pooler:
+1. Connect to the management API at http://127.0.0.1:18477 using the management bearer token in pooler-starter/management.token.
+2. Query `/usage` and `/requests` endpoints to summarize token counts, TTFT latency, and recent model failover events.
 ```
