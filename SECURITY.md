@@ -6,13 +6,12 @@ Pooler sits between developer tools and paid provider accounts, and it stores cr
 
 **Do not open a public issue or pull request for a security problem.**
 
-Report privately through GitHub's private vulnerability reporting:
+Use either private channel:
 
-1. Go to <https://github.com/coder-company/pooler/security/advisories/new>.
-2. Describe the issue, the affected version, and the impact.
-3. Include the smallest reproduction you have.
+- **GitHub advisory**, preferred: <https://github.com/coder-company/pooler/security/advisories/new>. This keeps the discussion, the fix, and the eventual disclosure in one place, and it lets us credit you.
+- **Email**: [c@coder.company](mailto:c@coder.company). Use this if you cannot use GitHub, or if you would rather make first contact by mail.
 
-A private advisory keeps the discussion, the fix, and the eventual disclosure in one place, and it lets us credit you.
+Either way, tell us the issue, the affected version, the impact, and the smallest reproduction you have.
 
 ### What to include
 

@@ -59,10 +59,8 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement by opening a
-private report at
-<https://github.com/coder-company/pooler/security/advisories/new>, which is
-visible only to repository maintainers.
+reported to the community leaders responsible for enforcement by email at
+[c@coder.company](mailto:c@coder.company).
 
 All complaints will be reviewed and investigated promptly and fairly.
 

@@ -26,7 +26,7 @@ Two things catch almost everyone:
 | :--- | :--- |
 | Ask how to do something | [Discussions](https://github.com/coder-company/pooler/discussions) |
 | Report a bug | [New issue](https://github.com/coder-company/pooler/issues/new/choose) |
-| Report a vulnerability | [Private advisory](https://github.com/coder-company/pooler/security/advisories/new), never a public issue |
+| Report a vulnerability | [Private advisory](https://github.com/coder-company/pooler/security/advisories/new) or [c@coder.company](mailto:c@coder.company), never a public issue |
 | Propose a feature | [New issue](https://github.com/coder-company/pooler/issues/new/choose) |
 | Contribute a change | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
