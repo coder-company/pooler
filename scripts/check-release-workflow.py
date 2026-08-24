@@ -510,10 +510,6 @@ def validate_hosted_release_assets(
     schema = root / "schema" / "pooler.schema.json"
     if schema.is_symlink() or not schema.is_file() or schema.stat().st_size == 0:
         fail(f"required release schema is missing or unsafe: {schema}")
-    migrator = root / "crates" / "pooler-cli" / "src" / "production_migrate.rs"
-    if (root / "Cargo.toml").is_file() and not migrator.is_file():
-        fail(f"required Pooler-v1 migrator source is missing or unsafe: {migrator}")
-
     jobs = mapping(release["jobs"], f"{path}.jobs")
     build = mapping(jobs["build"], f"{path}.jobs.build")
     package_step = find_step(

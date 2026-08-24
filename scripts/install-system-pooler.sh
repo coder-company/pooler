@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Install the one canonical Pooler system service. The normal invocation is
-# explicit about every input so a migration cannot select an interactive
+# explicit about every input so an installation cannot select an interactive
 # user's configuration, keyring, or state directory by accident.
 
 set -Eeuo pipefail
@@ -17,11 +17,8 @@ Options:
   --root DIRECTORY          Prefix the system layout (for sandbox fixtures).
   --binary PATH             Release pooler executable.
   --config PATH             Version-2 canonical configuration source.
-  --source-config PATH      Alias for --config.
-  --store PATH              Encrypted credential store source.
-  --source-store PATH       Alias for --store.
+  --store PATH              Fresh SQLite credential store source.
   --store-key PATH          Store-key source (generated when omitted).
-  --source-key PATH         Alias for --store-key.
   --management-key PATH     Management bearer source (generated when omitted).
   --unit PATH               Dedicated pooler.service source.
   --backup-root DIRECTORY   Backup root (default: /var/backups/pooler).
@@ -55,11 +52,8 @@ while (($# > 0)); do
         --root) (($# >= 2)) || usage; ROOT=$2; shift 2 ;;
         --binary) (($# >= 2)) || usage; BINARY=$2; shift 2 ;;
         --config) (($# >= 2)) || usage; CONFIG=$2; shift 2 ;;
-        --source-config) (($# >= 2)) || usage; CONFIG=$2; shift 2 ;;
         --store) (($# >= 2)) || usage; STORE=$2; shift 2 ;;
-        --source-store) (($# >= 2)) || usage; STORE=$2; shift 2 ;;
         --store-key) (($# >= 2)) || usage; STORE_KEY=$2; shift 2 ;;
-        --source-key) (($# >= 2)) || usage; STORE_KEY=$2; shift 2 ;;
         --management-key) (($# >= 2)) || usage; MANAGEMENT_KEY=$2; shift 2 ;;
         --unit) (($# >= 2)) || usage; UNIT=$2; shift 2 ;;
         --backup-root) (($# >= 2)) || usage; BACKUP_ROOT=$2; shift 2 ;;

@@ -21,13 +21,9 @@ mod doctor;
 mod fixture_replay;
 mod migrate;
 mod preflight;
-mod production_migrate;
 mod tui;
 pub use auth::{AuthCommand, AuthLoginMethod, OAuthEncodingArgument, OAuthOverrideArgs};
 pub use catalog::{CatalogCommand, VENDORED_MODEL_FACTS_PATH};
-pub use production_migrate::{
-    migrate as migrate_pooler_v1, recover_transaction, MigrationOptions, MigrationReport,
-};
 
 /// Top-level command-line arguments.
 #[derive(Debug, Parser)]
@@ -171,43 +167,6 @@ pub enum MigrateCommand {
         /// New owner-private Pooler configuration path for a non-dry migration.
         #[arg(long)]
         output: Option<PathBuf>,
-    },
-    /// Convert one quiesced Pooler-v1 configuration and encrypted store.
-    #[command(name = "pooler-v1", alias = "production")]
-    PoolerV1 {
-        /// Retired Pooler-v1 configuration.
-        #[arg(long = "config", alias = "source-config")]
-        source_config: Option<PathBuf>,
-        /// Retired Pooler-v1 encrypted SQLite store.
-        #[arg(long = "store", alias = "source-store")]
-        source_store: Option<PathBuf>,
-        /// Raw owner-private source store key file.
-        #[arg(long = "key", alias = "source-key")]
-        source_key: Option<PathBuf>,
-        /// Canonical v2 configuration destination.
-        #[arg(long = "output-config")]
-        output_config: Option<PathBuf>,
-        /// Canonical v2 encrypted SQLite store destination.
-        #[arg(long = "output-store")]
-        output_store: Option<PathBuf>,
-        /// Canonical v2 store-key destination.
-        #[arg(long = "output-key")]
-        output_key: Option<PathBuf>,
-        /// Private transaction directory used for staging and recovery.
-        #[arg(long)]
-        transaction_dir: Option<PathBuf>,
-        /// Validate and stage without checkpointing or promoting.
-        #[arg(long)]
-        dry_run: bool,
-        /// Required acknowledgement that every source writer is stopped.
-        #[arg(long)]
-        quiesced: bool,
-        /// Recover and reverse a prior transaction instead of starting one.
-        #[arg(long)]
-        recover: bool,
-        /// Replace existing destinations after copying private rollback backups.
-        #[arg(long)]
-        replace_existing: bool,
     },
 }
 
@@ -399,61 +358,6 @@ pub fn run(cli: Cli) -> Result<()> {
                     output,
                 },
         } => migrate::cliproxy(&input, dry_run, output.as_deref()),
-        Command::Migrate {
-            command:
-                MigrateCommand::PoolerV1 {
-                    source_config,
-                    source_store,
-                    source_key,
-                    output_config,
-                    output_store,
-                    output_key,
-                    transaction_dir,
-                    dry_run,
-                    quiesced,
-                    recover,
-                    replace_existing,
-                },
-        } => {
-            let recovery = if recover {
-                Some(
-                    transaction_dir
-                        .clone()
-                        .ok_or_else(|| anyhow!("--recover requires --transaction-dir"))?,
-                )
-            } else {
-                None
-            };
-            let options = if recover {
-                MigrationOptions::new(".", ".", ".", ".", ".", ".")
-            } else {
-                MigrationOptions {
-                    source_config: source_config.ok_or_else(|| {
-                        anyhow!("--config is required unless --recover is supplied")
-                    })?,
-                    source_store: source_store.ok_or_else(|| {
-                        anyhow!("--store is required unless --recover is supplied")
-                    })?,
-                    source_key: source_key
-                        .ok_or_else(|| anyhow!("--key is required unless --recover is supplied"))?,
-                    destination_config: output_config.ok_or_else(|| {
-                        anyhow!("--output-config is required unless --recover is supplied")
-                    })?,
-                    destination_store: output_store.ok_or_else(|| {
-                        anyhow!("--output-store is required unless --recover is supplied")
-                    })?,
-                    destination_key: output_key.ok_or_else(|| {
-                        anyhow!("--output-key is required unless --recover is supplied")
-                    })?,
-                    transaction_dir: transaction_dir.clone(),
-                    dry_run,
-                    quiesced,
-                    replace_existing,
-                    fail_after: None,
-                }
-            };
-            production_migrate::run(options, recovery)
-        }
         Command::Auth { command } => auth::run(
             command,
             &config_path::resolve(config.as_deref())?,

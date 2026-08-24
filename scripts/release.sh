@@ -109,11 +109,6 @@ scripts/release.sh"
             exit 1
         fi
     done
-    if [ -f "$root_directory/Cargo.toml" ] &&
-        [ ! -f "$root_directory/crates/pooler-cli/src/production_migrate.rs" ]; then
-        printf 'release source is missing the Pooler-v1 migrator module\n' >&2
-        exit 1
-    fi
     config_count=0
     for config in "$root_directory"/config/*.example.yaml; do
         [ -e "$config" ] || [ -L "$config" ] || continue
