@@ -274,24 +274,53 @@ Everything the dashboard and management API expose is metadata. Prompts, respons
 
 ---
 
-## Development
+## Contributing
+
+Pull requests are welcome. Pooler has a strong bias toward provable behavior: documentation is checked against the shipped binary in CI, so an example that does not compile fails the build.
 
 ```sh
+cargo build -p pooler-cli --bin pooler
 cargo run -p pooler-cli -- check --config config/pooler.example.yaml
-./scripts/verify-compatibility-fixtures.py
-./scripts/check-config-schema.sh
 ```
 
-Reproducible release archives, checksums, and SBOMs:
+Before opening a pull request, run what CI runs:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+./scripts/check-config-schema.sh
+python3 scripts/check-docs-links.py
+python3 scripts/check-docs-examples.py --require-binary
+./scripts/verify-compatibility-fixtures.py
+```
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for the repository layout, how to add a preset or provider, fixture requirements, and the rules that apply to authentication and management code. Participation is governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+**Found a vulnerability?** Do not open a public issue. Report it privately through a [security advisory](https://github.com/coder-company/pooler/security/advisories/new). Scope and response targets are in [SECURITY.md](SECURITY.md).
+
+Need help rather than wanting to contribute? See [SUPPORT.md](SUPPORT.md).
+
+## Releases
+
+Reproducible archives, checksums, and SBOMs for all four supported targets:
 
 ```sh
 SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) scripts/release.sh --output dist
 ```
 
-See [release](docs/release.md) and [release acceptance](docs/release-acceptance.md).
+Each release publishes per-target `pooler-<version>-<target>.tar.gz` archives, a `SHA256SUMS` manifest with a Sigstore bundle, and CycloneDX and SPDX bills of material. See [release](docs/release.md) and [release acceptance](docs/release-acceptance.md).
 
 ---
 
 <div align="center">
-<sub><a href="https://github.com/coder-company/pooler/issues">Issues</a> · <a href="docs/index.md">Documentation</a> · Apache-2.0</sub>
+<sub>
+<a href="docs/index.md">Documentation</a> ·
+<a href="CONTRIBUTING.md">Contributing</a> ·
+<a href="SECURITY.md">Security</a> ·
+<a href="SUPPORT.md">Support</a> ·
+<a href="https://github.com/coder-company/pooler/issues">Issues</a>
+<br><br>
+Apache-2.0 · Copyright 2026 Pooler contributors
+</sub>
 </div>

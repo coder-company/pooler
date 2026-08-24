@@ -1,0 +1,15 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/coder-company/pooler/security/advisories/new
+    about: >-
+      Report privately. Do not open a public issue for a security problem. See
+      SECURITY.md for scope and what to include.
+  - name: Ask a question or get help
+    url: https://github.com/coder-company/pooler/discussions
+    about: >-
+      Setup help, configuration questions, and provider behavior questions.
+      Check `pooler doctor` and `pooler preflight` output first.
+  - name: Documentation
+    url: https://github.com/coder-company/pooler/blob/main/docs/index.md
+    about: Setup guides, CLI reference, presets, and troubleshooting.

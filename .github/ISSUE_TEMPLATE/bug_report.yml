@@ -1,0 +1,93 @@
+name: Bug report
+description: Something does not work the way the documentation says it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report a security vulnerability here. Use a
+        [private advisory](https://github.com/coder-company/pooler/security/advisories/new)
+        instead. See [SECURITY.md](https://github.com/coder-company/pooler/blob/main/SECURITY.md).
+
+        Never paste a real API key, token, or prompt into this issue.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How to reproduce
+      description: The exact commands you ran, in order.
+      placeholder: |
+        1. pooler check --config ...
+        2. pooler serve
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Pooler version
+      description: Output of `pooler --version`.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How did you install Pooler?
+      options:
+        - install.sh, system-wide
+        - install.sh, --user
+        - cargo install
+        - Built from source
+        - Release archive, installed manually
+        - scripts/install-system-pooler.sh, systemd service
+        - Container image
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Operating system and architecture, for example Ubuntu 24.04 x86_64 or macOS 15 arm64.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: >-
+        The smallest configuration that reproduces this. Redact every secret;
+        keep the reference form such as `env:OPENAI_API_KEY` and remove values.
+        `pooler config render` produces an expanded copy without resolving secrets.
+      render: yaml
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: >-
+        Output of `pooler doctor` and, if the problem involves a provider,
+        `pooler preflight`. Both are read-only and send no inference request.
+      render: text
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed every credential, token, and prompt from this report.
+          required: true
+        - label: I checked that this is not already reported.
+          required: true

@@ -28,7 +28,11 @@ def anchors(path: Path) -> set[str]:
 
 
 def main() -> int:
-    targets = [ROOT / "README.md", ROOT / "llms.txt", *sorted((ROOT / "docs").glob("*.md"))]
+    targets = [
+        *sorted(ROOT.glob("*.md")),
+        ROOT / "llms.txt",
+        *sorted((ROOT / "docs").glob("*.md")),
+    ]
     failures: list[str] = []
 
     for source in targets:

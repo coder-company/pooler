@@ -1,0 +1,62 @@
+name: Feature request
+description: Propose a capability or a change in behavior.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Pooler rejects protocol behavior it cannot represent faithfully rather
+        than approximating it. A proposal is easier to accept when it explains
+        what provider or client documentation makes the behavior verifiable.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you hitting?
+      description: Describe the situation, not the solution. What are you unable to do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like Pooler to do?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this touch?
+      options:
+        - A new provider integration
+        - An existing provider integration
+        - A client adapter or preset (Cursor, Devin, Factory, fx, gateway, xai)
+        - Account pooling, retry, or quota policy
+        - Authentication or the credential store
+        - Management API or dashboard
+        - Configuration schema
+        - CLI
+        - Deployment or packaging
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Supporting documentation
+      description: >-
+        Links to the provider or client documentation that establishes the
+        behavior. This matters because Pooler will not ship a guessed endpoint,
+        URL template, OAuth client, or scope.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried?
+      description: >-
+        Existing options you have already ruled out, for example a custom
+        upstream with an explicit `url` and `auth` block, or a `catalog`
+        override.
