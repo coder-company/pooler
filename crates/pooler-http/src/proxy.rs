@@ -114,8 +114,23 @@ pub struct SemanticResponseHint {
     /// This differs from `mode` only for provider bridges that must consume a
     /// streaming upstream before returning one unary downstream document.
     pub upstream_mode: SemanticResponseMode,
+    /// Wire protocol selected after model/provider routing.
+    pub upstream_wire: Option<SemanticWire>,
     /// Model resolved from the downstream request before upstream translation.
     pub requested_model: Option<String>,
+}
+
+/// Provider wire selected after model and account routing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticWire {
+    /// OpenAI Chat Completions chunks.
+    OpenAiChat,
+    /// OpenAI Responses named events.
+    OpenAiResponses,
+    /// Anthropic Messages JSON and named events.
+    AnthropicMessages,
+    /// Google Gemini GenerateContent JSON and SSE chunks.
+    GeminiGenerateContent,
 }
 
 /// Request-local response representation selected by a semantic adapter.
@@ -174,6 +189,18 @@ pub trait SemanticAdapter: Clone + Send + Sync + 'static {
         body: &[u8],
     ) -> Result<SemanticRequestBody, BoxError> {
         self.encode_request(route, headers, body)
+    }
+
+    /// Re-encode a validated semantic request for the wire selected after
+    /// model/provider routing. The default preserves adapters whose upstream
+    /// wire is fixed by the route.
+    fn reencode_request_for_wire(
+        &self,
+        _route: &RoutePlan,
+        body: &[u8],
+        _wire: SemanticWire,
+    ) -> Result<Vec<u8>, BoxError> {
+        Ok(body.to_vec())
     }
 
     /// Decode request-local policy inputs before upstream translation.
@@ -2199,6 +2226,7 @@ where
         let mut providers_used = BTreeSet::new();
         let mut forced_selection = None;
         let mut native_refresh_attempted = false;
+        let mut websocket_http_fallback_attempted = false;
 
         loop {
             let mut selection = if let Some(selection) = forced_selection.take() {
@@ -2254,8 +2282,16 @@ where
             // when the route also declares a reusable Responses WebSocket
             // transport. The response hint is decoded from this request, so
             // it is the authoritative per-request transport choice.
-            let websocket_transport = (semantic_response_hint.mode != SemanticResponseMode::Json)
-                .then(|| self.semantic.websocket_transport(route))
+            let websocket_transport = (semantic_response_hint.mode != SemanticResponseMode::Json
+                && !websocket_http_fallback_attempted)
+                .then(|| {
+                    self.semantic.websocket_transport(route).or_else(|| {
+                        selected_upstream
+                            .native()
+                            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+                            .then_some(SemanticWebSocketTransport::OpenAiResponses)
+                    })
+                })
                 .flatten();
             // Semantic Responses selection uses the REST provider identity so
             // catalog aliases and account state match the discovered target.
@@ -2277,8 +2313,12 @@ where
             } else {
                 selected_upstream
             };
-            let force_codex_unary_stream =
-                codex_unary_responses_requires_streaming(route, upstream, &semantic_response_hint);
+            let force_unary_responses_stream = semantic_unary_responses_requires_streaming(
+                route,
+                &selection,
+                upstream,
+                &semantic_response_hint,
+            );
             if websocket_transport.is_some()
                 && route.target().transport_upstream().is_some()
                 && !matches!(upstream.transport(), "ws" | "wss")
@@ -2287,6 +2327,11 @@ where
                     "semantic WebSocket transport requires a ws or wss target transport".to_owned(),
                 ));
             }
+            let websocket_attempt = websocket_transport.is_some()
+                && (matches!(upstream.transport(), "ws" | "wss")
+                    || upstream
+                        .native()
+                        .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex")));
             let retry_deadline = retry_deadline(started, limits, upstream, selection.policy());
             let _secret = (upstream.native().is_some()
                 || selection.account_secret().is_some()
@@ -2343,14 +2388,15 @@ where
                 cancellation: &cancellation,
                 started,
             };
-            let response = match (
-                websocket_transport,
-                matches!(upstream.transport(), "ws" | "wss"),
-            ) {
+            let response = match (websocket_transport, websocket_attempt) {
                 (Some(transport), true) => {
-                    match prepared
-                        .buffered_bytes_for_attempt(route, &selection, upstream, lifecycle)
-                    {
+                    match prepared.buffered_bytes_for_attempt(
+                        route,
+                        &selection,
+                        upstream,
+                        &self.semantic,
+                        lifecycle,
+                    ) {
                         Ok(bytes) => {
                             self.send_openai_responses_websocket_attempt(
                                 attempt_request,
@@ -2363,9 +2409,15 @@ where
                     }
                 }
                 _ => {
-                    let attempt_body = if force_codex_unary_stream {
+                    let attempt_body = if force_unary_responses_stream {
                         prepared
-                            .buffered_bytes_for_attempt(route, &selection, upstream, lifecycle)
+                            .buffered_bytes_for_attempt(
+                                route,
+                                &selection,
+                                upstream,
+                                &self.semantic,
+                                lifecycle,
+                            )
                             .and_then(|bytes| force_responses_streaming_request(&bytes, limits))
                             .map(|bytes| {
                                 Full::new(bytes)
@@ -2373,7 +2425,13 @@ where
                                     .boxed()
                             })
                     } else {
-                        prepared.body_for_attempt(route, &selection, upstream, lifecycle)
+                        prepared.body_for_attempt(
+                            route,
+                            &selection,
+                            upstream,
+                            &self.semantic,
+                            lifecycle,
+                        )
                     };
                     match attempt_body {
                         Ok(attempt_body) => self.send_attempt(attempt_request, attempt_body).await,
@@ -2435,6 +2493,22 @@ where
             let mut response = match response {
                 Ok(response) => response,
                 Err(error) => {
+                    if websocket_attempt
+                        && !websocket_http_fallback_attempted
+                        && websocket_http_fallback_safe(&error)
+                    {
+                        websocket_http_fallback_attempted = true;
+                        lifecycle.retry(
+                            attempt,
+                            "responses_websocket_http_fallback",
+                            Duration::ZERO,
+                            None,
+                            None,
+                        );
+                        forced_selection = Some(selection);
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
                     let failure_status = match &error {
                         ProxyError::WebSocketHandshakeStatus(status) => Some(*status),
                         _ => None,
@@ -2672,8 +2746,12 @@ where
                 .take()
                 .expect("request observation remains until response is ready");
             let mut final_response_hint = semantic_response_hint;
-            if force_codex_unary_stream {
+            if force_unary_responses_stream {
                 final_response_hint.upstream_mode = SemanticResponseMode::ServerSentEvents;
+            }
+            if route.ingress().mode() == BodyMode::Semantic {
+                final_response_hint.upstream_wire =
+                    selected_semantic_wire(&selection, route, upstream);
             }
             return self
                 .finish_response(
@@ -2760,7 +2838,7 @@ where
         if upstream
             .native()
             .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
-            && route.ingress().decoder() == Some("decode.openai.responses")
+            && route.ingress().mode() == BodyMode::Semantic
         {
             headers.insert(
                 header::ACCEPT,
@@ -2914,7 +2992,13 @@ where
                 header_bytes(&headers),
             )
             .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
-        let endpoint = upstream_uri.to_string();
+        let upstream_uri = rewrite_native_upstream_uri(
+            upstream,
+            &upstream_uri,
+            selection.upstream_model(),
+            upstream_uri.clone(),
+        )?;
+        let endpoint = responses_websocket_endpoint(&upstream_uri)?;
         let profile = match transport {
             SemanticWebSocketTransport::OpenAiResponses if native_profile => "codex_subscription",
             SemanticWebSocketTransport::OpenAiResponses => "openai_api_key",
@@ -3124,10 +3208,6 @@ where
             lifecycle,
         } = context;
         let (parts, body) = response.into_parts();
-        let semantic_websocket = parts
-            .extensions
-            .get::<SemanticWebSocketResponse>()
-            .is_some();
         let mut response_headers = parts.headers;
         strip_hop_by_hop_headers(&mut response_headers);
         if routing_metadata_requested {
@@ -3165,9 +3245,7 @@ where
         let response_deadline =
             Instant::from_std(started + effective_request_timeout(route.limits(), upstream));
         observation.mark_headers();
-        let mut body = if route.response().mode() == BodyMode::Semantic
-            && parts.status.is_success()
-            && !semantic_websocket
+        let mut body = if route.response().mode() == BodyMode::Semantic && parts.status.is_success()
         {
             let transformed = self
                 .semantic
@@ -3340,11 +3418,12 @@ struct InspectedFailureResponse {
 }
 
 impl PreparedBody {
-    fn buffered_bytes_for_attempt(
+    fn buffered_bytes_for_attempt<S: SemanticAdapter>(
         &self,
         route: &RoutePlan,
         selection: &PoolSelection,
         upstream: &UpstreamPlan,
+        semantic: &S,
         lifecycle: &RequestLifecycle,
     ) -> Result<Bytes, ProxyError> {
         let Self::Buffered { bytes, patch_model } = self else {
@@ -3354,17 +3433,20 @@ impl PreparedBody {
         };
         if *patch_model {
             if let Some(model) = selection.upstream_model() {
-                return patch_body_for_target(bytes, route, model, selection, upstream, lifecycle);
+                return patch_body_for_target(
+                    bytes, route, model, selection, upstream, semantic, lifecycle,
+                );
             }
         }
         Ok(bytes.clone())
     }
 
-    fn body_for_attempt(
+    fn body_for_attempt<S: SemanticAdapter>(
         &mut self,
         route: &RoutePlan,
         selection: &PoolSelection,
         upstream: &UpstreamPlan,
+        semantic: &S,
         lifecycle: &RequestLifecycle,
     ) -> Result<ProxyBody, ProxyError> {
         match self {
@@ -3377,7 +3459,9 @@ impl PreparedBody {
             Self::Buffered { bytes, patch_model } => {
                 let bytes = if *patch_model {
                     if let Some(model) = selection.upstream_model() {
-                        patch_body_for_target(bytes, route, model, selection, upstream, lifecycle)?
+                        patch_body_for_target(
+                            bytes, route, model, selection, upstream, semantic, lifecycle,
+                        )?
                     } else {
                         bytes.clone()
                     }
@@ -4067,6 +4151,31 @@ fn openai_websocket_error(error: OpenAiResponsesWebSocketError) -> ProxyError {
     )
 }
 
+fn websocket_http_fallback_safe(error: &ProxyError) -> bool {
+    match error {
+        ProxyError::WebSocketHandshakeStatus(_) => true,
+        ProxyError::Upstream(error) => error
+            .downcast_ref::<OpenAiResponsesWebSocketError>()
+            .is_some_and(|error| matches!(error, OpenAiResponsesWebSocketError::Connect)),
+        _ => false,
+    }
+}
+
+fn responses_websocket_endpoint(uri: &Uri) -> Result<String, ProxyError> {
+    let mut endpoint = url::Url::parse(&uri.to_string()).map_err(|_| ProxyError::InvalidUri)?;
+    match endpoint.scheme() {
+        "http" => endpoint
+            .set_scheme("ws")
+            .map_err(|_| ProxyError::InvalidUri)?,
+        "https" => endpoint
+            .set_scheme("wss")
+            .map_err(|_| ProxyError::InvalidUri)?,
+        "ws" | "wss" => {}
+        _ => return Err(ProxyError::InvalidUri),
+    }
+    Ok(endpoint.to_string())
+}
+
 fn upstream_client_error(error: hyper_util::client::legacy::Error) -> ProxyError {
     let mut source: Option<&(dyn Error + 'static)> = Some(&error);
     while let Some(current) = source {
@@ -4089,22 +4198,25 @@ fn is_exact_gemini_interaction_create(method: &http::Method, path: &str) -> bool
         )
 }
 
-fn codex_unary_responses_requires_streaming(
+fn semantic_unary_responses_requires_streaming(
     route: &RoutePlan,
+    selection: &PoolSelection,
     upstream: &UpstreamPlan,
     hint: &SemanticResponseHint,
 ) -> bool {
+    let responses_upstream =
+        selected_semantic_wire(selection, route, upstream) == Some(SemanticWire::OpenAiResponses);
+    let cross_protocol = route.ingress().decoder() != Some("decode.openai.responses");
+    let codex = upstream.native().is_some_and(|native| {
+        native
+            .kind()
+            .eq_ignore_ascii_case(adapter_codex::CODEX_PROVIDER_ID)
+    });
     hint.mode == SemanticResponseMode::Json
         && route.ingress().mode() == BodyMode::Semantic
-        && route.ingress().decoder() == Some("decode.openai.responses")
         && route.response().mode() == BodyMode::Semantic
-        && route.response().decoder() == Some("decode.openai.responses.events")
-        && route.response().encoder() == Some("encode.openai.responses.events")
-        && upstream.native().is_some_and(|native| {
-            native
-                .kind()
-                .eq_ignore_ascii_case(adapter_codex::CODEX_PROVIDER_ID)
-        })
+        && responses_upstream
+        && (codex || cross_protocol)
 }
 
 fn force_responses_streaming_request(
@@ -4171,12 +4283,13 @@ fn downstream_session_identity(headers: &HeaderMap, body: &[u8]) -> Option<Arc<s
 /// without it the request is forwarded only to be refused upstream. The drop is
 /// recorded rather than silent, and `loss_policy: reject` fails the request
 /// before any upstream call instead.
-fn patch_body_for_target(
+fn patch_body_for_target<S: SemanticAdapter>(
     bytes: &Bytes,
     route: &RoutePlan,
     model: &str,
     selection: &PoolSelection,
     upstream: &UpstreamPlan,
+    semantic: &S,
     lifecycle: &RequestLifecycle,
 ) -> Result<Bytes, ProxyError> {
     let profile = selection.profile();
@@ -4279,15 +4392,46 @@ fn patch_body_for_target(
         });
     }
     enforce_output_limit(&mut document, route, model, profile.output_limit)?;
-    let bytes = Bytes::from(document.bytes().into_owned());
+    let mut bytes = Bytes::from(document.bytes().into_owned());
+    if route.ingress().mode() == BodyMode::Semantic {
+        let wire = selected_semantic_wire(selection, route, upstream).ok_or_else(|| {
+            ProxyError::SemanticRequest(
+                "selected provider has no compatible semantic endpoint".to_owned(),
+            )
+        })?;
+        bytes = Bytes::from(
+            semantic
+                .reencode_request_for_wire(route, &bytes, wire)
+                .map_err(|error| ProxyError::SemanticRequest(error.to_string()))?,
+        );
+    }
     if upstream
         .native()
         .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
-        && route.ingress().decoder() == Some("decode.openai.responses")
     {
         return normalize_codex_responses_request(&bytes);
     }
     Ok(bytes)
+}
+
+fn selected_semantic_wire(
+    selection: &PoolSelection,
+    route: &RoutePlan,
+    upstream: &UpstreamPlan,
+) -> Option<SemanticWire> {
+    if upstream
+        .native()
+        .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+    {
+        return Some(SemanticWire::OpenAiResponses);
+    }
+    match selection.endpoint_family_for(route) {
+        Some("responses") => Some(SemanticWire::OpenAiResponses),
+        Some("chat_completions") => Some(SemanticWire::OpenAiChat),
+        Some("messages") => Some(SemanticWire::AnthropicMessages),
+        Some("generate_content") => Some(SemanticWire::GeminiGenerateContent),
+        _ => None,
+    }
 }
 
 fn normalize_codex_responses_request(bytes: &Bytes) -> Result<Bytes, ProxyError> {
@@ -4494,9 +4638,13 @@ fn rewrite_native_upstream_uri(
         return Ok(upstream_uri);
     };
     if native.kind().eq_ignore_ascii_case("codex") {
-        let path = match downstream.path() {
-            "/v1/responses" => adapter_codex::CODEX_RESPONSES_PATH,
-            "/v1/models" => adapter_codex::CODEX_MODELS_PATH_AND_QUERY,
+        let path = match upstream_uri.path() {
+            "/v1/responses" | "/v1/chat/completions" | adapter_codex::CODEX_RESPONSES_PATH => {
+                adapter_codex::CODEX_RESPONSES_PATH
+            }
+            "/v1/models" | adapter_codex::CODEX_MODELS_PATH => {
+                adapter_codex::CODEX_MODELS_PATH_AND_QUERY
+            }
             _ => return Ok(upstream_uri),
         };
         let mut target =

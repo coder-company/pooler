@@ -183,6 +183,21 @@ impl SemanticAdapter for RuntimeSemanticAdapter {
         }
     }
 
+    fn reencode_request_for_wire(
+        &self,
+        route: &pooler_config::RoutePlan,
+        body: &[u8],
+        wire: pooler_http::SemanticWire,
+    ) -> Result<Vec<u8>, BoxError> {
+        if OpenAiSemanticAdapter.supports(route) {
+            OpenAiSemanticAdapter.reencode_request_for_wire(route, body, wire)
+        } else if AnthropicSemanticAdapter.supports(route) {
+            AnthropicSemanticAdapter.reencode_request_for_wire(route, body, wire)
+        } else {
+            Ok(body.to_vec())
+        }
+    }
+
     fn selection_context(
         &self,
         route: &pooler_config::RoutePlan,

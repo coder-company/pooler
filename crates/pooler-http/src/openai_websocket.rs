@@ -207,6 +207,7 @@ impl Body for OpenAiResponsesWebSocketBody {
         match self.receiver.poll_recv(context) {
             Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
             Poll::Ready(Some(Err(error))) => {
+                tracing::warn!(error = %error, "Responses WebSocket response body failed");
                 self.ended = true;
                 Poll::Ready(Some(Err(Box::new(error))))
             }
@@ -339,6 +340,16 @@ impl TurnCodec {
             .and_then(Value::as_str)
             .ok_or(OpenAiResponsesWebSocketError::Protocol)?
             .to_owned();
+        if matches!(
+            event_type.as_str(),
+            "codex.rate_limits" | "codex.response.metadata" | "responsesapi.websocket_timing"
+        ) {
+            return Ok(EncodedProviderEvent {
+                bytes: Bytes::new(),
+                terminal: Terminal::None,
+                response_id: None,
+            });
+        }
         if event_type == "response.done" {
             object.insert(
                 "type".to_owned(),
@@ -362,10 +373,10 @@ impl TurnCodec {
             .map(str::to_owned);
         let raw =
             serde_json::to_vec(&value).map_err(|_| OpenAiResponsesWebSocketError::Protocol)?;
-        let semantic = self
-            .decoder
-            .decode_data(&raw)
-            .map_err(|_| OpenAiResponsesWebSocketError::Protocol)?;
+        let semantic = self.decoder.decode_data(&raw).map_err(|error| {
+            tracing::warn!(event_type, error = %error, "Responses WebSocket event was rejected");
+            OpenAiResponsesWebSocketError::Protocol
+        })?;
         let mut output = Vec::new();
         for event in semantic {
             self.encode_semantic_event(&event, &mut output)?;
@@ -1450,6 +1461,22 @@ mod tests {
         assert!(wire.contains("call_1"));
         assert!(wire.contains("\"input_tokens\":12"));
         assert!(wire.contains("\"reasoning_tokens\":4"));
+    }
+
+    #[test]
+    fn codex_private_handshake_metadata_is_consumed_without_reaching_clients() {
+        let mut codec = TurnCodec::new(&RouteLimits::default(), LossPolicy::Reject);
+        for event in [
+            json!({"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":1}}}),
+            json!({"type":"codex.response.metadata","metadata":{"conversation_id":"conv_1"}}),
+            json!({"type":"responsesapi.websocket_timing","timing":{"total_ms":12}}),
+        ] {
+            let encoded = codec
+                .encode(event)
+                .expect("known Codex metadata is accepted");
+            assert!(encoded.bytes.is_empty());
+            assert_eq!(encoded.terminal, Terminal::None);
+        }
     }
 
     #[tokio::test]

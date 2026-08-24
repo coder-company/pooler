@@ -12,6 +12,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use adapter_anthropic::{AnthropicEventDecoder, AnthropicMessageCodec, AnthropicMessagesCodec};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use http_body::{Body, Frame, SizeHint};
@@ -20,7 +21,7 @@ use pooler_config::RoutePlan;
 use pooler_http::{
     BoxError, ProxyBody, SelectionContext, SemanticAdapter, SemanticRequestBody,
     SemanticResponseBody, SemanticResponseHint, SemanticResponseMode, SemanticWebSocketTransport,
-    SseEncoder, SseEvent, SseLimits, SseParser,
+    SemanticWire, SseEncoder, SseEvent, SseLimits, SseParser,
 };
 use pooler_protocol::{
     ExtensionKey, LossPolicy, OpenAiChatCodec, OpenAiChatEventDecoder, OpenAiChatEventEncoder,
@@ -28,7 +29,7 @@ use pooler_protocol::{
     SemanticRequest, StreamEvent, OPENAI_CHAT_UNKNOWN_FIELDS_EXTENSION,
     OPENAI_RESPONSES_UNKNOWN_FIELDS_EXTENSION,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -63,6 +64,7 @@ enum RequestWire {
 enum EventWire {
     Responses,
     Chat,
+    Anthropic,
 }
 
 impl SemanticAdapter for OpenAiSemanticAdapter {
@@ -81,14 +83,6 @@ impl SemanticAdapter for OpenAiSemanticAdapter {
         let request =
             decode_request_for_wires(request_wire, upstream_wire, body, route.loss_policy())?;
         let streaming = request_streaming(&request);
-        if !streaming
-            && matches!(
-                (request_wire, upstream_wire),
-                (RequestWire::Responses, EventWire::Chat)
-            )
-        {
-            return Err(Box::new(OpenAiAdapterError::UnaryCrossProtocolUnsupported));
-        }
         let encoded = if request_wire_matches_event_wire(request_wire, upstream_wire) {
             prepare_same_wire_request(body, upstream_wire, streaming)?
         } else {
@@ -110,6 +104,32 @@ impl SemanticAdapter for OpenAiSemanticAdapter {
         })
     }
 
+    fn reencode_request_for_wire(
+        &self,
+        route: &RoutePlan,
+        body: &[u8],
+        wire: SemanticWire,
+    ) -> Result<Vec<u8>, BoxError> {
+        let (request_wire, _) = route_wires(route)
+            .ok_or_else(|| Box::new(OpenAiAdapterError::UnsupportedRoute) as BoxError)?;
+        let upstream_wire = match wire {
+            SemanticWire::OpenAiChat => EventWire::Chat,
+            SemanticWire::OpenAiResponses => EventWire::Responses,
+            SemanticWire::AnthropicMessages => EventWire::Anthropic,
+            SemanticWire::GeminiGenerateContent => {
+                return Err(Box::new(OpenAiAdapterError::UnsupportedRoute));
+            }
+        };
+        if request_wire_matches_event_wire(request_wire, upstream_wire) {
+            return Ok(body.to_vec());
+        }
+        let request = decode_request(request_wire, body, route.loss_policy())?;
+        if upstream_wire == EventWire::Anthropic {
+            return encode_anthropic_request(request, route.loss_policy());
+        }
+        encode_upstream_request(upstream_wire, &request, route.loss_policy())
+    }
+
     fn selection_context(
         &self,
         route: &RoutePlan,
@@ -123,9 +143,6 @@ impl SemanticAdapter for OpenAiSemanticAdapter {
         let mut context = SelectionContext::from_semantic_request(&request);
         if request_streaming(&request) {
             context.require(pooler_core::Capability::Streaming);
-        }
-        if let Some(codec) = route.ingress().decoder() {
-            context.with_codec(codec);
         }
         Ok(context)
     }
@@ -144,43 +161,9 @@ impl SemanticAdapter for OpenAiSemanticAdapter {
         body: ProxyBody,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
-        let (request_wire, upstream_wire) = route_wires(route)
+        let (_, upstream_wire) = route_wires(route)
             .ok_or_else(|| Box::new(OpenAiAdapterError::UnsupportedRoute) as BoxError)?;
-        let downstream_wire = match request_wire {
-            RequestWire::Responses => EventWire::Responses,
-            RequestWire::Chat => EventWire::Chat,
-        };
-        let limits = SseLimits::new(
-            usize_limit(route.limits().max_frame_bytes),
-            usize_limit(route.limits().max_event_bytes),
-        );
-        let max_queue_items = usize_limit(u64::from(route.limits().max_queue_items));
-        let max_queue_bytes = usize_limit(route.limits().max_queue_bytes);
-        let stream =
-            if upstream_wire == EventWire::Responses && downstream_wire == EventWire::Responses {
-                OpenAiResponseBody::responses_passthrough(
-                    body,
-                    limits,
-                    max_queue_items,
-                    max_queue_bytes,
-                    cancellation,
-                )
-            } else {
-                OpenAiResponseBody::transform(
-                    body,
-                    upstream_wire,
-                    downstream_wire,
-                    route.loss_policy(),
-                    limits,
-                    max_queue_items,
-                    max_queue_bytes,
-                    cancellation,
-                )
-            };
-        Ok(SemanticResponseBody {
-            body: stream.boxed(),
-            content_type: HeaderValue::from_static("text/event-stream"),
-        })
+        decode_stream_response(route, body, upstream_wire, cancellation)
     }
 
     fn decode_response_with_hint(
@@ -191,13 +174,19 @@ impl SemanticAdapter for OpenAiSemanticAdapter {
         hint: &SemanticResponseHint,
         cancellation: CancellationToken,
     ) -> Result<SemanticResponseBody, BoxError> {
-        if hint.mode != SemanticResponseMode::Json {
-            return self.decode_response(route, body, cancellation);
-        }
-        let (_, upstream_wire) = route_wires(route)
+        let (downstream_wire, route_upstream_wire) = route_wires(route)
             .ok_or_else(|| Box::new(OpenAiAdapterError::UnsupportedRoute) as BoxError)?;
-        if upstream_wire == EventWire::Chat {
-            return Err(Box::new(OpenAiAdapterError::UnaryCrossProtocolUnsupported));
+        let upstream_wire = match hint.upstream_wire {
+            Some(SemanticWire::OpenAiChat) => EventWire::Chat,
+            Some(SemanticWire::OpenAiResponses) => EventWire::Responses,
+            Some(SemanticWire::AnthropicMessages) => EventWire::Anthropic,
+            Some(SemanticWire::GeminiGenerateContent) => {
+                return Err(Box::new(OpenAiAdapterError::UnsupportedRoute));
+            }
+            None => route_upstream_wire,
+        };
+        if hint.mode != SemanticResponseMode::Json {
+            return decode_stream_response(route, body, upstream_wire, cancellation);
         }
         let limit = usize_limit(route.limits().max_response_body_bytes);
         let unary = if hint.upstream_mode == SemanticResponseMode::ServerSentEvents {
@@ -208,8 +197,26 @@ impl SemanticAdapter for OpenAiSemanticAdapter {
             OpenAiStreamingUnaryResponseBody::new(
                 body,
                 upstream_wire,
+                downstream_wire,
                 route.loss_policy(),
                 limits,
+                limit,
+                cancellation,
+            )
+            .boxed()
+        } else if upstream_wire == EventWire::Chat && downstream_wire == RequestWire::Responses {
+            OpenAiUnaryResponseBody::chat_to_responses(
+                body,
+                route.loss_policy(),
+                limit,
+                cancellation,
+            )
+            .boxed()
+        } else if upstream_wire == EventWire::Anthropic {
+            OpenAiUnaryResponseBody::anthropic_to_openai(
+                body,
+                downstream_wire,
+                route.loss_policy(),
                 limit,
                 cancellation,
             )
@@ -222,6 +229,51 @@ impl SemanticAdapter for OpenAiSemanticAdapter {
             content_type: HeaderValue::from_static("application/json"),
         })
     }
+}
+
+fn decode_stream_response(
+    route: &RoutePlan,
+    body: ProxyBody,
+    upstream_wire: EventWire,
+    cancellation: CancellationToken,
+) -> Result<SemanticResponseBody, BoxError> {
+    let (request_wire, _) = route_wires(route)
+        .ok_or_else(|| Box::new(OpenAiAdapterError::UnsupportedRoute) as BoxError)?;
+    let downstream_wire = match request_wire {
+        RequestWire::Responses => EventWire::Responses,
+        RequestWire::Chat => EventWire::Chat,
+    };
+    let limits = SseLimits::new(
+        usize_limit(route.limits().max_frame_bytes),
+        usize_limit(route.limits().max_event_bytes),
+    );
+    let max_queue_items = usize_limit(u64::from(route.limits().max_queue_items));
+    let max_queue_bytes = usize_limit(route.limits().max_queue_bytes);
+    let stream = if upstream_wire == EventWire::Responses && downstream_wire == EventWire::Responses
+    {
+        OpenAiResponseBody::responses_passthrough(
+            body,
+            limits,
+            max_queue_items,
+            max_queue_bytes,
+            cancellation,
+        )
+    } else {
+        OpenAiResponseBody::transform(
+            body,
+            upstream_wire,
+            downstream_wire,
+            route.loss_policy(),
+            limits,
+            max_queue_items,
+            max_queue_bytes,
+            cancellation,
+        )
+    };
+    Ok(SemanticResponseBody {
+        body: stream.boxed(),
+        content_type: HeaderValue::from_static("text/event-stream"),
+    })
 }
 
 fn route_wires(route: &RoutePlan) -> Option<(RequestWire, EventWire)> {
@@ -274,7 +326,6 @@ fn decode_request(
             Ok(decoded.request)
         }
         RequestWire::Chat => {
-            require_streaming(body)?;
             let decoded = OpenAiChatCodec::decode_request_with_report(body)
                 .map_err(|error| Box::new(error) as BoxError)?;
             decoded
@@ -299,12 +350,9 @@ fn decode_request_for_wires(
         RequestWire::Responses => OpenAiResponsesCodec::decode_request_with_report(body)
             .map(|decoded| decoded.request)
             .map_err(|error| Box::new(error) as BoxError),
-        RequestWire::Chat => {
-            require_streaming(body)?;
-            OpenAiChatCodec::decode_request_with_report(body)
-                .map(|decoded| decoded.request)
-                .map_err(|error| Box::new(error) as BoxError)
-        }
+        RequestWire::Chat => OpenAiChatCodec::decode_request_with_report(body)
+            .map(|decoded| decoded.request)
+            .map_err(|error| Box::new(error) as BoxError),
     }
 }
 
@@ -324,7 +372,9 @@ fn prepare_same_wire_request(
     let object = value
         .as_object_mut()
         .ok_or_else(|| Box::new(OpenAiAdapterError::EncodedRequestNotObject) as BoxError)?;
-    if matches!(wire, EventWire::Responses) {
+    if matches!(wire, EventWire::Anthropic) {
+        unreachable!("Anthropic is never an OpenAI same-wire request");
+    } else if matches!(wire, EventWire::Responses) {
         object.entry("store").or_insert(Value::Bool(false));
     } else if streaming {
         object
@@ -332,18 +382,6 @@ fn prepare_same_wire_request(
             .or_insert_with(|| serde_json::json!({"include_usage": true}));
     }
     serde_json::to_vec(&value).map_err(|error| Box::new(error) as BoxError)
-}
-
-fn require_streaming(body: &[u8]) -> Result<(), BoxError> {
-    let value: Value = serde_json::from_slice(body)?;
-    let stream = value
-        .as_object()
-        .and_then(|object| object.get("stream"))
-        .and_then(Value::as_bool);
-    match stream {
-        Some(true) => Ok(()),
-        Some(false) | None => Err(Box::new(OpenAiAdapterError::StreamingRequired)),
-    }
 }
 
 fn request_streaming(request: &SemanticRequest) -> bool {
@@ -385,6 +423,7 @@ fn encode_upstream_request(
                 .map_err(|error| Box::new(error) as BoxError)?
                 .body
         }
+        EventWire::Anthropic => unreachable!("Anthropic uses its native request codec"),
     };
     let mut value: Value = serde_json::from_slice(&body)?;
     let object = value
@@ -408,6 +447,7 @@ fn encode_upstream_request(
                 object.remove("stream_options");
             }
         }
+        EventWire::Anthropic => unreachable!("Anthropic uses its native request codec"),
     }
     serde_json::to_vec(&value).map_err(|error| Box::new(error) as BoxError)
 }
@@ -421,6 +461,7 @@ fn prepare_request_for_wire(
     let foreign_extension = match wire {
         EventWire::Responses => OPENAI_CHAT_UNKNOWN_FIELDS_EXTENSION,
         EventWire::Chat => OPENAI_RESPONSES_UNKNOWN_FIELDS_EXTENSION,
+        EventWire::Anthropic => unreachable!("Anthropic uses its native request codec"),
     };
     let key =
         ExtensionKey::parse(foreign_extension).map_err(|error| Box::new(error) as BoxError)?;
@@ -452,25 +493,60 @@ fn prepare_request_for_wire(
     Ok((request, passthrough))
 }
 
+fn encode_anthropic_request(
+    mut request: SemanticRequest,
+    policy: LossPolicy,
+) -> Result<Vec<u8>, BoxError> {
+    let mut stream = false;
+    for key in [
+        OPENAI_RESPONSES_UNKNOWN_FIELDS_EXTENSION,
+        OPENAI_CHAT_UNKNOWN_FIELDS_EXTENSION,
+    ] {
+        let key = ExtensionKey::parse(key).map_err(|error| Box::new(error) as BoxError)?;
+        let Some(extension) = request.extensions.remove(&key) else {
+            continue;
+        };
+        let fields: Value = serde_json::from_slice(extension.as_bytes())?;
+        let fields = fields
+            .as_object()
+            .ok_or_else(|| Box::new(OpenAiAdapterError::InvalidTransportExtension) as BoxError)?;
+        if let Some(value) = fields.get("stream").and_then(Value::as_bool) {
+            stream = value;
+        }
+        for field in fields.keys().filter(|field| field.as_str() != "stream") {
+            if !policy.allows_degradation() {
+                return Err(Box::new(OpenAiAdapterError::UnsupportedCrossProtocolField(
+                    field.clone(),
+                )));
+            }
+        }
+    }
+    let encoded = AnthropicMessagesCodec::encode_request(&request, policy)
+        .map_err(|error| Box::new(error) as BoxError)?;
+    let mut value: Value = serde_json::from_slice(&encoded.body)?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| Box::new(OpenAiAdapterError::EncodedRequestNotObject) as BoxError)?
+        .insert("stream".to_owned(), Value::Bool(stream));
+    serde_json::to_vec(&value).map_err(|error| Box::new(error) as BoxError)
+}
+
 #[derive(Debug, Error)]
 enum OpenAiAdapterError {
     #[error("route is not a supported OpenAI semantic route")]
     UnsupportedRoute,
-    #[error("OpenAI Chat semantic routes require stream=true")]
-    StreamingRequired,
     #[error("encoded OpenAI request is not a JSON object")]
     EncodedRequestNotObject,
     #[error("OpenAI transport extension is not a JSON object")]
     InvalidTransportExtension,
     #[error("OpenAI field `{0}` cannot be preserved across Responses and Chat")]
     UnsupportedCrossProtocolField(String),
-    #[error("unary Responses-to-Chat translation is not supported")]
-    UnaryCrossProtocolUnsupported,
 }
 
 enum UpstreamDecoder {
     Responses(OpenAiResponsesEventDecoder),
     Chat(OpenAiChatEventDecoder),
+    Anthropic(AnthropicEventDecoder),
 }
 
 impl UpstreamDecoder {
@@ -478,6 +554,7 @@ impl UpstreamDecoder {
         match wire {
             EventWire::Responses => Self::Responses(OpenAiResponsesEventDecoder::new()),
             EventWire::Chat => Self::Chat(OpenAiChatEventDecoder::new()),
+            EventWire::Anthropic => Self::Anthropic(AnthropicEventDecoder::new()),
         }
     }
 
@@ -488,6 +565,9 @@ impl UpstreamDecoder {
                 .map_err(|error| Box::new(error) as BoxError),
             Self::Chat(decoder) => decoder
                 .decode_data(event.data.as_bytes())
+                .map_err(|error| Box::new(error) as BoxError),
+            Self::Anthropic(decoder) => decoder
+                .decode_sse_event(event)
                 .map_err(|error| Box::new(error) as BoxError),
         }
     }
@@ -500,6 +580,8 @@ impl UpstreamDecoder {
             Self::Chat(decoder) => decoder
                 .finish()
                 .map_err(|error| Box::new(error) as BoxError),
+            Self::Anthropic(decoder) if decoder.is_finished() => Ok(Vec::new()),
+            Self::Anthropic(_) => Err(Box::new(OpenAiStreamError::MissingUnaryTerminal)),
         }
     }
 }
@@ -514,6 +596,7 @@ impl DownstreamEncoder {
         match wire {
             EventWire::Responses => Self::Responses(Box::new(OpenAiResponsesEventEncoder::new())),
             EventWire::Chat => Self::Chat(OpenAiChatEventEncoder::new()),
+            EventWire::Anthropic => unreachable!("downstream OpenAI wire is never Anthropic"),
         }
     }
 
@@ -568,11 +651,19 @@ impl DownstreamEncoder {
     }
 }
 
+#[derive(Clone, Copy)]
+enum UnaryTransform {
+    ChatToResponses,
+    AnthropicToOpenAi(RequestWire),
+}
+
 struct OpenAiUnaryResponseBody {
     inner: Pin<Box<ProxyBody>>,
     limit: usize,
     cancellation_wait: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
     buffer: Vec<u8>,
+    transform: Option<UnaryTransform>,
+    policy: LossPolicy,
     output: Option<Bytes>,
     ended: bool,
     error: Option<BoxError>,
@@ -586,10 +677,37 @@ impl OpenAiUnaryResponseBody {
             limit,
             cancellation_wait,
             buffer: Vec::new(),
+            transform: None,
+            policy: LossPolicy::Reject,
             output: None,
             ended: false,
             error: None,
         }
+    }
+
+    fn chat_to_responses(
+        body: ProxyBody,
+        policy: LossPolicy,
+        limit: usize,
+        cancellation: CancellationToken,
+    ) -> Self {
+        let mut body = Self::new(body, limit, cancellation);
+        body.transform = Some(UnaryTransform::ChatToResponses);
+        body.policy = policy;
+        body
+    }
+
+    fn anthropic_to_openai(
+        body: ProxyBody,
+        downstream: RequestWire,
+        policy: LossPolicy,
+        limit: usize,
+        cancellation: CancellationToken,
+    ) -> Self {
+        let mut body = Self::new(body, limit, cancellation);
+        body.transform = Some(UnaryTransform::AnthropicToOpenAi(downstream));
+        body.policy = policy;
+        body
     }
 
     fn finish(&mut self) -> Result<(), BoxError> {
@@ -598,7 +716,24 @@ impl OpenAiUnaryResponseBody {
         if !value.is_object() {
             return Err(Box::new(OpenAiStreamError::InvalidJsonResponse));
         }
-        let output = self.buffer.clone();
+        let output = match self.transform {
+            Some(UnaryTransform::ChatToResponses) => {
+                encode_responses_unary(&decode_openai_chat_unary(&self.buffer)?, self.policy)?
+            }
+            Some(UnaryTransform::AnthropicToOpenAi(downstream)) => {
+                let decoded = AnthropicMessageCodec::decode_response(&self.buffer)
+                    .map_err(|error| Box::new(error) as BoxError)?;
+                decoded
+                    .report
+                    .validate(self.policy)
+                    .map_err(|error| Box::new(error) as BoxError)?;
+                match downstream {
+                    RequestWire::Responses => encode_responses_unary(&decoded.events, self.policy)?,
+                    RequestWire::Chat => encode_chat_unary(&decoded.events, self.policy)?,
+                }
+            }
+            None => self.buffer.clone(),
+        };
         if output.len() > self.limit {
             return Err(Box::new(OpenAiStreamError::UnaryBodyTooLarge {
                 observed: output.len(),
@@ -674,11 +809,262 @@ impl Body for OpenAiUnaryResponseBody {
     }
 }
 
+fn decode_openai_chat_unary(input: &[u8]) -> Result<Vec<StreamEvent>, BoxError> {
+    let mut value: Value = serde_json::from_slice(input)?;
+    let choices = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("choices"))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
+    if choices.len() != 1 {
+        return Err(Box::new(OpenAiStreamError::InvalidJsonResponse));
+    }
+    let choice = choices[0]
+        .as_object_mut()
+        .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
+    let message = choice
+        .remove("message")
+        .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
+    choice.insert("delta".to_owned(), message);
+    let mut decoder = OpenAiChatEventDecoder::new();
+    let mut events = decoder
+        .decode_chunk(&serde_json::to_vec(&value)?)
+        .map_err(|error| Box::new(error) as BoxError)?;
+    events.extend(
+        decoder
+            .finish()
+            .map_err(|error| Box::new(error) as BoxError)?,
+    );
+    Ok(events)
+}
+
+fn encode_responses_unary(events: &[StreamEvent], policy: LossPolicy) -> Result<Vec<u8>, BoxError> {
+    let mut encoder = OpenAiResponsesEventEncoder::new();
+    let mut response = None;
+    for event in events {
+        for encoded in encoder
+            .encode_event(event, policy)
+            .map_err(|error| Box::new(error) as BoxError)?
+        {
+            if !is_terminal_response_event(&encoded.event) {
+                continue;
+            }
+            let value: Value = serde_json::from_slice(&encoded.body)?;
+            let terminal = value
+                .get("response")
+                .cloned()
+                .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
+            if response.replace(terminal).is_some() {
+                return Err(Box::new(OpenAiStreamError::MultipleUnaryTerminals));
+            }
+        }
+    }
+    serde_json::to_vec(
+        &response.ok_or_else(|| Box::new(OpenAiStreamError::MissingUnaryTerminal) as BoxError)?,
+    )
+    .map_err(|error| Box::new(error) as BoxError)
+}
+
+fn encode_chat_unary(events: &[StreamEvent], policy: LossPolicy) -> Result<Vec<u8>, BoxError> {
+    let mut encoder = OpenAiChatEventEncoder::new();
+    let mut completion = ChatCompletionAccumulator::default();
+    for event in events {
+        if let Some(encoded) = encoder
+            .encode_event(event, policy)
+            .map_err(|error| Box::new(error) as BoxError)?
+        {
+            completion.push(&encoded.body)?;
+        }
+    }
+    completion.finish()
+}
+
+#[derive(Default)]
+struct ChatCompletionAccumulator {
+    id: Option<String>,
+    model: Option<String>,
+    created: Option<Value>,
+    system_fingerprint: Option<Value>,
+    content: String,
+    saw_content: bool,
+    refusal: String,
+    saw_refusal: bool,
+    tool_calls: BTreeMap<u64, Map<String, Value>>,
+    finish_reason: Option<Value>,
+    usage: Option<Value>,
+}
+
+impl ChatCompletionAccumulator {
+    fn push(&mut self, input: &[u8]) -> Result<(), BoxError> {
+        let value: Value = serde_json::from_slice(input)
+            .map_err(|_| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
+        if let Some(id) = object.get("id").and_then(Value::as_str) {
+            self.id = Some(id.to_owned());
+        }
+        if let Some(model) = object.get("model").and_then(Value::as_str) {
+            self.model = Some(model.to_owned());
+        }
+        if let Some(created) = object.get("created") {
+            self.created = Some(created.clone());
+        }
+        if let Some(fingerprint) = object.get("system_fingerprint") {
+            self.system_fingerprint = Some(fingerprint.clone());
+        }
+        if let Some(usage) = object.get("usage") {
+            self.usage = Some(usage.clone());
+        }
+        let choices = object
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if choices.len() > 1 {
+            return Err(Box::new(OpenAiStreamError::InvalidJsonResponse));
+        }
+        let Some(choice) = choices.first().and_then(Value::as_object) else {
+            return Ok(());
+        };
+        if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
+            self.finish_reason = Some(reason.clone());
+        }
+        let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        if let Some(content) = delta.get("content").and_then(Value::as_str) {
+            self.content.push_str(content);
+            self.saw_content = true;
+        }
+        if let Some(refusal) = delta.get("refusal").and_then(Value::as_str) {
+            self.refusal.push_str(refusal);
+            self.saw_refusal = true;
+        }
+        for call in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let call = call
+                .as_object()
+                .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
+            let index = call
+                .get("index")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
+            let accumulated = self.tool_calls.entry(index).or_default();
+            for key in ["id", "type"] {
+                if let Some(value) = call.get(key) {
+                    accumulated.insert(key.to_owned(), value.clone());
+                }
+            }
+            if let Some(function) = call.get("function").and_then(Value::as_object) {
+                let accumulated_function = accumulated
+                    .entry("function".to_owned())
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+                    .ok_or_else(|| Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError)?;
+                if let Some(name) = function.get("name") {
+                    accumulated_function.insert("name".to_owned(), name.clone());
+                }
+                if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                    let current = accumulated_function
+                        .entry("arguments".to_owned())
+                        .or_insert_with(|| Value::String(String::new()))
+                        .as_str()
+                        .ok_or_else(|| {
+                            Box::new(OpenAiStreamError::InvalidJsonResponse) as BoxError
+                        })?
+                        .to_owned();
+                    accumulated_function.insert(
+                        "arguments".to_owned(),
+                        Value::String(format!("{current}{arguments}")),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<Vec<u8>, BoxError> {
+        let finish_reason = self
+            .finish_reason
+            .take()
+            .ok_or_else(|| Box::new(OpenAiStreamError::MissingUnaryTerminal) as BoxError)?;
+        let mut message = Map::from_iter([
+            ("role".to_owned(), Value::String("assistant".to_owned())),
+            (
+                "content".to_owned(),
+                if self.saw_content {
+                    Value::String(std::mem::take(&mut self.content))
+                } else {
+                    Value::Null
+                },
+            ),
+        ]);
+        if self.saw_refusal {
+            message.insert(
+                "refusal".to_owned(),
+                Value::String(std::mem::take(&mut self.refusal)),
+            );
+        }
+        if !self.tool_calls.is_empty() {
+            message.insert(
+                "tool_calls".to_owned(),
+                Value::Array(
+                    std::mem::take(&mut self.tool_calls)
+                        .into_values()
+                        .map(Value::Object)
+                        .collect(),
+                ),
+            );
+        }
+        let mut response = Map::from_iter([
+            (
+                "id".to_owned(),
+                Value::String(
+                    self.id
+                        .take()
+                        .unwrap_or_else(|| "chatcmpl_pooler".to_owned()),
+                ),
+            ),
+            (
+                "object".to_owned(),
+                Value::String("chat.completion".to_owned()),
+            ),
+            (
+                "created".to_owned(),
+                self.created.take().unwrap_or_else(|| Value::from(0)),
+            ),
+            (
+                "model".to_owned(),
+                Value::String(self.model.take().unwrap_or_default()),
+            ),
+            (
+                "choices".to_owned(),
+                serde_json::json!([{"index":0,"message":message,"finish_reason":finish_reason}]),
+            ),
+        ]);
+        if let Some(fingerprint) = self.system_fingerprint.take() {
+            response.insert("system_fingerprint".to_owned(), fingerprint);
+        }
+        if let Some(usage) = self.usage.take() {
+            response.insert("usage".to_owned(), usage);
+        }
+        serde_json::to_vec(&Value::Object(response)).map_err(|error| Box::new(error) as BoxError)
+    }
+}
+
 struct OpenAiStreamingUnaryResponseBody {
     inner: Pin<Box<ProxyBody>>,
     parser: SseParser,
     decoder: UpstreamDecoder,
     encoder: Box<OpenAiResponsesEventEncoder>,
+    chat_encoder: OpenAiChatEventEncoder,
+    chat_completion: ChatCompletionAccumulator,
+    downstream_wire: RequestWire,
     policy: LossPolicy,
     limit: usize,
     observed_bytes: usize,
@@ -696,6 +1082,7 @@ impl OpenAiStreamingUnaryResponseBody {
     fn new(
         body: ProxyBody,
         upstream: EventWire,
+        downstream_wire: RequestWire,
         policy: LossPolicy,
         limits: SseLimits,
         limit: usize,
@@ -707,6 +1094,9 @@ impl OpenAiStreamingUnaryResponseBody {
             parser: SseParser::with_limits(limits),
             decoder: UpstreamDecoder::new(upstream),
             encoder: Box::new(OpenAiResponsesEventEncoder::new()),
+            chat_encoder: OpenAiChatEventEncoder::new(),
+            chat_completion: ChatCompletionAccumulator::default(),
+            downstream_wire,
             policy,
             limit,
             observed_bytes: 0,
@@ -742,7 +1132,9 @@ impl OpenAiStreamingUnaryResponseBody {
     fn process_event(&mut self, event: &SseEvent) -> Result<(), BoxError> {
         let projection = semantic_validation_projection(event);
         let semantic = self.decoder.decode(projection.as_ref().unwrap_or(event))?;
-        self.observe_raw_event(event)?;
+        if self.downstream_wire == RequestWire::Responses {
+            self.observe_raw_event(event)?;
+        }
         for semantic in semantic {
             self.process_semantic(&semantic)?;
         }
@@ -787,6 +1179,16 @@ impl OpenAiStreamingUnaryResponseBody {
     }
 
     fn process_semantic(&mut self, event: &StreamEvent) -> Result<(), BoxError> {
+        if self.downstream_wire == RequestWire::Chat {
+            if let Some(encoded) = self
+                .chat_encoder
+                .encode_event(event, self.policy)
+                .map_err(|error| Box::new(error) as BoxError)?
+            {
+                self.chat_completion.push(&encoded.body)?;
+            }
+            return Ok(());
+        }
         for encoded in self
             .encoder
             .encode_event(event, self.policy)
@@ -811,6 +1213,18 @@ impl OpenAiStreamingUnaryResponseBody {
         }
         for semantic in self.decoder.finish()? {
             self.process_semantic(&semantic)?;
+        }
+        if self.downstream_wire == RequestWire::Chat {
+            let output = self.chat_completion.finish()?;
+            if output.len() > self.limit {
+                return Err(Box::new(OpenAiStreamError::UnaryBodyTooLarge {
+                    observed: output.len(),
+                    limit: self.limit,
+                }));
+            }
+            self.output = Some(Bytes::from(output));
+            self.ended = true;
+            return Ok(());
         }
         let mut response = if let Some(response) = self.raw_terminal_response.take() {
             response
@@ -1320,7 +1734,9 @@ mod tests {
     use http_body::{Body, Frame, SizeHint};
     use http_body_util::{BodyExt, Full};
     use pooler_config::Config;
-    use pooler_http::{SemanticAdapter, SemanticResponseHint, SemanticResponseMode, SseParser};
+    use pooler_http::{
+        SemanticAdapter, SemanticResponseHint, SemanticResponseMode, SemanticWire, SseParser,
+    };
     use serde_json::{json, Value};
     use tokio_util::sync::CancellationToken;
 
@@ -1418,6 +1834,7 @@ mod tests {
                     mode: SemanticResponseMode::Json,
                     upstream_mode: SemanticResponseMode::ServerSentEvents,
                     requested_model: Some("openai-model".to_owned()),
+                    ..SemanticResponseHint::default()
                 },
                 CancellationToken::new(),
             )
@@ -1627,19 +2044,209 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unary_responses_to_chat_is_rejected_before_upstream() {
-        let reject = route(
+    #[tokio::test]
+    async fn unary_chat_round_trips_through_streaming_responses() {
+        let route = route(
+            OPENAI_CHAT_REQUEST_DECODER,
+            OPENAI_CHAT_EVENT_DECODER,
+            OPENAI_CHAT_EVENT_ENCODER,
+        );
+        let request = json!({
+            "model":"openai-model",
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":false
+        });
+        let encoded = OpenAiSemanticAdapter
+            .reencode_request_for_wire(
+                &route,
+                &serde_json::to_vec(&request).expect("Chat request JSON"),
+                SemanticWire::OpenAiResponses,
+            )
+            .expect("Chat request converts to Responses");
+        let encoded: Value = serde_json::from_slice(&encoded).expect("Responses request JSON");
+        assert_eq!(encoded["model"], "openai-model");
+        assert_eq!(encoded["stream"], false);
+        assert_eq!(encoded["input"][0]["role"], "user");
+
+        let events = [
+            json!({
+                "type":"response.created",
+                "response":{"id":"resp_chat","model":"openai-model","status":"in_progress"}
+            }),
+            json!({
+                "type":"response.output_item.added","output_index":0,
+                "item":{"id":"msg_chat","type":"message","status":"in_progress","role":"assistant","content":[]}
+            }),
+            json!({
+                "type":"response.content_part.added","item_id":"msg_chat",
+                "output_index":0,"content_index":0,
+                "part":{"type":"output_text","text":"","annotations":[]}
+            }),
+            json!({
+                "type":"response.output_text.delta","item_id":"msg_chat",
+                "output_index":0,"content_index":0,"delta":"POOLER_OK"
+            }),
+            json!({
+                "type":"response.output_item.done","output_index":0,
+                "item":{"id":"msg_chat","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"POOLER_OK","annotations":[]}]}
+            }),
+            json!({
+                "type":"response.completed",
+                "response":{"id":"resp_chat","model":"openai-model","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}
+            }),
+        ];
+        let source = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let body = Full::new(Bytes::from(source))
+            .map_err(|never| match never {})
+            .boxed();
+        let response = OpenAiSemanticAdapter
+            .decode_response_with_hint(
+                &route,
+                body,
+                &HeaderMap::new(),
+                &SemanticResponseHint {
+                    mode: SemanticResponseMode::Json,
+                    upstream_mode: SemanticResponseMode::ServerSentEvents,
+                    upstream_wire: Some(SemanticWire::OpenAiResponses),
+                    requested_model: Some("openai-model".to_owned()),
+                },
+                CancellationToken::new(),
+            )
+            .expect("Responses stream converts to unary Chat");
+        let body: Value = serde_json::from_slice(
+            &response
+                .body
+                .collect()
+                .await
+                .expect("unary Chat body")
+                .to_bytes(),
+        )
+        .expect("unary Chat JSON");
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["choices"][0]["message"]["content"], "POOLER_OK");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["total_tokens"], 5);
+    }
+
+    #[tokio::test]
+    async fn unary_responses_round_trips_through_chat() {
+        let route = route(
             OPENAI_RESPONSES_REQUEST_DECODER,
             OPENAI_CHAT_EVENT_DECODER,
             OPENAI_RESPONSES_EVENT_ENCODER,
         );
         let request = json!({"model":"openai-model","input":"hello","stream":false});
         let body = serde_json::to_vec(&request).expect("request JSON");
-        let error = OpenAiSemanticAdapter
-            .encode_request(&reject, &HeaderMap::new(), &body)
-            .expect_err("unary cross-protocol route must fail before upstream");
-        assert!(error.to_string().contains("not supported"));
+        let encoded = OpenAiSemanticAdapter
+            .encode_request(&route, &HeaderMap::new(), &body)
+            .expect("Responses request converts to Chat");
+        let encoded: Value = serde_json::from_slice(&encoded.body).expect("Chat request JSON");
+        assert_eq!(encoded["messages"][0]["content"], "hello");
+        assert_eq!(encoded["stream"], false);
+
+        let upstream = json!({
+            "id":"chat_unary","object":"chat.completion","created":123,
+            "model":"openai-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"POOLER_RESPONSES_OK"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
+        });
+        let response = OpenAiSemanticAdapter
+            .decode_response_with_hint(
+                &route,
+                Full::new(Bytes::from(
+                    serde_json::to_vec(&upstream).expect("Chat response JSON"),
+                ))
+                .map_err(|never| match never {})
+                .boxed(),
+                &HeaderMap::new(),
+                &SemanticResponseHint {
+                    mode: SemanticResponseMode::Json,
+                    upstream_mode: SemanticResponseMode::Json,
+                    upstream_wire: Some(SemanticWire::OpenAiChat),
+                    requested_model: Some("openai-model".to_owned()),
+                },
+                CancellationToken::new(),
+            )
+            .expect("Chat response converts to Responses");
+        let response: Value = serde_json::from_slice(
+            &response
+                .body
+                .collect()
+                .await
+                .expect("Responses body")
+                .to_bytes(),
+        )
+        .expect("Responses JSON");
+        assert_eq!(response["object"], "response");
+        assert_eq!(
+            response["output"][0]["content"][0]["text"],
+            "POOLER_RESPONSES_OK"
+        );
+        assert_eq!(response["usage"]["total_tokens"], 5);
+    }
+
+    #[tokio::test]
+    async fn unary_chat_round_trips_through_anthropic_messages() {
+        let route = route(
+            OPENAI_CHAT_REQUEST_DECODER,
+            OPENAI_CHAT_EVENT_DECODER,
+            OPENAI_CHAT_EVENT_ENCODER,
+        );
+        let request = json!({
+            "model":"claude-test",
+            "messages":[{"role":"user","content":"hello"}],
+            "max_completion_tokens":64,
+            "stream":false
+        });
+        let encoded = OpenAiSemanticAdapter
+            .reencode_request_for_wire(
+                &route,
+                &serde_json::to_vec(&request).expect("Chat request JSON"),
+                SemanticWire::AnthropicMessages,
+            )
+            .expect("Chat request converts to Messages");
+        let encoded: Value = serde_json::from_slice(&encoded).expect("Messages request JSON");
+        assert_eq!(encoded["model"], "claude-test");
+        assert_eq!(encoded["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(encoded["stream"], false);
+
+        let upstream = json!({
+            "id":"msg_anthropic","type":"message","role":"assistant","model":"claude-test",
+            "content":[{"type":"text","text":"POOLER_ANTHROPIC_BRIDGE_OK"}],
+            "stop_reason":"end_turn","stop_sequence":null,
+            "usage":{"input_tokens":3,"output_tokens":2}
+        });
+        let response = OpenAiSemanticAdapter
+            .decode_response_with_hint(
+                &route,
+                Full::new(Bytes::from(
+                    serde_json::to_vec(&upstream).expect("Messages response JSON"),
+                ))
+                .map_err(|never| match never {})
+                .boxed(),
+                &HeaderMap::new(),
+                &SemanticResponseHint {
+                    mode: SemanticResponseMode::Json,
+                    upstream_mode: SemanticResponseMode::Json,
+                    upstream_wire: Some(SemanticWire::AnthropicMessages),
+                    requested_model: Some("claude-test".to_owned()),
+                },
+                CancellationToken::new(),
+            )
+            .expect("Messages response converts to Chat");
+        let response: Value =
+            serde_json::from_slice(&response.body.collect().await.expect("Chat body").to_bytes())
+                .expect("Chat JSON");
+        assert_eq!(response["object"], "chat.completion");
+        assert_eq!(
+            response["choices"][0]["message"]["content"],
+            "POOLER_ANTHROPIC_BRIDGE_OK"
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], "stop");
+        assert_eq!(response["usage"]["prompt_tokens"], 3);
     }
 
     #[tokio::test]
@@ -1711,6 +2318,7 @@ mod tests {
                     mode: SemanticResponseMode::Json,
                     upstream_mode: SemanticResponseMode::ServerSentEvents,
                     requested_model: Some("openai-model".to_owned()),
+                    ..SemanticResponseHint::default()
                 },
                 CancellationToken::new(),
             )
@@ -1740,6 +2348,7 @@ mod tests {
                     mode: SemanticResponseMode::Json,
                     upstream_mode: SemanticResponseMode::ServerSentEvents,
                     requested_model: Some("openai-model".to_owned()),
+                    ..SemanticResponseHint::default()
                 },
                 CancellationToken::new(),
             )
@@ -1765,6 +2374,7 @@ mod tests {
                     mode: SemanticResponseMode::Json,
                     upstream_mode: SemanticResponseMode::ServerSentEvents,
                     requested_model: Some("openai-model".to_owned()),
+                    ..SemanticResponseHint::default()
                 },
                 cancellation,
             )
@@ -1910,6 +2520,7 @@ mod tests {
                     mode: SemanticResponseMode::Json,
                     upstream_mode: SemanticResponseMode::ServerSentEvents,
                     requested_model: Some("openai-model".to_owned()),
+                    ..SemanticResponseHint::default()
                 },
                 CancellationToken::new(),
             )

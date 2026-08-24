@@ -134,17 +134,39 @@ def payload(path: str) -> dict:
                 {"id": "openai-subscription", "name": "OpenAI subscription (ChatGPT)", "base_url": "Managed by Pooler", "known_provider": "openai", "auth_methods": ["oauth"], "native_kind": "codex", "native_config": True, "model_discovery": True},
                 {"id": "openai", "name": "OpenAI", "base_url": "https://api.openai.com/v1", "auth_kind": "bearer_secret", "model_discovery": True, "native_kind": "openai_compatible"},
                 {"id": "anthropic", "name": "Anthropic", "base_url": "https://api.anthropic.com/v1", "auth_kind": "header", "model_discovery": True, "native_kind": "anthropic"},
+                {"id": "palantir-aip", "name": "Palantir AIP", "base_url": "Your Foundry enrollment", "auth_methods": ["oauth"], "native_kind": "palantir_aip", "native_config": True, "dynamic_origin": True, "model_discovery": False},
             ],
             "providers": [
                 {
                     "id": "openai-upstream",
                     "instance_id": "openai-upstream",
+                    "known_provider": "openai",
                     "origin": "https://api.example.com",
                     "base_url": "https://api.example.com/v1",
                     "accounts": 1,
                     "pools": 0,
                     "auth": {"required": True, "kind": "bearer", "header": "authorization"},
-                }
+                },
+                {
+                    "id": "anthropic",
+                    "instance_id": "anthropic",
+                    "known_provider": "anthropic",
+                    "origin": "https://api.anthropic.com",
+                    "base_url": "https://api.anthropic.com/v1",
+                    "accounts": 0,
+                    "pools": 0,
+                    "auth": {"required": True, "kind": "header", "header": "x-api-key"},
+                },
+                {
+                    "id": "anthropic-work",
+                    "instance_id": "anthropic-work",
+                    "known_provider": "anthropic",
+                    "origin": "https://api.anthropic.com",
+                    "base_url": "https://api.anthropic.com/v1",
+                    "accounts": 0,
+                    "pools": 0,
+                    "auth": {"required": True, "kind": "header", "header": "x-api-key"},
+                },
             ],
             "accounts": [
                 {
@@ -191,7 +213,14 @@ def payload(path: str) -> dict:
                             {"binding": {"binding_id": "gpt-test/openai-primary", "target_id": "openai-primary"}, "provider": "openai-upstream", "account": "primary", "priority": 1, "upstream_model": "gpt-test", "capabilities": ["text", "streaming"], "profile": {"endpoint_variants": {"responses": True}, "request_transform": "openai_chat"}},
                             {"binding": {"binding_id": "gpt-test/openai-fallback", "target_id": "openai-fallback"}, "provider": "openai-upstream", "account": "backup", "priority": 2, "upstream_model": "gpt-test-fallback", "capabilities": ["text"], "profile": {"endpoint_variants": {"responses": True}, "request_transform": "openai_chat"}},
                         ],
-                    }
+                    },
+                    {
+                        "id": "claude-test",
+                        "enabled": True,
+                        "targets": [
+                            {"binding": {"binding_id": "claude-test/anthropic", "target_id": "anthropic-primary"}, "provider": "anthropic", "account": "primary", "priority": 1, "upstream_model": "claude-test", "capabilities": ["text"], "profile": {"request_transform": "anthropic_messages"}},
+                        ],
+                    },
                 ],
             },
             "quota": [],
@@ -1713,6 +1742,11 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
         page.wait_for_selector(".view-providers")
         expect(page.get_by_role("button", name="Add built-in provider", exact=True).count() == 1, "built-in provider action is missing")
         expect(page.get_by_role("button", name="Add custom provider", exact=True).count() == 1, "custom provider action is missing")
+        expect(
+            page.locator('[data-provider="anthropic"] .panel-title').inner_text().strip() == "Anthropic 1"
+            and page.locator('[data-provider="anthropic-work"] .panel-title').inner_text().strip() == "Anthropic 2",
+            "provider cards are duplicated or indistinguishable without their internal IDs",
+        )
         page.locator('[data-provider-action="show-form"]').click()
         expect(page.locator('[data-provider-field="template"] option[value="openai"]').count() == 1, "built-in OpenAI provider is missing")
         expect(page.locator('[data-provider-field="template"] option[value="openai-subscription"]').count() == 1, "built-in OpenAI subscription login is missing")
@@ -1721,6 +1755,13 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
             provider_labels == sorted(provider_labels, key=str.casefold),
             "built-in provider choices are not alphabetized by display name",
         )
+        page.locator('[data-provider-field="template"]').select_option("palantir-aip")
+        expect(
+            "add this exact redirect uri" in page.locator(".view-providers").inner_text().lower()
+            and "/management/oauth/browser/callback" in page.locator(".view-providers").inner_text(),
+            "Palantir setup does not show the installation-specific OAuth redirect URI",
+        )
+        page.locator('[data-provider-field="template"]').select_option("openai")
         expect("https://api.openai.com/v1" in page.locator(".view-providers").inner_text(), "built-in provider did not show its automatic API address")
         expect(page.locator('[data-provider-field="origin"]').count() == 0, "built-in provider incorrectly asks for an API URL")
         expect(page.locator('[data-provider-field="id"]').count() == 0, "provider onboarding exposes an internal instance ID")
@@ -1764,19 +1805,30 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
         expect(page.locator('[data-model-selection-id]:checked').count() == 0, "Select none left models exposed")
         page.locator('[data-model-selection="all"]').click()
         expect(page.locator('[data-model-selection-id]:checked').count() > 0, "Select all did not expose models")
-        expect(page.locator(".target-row").count() == 2, "semantic model target rows were not rendered")
+        multi_provider_model = page.locator('[data-target-model-panel="gpt-test"]')
+        single_provider_model = page.locator('[data-target-model-panel="claude-test"]')
+        expect(page.locator(".target-row").count() == 3, "semantic model target rows were not rendered")
         expect(
             all(value and value != "undefined" for value in page.locator("[data-target-row]").evaluate_all("rows => rows.map(row => row.dataset.targetId)")),
             "discovered target rows do not expose stable binding IDs",
         )
+        expect(
+            "priority only compares providers that serve the same model" in page.locator(".view-models").inner_text().lower(),
+            "model page does not explain the provider-only priority boundary",
+        )
+        expect(
+            single_provider_model.locator('[data-target-priority], [data-target-move], [draggable="true"]').count() == 0
+            and "nothing to rank" in single_provider_model.inner_text().lower(),
+            "single-provider model exposes meaningless priority controls",
+        )
         expect(page.locator("[data-target-priority]").count() == 2, "dense numeric priority controls are missing")
         expect(page.locator("[data-target-move]").count() >= 8, "keyboard and move controls are incomplete")
-        page.locator('[data-target-move="down"]').first.click()
+        multi_provider_model.locator('[data-target-move="down"]').first.click()
         expect("moved to priority" in page.locator("#target-announcement").inner_text(), "target move did not announce the new priority")
-        page.locator("[data-target-row]").first.drag_to(page.locator("[data-target-row]").last)
+        multi_provider_model.locator("[data-target-row]").first.drag_to(multi_provider_model.locator("[data-target-row]").last)
         expect("moved to priority" in page.locator("#target-announcement").inner_text(), "pointer target drag did not reorder or announce")
-        page.locator("[data-target-row]").first.focus()
-        page.locator("[data-target-row]").first.press("Alt+End")
+        multi_provider_model.locator("[data-target-row]").first.focus()
+        multi_provider_model.locator("[data-target-row]").first.press("Alt+End")
         expect(page.locator("#target-announcement").inner_text() != "", "Alt+End target move had no live announcement")
         priority = page.locator("[data-target-priority]").first
         priority.fill("7")

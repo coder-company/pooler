@@ -1554,6 +1554,15 @@ code,
 .target-model-panel {
   overflow: hidden;
 }
+.provider-heading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.provider-heading svg {
+  flex: none;
+}
 .target-order {
   display: grid;
   gap: 6px;
@@ -1564,7 +1573,7 @@ code,
 }
 .target-row {
   display: grid;
-  grid-template-columns: auto auto minmax(160px, 1.1fr) minmax(100px, auto) minmax(100px, 0.9fr) minmax(120px, 1fr) minmax(150px, 1.2fr) 74px minmax(260px, auto);
+  grid-template-columns: auto auto minmax(160px, 1fr) auto auto auto minmax(220px, auto) minmax(180px, auto);
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -1573,6 +1582,9 @@ code,
   border-radius: var(--radius-md);
   background: var(--surface);
   transition: border-color 150ms ease, background-color 150ms ease;
+}
+.target-row-single {
+  grid-template-columns: minmax(160px, 1fr) auto auto auto minmax(180px, auto);
 }
 .target-row:hover,
 .target-row:focus-visible {
@@ -1728,7 +1740,10 @@ code,
 
 @media (max-width: 1080px) {
   .target-row {
-    grid-template-columns: auto auto minmax(150px, 1fr) minmax(110px, 1fr) minmax(110px, 1fr) minmax(140px, 1fr) 74px minmax(210px, auto);
+    grid-template-columns: auto auto minmax(150px, 1fr) auto auto auto minmax(180px, auto);
+  }
+  .target-row-single {
+    grid-template-columns: minmax(150px, 1fr) auto auto auto;
   }
   .target-evidence {
     grid-column: 3 / -1;
@@ -1798,7 +1813,7 @@ code,
     grid-template-columns: auto auto minmax(0, 1fr) 74px;
     gap: 7px;
   }
-  .target-row .provider-cell,
+  .target-row .provider-heading,
   .target-upstream,
   .target-capabilities,
   .target-evidence,
@@ -1835,7 +1850,7 @@ code,
   .target-row {
     grid-template-columns: auto auto minmax(0, 1fr) 74px;
   }
-  .target-row .provider-cell,
+  .target-row .provider-heading,
   .target-upstream,
   .target-capabilities,
   .target-evidence,

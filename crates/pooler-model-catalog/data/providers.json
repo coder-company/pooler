@@ -1356,6 +1356,7 @@
         "quota_classifier": "openai",
         "endpoint_families": [
           "chat_completions",
+          "messages",
           "models"
         ],
         "required_headers": {},

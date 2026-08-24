@@ -786,8 +786,15 @@ pub fn merged_model_catalog_value(
         .collect::<BTreeMap<_, _>>();
 
     if let Some(snapshot) = snapshot.as_deref() {
+        let disabled = snapshot
+            .overrides()
+            .disabled_models()
+            .iter()
+            .map(|model| model.as_str())
+            .collect::<BTreeSet<_>>();
         for model in snapshot.models().values() {
-            let discovered = discovered_model_value(model);
+            let mut discovered = discovered_model_value(model);
+            discovered["enabled"] = json!(!disabled.contains(model.id().as_str()));
             if let Some(configured) = models.get_mut(model.id().as_str()) {
                 configured
                     .as_object_mut()

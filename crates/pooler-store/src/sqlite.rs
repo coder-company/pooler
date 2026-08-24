@@ -3098,23 +3098,52 @@ fn validate_payload(payload: &[u8]) -> StoreResult<()> {
             "control payload exceeds bounds".to_owned(),
         ));
     }
-    if let Ok(text) = std::str::from_utf8(payload) {
-        let lower = text.to_ascii_lowercase();
-        for forbidden in [
-            "access_token",
-            "refresh_token",
-            "client_secret",
-            "bearer ",
-            "password",
-            "cookie_secret",
-            "pkce_verifier",
-        ] {
-            if lower.contains(forbidden) {
-                return Err(StoreError::Serialization(
-                    "control draft must not contain secret-bearing fields".to_owned(),
-                ));
+    let value: serde_json::Value = serde_json::from_slice(payload).map_err(|_| {
+        StoreError::Serialization("control draft payload must be valid JSON".to_owned())
+    })?;
+    validate_draft_value(&value, None)
+}
+
+fn validate_draft_value(value: &serde_json::Value, key: Option<&str>) -> StoreResult<()> {
+    let rejected = || {
+        StoreError::Serialization("control draft must not contain secret-bearing fields".to_owned())
+    };
+    if let Some(key) = key {
+        let key = key.to_ascii_lowercase();
+        if matches!(
+            key.as_str(),
+            "access_token" | "refresh_token" | "password" | "cookie_secret" | "pkce_verifier"
+        ) {
+            return Err(rejected());
+        }
+        if matches!(key.as_str(), "secret" | "client_secret") {
+            let reference = value.as_str().is_some_and(|value| {
+                value.len() <= 2_048
+                    && !value.chars().any(char::is_control)
+                    && ["managed:", "file:", "env:", "keyring:"]
+                        .into_iter()
+                        .any(|prefix| value.strip_prefix(prefix).is_some_and(|id| !id.is_empty()))
+            });
+            if !reference {
+                return Err(rejected());
             }
         }
+    }
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                validate_draft_value(value, Some(key))?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                validate_draft_value(value, None)?;
+            }
+        }
+        serde_json::Value::String(value) if value.to_ascii_lowercase().contains("bearer ") => {
+            return Err(rejected());
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -6600,5 +6629,21 @@ mod tests {
             reopened.draft(draft.draft_id, "other-session", 5),
             Err(StoreError::OwnerMismatch)
         ));
+    }
+
+    #[test]
+    fn control_drafts_allow_only_managed_secret_references() {
+        validate_payload(
+            br#"{"management":{"auth":{"secret":"file:/etc/pooler/management.key"}},"upstreams":{"foundry":{"oauth":{"client_secret":"managed:oauth-client"}}},"accounts":{"primary":{"secret":"managed:api-key"}}}"#,
+        )
+        .expect("managed references are non-secret draft metadata");
+
+        for payload in [
+            br#"{"oauth":{"client_secret":"literal-secret"}}"#.as_slice(),
+            br#"{"oauth":{"access_token":"literal-token"}}"#.as_slice(),
+            br#"{"header":"Bearer literal-token"}"#.as_slice(),
+        ] {
+            assert!(validate_payload(payload).is_err());
+        }
     }
 }

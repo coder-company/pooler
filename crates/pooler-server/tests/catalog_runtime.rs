@@ -562,11 +562,11 @@ catalog:
     runtime.refresh().await.expect("refresh");
     let snapshot = runtime.snapshot();
 
-    // A withheld model is absent from the published catalog, so no request can
-    // resolve a target for it.
+    // A withheld model stays in management inventory so it can be enabled
+    // again; selection still rejects it through the disabled override state.
     assert!(
-        snapshot.get("gpt-4o").is_none(),
-        "a disabled model must not be published"
+        snapshot.get("gpt-4o").is_some(),
+        "a disabled model must remain available to management"
     );
     assert!(
         snapshot.get("gpt-4o-mini").is_some(),
@@ -612,9 +612,16 @@ catalog:
         .map(|model| model["id"].as_str().expect("model id"))
         .collect::<Vec<_>>();
     assert!(
-        !ids.contains(&"gpt-4o"),
-        "the model view must not advertise a withheld model"
+        ids.contains(&"gpt-4o"),
+        "management must show a withheld model"
     );
+    let disabled = view["models"]
+        .as_array()
+        .expect("model array")
+        .iter()
+        .find(|model| model["id"] == "gpt-4o")
+        .expect("disabled model");
+    assert_eq!(disabled["enabled"], false);
     assert_eq!(view["model_overrides"]["disabled_models"][0], "gpt-4o");
     assert_eq!(
         view["model_overrides"]["unmatched_models"][0],

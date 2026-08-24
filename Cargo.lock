@@ -132,6 +132,7 @@ dependencies = [
 name = "adapter-openai"
 version = "0.1.0"
 dependencies = [
+ "adapter-anthropic",
  "bytes",
  "http",
  "http-body",

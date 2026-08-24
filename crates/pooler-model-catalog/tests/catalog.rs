@@ -208,8 +208,8 @@ fn an_operator_override_outranks_every_discovered_fact() {
     )
     .expect("merge succeeds");
 
-    // A disabled model leaves the catalog entirely, so nothing can route to it.
-    assert!(snapshot.get("hide-me").is_none());
+    // A disabled model remains visible to management so it can be enabled again.
+    assert!(snapshot.get("hide-me").is_some());
     assert_eq!(
         snapshot.overrides().disabled_models(),
         &[ModelId::new("hide-me").expect("model id")]

@@ -325,8 +325,9 @@ impl ModelOverrides {
 
     /// Apply every override to the merged models, reporting what each did.
     ///
-    /// Returns the surviving models and the state needed to explain the result:
-    /// which models an operator withheld, and which overrides matched nothing.
+    /// Returns every discovered model and the state needed to explain which
+    /// models are disabled for routing and which overrides matched nothing.
+    /// Disabled models remain inspectable so an operator can enable them again.
     pub(crate) fn apply_all(
         &self,
         models: BTreeMap<ModelId, CatalogModel>,
@@ -344,8 +345,7 @@ impl ModelOverrides {
             };
             matched.insert(public_id.clone());
             if overridden.disabled {
-                disabled_models.push(public_id);
-                continue;
+                disabled_models.push(public_id.clone());
             }
             retained.insert(public_id.clone(), overridden.apply(model));
         }

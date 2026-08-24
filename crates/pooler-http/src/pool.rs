@@ -542,11 +542,14 @@ impl PoolSelection {
         downstream: &Uri,
     ) -> Result<Uri, PoolError> {
         let requested_path = route.target().path().unwrap_or_else(|| downstream.path());
-        let endpoint_family = self
-            .binding_target
-            .as_ref()
-            .and_then(|target| target.endpoint_family.as_deref())
-            .or_else(|| route.target().endpoint_family());
+        let endpoint_family = if upstream
+            .native()
+            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+        {
+            Some("responses")
+        } else {
+            self.endpoint_family_for(route)
+        };
         let path = provider_endpoint_path(upstream, requested_path, endpoint_family)?;
         let mut url = upstream.url().clone();
         url.set_path(&path);
@@ -555,6 +558,20 @@ impl PoolSelection {
         url.as_str()
             .parse()
             .map_err(|_| PoolError::InvalidUpstreamUri)
+    }
+
+    /// Endpoint family supported by the selected model target. Prefer the
+    /// caller's route family when that target supports it; otherwise use the
+    /// target's native family and let the semantic bridge translate.
+    pub(crate) fn endpoint_family_for<'a>(&'a self, route: &'a RoutePlan) -> Option<&'a str> {
+        let requested = route.target().endpoint_family();
+        let Some(target) = self.binding_target.as_ref() else {
+            return requested;
+        };
+        if requested.is_some_and(|family| endpoint_family_supported(target.profile, family)) {
+            return requested;
+        }
+        target.endpoint_family.as_deref().or(requested)
     }
 
     /// Model to place in an upstream semantic/JSON request, when model
@@ -699,6 +716,18 @@ impl PoolSelection {
     }
 }
 
+fn endpoint_family_supported(profile: ModelProfile, family: &str) -> bool {
+    let variants = profile.endpoint_variants;
+    match family {
+        "responses" => variants.responses,
+        "chat_completions" => variants.chat_completions,
+        "messages" => variants.messages,
+        "generate_content" => variants.generate_content,
+        "realtime" => variants.realtime,
+        _ => false,
+    }
+}
+
 const PALANTIR_OPENAI_PROXY_PREFIX: &str = "/api/v2/llm/proxy/openai";
 const PALANTIR_ANTHROPIC_PROXY_PREFIX: &str = "/api/v2/llm/proxy/anthropic";
 
@@ -707,7 +736,11 @@ fn provider_endpoint_path(
     requested_path: &str,
     endpoint_family: Option<&str>,
 ) -> Result<String, PoolError> {
-    let canonical = canonical_provider_path(requested_path);
+    let requested_canonical = canonical_provider_path(requested_path);
+    let canonical = endpoint_family
+        .and_then(normalize_endpoint_family)
+        .map(endpoint_family_path)
+        .unwrap_or(requested_canonical);
     if upstream
         .native()
         .is_some_and(|native| native.kind().eq_ignore_ascii_case("palantir_aip"))
@@ -776,6 +809,15 @@ fn normalize_endpoint_family(value: &str) -> Option<&'static str> {
         "responses" | "openai_responses" => Some("responses"),
         "messages" | "anthropic_messages" => Some("messages"),
         _ => None,
+    }
+}
+
+fn endpoint_family_path(family: &str) -> &'static str {
+    match family {
+        "chat_completions" => "/v1/chat/completions",
+        "responses" => "/v1/responses",
+        "messages" => "/v1/messages",
+        _ => unreachable!("endpoint family is normalized before path selection"),
     }
 }
 
@@ -1322,7 +1364,17 @@ impl PoolingCoordinator {
             .disabled_models
             .read()
             .map_err(|_| PoolError::Selection)?;
-        Ok(!disabled.contains(model))
+        if disabled.contains(model) {
+            return Ok(false);
+        }
+        Ok(!self.catalog.as_ref().is_some_and(|catalog| {
+            catalog
+                .snapshot()
+                .overrides()
+                .disabled_models()
+                .iter()
+                .any(|disabled| disabled.as_str() == model)
+        }))
     }
 
     /// Return operator-disabled public model IDs in deterministic order.
