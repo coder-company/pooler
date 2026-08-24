@@ -1,32 +1,48 @@
 # Adapters and presets
 
-Pooler includes built-in presets that configure listeners, routing rules, request/response decoders, and semantic transformations for AI coding agents and standard protocols.
+A preset is a built-in configuration fragment that mounts the listeners, routes, decoders, and transforms one client expects. Import a preset instead of hand-authoring a route plan.
 
-## Using presets in configuration
+Pooler ships seven presets: `cursor`, `devin`, `factory`, `fx`, `gateway`, `media`, and `xai`.
 
-Import a preset using the `imports` list in your `pooler.yaml`:
+## Import a preset
 
 ```yaml
 version: 2
 
 imports:
-  - preset: <PRESET_NAME>
-    as: <UNIQUE_NAMESPACE>
+  - preset: cursor
+    as: cursor-adapter
     with:
-      bind: <LISTEN_ADDRESS>
-      upstream_url: <UPSTREAM_ADDRESS>
-      secret: <SECRET_REF>
+      bind: 127.0.0.1:8333
 ```
+
+The `as` value namespaces the generated listener, upstream, and route identifiers, so you can import the same preset twice with different parameters.
+
+Every preset rejects unknown parameters. Use the exact parameter names in the table below, then validate with `pooler check`.
+
+## Preset reference
+
+| Preset | Client | Default bind | Accepted `with:` parameters |
+| :--- | :--- | :--- | :--- |
+| `cursor` | Cursor | `127.0.0.1:8333` | `bind`, `upstream_url`, `secret`, `reasoning_effort`, `model_prefix` |
+| `devin` | Devin | `127.0.0.1:18473` | `bind`, `upstream_url`, `secret` |
+| `factory` | Factory Droid | `127.0.0.1:18474` | `bind`, `upstream_url`, `secret` |
+| `fx` | Vercel Labs fx | `127.0.0.1:18475` | `bind`, `upstream_url`, `secret` |
+| `xai` | xAI Grok | `127.0.0.1:18476` | `bind`, `rest_url`, `websocket_url`, `secret` |
+| `media` | Media surfaces | `127.0.0.1:18476` | `bind`, `upstream_url`, `secret` |
+| `gateway` | OpenAI, Anthropic, and Gemini SDKs | `127.0.0.1:8400` | `bind`, `provider`, `upstream_url`, `websocket_url`, `secret` |
+
+The `xai` preset takes `rest_url`, not `upstream_url`, because it declares separate REST and WebSocket transports. The `media` preset shares port `18476` with `xai`; change one `bind` if you import both.
 
 ---
 
-## Supported presets
+## `cursor`
 
-### 1. Cursor preset (`cursor`)
-
-Configures an ingress proxy tailored for Cursor IDE requests. It applies JSON patching rules to rewrite model prefixes and dynamically adjust reasoning parameters.
+Forwards Cursor's JSON requests and rewrites the request body before it reaches the upstream. `reasoning_effort` sets the value written to `/reasoning_effort`, and `model_prefix` restricts which model names receive it.
 
 ```yaml
+version: 2
+
 imports:
   - preset: cursor
     as: cursor-adapter
@@ -38,15 +54,15 @@ imports:
       reasoning_effort: high
 ```
 
-- **Default bind**: `127.0.0.1:8333`
-- **Protocol**: OpenAI-compatible HTTP POST `/`
-- **Transforms**: Inspects OpenAI model names and sets `reasoning_effort` for matching model prefixes.
+Point Cursor's OpenAI base URL at `http://127.0.0.1:8333`.
 
-### 2. Devin ConnectRPC preset (`devin`)
+## `devin`
 
-Provides a semantic bridge translating Devin protobuf ConnectRPC requests into upstream OpenAI chat completion requests, and translates streaming completions back into ConnectRPC envelopes.
+Translates Devin's ConnectRPC protobuf calls into OpenAI chat completions and encodes the streamed reply back into ConnectRPC envelopes. Its `loss_policy` is `reject`, so a request that cannot be represented faithfully fails instead of degrading silently.
 
 ```yaml
+version: 2
+
 imports:
   - preset: devin
     as: devin-bridge
@@ -56,19 +72,15 @@ imports:
       secret: env:OPENAI_API_KEY
 ```
 
-- **Default bind**: `127.0.0.1:18473`
-- **Key routes**:
-  - `POST /exa.api_server_pb.ApiServerService/GetChatMessage`: ConnectRPC semantic bridge (`decode.devin.chat` → `decode.openai.chat.events` → `encode.devin.connect`).
-  - `POST /exa.api_server_pb.ApiServerService/GetCliModelConfigs`: Model config forwarding.
-  - `POST /exa.seat_management_pb.SeatManagementService/GetUserStatus`: Seat status passthrough.
-  - `POST /exa.auth_pb.AuthService/GetUserJwt`: Auth token handling.
-  - `GET, POST /v3/self`: Identity passthrough.
+The preset mounts the chat bridge on `/exa.api_server_pb.ApiServerService/GetChatMessage` and forwards the model-config, seat-management, auth, analytics, and `/v3/self` surfaces unchanged.
 
-### 3. Factory Droid preset (`factory`)
+## `factory`
 
-Translates Factory Droid language-model requests (`/v3/ai/language-model`, `/v4/ai/language-model`) to OpenAI `/v1/chat/completions` and encodes event streams back to Factory SSE format.
+Translates Factory Droid's `/v3/ai/language-model` and `/v4/ai/language-model` requests into OpenAI chat completions and re-encodes the event stream. Its `loss_policy` is `degrade`. The `/v3/ai/config` and `/v4/ai/config` routes are forwarded unchanged.
 
 ```yaml
+version: 2
+
 imports:
   - preset: factory
     as: factory-adapter
@@ -78,16 +90,15 @@ imports:
       secret: env:OPENAI_API_KEY
 ```
 
-- **Default bind**: `127.0.0.1:18474`
-- **Key routes**:
-  - `POST /v3/ai/language-model` & `POST /v4/ai/language-model`: Decodes Factory JSON format and encodes streaming completions.
-  - `GET /v3/ai/config` & `GET /v4/ai/config`: Passes through model configuration endpoints.
+Point Factory Droid at `http://127.0.0.1:18474`.
 
-### 4. Vercel Labs fx preset (`fx`)
+## `fx`
 
-Integrates with the Vercel Labs fx execution runtime, providing model discovery, streaming inference, and tool-result continuation.
+Serves the native Vercel Labs fx adapter, including model discovery, streaming, and tool-result continuation. Factory Droid is a separate client and does not use this adapter. See [fx](fx.md).
 
 ```yaml
+version: 2
+
 imports:
   - preset: fx
     as: fx-runtime
@@ -97,52 +108,53 @@ imports:
       secret: env:OPENAI_API_KEY
 ```
 
-- **Details**: See [Vercel Labs fx guide](fx.md) for tool-result continuations and streaming options.
+## `xai`
 
-### 5. Multi-provider Gateway preset (`gateway`)
-
-Mounts the standard endpoint families expected by OpenAI, Anthropic, Gemini, and general AI SDKs without requiring hand-authored route plans.
+Routes xAI Grok traffic across separate REST and WebSocket transports.
 
 ```yaml
-imports:
-  - preset: gateway
-    as: gateway
-    with:
-      bind: 127.0.0.1:8400
-      upstream_url: https://api.openai.com
-      websocket_url: wss://api.openai.com
-      secret: env:POOLER_GATEWAY_KEY
-```
+version: 2
 
-- **Default bind**: `127.0.0.1:8400`
-- **Supported endpoints**:
-  - `/v1/chat/completions` (OpenAI format)
-  - `/v1/messages` (Anthropic format)
-  - `/v1beta/models/*` (Gemini format)
-  - `/v1/models` (Catalog listing)
-  - `/v1/embeddings`, `/v1/audio/*`, `/v1/images/*` (Multi-modal routes)
-
-### 6. xAI Grok preset (`xai`)
-
-Configures optimized routing for xAI Grok models with reasoning parameters and native live search integration.
-
-```yaml
 imports:
   - preset: xai
     as: xai-gateway
     with:
       bind: 127.0.0.1:18476
-      upstream_url: https://api.x.ai
+      rest_url: https://api.x.ai
       secret: env:XAI_API_KEY
 ```
 
+## `gateway`
+
+Mounts the endpoint families a general OpenAI, Anthropic, or Gemini client expects. The upstream is declared with `known_provider`, so its base URL, discovery parser, model aliases, and exclusions come from the shipped provider catalog.
+
+```yaml
+version: 2
+
+imports:
+  - preset: gateway
+    as: gateway
+    with:
+      bind: 127.0.0.1:8400
+      secret: env:POOLER_GATEWAY_KEY
+```
+
+Routes use one of two modes. In `patch` mode Pooler preserves the caller's JSON body and rewrites only the `/model` pointer, which is what makes catalog aliases, account pooling, and capability filtering apply. In `opaque` mode bytes and frames are forwarded without semantic decoding, so media, file, and batch surfaces keep provider-specific fields exactly.
+
+Opaque forwarding is not protocol translation. A route only translates between protocols when it declares an explicit decoder and encoder.
+
+Set `websocket_url` whenever `provider` is not `openai`, because a WebSocket route needs an explicit `ws`/`wss` transport that cannot be derived from `known_provider`. See [gateway](gateway.md) for the full route inventory.
+
 ---
 
-## Verifying preset compilation
+## Verify a preset
 
-To inspect the fully expanded routes and transforms created by presets:
+Expand imports and confirm the compiled result before serving:
 
 ```sh
+pooler check --config config/your-config.yaml
 pooler --config config/your-config.yaml config render
 pooler --config config/your-config.yaml routes
 ```
+
+`config render` prints the fully expanded configuration without resolving secrets. `routes` lists the compiled routes in match order.

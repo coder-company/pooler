@@ -50,6 +50,8 @@ jobs:
         run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
       - run: bash scripts/check-release-workflow.sh
       - run: ./scripts/check-config-schema.sh
+      - name: Check documentation links
+        run: python3 scripts/check-docs-links.py
       - name: Verify dashboard asset provenance
         run: python3 scripts/tests/test_dashboard_asset_provenance.py
       - name: Install Playwright browser
@@ -62,6 +64,9 @@ jobs:
       - run: >-
           cargo clippy --workspace --all-targets --all-features --locked --
           -D warnings
+      - run: cargo build -p pooler-cli --bin pooler --locked
+      - name: Compile documented configuration examples
+        run: python3 scripts/check-docs-examples.py --require-binary
       - run: cargo test --workspace --all-features --locked
       - run: cargo test --workspace --all-features --locked --doc
 

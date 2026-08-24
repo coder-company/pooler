@@ -1,102 +1,141 @@
-# Troubleshooting and diagnostics
+# Troubleshooting
 
-This guide covers diagnostic tools, health checks, error codes, and resolution steps for Pooler installations.
-
-## Diagnostic tools
-
-### 1. Run local environment diagnostics with `doctor`
-
-`pooler doctor` runs local read-only checks covering file permissions, store integrity, master key derivation, port availability, and configuration validity:
+Start with the two diagnostic commands. Both are read-only and neither sends a billable request.
 
 ```sh
-pooler doctor --config pooler.yaml
+pooler doctor
+pooler preflight
 ```
 
-Example output:
-```json
-{
-  "status": "ok",
-  "checks": [
-    {
-      "name": "config.valid",
-      "status": "passed",
-      "detail": "configuration parsed and compiled successfully"
-    },
-    {
-      "name": "store.sqlite_master_key",
-      "status": "passed",
-      "detail": "master key derived and encrypted store readable"
-    },
-    {
-      "name": "listeners.ports_available",
-      "status": "passed",
-      "detail": "all configured listener ports are available"
-    }
-  ]
-}
-```
+`doctor` checks the local installation: configuration compilation, listener port availability, file permissions, credential-store integrity, and extensions. It emits one redacted JSON report and exits non-zero if any check fails.
 
-If any check fails, `pooler doctor` returns exit code `1` and details the failing check.
-
-### 2. Verify upstream connectivity with `preflight`
-
-`pooler preflight` tests DNS resolution, native-root TLS certificates, and provider base-endpoint reachability:
-
-```sh
-pooler --config pooler.yaml preflight
-```
-
-Preflight never sends inference requests and reports `inference_requests_sent: 0`.
+`preflight` checks the network: DNS resolution, native-root TLS, base-endpoint reachability, and configured discovery. It reports `inference_requests_sent: 0`. Success does not claim quota availability or model correctness.
 
 ---
 
-## Common issues and solutions
+## Configuration is not found
 
-### Port binding conflict (`Address already in use`)
+```
+failed to read configuration `/home/you/.config/pooler/pooler.yaml`: file does not exist
+```
 
-- **Cause**: Another process or previous Pooler instance is bound to the configured port (for example, `8319`, `18477`, or `8400`).
-- **Fix**: Check running processes on the port:
-  ```sh
-  lsof -i :8319
-  ```
-  Terminate the blocking process or update the `bind` address in `pooler.yaml`.
+Pooler resolves configuration in this order: an explicit `--config PATH`, then `./pooler.yaml`, then `$XDG_CONFIG_HOME/pooler/pooler.yaml`.
 
-### Credential store key mismatch (`cannot decrypt store`)
+`pooler init` does not create the third path. It creates a starter directory in the current directory, so bare commands will not find it. Either pass the path explicitly or move the file:
 
-- **Cause**: The master key supplied via `--credential-key-ref` does not match the key used when initializing `credentials.sqlite3`.
-- **Fix**: Verify that the environment variable or file referenced by `--credential-key-ref` contains the exact 32-byte key generated during initialization:
-  ```sh
-  # If using file reference:
-  pooler --config pooler.yaml --credential-key-ref file:/path/to/store.key doctor
-  ```
+```sh
+mkdir -p ~/.config/pooler
+mv ./pooler-starter/pooler.yaml ~/.config/pooler/pooler.yaml
+```
 
-### Insecure file permissions warning
+## An unknown field is rejected
 
-- **Cause**: Secrets, configuration files, or the credential store have group-readable or world-readable permissions.
-- **Fix**: Restrict permissions to owner-only:
-  ```sh
-  chmod 0700 /path/to/pooler-directory
-  chmod 0600 /path/to/pooler-directory/*.key /path/to/pooler-directory/*.token
-  ```
+```
+policies.my-policy.selection: unknown field `accounts`, expected one of `strategy`, `session_affinity`, `affinity`
+```
 
-### Unsupported route or protocol error (`404 Not Found` or `400 Bad Request`)
+The configuration schema is strict, so a misplaced or misspelled key fails instead of being ignored. The error names the section, the offending key, and the accepted alternatives.
 
-- **Cause**: A client requested an endpoint or method that is not mapped by the active compiled routes.
-- **Fix**: Inspect all compiled routes in match order:
-  ```sh
-  pooler --config pooler.yaml routes
-  ```
-  If the route is missing, check your route definitions or import the corresponding preset (such as `gateway`, `cursor`, `devin`, or `factory`).
+Accounts belong in `accounts` and `account_pools`, not inside `policies.<name>.selection`. To see the authoritative field list for any section:
+
+```sh
+pooler config schema
+```
+
+## An unknown preset parameter is rejected
+
+```
+invalid configuration at pooler.yaml:1:1 ($): unknown preset parameter `upstream_url`
+```
+
+Preset parameters are validated per preset and are not interchangeable. In particular, the `xai` preset takes `rest_url`, not `upstream_url`. See the [preset reference](adapters-and-presets.md#preset-reference) for the exact list each preset accepts.
+
+## A port is already in use
+
+```
+Address already in use
+```
+
+Find the process holding the port and either stop it or change the `bind` in your configuration:
+
+```sh
+lsof -i :8333
+```
+
+Two presets share a default: `xai` and `media` both bind `127.0.0.1:18476`. If you import both, change one `bind`.
+
+Confirm what Pooler intends to bind before starting it:
+
+```sh
+pooler routes
+pooler endpoint-inventory
+```
+
+## The credential store cannot be decrypted
+
+The `--credential-key-ref` you passed does not derive the key that encrypted `credentials.sqlite3`. The reference must resolve to the same secret used when the store was created, for example the `store.key` written by `pooler init`:
+
+```sh
+pooler --credential-key-ref file:/absolute/path/to/store.key doctor
+```
+
+Literal values are rejected. Use `env:`, `file:`, or `keyring:`.
+
+## A login method is not supported
+
+```
+Anthropic does not support OAuth device-code login.
+```
+
+Login support is decided by the provider. Anthropic and xAI accept API keys only; Google supports browser PKCE but not device code; Kimi and Palantir AIP need an operator-owned client registration that Pooler will not invent.
+
+Check what is actually available before retrying:
+
+```sh
+pooler auth providers
+pooler auth providers gemini
+```
+
+## The dashboard will not open
+
+`pooler dashboard` needs a `management` section with a loopback TCP bind. Common causes:
+
+- **Management is disabled.** Add a `management` block with a `bind` and an `auth.secret` reference.
+- **The bind is not loopback.** Remote dashboards require an explicit trusted HTTPS `--url`.
+- **The bind is a Unix socket.** A browser cannot open it; use `pooler tui --token-ref file:/path/to/management.token`.
+
+The bearer token is entered in the browser, never in the URL. `--no-open` prints the URL without launching a browser.
+
+## Permissions are too open
+
+Pooler treats credential material as owner-private. Restore the expected modes:
+
+```sh
+chmod 0700 /path/to/pooler-directory
+chmod 0600 /path/to/pooler-directory/*.key /path/to/pooler-directory/*.token
+```
+
+## A request returns 404 or 400
+
+The client asked for an endpoint or method no compiled route matches. List the routes in match order and compare:
+
+```sh
+pooler routes
+```
+
+If the route is missing, import the preset for that client rather than hand-authoring one. See [adapters and presets](adapters-and-presets.md).
+
+A `400` can also mean a route rejected a request it could not represent faithfully. The `devin` preset uses `loss_policy: reject` deliberately, so an unrepresentable request fails instead of degrading silently.
 
 ---
 
-## Generating a diagnostic export
+## Collecting a diagnostic export
 
-For support and bug reports, export a redacted diagnostic bundle:
+For a bug report, export the redacted diagnostic bundle:
 
 ```sh
-curl -H "Authorization: Bearer $POOLER_MANAGEMENT_TOKEN" \
+curl -H "Authorization: Bearer $(cat /path/to/management.token)" \
   http://127.0.0.1:18477/export > pooler-diagnostic-export.json
 ```
 
-The diagnostic export contains process status, compiler statistics, route metadata, and configuration generations. All secrets, credentials, authorization headers, prompts, and response bodies are strictly omitted.
+The export contains process status, compiled route metadata, and configuration generations. Secrets, credentials, authorization headers, prompts, and response bodies are never included. It is a diagnostic bundle, not a credential backup, and cannot restore tokens.

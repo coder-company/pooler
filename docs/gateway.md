@@ -14,7 +14,7 @@ imports:
       provider: openai
       secret: env:POOLER_GATEWAY_KEY
 
-version: 1
+version: 2
 ```
 
 ```sh

@@ -2,10 +2,10 @@
   "$schema": "https://mintlify.com/schema.json",
   "name": "Pooler",
   "logo": {
-    "dark": "/logo/dark.svg",
-    "light": "/logo/light.svg"
+    "dark": "/assets/mark-white-256.png",
+    "light": "/assets/mark-charcoal-256.png"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "/assets/favicon-warm-black-32.png",
   "colors": {
     "primary": "#10B981",
     "light": "#34D399",
@@ -13,27 +13,22 @@
   },
   "topbarLinks": [
     {
-      "name": "llms.txt",
-      "url": "/llms.txt"
+      "name": "GitHub",
+      "url": "https://github.com/coder-company/pooler"
     }
   ],
   "navigation": [
     {
-      "group": "Getting Started",
+      "group": "Getting started",
       "pages": [
         "docs/index",
         "docs/quickstart",
+        "docs/agent-native",
         "docs/onboarding"
       ]
     },
     {
-      "group": "Agent Native",
-      "pages": [
-        "docs/agent-native"
-      ]
-    },
-    {
-      "group": "Adapters & Presets",
+      "group": "Adapters and presets",
       "pages": [
         "docs/adapters-and-presets",
         "docs/gateway",
@@ -43,14 +38,14 @@
       ]
     },
     {
-      "group": "Configuration & Auth",
+      "group": "Configuration and authentication",
       "pages": [
         "docs/provider-login",
         "docs/configuration-management"
       ]
     },
     {
-      "group": "Management & Operations",
+      "group": "Management and operations",
       "pages": [
         "docs/management",
         "docs/deployment",

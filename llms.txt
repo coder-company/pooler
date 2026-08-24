@@ -1,52 +1,55 @@
 # Pooler
 
-> Pooler is a system-wide local protocol daemon and pooling proxy by Coder Company. It connects AI coding tools (Cursor, Devin, Factory Droid, Claude Code, and AI SDKs) to AI subscriptions (ChatGPT / Codex) and model providers (OpenAI, Anthropic Claude, Google Gemini, xAI Grok). It translates request formats, pools multiple accounts to bypass rate limits, stores credentials in encrypted SQLite, and provides a local web dashboard for monitoring requests.
+> Pooler is a local protocol runtime by Coder Company. It runs as one process on a machine and gives every AI coding tool a single local endpoint, translating between OpenAI, Anthropic, Gemini, xAI, Factory, fx, and ConnectRPC wire protocols. It pools multiple subscriptions and API keys with automatic failover on rate limits, keeps credentials encrypted in local SQLite, and exposes an authenticated local dashboard for request timelines, usage, and cost.
 
 Repository: https://github.com/coder-company/pooler
-Agent Index: https://raw.githubusercontent.com/coder-company/pooler/main/llms.txt
+Agent protocol: https://raw.githubusercontent.com/coder-company/pooler/main/docs/agent-native.md
+Configuration schema: https://raw.githubusercontent.com/coder-company/pooler/main/schema/pooler.schema.json
 
-## Agent Initiation Prompt (Give This to Your Agent)
+## Setting Pooler up
 
-Paste this prompt into your coding agent (Cursor, Devin, Claude Code, Factory Droid) to start system-wide setup on your machine:
+Pooler is set up by an agent that asks the user what they need. Read the agent protocol before acting, then work through its eight steps in order.
 
-```text
-Set up and configure Pooler system-wide on my machine from https://github.com/coder-company/pooler:
-1. First, ask me using your interactive question tool:
-   - Which coding tools/agents I use on this machine (Cursor, Devin, Factory Droid, Claude Code / Codex, or general SDKs).
-   - What credentials/subscriptions I want to connect (ChatGPT / Codex subscription via device OAuth, Google Gemini OAuth, Anthropic Claude API key, OpenAI API key, xAI Grok, or Custom).
-   - Whether I want multi-account pooling with automatic rate-limit failover across my subscriptions.
-   - What specific models or reasoning settings I want enabled (e.g. gpt-4o, claude-3-7-sonnet, gemini-2.5-pro, o3-mini with high reasoning).
-2. Fetch documentation and recipes from https://raw.githubusercontent.com/coder-company/pooler/main/llms.txt or inspect the repository at https://github.com/coder-company/pooler.
-3. Install the Pooler binary if not already present:
-   `curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | bash`
-4. Set up the system-wide configuration at ~/.config/pooler/pooler.yaml.
-5. Guide me through authenticating my subscriptions (such as running `pooler auth login openai --method device-code` for Codex subscriptions or setting environment variables).
-6. Run `pooler check` and `pooler preflight` to verify system-wide setup.
-7. Start the system-wide daemon with `pooler serve` and verify with `pooler dashboard`.
-8. Provide the exact local connection URLs for all my coding tools.
-```
+- [Agent protocol](docs/agent-native.md): the authoritative step-by-step setup procedure, including the questions to ask the user first and the rules that apply to every task.
+- [Quickstart](docs/quickstart.md): the equivalent procedure done by hand.
 
-## Agent Protocol & Task Recipes
+Install, system-wide (default, requires root, installs `/usr/local/bin/pooler`):
+`curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | sudo bash`
 
-- [Agent-Native Setup Guide](docs/agent-native.md): Detailed 6-step autonomous protocol for system-wide setup.
-- [Connect Codex Subscription](docs/agent-native.md#step-4-authenticate-subscriptions--accounts): Authenticate ChatGPT / Codex subscription via device code OAuth.
-- [Import Local Codex Credentials](docs/agent-native.md#step-4-authenticate-subscriptions--accounts): Import local Codex CLI credentials from `~/.codex/credentials.json`.
-- [Configure Multi-Account Pooling](docs/agent-native.md#pool-multiple-subscriptions-for-zero-downtime-rate-limits): Set up multiple subscriptions with automatic failover on rate limits.
-- [Configure Cursor Adapter](docs/agent-native.md#step-3-generate-system-wide-configuration-configpoolerpooleryaml): Ingress model rewriting and reasoning effort injection on port 8333.
-- [Configure Devin Bridge](docs/agent-native.md#step-3-generate-system-wide-configuration-configpoolerpooleryaml): ConnectRPC protobuf bridge to OpenAI on port 18473.
-- [Configure Factory Droid](docs/agent-native.md#step-3-generate-system-wide-configuration-configpoolerpooleryaml): Factory language-model translation on port 18474.
-- [Configure Multi-Provider Gateway](docs/agent-native.md#step-3-generate-system-wide-configuration-configpoolerpooleryaml): Universal gateway on port 8400 for OpenAI, Claude, and Gemini SDKs.
+Install, per user (no root, installs `~/.local/bin/pooler`):
+`curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | bash -s -- --user`
 
-## Core Documentation
+## Facts an agent needs before writing configuration
 
-- [Overview](docs/index.md): Architecture, supported protocols, core capabilities, and security boundaries.
-- [Quickstart](docs/quickstart.md): 3-minute system-wide quickstart.
-- [CLI Reference](docs/cli-reference.md): Complete reference for all CLI subcommands, arguments, flags, and exit codes.
-- [Adapters & Presets](docs/adapters-and-presets.md): Presets for Cursor, Devin, Factory Droid, Vercel fx, xAI, Media, and Gateway.
-- [Gateway Architecture](docs/gateway.md): Comprehensive routing, endpoint families, streaming, fallbacks, and model translation.
-- [Provider Login & Auth](docs/provider-login.md): Device authorization, browser PKCE OAuth, OpenAI Codex profiles, and API key safety.
-- [Management & Dashboard](docs/management.md): Authenticated REST management API, request timeline explorer, usage ledger, price books, and web dashboard.
-- [Configuration Management](docs/configuration-management.md): Schema validation, imports, overrides, atomic writes, ETag validation, and hot reload.
-- [Deployment & Operations](docs/deployment.md): Docker, docker-compose, systemd units, Prometheus metrics, and OTLP export.
-- [Troubleshooting & Doctor](docs/troubleshooting.md): Diagnosis checks, preflight rules, error codes, and audit trail analysis.
-- [Compatibility Matrix](docs/compatibility-report.md): Verified provider fixture compatibility across all endpoints.
+- Configuration resolution order: explicit `--config PATH`, then `./pooler.yaml`, then `$XDG_CONFIG_HOME/pooler/pooler.yaml` (normally `~/.config/pooler/pooler.yaml`). Placing the file at the last path makes every bare command work with no flags.
+- `pooler init` does not write to `~/.config/pooler`. It creates a new starter directory in the current working directory, default `./pooler-starter`, containing `pooler.yaml`, a generated `management.token`, a generated `store.key`, and an empty `provider.key`. Directory mode `0700`, files `0600`. It refuses an existing destination.
+- Secrets are never literals. Use `env:NAME`, `file:/absolute/path`, or `keyring:service/account`. Pooler rejects a literal secret and never accepts an API key as a command-line value.
+- Preset parameter names are validated strictly and differ per preset. The `xai` preset takes `rest_url`, not `upstream_url`.
+- Default binds: cursor `8333`, devin `18473`, factory `18474`, fx `18475`, xai and media `18476`, gateway `8400`. The `pooler init` starter uses management `18477`; the hardened systemd service uses inference `18400` and management `18401`.
+- The browser OAuth loopback callback default is `http://localhost:1455/auth/callback`.
+- Login support is decided by the provider. OpenAI (alias `codex`) supports API key, browser PKCE, and device code. Google (alias `gemini`) supports API key and browser PKCE but not device code. Anthropic (alias `claude`) and xAI (alias `grok`) support API keys only. Kimi and Palantir AIP need operator-owned registration. Verify with `pooler auth providers`; do not invent OAuth support.
+- `pooler preflight` sends no inference request and reports `inference_requests_sent: 0`, so it is always safe to run.
+
+## Task prompts
+
+Prompts a user can paste into a coding agent. Full text in the agent protocol.
+
+- [Pool accounts with failover](docs/agent-native.md#pool-several-accounts-with-failover): add a second account and pool it so requests fail over on a rate limit.
+- [Switch the active account](docs/agent-native.md#switch-which-account-is-active): inspect accounts and switch which one serves traffic.
+- [Investigate slow requests](docs/agent-native.md#investigate-slow-or-failing-requests): read latency, TTFT, retries, and cooldowns from the management API.
+- [Diagnose a broken setup](docs/agent-native.md#diagnose-a-broken-setup): run `doctor` and `preflight` and repair what is safe to repair.
+- [Migrate from CLIProxyAPI](docs/agent-native.md#migrate-from-cliproxyapi): dry-run a legacy configuration, then write a validated one.
+
+## Reference documentation
+
+- [Overview](docs/index.md): what Pooler is, what it guarantees, and how the pieces fit.
+- [CLI reference](docs/cli-reference.md): every command, argument, and flag.
+- [Adapters and presets](docs/adapters-and-presets.md): all seven presets with their exact accepted parameters and ports.
+- [Gateway](docs/gateway.md): route inventory, patch and opaque modes, streaming, and model translation.
+- [Provider login](docs/provider-login.md): device and browser OAuth, endpoint overrides, DNS allowlists, and API-key guidance.
+- [Management](docs/management.md): authenticated management API, request explorer, usage and cost ledger, audit log, and redacted export.
+- [Configuration management](docs/configuration-management.md): schema validation, imports, typed drafts, atomic persistence, and hot reload.
+- [Deployment](docs/deployment.md): container and systemd deployment and the canonical hardened system layout.
+- [Troubleshooting](docs/troubleshooting.md): `doctor` and `preflight` checks, common failures, and diagnostic export.
+- [Compatibility report](docs/compatibility-report.md): verified fixture compatibility per adapter and runtime boundary.
+- [Onboarding](docs/onboarding.md): bootstrap, dashboard, typed account creation, and migration.

@@ -1,189 +1,264 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/mark-white-128.png">
-  <source media="(prefers-color-scheme: light)" srcset="assets/mark-charcoal-128.png">
-  <img alt="Pooler by Coder Company" src="assets/mark-charcoal-128.png" width="88" height="78">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/mark-white-256.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/mark-charcoal-256.png">
+  <img alt="Pooler" src="assets/mark-charcoal-256.png" width="84">
 </picture>
 
-# Pooler
-**by Coder Company**
+<h1>Pooler</h1>
 
-### The system-wide protocol daemon and account pooling proxy for AI coding agents.
+<p><strong>by Coder Company</strong></p>
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-black?style=flat-square)](LICENSE)
-[![Built for Agents](https://img.shields.io/badge/agent--native-llms.txt-10B981?style=flat-square)](llms.txt)
-[![Rust](https://img.shields.io/badge/runtime-Rust-orange?style=flat-square&logo=rust)](Cargo.toml)
-[![Mintlify](https://img.shields.io/badge/docs-Mintlify-059669?style=flat-square)](mint.json)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue?style=flat-square)](docs/deployment.md)
+<p>One local endpoint that connects every AI coding tool you use<br>to every model subscription and API key you own.</p>
 
-[**Quick Install**](#-quick-install) · [**Agent Initiation Prompt**](#-1-agent-native-setup-primary) · [**Subscriptions & APIs**](#-2-connect-subscriptions--provider-apis) · [**Dashboard**](#-management-dashboard) · [**Adapters**](#-adapters--presets) · [**llms.txt**](llms.txt)
+<p>
+  <a href="LICENSE"><img alt="Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-1c1917?style=flat-square"></a>
+  <a href="llms.txt"><img alt="Agent native" src="https://img.shields.io/badge/setup-agent--native-10b981?style=flat-square"></a>
+  <a href="Cargo.toml"><img alt="Rust" src="https://img.shields.io/badge/built%20in-Rust-b7410e?style=flat-square"></a>
+  <a href="docs/deployment.md"><img alt="Linux and macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-0f766e?style=flat-square"></a>
+</p>
 
----
+<p>
+  <a href="#install">Install</a> ·
+  <a href="#set-it-up-with-an-agent">Agent setup</a> ·
+  <a href="#connect-your-accounts">Accounts</a> ·
+  <a href="#presets">Presets</a> ·
+  <a href="#dashboard">Dashboard</a> ·
+  <a href="docs/index.md">Docs</a>
+</p>
 
 </div>
 
-## What is Pooler?
+---
 
-**Pooler** is a **system-wide background proxy daemon** that connects your AI coding tools (**Cursor**, **Devin**, **Factory Droid**, **Claude Code**, and terminal SDKs) across all your projects to your **ChatGPT / Codex subscriptions** and **model provider APIs** (OpenAI, Anthropic Claude, Google Gemini, xAI Grok, custom providers).
+## What it does
 
-- **System-wide local proxy**: Install once on your machine. All your projects, repositories, and tools talk to the same background daemon.
-- **Account pooling & automatic failover**: Connect multiple subscriptions or API keys. When one hits a rate limit or hourly quota, Pooler switches to the next available account instantly.
-- **Brokered OAuth & safe credentials**: Log in with one-click device OAuth or browser PKCE. Credentials stay encrypted in local SQLite (`AES-GCM`) instead of leaking plaintext keys.
-- **Real-time web dashboard**: Run `pooler dashboard` to view live request timelines, time-to-first-token (TTFT), cooldowns, token counts, and cost ledgers on `http://127.0.0.1:18477`.
+Pooler runs as one local process on your machine. Your coding tools point at it instead of at a provider, and Pooler decides which of your accounts serves each request.
+
+**Every tool, one endpoint.** Cursor, Devin, Factory Droid, Claude Code, Vercel fx, and plain OpenAI, Anthropic, or Gemini SDKs each speak a different wire protocol. Pooler translates them, so a tool built for one provider can reach another.
+
+**Rate limits stop being your problem.** Add several subscriptions and API keys to a pool. When one hits a quota or cooldown, Pooler moves the next request to the next eligible account and records why.
+
+**Credentials stay out of your config files.** Sign in with a provider's own OAuth device or browser flow. Tokens are encrypted at rest in local SQLite. Pooler rejects a literal secret in YAML and never accepts an API key as a command-line argument.
+
+**You can see what happened.** `pooler dashboard` opens a local, authenticated view of every request: which account served it, time to first token, retries, quota cooldowns, token counts, and cost.
 
 ```
-+---------------------------------------------------------------------------------------+
-|                 Your Machine's Coding Tools & Agents (All Repositories)               |
-|        Cursor (:8333) | Devin (:18473) | Factory Droid (:18474) | SDKs (:8400)        |
-+-------------------------------------------+-------------------------------------------+
-                                            |
-                                            v
-+---------------------------------------------------------------------------------------+
-|                           Pooler System-Wide Background Daemon                        |
-|  +------------------------------------+  +-----------------------------------------+  |
-|  | Protocol & Presets Translation     |  | Multi-Account Pooling & Quota Cooldowns |  |
-|  | - JSON Patch (Cursor)              |  | - Fill-first / round-robin selection   |  |
-|  | - ConnectRPC Protobuf (Devin)      |  | - Automatic rate-limit retry & failover |  |
-|  | - Factory v3/v4 Language Model     |  | - Encrypted SQLite token persistence   |  |
-|  +------------------------------------+  +-----------------------------------------+  |
-|                                                                                       |
-|  +---------------------------------------------------------------------------------+  |
-|  | Web Management Dashboard (:18477) · Request Timelines · Real-time Usage Ledger  |  |
-|  +---------------------------------------------------------------------------------+  |
-+-------------------------------------------+-------------------------------------------+
-                                            |
-                                            v
-+---------------------------------------------------------------------------------------+
-|                           Your Subscriptions & Provider APIs                          |
-|         ChatGPT / Codex Subscriptions | Claude | Gemini | xAI Grok | Custom           |
-+---------------------------------------------------------------------------------------+
+      Cursor        Devin      Factory Droid    Claude Code / SDKs
+       :8333        :18473        :18474              :8400
+         └─────────────┴──────────────┴──────────────────┘
+                                │
+                    ┌───────────▼────────────┐
+                    │        Pooler          │
+                    │  translate · pool ·    │
+                    │  encrypt · observe     │
+                    └───────────┬────────────┘
+                                │
+         ┌──────────────┬───────┴───────┬──────────────┐
+      ChatGPT /       Claude         Gemini          Grok
+    Codex subs       API keys       API + OAuth     API keys
 ```
 
 ---
 
-## ⚡ Quick Install
+## Install
 
-Install the standalone Pooler binary system-wide:
+System-wide is the default and installs `/usr/local/bin/pooler`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | sudo bash
 ```
 
-*Or install via Cargo:*
+Just for your user, with no root, installing `~/.local/bin/pooler`:
+
 ```sh
-cargo install --git https://github.com/coder-company/pooler.git pooler-cli --bin pooler
+curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | bash -s -- --user
 ```
+
+The installer verifies the release checksum and fails loudly rather than half-installing. To pin a version, pass `--version 0.1.0`. To build from source instead, use `cargo install --git https://github.com/coder-company/pooler.git pooler-cli`.
+
+Running Pooler as a hardened systemd service is a separate, deliberate step. See [deployment](docs/deployment.md).
 
 ---
 
-## 🤖 1. Agent-Native Setup (Primary)
+## Set it up with an agent
 
-Pooler is built agent-native. Copy this prompt into your coding agent (**Cursor**, **Devin**, **Claude Code**, **Codex**, or **Factory Droid**):
-
-### Copy-Paste Agent Initiation Prompt:
+Pooler is configured by an agent asking you questions, not by you reading a reference manual. Paste this into Cursor, Devin, Claude Code, Codex, or Factory Droid:
 
 ```text
-Set up and configure Pooler system-wide on my machine from https://github.com/coder-company/pooler:
-1. First, ask me using your interactive question tool:
-   - Which coding tools/agents I use on this machine (Cursor, Devin, Factory Droid, Claude Code / Codex, or general SDKs).
-   - What credentials/subscriptions I want to connect (ChatGPT / Codex subscription via device OAuth, Google Gemini OAuth, Anthropic Claude API key, OpenAI API key, xAI Grok, or Custom).
-   - Whether I want multi-account pooling with automatic rate-limit failover across my subscriptions.
-   - What specific models or reasoning settings I want enabled (e.g. gpt-4o, claude-3-7-sonnet, gemini-2.5-pro, o3-mini with high reasoning).
-2. Fetch documentation and recipes from https://raw.githubusercontent.com/coder-company/pooler/main/llms.txt or inspect the repository at https://github.com/coder-company/pooler.
-3. Install the Pooler binary if not already present:
-   `curl -fsSL https://raw.githubusercontent.com/coder-company/pooler/main/install.sh | bash`
-4. Set up the system-wide configuration at ~/.config/pooler/pooler.yaml.
-5. Guide me through authenticating my subscriptions (such as running `pooler auth login openai --method device-code` for Codex subscriptions or setting environment variables).
-6. Run `pooler check` and `pooler preflight` to verify system-wide setup.
-7. Start the system-wide daemon with `pooler serve` and verify with `pooler dashboard`.
-8. Provide the exact local connection URLs for all my coding tools.
+Set up Pooler on my machine.
+
+Read https://raw.githubusercontent.com/coder-company/pooler/main/llms.txt first,
+then follow the agent protocol at
+https://raw.githubusercontent.com/coder-company/pooler/main/docs/agent-native.md
+
+Before you change anything, ask me these questions using your interactive
+question tool (one round, multiple choice where possible):
+
+1. Which coding tools should route through Pooler? (Cursor, Devin, Factory
+   Droid, Claude Code / Codex, Vercel fx, xAI Grok, or general OpenAI /
+   Anthropic / Gemini SDKs)
+2. Which accounts should I connect? (ChatGPT / Codex subscription, Google
+   Gemini, OpenAI API key, Anthropic Claude API key, xAI Grok API key, Kimi,
+   Palantir AIP, or something else)
+3. Do I want more than one account pooled with automatic failover when one
+   hits a rate limit?
+4. Which models and reasoning settings do I want?
+5. System-wide install for every user on this machine, or just my user?
+
+Then install Pooler, write the configuration, walk me through signing in,
+verify it with `pooler check` and `pooler preflight`, start it, and tell me
+the exact base URL to paste into each tool I named.
+
+Never write a literal API key or token into a YAML file or a shell command.
+Use env:, file:, or keyring: references only.
 ```
 
-👉 *Detailed autonomous agent protocol and task prompt recipes in [`llms.txt`](llms.txt) and [`docs/agent-native.md`](docs/agent-native.md).*
+The agent reads [`llms.txt`](llms.txt), then the step-by-step protocol in [agent-native setup](docs/agent-native.md), which also carries follow-up prompts for pooling accounts, switching accounts, and diagnosing slow requests.
+
+### Prefer to do it yourself
+
+```sh
+pooler init --output ./pooler-starter      # scaffolds config + generated secrets, mode 0700
+pooler check --config ./pooler-starter/pooler.yaml
+pooler --config ./pooler-starter/pooler.yaml preflight
+pooler --config ./pooler-starter/pooler.yaml dashboard
+```
+
+Move that `pooler.yaml` to `~/.config/pooler/pooler.yaml` and every later command works with no flags at all: `pooler check`, `pooler serve`, `pooler dashboard`. Full walkthrough in the [quickstart](docs/quickstart.md).
 
 ---
 
-## 🔑 2. Connect Subscriptions & Provider APIs
+## Connect your accounts
 
-### Option A: ChatGPT / Codex Subscription (Device OAuth)
+Which login methods exist is decided by the provider, not by Pooler. Check the shipped matrix with `pooler auth providers`.
+
+| Provider | Aliases | API key | Browser PKCE | Device code |
+| :--- | :--- | :---: | :---: | :---: |
+| OpenAI | `codex` | Yes | Yes | Yes |
+| Google | `gemini` | Yes | Yes | No |
+| Anthropic | `claude` | Yes | No | No |
+| xAI | `grok` | Yes | No | No |
+| Kimi | `moonshot` | Yes | No | Needs your own registration |
+| Palantir AIP | `foundry` | No | Needs your own registration | No |
+
+A ChatGPT or Codex subscription signs in headlessly:
+
 ```sh
 pooler auth login openai --method device-code
 ```
-*Open the verification URL, enter the code, and authorize. Tokens are encrypted in local SQLite.*
 
-### Option B: Google Gemini (Browser PKCE OAuth)
+Google Gemini uses a loopback browser redirect on `http://localhost:1455/auth/callback`:
+
 ```sh
 pooler auth login google --method oauth
 ```
 
-### Option C: Provider API Keys (Anthropic Claude, OpenAI, xAI Grok)
-Set your environment variables or store them in owner-private files (`0600`):
+Anthropic and xAI are API-key only. Export the key and reference it; never inline it:
+
 ```sh
-export ANTHROPIC_API_KEY="sk-ant-..."
-export OPENAI_API_KEY="sk-..."
-export XAI_API_KEY="xai-..."
+export ANTHROPIC_API_KEY="..."
 ```
 
-### Option D: 1-Click Login via Web Dashboard
-```sh
-pooler serve &
-pooler dashboard
+```yaml
+upstreams:
+  anthropic:
+    known_provider: anthropic
+    auth:
+      secret: env:ANTHROPIC_API_KEY
 ```
-*Go to **Accounts** → **Connect** in the web UI to authenticate subscriptions or add keys.*
+
+Already signed in with the Codex CLI? Import it instead of signing in again:
+
+```sh
+pooler auth import codex-account --profile codex --from-file ~/.codex/credentials.json
+```
+
+Details, including operator-owned OAuth registration, in [provider login](docs/provider-login.md).
 
 ---
 
-## 📊 Management Dashboard
+## Presets
 
-Just run:
-```sh
-pooler dashboard
-```
+A preset mounts the listeners, routes, and translations one client expects, so you never hand-author a route plan.
 
-Opens the authenticated management web dashboard on `http://127.0.0.1:18477`:
-- **Overview**: Active configuration generation, listener status, route inventory, and health status.
-- **Live Request Explorer**: Per-request timeline correlating admission, route selection, TTFT, retries, and token usage.
-- **Accounts & Failover**: Manage subscriptions, API keys, OAuth refresh tokens, and pool failover priority.
-- **Historical Usage Ledger**: Multidimensional time-range analytics for input/output/reasoning tokens and USD costs.
-- **Operations & Hot Reload**: Reload configuration in memory (`POST /reload`) without dropping active connections.
-
----
-
-## 🔌 Adapters & Presets
-
-| Preset | Target Client | Default Bind | Purpose |
+| Preset | Client | Default bind | `with:` parameters |
 | :--- | :--- | :--- | :--- |
-| [`cursor`](docs/adapters-and-presets.md#1-cursor-preset-cursor) | Cursor IDE | `127.0.0.1:8333` | Rewrites model prefixes and injects reasoning effort. |
-| [`devin`](docs/adapters-and-presets.md#2-devin-connectrpc-preset-devin) | Devin | `127.0.0.1:18473` | Translates ConnectRPC protobuf to OpenAI completions. |
-| [`factory`](docs/adapters-and-presets.md#3-factory-droid-preset-factory) | Factory Droid | `127.0.0.1:18474` | Translates `/v3/ai` and `/v4/ai` endpoints. |
-| [`gateway`](docs/gateway.md) | Multi-provider | `127.0.0.1:8400` | Unified OpenAI, Anthropic, and Gemini endpoint family. |
-| [`fx`](docs/fx.md) | Vercel Labs fx | `127.0.0.1:18475` | Streaming inference and tool-result continuation. |
-| [`xai`](docs/adapters-and-presets.md#6-xai-grok-preset-xai) | xAI Grok | `127.0.0.1:18476` | Native Grok routing with live search integration. |
+| [`cursor`](docs/adapters-and-presets.md#cursor) | Cursor | `127.0.0.1:8333` | `bind`, `upstream_url`, `secret`, `reasoning_effort`, `model_prefix` |
+| [`devin`](docs/adapters-and-presets.md#devin) | Devin | `127.0.0.1:18473` | `bind`, `upstream_url`, `secret` |
+| [`factory`](docs/adapters-and-presets.md#factory) | Factory Droid | `127.0.0.1:18474` | `bind`, `upstream_url`, `secret` |
+| [`fx`](docs/fx.md) | Vercel Labs fx | `127.0.0.1:18475` | `bind`, `upstream_url`, `secret` |
+| [`xai`](docs/adapters-and-presets.md#xai) | xAI Grok | `127.0.0.1:18476` | `bind`, `rest_url`, `websocket_url`, `secret` |
+| [`gateway`](docs/gateway.md) | OpenAI, Anthropic, Gemini SDKs | `127.0.0.1:8400` | `bind`, `provider`, `upstream_url`, `websocket_url`, `secret` |
+
+```yaml
+version: 2
+
+imports:
+  - preset: cursor
+    as: cursor-adapter
+    with:
+      bind: 127.0.0.1:8333
+      reasoning_effort: high
+      model_prefix: gpt-
+```
+
+Parameter names are validated strictly and differ per preset, so `pooler check` rejects a typo instead of quietly ignoring it. The `xai` preset takes `rest_url`, not `upstream_url`.
 
 ---
 
-## 📚 Documentation
+## Dashboard
 
-| Resource | Description |
+```sh
+pooler dashboard
+```
+
+The command derives the URL from your loopback management bind and prints it. You paste the management bearer token into the browser; it never appears in a URL, a log, or an export.
+
+**Requests** correlates one logical request end to end: admission, route and account selection, every upstream attempt, retries and failover, first event and TTFT, semantic degradation, and completion. **Accounts** shows redacted credential state and lets you enable, disable, or switch accounts. **Usage** reports token and cost ledgers over selectable time ranges. **Operations** triggers a configuration or catalog reload without dropping active connections.
+
+Everything the dashboard and management API expose is metadata. Prompts, responses, request bodies, credentials, and authorization headers are never stored or exported. Prefer a terminal? `pooler tui --token-ref file:/path/to/management.token`.
+
+---
+
+## Documentation
+
+| Guide | What it covers |
 | :--- | :--- |
-| [**Agent Native Setup Guide**](docs/agent-native.md) | Complete prompt cookbook and autonomous protocol for AI coding agents. |
-| [**Overview**](docs/index.md) | Architectural deep-dive, security boundaries, and data flow. |
-| [**Quickstart**](docs/quickstart.md) | 3-minute starter guide with subscription and API key login. |
-| [**CLI Reference**](docs/cli-reference.md) | Complete reference for all subcommands, arguments, and flags. |
-| [**Adapters & Presets**](docs/adapters-and-presets.md) | Presets for Cursor, Devin, Factory Droid, and Gateways. |
-| [**Provider Login & Auth**](docs/provider-login.md) | Device OAuth, browser PKCE, and encrypted SQLite storage. |
-| [**Management & Dashboard**](docs/management.md) | REST management API, request timeline explorer, and usage ledger. |
-| [**Troubleshooting & Doctor**](docs/troubleshooting.md) | Diagnostic checks and preflight network verification. |
-| [**Production Deployment**](docs/deployment.md) | Docker, docker-compose, and systemd units. |
-| [**llms.txt**](llms.txt) | Curated agent-native project index. |
+| [Overview](docs/index.md) | How Pooler fits together and what it guarantees |
+| [Quickstart](docs/quickstart.md) | Install to first request, by hand |
+| [Agent-native setup](docs/agent-native.md) | The paste-in prompt and the agent protocol |
+| [Adapters and presets](docs/adapters-and-presets.md) | Every preset, parameter, and port |
+| [Gateway](docs/gateway.md) | Route inventory, streaming, and model translation |
+| [Provider login](docs/provider-login.md) | Device and browser OAuth, API-key guidance |
+| [Management](docs/management.md) | Management API, request explorer, usage ledger |
+| [Configuration](docs/configuration-management.md) | Schema, imports, drafts, and hot reload |
+| [Deployment](docs/deployment.md) | Container, systemd, and the hardened system layout |
+| [Troubleshooting](docs/troubleshooting.md) | `doctor`, `preflight`, and common failures |
+| [CLI reference](docs/cli-reference.md) | Every command and flag |
+| [`llms.txt`](llms.txt) | Machine-readable index for agents |
+
+---
+
+## Development
+
+```sh
+cargo run -p pooler-cli -- check --config config/pooler.example.yaml
+./scripts/verify-compatibility-fixtures.py
+./scripts/check-config-schema.sh
+```
+
+Reproducible release archives, checksums, and SBOMs:
+
+```sh
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) scripts/release.sh --output dist
+```
+
+See [release](docs/release.md) and [release acceptance](docs/release-acceptance.md).
 
 ---
 
 <div align="center">
-
-**Built with precision by Coder Company**
-
-[Report Issue](https://github.com/coder-company/pooler/issues) · [Discussions](https://github.com/coder-company/pooler/discussions) · [Documentation](docs/index.md)
-
+<sub><a href="https://github.com/coder-company/pooler/issues">Issues</a> · <a href="docs/index.md">Documentation</a> · Apache-2.0</sub>
 </div>
