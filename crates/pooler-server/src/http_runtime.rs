@@ -3475,6 +3475,7 @@ mod tests {
             .local_addr()
             .expect("upstream address available");
         let saw_http2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (upstream_shutdown, upstream_shutdown_rx) = oneshot::channel();
         let upstream = tokio::spawn({
             let saw_http2 = Arc::clone(&saw_http2);
             async move {
@@ -3494,10 +3495,21 @@ mod tests {
                         Ok::<_, Infallible>(response)
                     }
                 });
-                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .expect("upstream h2 connection");
+                let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service);
+                tokio::pin!(connection);
+                tokio::select! {
+                    result = &mut connection => {
+                        result.expect("upstream h2 connection");
+                    }
+                    result = upstream_shutdown_rx => {
+                        result.expect("upstream shutdown signal");
+                        connection.as_mut().graceful_shutdown();
+                        connection
+                            .await
+                            .expect("upstream h2 connection shuts down cleanly");
+                    }
+                }
             }
         });
 
@@ -3522,13 +3534,19 @@ mod tests {
         assert_eq!(status(&response), 200);
         assert_eq!(response_body(&response), b"upstream");
         assert!(saw_http2.load(Ordering::Relaxed));
+        upstream_shutdown
+            .send(())
+            .expect("request upstream shutdown");
+        tokio::time::timeout(TEST_TIMEOUT, upstream)
+            .await
+            .expect("upstream h2 connection shuts down before proxy drain")
+            .expect("upstream task");
         server.drain(TEST_TIMEOUT).await.expect("proxy drains");
         runner
             .await
             .expect("proxy task does not panic")
             .expect("proxy task succeeds");
         drop(server);
-        upstream.await.expect("upstream task");
     }
 
     #[tokio::test]
