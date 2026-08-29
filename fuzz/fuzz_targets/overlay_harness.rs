@@ -5,7 +5,7 @@ use pooler_config::ConfigLoader;
 
 const MAX_INPUT_BYTES: usize = 128 * 1024;
 
-const BASE_YAML: &str = r#"version: 1
+const BASE_YAML: &str = r#"version: 2
 listeners:
   local:
     bind: 127.0.0.1:0
@@ -20,7 +20,7 @@ routes:
     target: local
 "#;
 
-const ROOT_YAML: &str = r#"version: 1
+const ROOT_YAML: &str = r#"version: 2
 imports:
   - file: base.yaml
   - overlay: overlay.yaml
@@ -44,9 +44,9 @@ pub fn execute(input: &[u8]) -> Execution {
     let overlay = directory.join("overlay.yaml");
     let input = &input[..input.len().min(MAX_INPUT_BYTES)];
 
-    if std::fs::write(&base, BASE_YAML).is_err()
-        || std::fs::write(&root, ROOT_YAML).is_err()
-        || std::fs::write(&overlay, input).is_err()
+    if write_owner_private_config(&base, BASE_YAML).is_err()
+        || write_owner_private_config(&root, ROOT_YAML).is_err()
+        || write_owner_private_config(&overlay, input).is_err()
     {
         cleanup(&directory);
         return Execution::default();
@@ -68,6 +68,20 @@ pub fn execute(input: &[u8]) -> Execution {
         loaded,
         compiled,
     }
+}
+
+fn write_owner_private_config(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn workdir() -> Option<PathBuf> {

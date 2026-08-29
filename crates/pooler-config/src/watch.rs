@@ -379,6 +379,17 @@ mod tests {
 
     use super::*;
 
+    fn write_owner_private_config(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+        fs::write(path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
     struct TestDir(PathBuf);
 
     impl TestDir {
@@ -395,7 +406,7 @@ mod tests {
 
         fn write(&self, name: &str, text: &str) -> PathBuf {
             let path = self.0.join(name);
-            fs::write(&path, text).expect("test config");
+            write_owner_private_config(&path, text).expect("test config");
             path
         }
     }
@@ -424,7 +435,7 @@ mod tests {
             .dependencies()
             .contains(&fs::canonicalize(&base).unwrap()));
 
-        fs::write(
+        write_owner_private_config(
             &base,
             "version: 2\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
         )
@@ -450,7 +461,7 @@ mod tests {
         let mut watcher =
             ConfigWatcher::with_loader_and_debounce(ConfigLoader::default(), &root, Duration::ZERO)
                 .expect("watcher loads");
-        fs::write(&root, "version: [bad]\n").expect("invalid rewrite");
+        write_owner_private_config(&root, "version: [bad]\n").expect("invalid rewrite");
         assert!(watcher.poll().expect("initial poll").is_none());
         let error = watcher.poll().expect_err("invalid candidate");
         assert!(error.to_string().contains("version"));
@@ -468,7 +479,7 @@ mod tests {
             "version: 2\nlisteners: {local: {bind: 127.0.0.1:1}}\n",
         );
         let mut watcher = ConfigWatcher::new(&root).expect("watcher loads");
-        fs::write(
+        write_owner_private_config(
             &root,
             "version: 2\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
         )
@@ -496,7 +507,7 @@ mod tests {
         let mut watcher =
             ConfigWatcher::with_loader_and_debounce(ConfigLoader::default(), &root, Duration::ZERO)
                 .expect("watcher loads");
-        fs::write(&root, "imports: [{file: later.yaml}]\nversion: 2\n")
+        write_owner_private_config(&root, "imports: [{file: later.yaml}]\nversion: 2\n")
             .expect("add missing import");
         assert!(watcher.poll().expect("root change poll").is_none());
         assert!(watcher
@@ -506,7 +517,7 @@ mod tests {
             .contains("later.yaml"));
         assert!(watcher.poll().expect("same failure is quiet").is_none());
 
-        fs::write(
+        write_owner_private_config(
             &missing,
             "version: 2\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
         )
@@ -535,7 +546,7 @@ mod tests {
             ConfigWatcher::with_loader_and_debounce(ConfigLoader::default(), &root, Duration::ZERO)
                 .expect("watcher loads");
 
-        fs::write(
+        write_owner_private_config(
             &base,
             format!(
                 "version: 2\n#{}\n",
@@ -554,7 +565,7 @@ mod tests {
             .expect("same oversized source is quiet")
             .is_none());
 
-        fs::write(
+        write_owner_private_config(
             &base,
             "version: 2\nlisteners: {local: {bind: 127.0.0.1:3}}\n",
         )

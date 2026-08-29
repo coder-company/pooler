@@ -1,7 +1,19 @@
 use std::fs;
+use std::path::Path;
 
 use pooler_config::ConfigLoader;
 use tempfile::tempdir;
+
+fn write_owner_private_config(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
 
 #[test]
 fn committed_overlay_seeds_replay_named_merge_and_remove() {
@@ -10,22 +22,22 @@ fn committed_overlay_seeds_replay_named_merge_and_remove() {
     let merge = directory.path().join("named-map-merge.yaml");
     let remove = directory.path().join("named-list-remove.yaml");
     let root = directory.path().join("root.yaml");
-    fs::write(
+    write_owner_private_config(
         &base,
         "version: 2\nupstreams:\n  local:\n    url: http://127.0.0.1:9000\nroutes:\n  - id: obsolete\n    listen: local\n    match:\n      path: /obsolete\n    target:\n      provider: local\n",
     )
     .expect("base fixture");
-    fs::write(
+    write_owner_private_config(
         &merge,
         include_str!("../../../fuzz/corpus/overlay/named-map-merge.yaml"),
     )
     .expect("merge seed");
-    fs::write(
+    write_owner_private_config(
         &remove,
         include_str!("../../../fuzz/corpus/overlay/named-list-remove.yaml"),
     )
     .expect("remove seed");
-    fs::write(
+    write_owner_private_config(
         &root,
         "version: 2\nimports:\n  - file: base.yaml\n  - overlay: named-map-merge.yaml\n  - overlay: named-list-remove.yaml\n",
     )
@@ -59,17 +71,17 @@ fn semantic_overlay_seed_replays_merge_render_and_compile() {
     let base = directory.path().join("base.yaml");
     let overlay = directory.path().join("semantic-route-merge.yaml");
     let root = directory.path().join("root.yaml");
-    fs::write(
+    write_owner_private_config(
         &base,
         "version: 2\nlisteners:\n  local:\n    bind: 127.0.0.1:0\nupstreams:\n  local:\n    url: http://127.0.0.1:1\nroutes:\n  - id: obsolete\n    listen: local\n    match:\n      path: /obsolete\n    target: local\n",
     )
     .expect("base fixture");
-    fs::write(
+    write_owner_private_config(
         &overlay,
         include_str!("../../../fuzz/corpus/overlay/semantic-route-merge.yaml"),
     )
     .expect("semantic overlay seed");
-    fs::write(
+    write_owner_private_config(
         &root,
         "version: 2\nimports:\n  - file: base.yaml\n  - overlay: semantic-route-merge.yaml\n",
     )

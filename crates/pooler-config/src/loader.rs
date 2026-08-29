@@ -2201,6 +2201,17 @@ mod tests {
 
     use super::*;
 
+    fn write_owner_private_config(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+        std::fs::write(path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
     struct TestDir(PathBuf);
 
     impl TestDir {
@@ -2217,7 +2228,7 @@ mod tests {
 
         fn write(&self, name: &str, text: &str) -> PathBuf {
             let path = self.0.join(name);
-            std::fs::write(&path, text).expect("test config");
+            write_owner_private_config(&path, text).expect("test config");
             path
         }
     }
@@ -2261,7 +2272,13 @@ mod tests {
         let dir = TestDir::new();
         let first = dir.write("first.yaml", "imports: [{file: second.yaml}]\nversion: 2\n");
         dir.write("second.yaml", "imports: [{file: first.yaml}]\nversion: 2\n");
-        assert!(ConfigLoader::default().load(&first).is_err());
+        let cycle = ConfigLoader::default()
+            .load(&first)
+            .expect_err("import cycle");
+        assert!(
+            cycle.to_string().contains("configuration import cycle"),
+            "{cycle}"
+        );
 
         let base = dir.write(
             "base.yaml",
@@ -2271,7 +2288,13 @@ mod tests {
             "duplicate.yaml",
             "imports: [{file: base.yaml}]\nversion: 2\nlisteners: {local: {bind: 127.0.0.1:2}}\n",
         );
-        assert!(render_path(&duplicate).is_err());
+        let duplicate = render_path(&duplicate).expect_err("duplicate declaration");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate declaration requires merge: true"),
+            "{duplicate}"
+        );
 
         let overlay = dir.write("bad-overlay.yaml", "version: []\n");
         let root = dir.write(
@@ -2282,7 +2305,13 @@ mod tests {
                 overlay.file_name().unwrap().to_string_lossy()
             ),
         );
-        assert!(render_path(root).is_err());
+        let type_change = render_path(root).expect_err("overlay type change");
+        assert!(
+            type_change
+                .to_string()
+                .contains("overlay cannot change a value's type"),
+            "{type_change}"
+        );
     }
 
     #[test]
