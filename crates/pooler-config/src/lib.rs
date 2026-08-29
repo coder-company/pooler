@@ -3527,12 +3527,6 @@ fn compile_config(
                 "response cache cannot be used with selection policy routes",
             ));
         }
-        if cache.is_some() && target.policy().is_some() {
-            return Err(invalid(
-                &label,
-                "response cache cannot be used with policy-based target selection",
-            ));
-        }
         if matcher.websocket() == Some(true) && target.model_source().is_none() {
             let transport_upstream = target
                 .transport_upstream()
@@ -7950,23 +7944,6 @@ routes:
 "#;
         let compiled = compile_yaml("cache-opaque.yaml", opaque).expect("opaque cache");
         assert!(compiled.routes()[0].cache().is_some());
-
-        let policy = r#"
-version: 2
-listeners: {local: {bind: 127.0.0.1:1}}
-upstreams: {local: {url: http://127.0.0.1:2}}
-policies:
-  pooled:
-    selection: {strategy: ordered_fallback}
-routes:
-  - id: route
-    listen: local
-    ingress: {mode: patch}
-    cache: {enabled: true}
-    target: {upstream: local, policy: pooled}
-"#;
-        let error = compile_yaml("cache-policy.yaml", policy).expect_err("policy cache");
-        assert!(error.to_string().contains("selection policy"));
     }
 
     #[test]
@@ -7998,7 +7975,13 @@ routes:
     target: {provider: local, policy: default}
 "#;
         let error = compile_yaml("cache-policy.yaml", policy).expect_err("policy cache");
-        assert!(error.to_string().contains("selection policy"));
+        assert_eq!(
+            error.to_string(),
+            "invalid configuration at cache-policy.yaml (routes[0]): response cache cannot be used with selection policy routes"
+        );
+
+        let policy_only = policy.replace("    cache: {enabled: true}\n", "");
+        compile_yaml("policy-only.yaml", &policy_only).expect("policy-only route compiles");
     }
 
     #[test]
