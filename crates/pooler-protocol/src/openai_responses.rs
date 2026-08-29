@@ -282,6 +282,7 @@ fn parse_message_item(
         field,
         report,
     );
+    report_discarded_item_string(object, "status", field, report)?;
     Ok(InputItem::Message(Message {
         id: optional_string(object, "id", &format!("{field}.id"))?,
         role,
@@ -326,6 +327,12 @@ fn parse_content_part(
     let kind = required_string(object, "type", &format!("{field}.type"))?;
     match kind {
         "input_text" | "output_text" => {
+            if kind == "output_text" {
+                report.drop_optional(
+                    format!("{field}.type"),
+                    "semantic message history re-encodes text as Responses input_text",
+                );
+            }
             if let Some(annotations) = object.get("annotations") {
                 let annotations = annotations
                     .as_array()
@@ -385,11 +392,18 @@ fn parse_content_part(
                 MediaSource::uri(source),
             ))
         }
-        "refusal" => Ok(ContentPart::Provider {
-            namespace: UNKNOWN_FIELDS_NAMESPACE.to_owned(),
-            name: "refusal".to_owned(),
-            data: PreservedJson::from_value(value.clone())?,
-        }),
+        "refusal" => {
+            report_unknown_fields(object, &["type", "refusal"], field, report);
+            report.drop_optional(
+                format!("{field}.type"),
+                "semantic message history re-encodes refusals as Responses input_text",
+            );
+            Ok(ContentPart::text(required_string(
+                object,
+                "refusal",
+                &format!("{field}.refusal"),
+            )?))
+        }
         other => {
             report.preserve_capability(format!("openai.responses.content.{other}"));
             Ok(ContentPart::Provider {
@@ -412,6 +426,8 @@ fn parse_function_call(
         field,
         report,
     );
+    report_discarded_item_string(object, "id", field, report)?;
+    report_discarded_item_string(object, "status", field, report)?;
     let call_id = required_string(object, "call_id", &format!("{field}.call_id"))?;
     let name = required_string(object, "name", &format!("{field}.name"))?;
     let arguments = required_string(object, "arguments", &format!("{field}.arguments"))?;
@@ -431,6 +447,8 @@ fn parse_function_output(
         field,
         report,
     );
+    report_discarded_item_string(object, "id", field, report)?;
+    report_discarded_item_string(object, "status", field, report)?;
     let call_id = required_string(object, "call_id", &format!("{field}.call_id"))?;
     let output = object
         .get("output")
@@ -461,6 +479,7 @@ fn parse_reasoning_item(
         field,
         report,
     );
+    report_discarded_item_string(object, "status", field, report)?;
     let summary = parse_summary(object.get("summary"), &format!("{field}.summary"))?;
     let encrypted_content = optional_string(
         object,
@@ -469,7 +488,7 @@ fn parse_reasoning_item(
     )?
     .map(String::into_bytes);
     Ok(InputItem::Content(ContentPart::Reasoning(ReasoningBlock {
-        id: optional_string(object, "id", &format!("{field}.id"))?,
+        id: Some(required_string(object, "id", &format!("{field}.id"))?.to_owned()),
         text: None,
         summary,
         encrypted_content,
@@ -712,17 +731,11 @@ pub fn encode_responses_request(
     let mut report = ConversionReport::default();
     let mut object = preserved_unknown_fields(&request.extensions, &mut report)?;
     object.insert("model".to_owned(), Value::String(request.model.clone()));
-    object.insert(
-        "input".to_owned(),
-        Value::Array(
-            request
-                .input
-                .iter()
-                .map(|item| encode_input_items(item, &mut report))
-                .collect::<Result<Vec<_>, _>>()?
-                .concat(),
-        ),
-    );
+    let mut input = Vec::with_capacity(request.input.len());
+    for item in &request.input {
+        encode_input_items(item, &mut report, &mut input)?;
+    }
+    object.insert("input".to_owned(), Value::Array(input));
     let tools = match take_preserved_tools(&mut object)? {
         Some(tools) => tools,
         None => request
@@ -805,41 +818,141 @@ pub fn encode_responses_request(
 
 /// Encode one semantic input item as the Responses input items it requires.
 ///
-/// One item can expand into several. Responses carries a function call and its
-/// output as top-level items, so a message holding either in its content has
-/// them hoisted into siblings; nesting them under `content` is rejected by the
-/// API, which accepts only content-part types there.
+/// Responses represents reasoning, function calls, and function outputs as
+/// top-level items. Message content is therefore emitted in ordered runs around
+/// those items instead of being regrouped or nested under `content`.
 fn encode_input_items(
     item: &InputItem,
     report: &mut ConversionReport,
-) -> Result<Vec<Value>, OpenAiResponsesError> {
-    let InputItem::Message(message) = item else {
-        return Ok(vec![encode_input_item(item, report)?]);
-    };
-    let mut hoisted = Vec::new();
-    let mut content = Vec::new();
-    for part in &message.content {
-        match part {
-            ContentPart::ToolCall(call) => hoisted.push(encode_tool_call(call, report)?),
-            ContentPart::ToolResult(result) => hoisted.push(encode_tool_result(result, report)?),
-            retained => content.push(retained.clone()),
+    output: &mut Vec<Value>,
+) -> Result<(), OpenAiResponsesError> {
+    match item {
+        InputItem::Message(message) => encode_message_items(message, report, output),
+        _ => {
+            output.push(encode_input_item(item, report)?);
+            Ok(())
         }
     }
-    if hoisted.is_empty() {
-        return Ok(vec![encode_message(message, report)?]);
+}
+
+fn encode_message_items(
+    message: &Message,
+    report: &mut ConversionReport,
+    output: &mut Vec<Value>,
+) -> Result<(), OpenAiResponsesError> {
+    if message.role == Role::Tool {
+        report_message_envelope(message, report);
+        let call_id = message.tool_call_id.as_deref().ok_or_else(|| {
+            invalid_value("message.tool_call_id", "tool messages require a call ID")
+        })?;
+        output.push(encode_tool_result_parts(
+            call_id,
+            &message.content,
+            false,
+            &Extensions::default(),
+            report,
+        )?);
+        return Ok(());
     }
-    let mut items = Vec::with_capacity(hoisted.len() + 1);
-    // The remaining prose precedes the calls it introduced. A message left with
-    // no content is dropped rather than sent as an empty turn.
-    if !content.is_empty() {
-        let trimmed = Message {
-            content,
-            ..message.clone()
-        };
-        items.push(encode_message(&trimmed, report)?);
+
+    let expands = message.content.iter().any(is_top_level_input_part);
+    report_message_envelope(message, report);
+    if !expands {
+        output.push(encode_message_content(
+            message.role,
+            &message.content,
+            report,
+        )?);
+        return Ok(());
     }
-    items.extend(hoisted);
-    Ok(items)
+
+    let mut content_start = None;
+    for (index, part) in message.content.iter().enumerate() {
+        if !is_top_level_input_part(part) {
+            content_start.get_or_insert(index);
+            continue;
+        }
+        if let Some(start) = content_start.take() {
+            output.push(encode_message_content(
+                message.role,
+                &message.content[start..index],
+                report,
+            )?);
+        }
+        match part {
+            ContentPart::Reasoning(reasoning) => {
+                if message.role != Role::Assistant {
+                    report.unsupported_required(
+                        "message.content.reasoning",
+                        "Responses reasoning history must originate from an assistant message",
+                    );
+                }
+                output.push(encode_reasoning_item(reasoning, report)?);
+            }
+            ContentPart::ToolCall(call) => {
+                if message.role != Role::Assistant {
+                    report.unsupported_required(
+                        "message.content.tool_call",
+                        "Responses function-call history must originate from an assistant message",
+                    );
+                }
+                output.push(encode_tool_call(call, report)?);
+            }
+            ContentPart::ToolResult(result) => {
+                if message.role != Role::User {
+                    report.unsupported_required(
+                        "message.content.tool_result",
+                        "Responses function outputs must originate from a user or tool message",
+                    );
+                }
+                output.push(encode_tool_result(result, report)?);
+            }
+            _ => unreachable!("only top-level input parts enter this branch"),
+        }
+    }
+    if let Some(start) = content_start {
+        output.push(encode_message_content(
+            message.role,
+            &message.content[start..],
+            report,
+        )?);
+    }
+    Ok(())
+}
+
+const fn is_top_level_input_part(part: &ContentPart) -> bool {
+    matches!(
+        part,
+        ContentPart::Reasoning(_) | ContentPart::ToolCall(_) | ContentPart::ToolResult(_)
+    )
+}
+
+fn report_message_envelope(message: &Message, report: &mut ConversionReport) {
+    if message.id.is_some() {
+        report.drop_optional(
+            "message.id",
+            "Responses EasyInputMessage history has no portable message identifier",
+        );
+    }
+    if message.name.is_some() {
+        report.drop_optional(
+            "message.name",
+            "Responses messages have no portable name field",
+        );
+    }
+    if !message.metadata.is_empty() {
+        report.drop_optional(
+            "message.metadata",
+            "Responses has no per-message metadata field",
+        );
+    }
+    report_extensions("message.extensions", &message.extensions, report);
+    if message.role != Role::Tool && message.tool_call_id.is_some() {
+        report.unsupported_required(
+            "message.tool_call_id",
+            "only tool messages can consume a function-call identifier",
+        );
+    }
 }
 
 fn encode_input_item(
@@ -847,19 +960,16 @@ fn encode_input_item(
     report: &mut ConversionReport,
 ) -> Result<Value, OpenAiResponsesError> {
     match item {
-        InputItem::Message(message) => encode_message(message, report),
+        InputItem::Message(_) => unreachable!("messages are expanded by encode_input_items"),
         InputItem::ToolCall(call) => encode_tool_call(call, report),
         InputItem::ToolResult(result) => encode_tool_result(result, report),
         InputItem::Content(part) => match part {
             ContentPart::Reasoning(reasoning) => encode_reasoning_item(reasoning, report),
-            // A function call and its output are top-level items in Responses.
-            // Wrapping either in a message would nest it under `content`, which
-            // accepts only content-part types.
             ContentPart::ToolCall(call) => encode_tool_call(call, report),
             ContentPart::ToolResult(result) => encode_tool_result(result, report),
             _ => Ok(serde_json::json!({
                 "role":"user",
-                "content":[encode_content_part(part, Role::User, report)?]
+                "content":[encode_content_part(part, report)?]
             })),
         },
         InputItem::Provider {
@@ -882,76 +992,40 @@ fn encode_input_item(
     }
 }
 
-fn encode_message(
-    message: &Message,
+fn encode_message_content(
+    role: Role,
+    content: &[ContentPart],
     report: &mut ConversionReport,
 ) -> Result<Value, OpenAiResponsesError> {
-    if !message.metadata.is_empty() {
-        report.drop_optional(
-            "message.metadata",
-            "Responses has no per-message metadata field",
-        );
-    }
-    report_extensions("message.extensions", &message.extensions, report);
-    if message.tool_call_id.is_some() {
-        report.unsupported_required(
-            "message.tool_call_id",
-            "tool results must be standalone function_call_output items",
-        );
-    }
-    let role = match message.role {
+    let role_name = match role {
         Role::System => "system",
         Role::Developer => "developer",
         Role::User => "user",
         Role::Assistant => "assistant",
-        Role::Tool => {
-            let call_id = message.tool_call_id.as_deref().ok_or_else(|| {
-                invalid_value("message.tool_call_id", "tool messages require a call ID")
-            })?;
-            return encode_tool_result(
-                &ToolResult {
-                    tool_call_id: call_id.to_owned(),
-                    content: message.content.clone(),
-                    is_error: false,
-                    extensions: Extensions::default(),
-                },
-                report,
-            );
-        }
+        Role::Tool => unreachable!("tool messages become function_call_output items"),
     };
     let mut object = Map::new();
-    object.insert("role".to_owned(), Value::String(role.to_owned()));
+    object.insert("role".to_owned(), Value::String(role_name.to_owned()));
     object.insert(
         "content".to_owned(),
         Value::Array(
-            message
-                .content
+            content
                 .iter()
-                .map(|part| encode_content_part(part, message.role, report))
+                .map(|part| encode_content_part(part, report))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
     );
-    if let Some(id) = message.id.as_ref() {
-        object.insert("id".to_owned(), Value::String(id.clone()));
-    }
-    if message.name.is_some() {
-        report.drop_optional(
-            "message.name",
-            "Responses messages have no portable name field",
-        );
-    }
     Ok(Value::Object(object))
 }
 
 fn encode_content_part(
     part: &ContentPart,
-    role: Role,
     report: &mut ConversionReport,
 ) -> Result<Value, OpenAiResponsesError> {
     match part {
         ContentPart::Text { text } => Ok(serde_json::json!({
-            "type": if role == Role::Assistant {"output_text"} else {"input_text"},
-            "text": text
+            "type":"input_text",
+            "text":text
         })),
         ContentPart::Image {
             media_type,
@@ -1003,9 +1077,13 @@ fn encode_content_part(
             }
             Ok(Value::Object(value))
         }
-        ContentPart::Reasoning(reasoning) => encode_reasoning_item(reasoning, report),
-        ContentPart::ToolCall(call) => encode_tool_call(call, report),
-        ContentPart::ToolResult(result) => encode_tool_result(result, report),
+        ContentPart::Reasoning(_) | ContentPart::ToolCall(_) | ContentPart::ToolResult(_) => {
+            report.unsupported_required(
+                "message.content",
+                "reasoning, function calls, and function outputs must be top-level Responses items",
+            );
+            Ok(Value::Null)
+        }
         ContentPart::Audio { .. } => {
             report.unsupported_required(
                 "input.audio",
@@ -1056,30 +1134,45 @@ fn encode_tool_result(
     result: &ToolResult,
     report: &mut ConversionReport,
 ) -> Result<Value, OpenAiResponsesError> {
-    report_extensions("tool_result.extensions", &result.extensions, report);
-    if result.is_error {
+    encode_tool_result_parts(
+        &result.tool_call_id,
+        &result.content,
+        result.is_error,
+        &result.extensions,
+        report,
+    )
+}
+
+fn encode_tool_result_parts(
+    call_id: &str,
+    content: &[ContentPart],
+    is_error: bool,
+    extensions: &Extensions,
+    report: &mut ConversionReport,
+) -> Result<Value, OpenAiResponsesError> {
+    report_extensions("tool_result.extensions", extensions, report);
+    if is_error {
         report.drop_optional(
             "tool_result.is_error",
             "Responses function_call_output has no standard error flag",
         );
     }
-    let output = if result.content.len() == 1 {
-        match &result.content[0] {
+    let output = if content.len() == 1 {
+        match &content[0] {
             ContentPart::Text { text } => Value::String(text.clone()),
-            part => Value::Array(vec![encode_content_part(part, Role::Tool, report)?]),
+            part => Value::Array(vec![encode_content_part(part, report)?]),
         }
     } else {
         Value::Array(
-            result
-                .content
+            content
                 .iter()
-                .map(|part| encode_content_part(part, Role::Tool, report))
+                .map(|part| encode_content_part(part, report))
                 .collect::<Result<Vec<_>, _>>()?,
         )
     };
     Ok(serde_json::json!({
         "type":"function_call_output",
-        "call_id":result.tool_call_id,
+        "call_id":call_id,
         "output":output
     }))
 }
@@ -1101,6 +1194,12 @@ fn encode_reasoning_item(
         );
     }
     report_extensions("reasoning.extensions", &reasoning.extensions, report);
+    if reasoning.id.is_none() {
+        report.unsupported_required(
+            "reasoning.id",
+            "Responses input reasoning items require their original item identifier",
+        );
+    }
     let mut value = Map::new();
     value.insert("type".to_owned(), Value::String("reasoning".to_owned()));
     if let Some(id) = reasoning.id.as_ref() {
@@ -1352,6 +1451,21 @@ fn encode_base64(bytes: &[u8]) -> String {
         }
     }
     output
+}
+
+fn report_discarded_item_string(
+    object: &Map<String, Value>,
+    key: &str,
+    field: &str,
+    report: &mut ConversionReport,
+) -> Result<(), OpenAiResponsesError> {
+    if optional_string(object, key, &format!("{field}.{key}"))?.is_some() {
+        report.drop_optional(
+            format!("{field}.{key}"),
+            "the semantic model does not retain this Responses input-item envelope field",
+        );
+    }
+    Ok(())
 }
 
 fn required_string<'a>(
@@ -3080,11 +3194,12 @@ mod tests {
 
     use super::{
         decode_responses_request_with_report, encode_responses_request, OpenAiResponsesCodec,
-        OpenAiResponsesEventDecoder, OpenAiResponsesEventEncoder,
+        OpenAiResponsesError, OpenAiResponsesEventDecoder, OpenAiResponsesEventEncoder,
     };
     use crate::{
-        encode_chat_request, FinishReason, LossPolicy, OpenAiChatCodec, OpenAiChatError,
-        OpenAiChatEventEncoder, ReasoningBlock, StreamEvent, StreamEventKind, StreamValidator,
+        encode_chat_request, ContentPart, FinishReason, InputItem, LossPolicy, Message,
+        OpenAiChatCodec, OpenAiChatError, OpenAiChatEventEncoder, PreservedJson, ReasoningBlock,
+        Role, SemanticRequest, StreamEvent, StreamEventKind, StreamValidator, ToolCall, ToolResult,
         Usage,
     };
 
@@ -3144,6 +3259,176 @@ mod tests {
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[1]["name"], "read_file");
         assert_eq!(input[2]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn responses_reasoning_input_requires_an_item_id() {
+        let source = serde_json::to_vec(&json!({
+            "model":"gpt-test",
+            "input":[{
+                "type":"reasoning",
+                "summary":[],
+                "encrypted_content":"provider-state"
+            }]
+        }))
+        .expect("Responses request JSON");
+
+        assert!(decode_responses_request_with_report(&source).is_err());
+    }
+
+    #[test]
+    fn idless_reasoning_cannot_be_sent_as_responses_history() {
+        let mut request = SemanticRequest::new("gpt-test");
+        request.push_message(Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::Reasoning(ReasoningBlock {
+                encrypted_content: Some(b"foreign-provider-state".to_vec()),
+                ..ReasoningBlock::default()
+            })],
+            ..Message::default()
+        });
+
+        let error = encode_responses_request(&request, LossPolicy::Degrade)
+            .expect_err("ID-less provider reasoning must be rejected");
+        assert!(matches!(error, OpenAiResponsesError::Conversion(_)));
+    }
+
+    #[test]
+    fn expanded_message_preserves_reasoning_tool_and_text_order() {
+        let mut request = SemanticRequest::new("gpt-test");
+        request.push_message(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentPart::text("before"),
+                ContentPart::Reasoning(ReasoningBlock {
+                    id: Some("rs_1".to_owned()),
+                    summary: Some("checked the input".to_owned()),
+                    ..ReasoningBlock::default()
+                }),
+                ContentPart::ToolCall(ToolCall::new(
+                    "call_1",
+                    "read_file",
+                    PreservedJson::from_value(json!({"path":"sample.txt"}))
+                        .expect("tool arguments"),
+                )),
+                ContentPart::text("after"),
+            ],
+            ..Message::default()
+        });
+
+        let encoded = encode_responses_request(&request, LossPolicy::Reject).expect("encodes");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("responses JSON");
+        let input = value["input"].as_array().expect("input array");
+        let kinds = input
+            .iter()
+            .map(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["message", "reasoning", "function_call", "message"]);
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "before");
+        assert_eq!(input[1]["id"], "rs_1");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[3]["content"][0]["type"], "input_text");
+        assert_eq!(input[3]["content"][0]["text"], "after");
+    }
+
+    #[test]
+    fn expanded_user_message_preserves_tool_result_before_follow_up_text() {
+        let mut request = SemanticRequest::new("gpt-test");
+        request.push_message(Message {
+            role: Role::User,
+            content: vec![
+                ContentPart::ToolResult(ToolResult::text("call_1", "alpha")),
+                ContentPart::text("now summarize it"),
+            ],
+            ..Message::default()
+        });
+
+        let encoded = encode_responses_request(&request, LossPolicy::Reject).expect("encodes");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("responses JSON");
+        let input = value["input"].as_array().expect("input array");
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], "now summarize it");
+    }
+
+    #[test]
+    fn tool_call_in_user_message_is_rejected() {
+        let mut request = SemanticRequest::new("gpt-test");
+        request.push_message(Message {
+            role: Role::User,
+            content: vec![ContentPart::ToolCall(ToolCall::new(
+                "call_1",
+                "read_file",
+                PreservedJson::from_value(json!({})).expect("tool arguments"),
+            ))],
+            ..Message::default()
+        });
+
+        let error = encode_responses_request(&request, LossPolicy::Degrade)
+            .expect_err("user-authored function call must be rejected");
+        assert!(matches!(error, OpenAiResponsesError::Conversion(_)));
+    }
+
+    #[test]
+    fn expanded_message_accounts_for_unrepresentable_envelope_fields() {
+        let mut request = SemanticRequest::new("gpt-test");
+        let mut message = Message {
+            id: Some("msg_1".to_owned()),
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall(ToolCall::new(
+                "call_1",
+                "read_file",
+                PreservedJson::from_value(json!({})).expect("tool arguments"),
+            ))],
+            name: Some("worker".to_owned()),
+            ..Message::default()
+        };
+        message
+            .metadata
+            .insert("trace".to_owned(), "opaque".to_owned());
+        request.push_message(message);
+
+        let encoded = encode_responses_request(&request, LossPolicy::Degrade).expect("degrades");
+        assert!(encoded
+            .report
+            .dropped_optional_fields
+            .iter()
+            .any(|field| field == "message.id"));
+        assert!(encoded
+            .report
+            .dropped_optional_fields
+            .iter()
+            .any(|field| field == "message.name"));
+        assert!(encoded
+            .report
+            .dropped_optional_fields
+            .iter()
+            .any(|field| field == "message.metadata"));
+        assert!(encode_responses_request(&request, LossPolicy::Reject).is_err());
+    }
+
+    #[test]
+    fn tool_role_message_consumes_call_id_without_reporting_it_unsupported() {
+        let mut request = SemanticRequest::new("gpt-test");
+        request.push_input(InputItem::Message(Message {
+            role: Role::Tool,
+            content: vec![ContentPart::text("alpha")],
+            tool_call_id: Some("call_1".to_owned()),
+            ..Message::default()
+        }));
+
+        let encoded = encode_responses_request(&request, LossPolicy::Reject).expect("encodes");
+        assert!(encoded.report.is_lossless());
+        let value: Value = serde_json::from_slice(&encoded.body).expect("responses JSON");
+        assert_eq!(value["input"][0]["type"], "function_call_output");
+        assert_eq!(value["input"][0]["call_id"], "call_1");
+        assert_eq!(value["input"][0]["output"], "alpha");
     }
 
     #[test]
@@ -3336,10 +3621,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_annotations_do_not_create_semantic_loss() {
+    fn output_message_envelope_loss_is_explicit_even_with_empty_annotations() {
         let source = json!({
             "model":"strict-model",
             "input":[{
+                "id":"msg_1",
+                "type":"message",
+                "status":"completed",
                 "role":"assistant",
                 "content":[{"type":"output_text","text":"plain","annotations":[]}]
             }]
@@ -3348,7 +3636,98 @@ mod tests {
             &serde_json::to_vec(&source).expect("request JSON"),
         )
         .expect("request decodes");
-        assert!(decoded.report.is_lossless());
+        assert!(decoded
+            .report
+            .dropped_optional_fields
+            .contains(&"input[0].status".to_owned()));
+        assert!(decoded
+            .report
+            .dropped_optional_fields
+            .contains(&"input[0].content[0].type".to_owned()));
+        assert!(!decoded
+            .report
+            .dropped_optional_fields
+            .contains(&"input[0].content[0].annotations".to_owned()));
+        assert!(decoded.report.validate(LossPolicy::Reject).is_err());
+        assert!(decoded.report.validate(LossPolicy::Degrade).is_ok());
+    }
+
+    #[test]
+    fn output_refusal_degrades_to_valid_input_text() {
+        let source = json!({
+            "model":"strict-model",
+            "input":[{
+                "id":"msg_1",
+                "type":"message",
+                "status":"completed",
+                "role":"assistant",
+                "content":[{"type":"refusal","refusal":"cannot comply"}]
+            }]
+        });
+        let decoded = decode_responses_request_with_report(
+            &serde_json::to_vec(&source).expect("request JSON"),
+        )
+        .expect("request decodes");
+        assert!(decoded.report.validate(LossPolicy::Reject).is_err());
+        assert!(decoded.report.validate(LossPolicy::Degrade).is_ok());
+
+        let encoded = encode_responses_request(&decoded.request, LossPolicy::Degrade)
+            .expect("refusal degrades to an input message");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("encoded request JSON");
+        assert_eq!(value["input"][0]["role"], "assistant");
+        assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(value["input"][0]["content"][0]["text"], "cannot comply");
+    }
+
+    #[test]
+    fn native_input_item_envelope_loss_is_reported() {
+        let source = json!({
+            "model":"strict-model",
+            "input":[
+                {
+                    "type":"function_call",
+                    "id":"fc_1",
+                    "call_id":"call_1",
+                    "name":"lookup",
+                    "arguments":"{}",
+                    "status":"completed"
+                },
+                {
+                    "type":"function_call_output",
+                    "id":"fco_1",
+                    "call_id":"call_1",
+                    "output":"done",
+                    "status":"completed"
+                },
+                {
+                    "type":"reasoning",
+                    "id":"rs_1",
+                    "summary":[],
+                    "status":"completed"
+                }
+            ]
+        });
+        let decoded = decode_responses_request_with_report(
+            &serde_json::to_vec(&source).expect("request JSON"),
+        )
+        .expect("request decodes");
+        for field in [
+            "input[0].id",
+            "input[0].status",
+            "input[1].id",
+            "input[1].status",
+            "input[2].status",
+        ] {
+            assert!(
+                decoded
+                    .report
+                    .dropped_optional_fields
+                    .contains(&field.to_owned()),
+                "missing loss accounting for {field}"
+            );
+        }
+        assert!(decoded.report.validate(LossPolicy::Reject).is_err());
+        assert!(decoded.report.validate(LossPolicy::Degrade).is_ok());
     }
 
     #[test]

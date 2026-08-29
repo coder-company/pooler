@@ -259,7 +259,60 @@ async fn same_wire_responses_stream_preserves_provider_events_exactly() {
 }
 
 #[tokio::test]
-async fn unary_responses_to_chat_reject_before_upstream() {
+async fn unary_responses_to_chat_round_trips_through_semantic_runtime() {
+    let upstream_body = serde_json::to_vec(&json!({
+        "id":"chat_unary",
+        "object":"chat.completion",
+        "created":123,
+        "model":"droid-model",
+        "choices":[{
+            "index":0,
+            "message":{"role":"assistant","content":"POOLER_RESPONSES_OK"},
+            "finish_reason":"stop"
+        }],
+        "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
+    }))
+    .expect("Chat response JSON");
+    let (upstream_address, upstream_task) = spawn_upstream("application/json", upstream_body).await;
+    let config = compile_yaml(
+        "droid-unary-chat.yaml",
+        &format!(
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: droid-unary-chat\n    listen: local\n    match: {{method: POST, path: /v1/responses, content_types: [application/json]}}\n    ingress: {{mode: semantic, decoder: decode.openai.responses}}\n    target: {{provider: local, path: /v1/chat/completions}}\n    response: {{mode: semantic, decoder: decode.openai.chat.events, encoder: encode.openai.responses.events}}\n    loss_policy: reject\n"
+        ),
+    )
+    .expect("unary Chat bridge config");
+    let running = start_server(config).await;
+    let request = serde_json::to_vec(&json!({
+        "model":"droid-model","input":"hello","stream":false
+    }))
+    .expect("unary request JSON");
+
+    let response = send_request(running.address, "/v1/responses", &request).await;
+    assert_eq!(response_status(&response), 200);
+    let body: Value =
+        serde_json::from_slice(&decoded_response_body(&response)).expect("Responses response JSON");
+    assert_eq!(body["object"], "response");
+    assert_eq!(
+        body["output"][0]["content"][0]["text"],
+        "POOLER_RESPONSES_OK"
+    );
+    assert_eq!(body["usage"]["total_tokens"], 5);
+
+    let upstream_request = timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("Chat upstream timeout")
+        .expect("Chat upstream task");
+    assert!(upstream_request.starts_with(b"POST /v1/chat/completions HTTP/1.1\r\n"));
+    let forwarded: Value =
+        serde_json::from_slice(http_body(&upstream_request)).expect("forwarded Chat request");
+    assert_eq!(forwarded["stream"], false);
+    assert_eq!(forwarded["messages"][0]["role"], "user");
+    assert_eq!(forwarded["messages"][0]["content"], "hello");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn unary_responses_with_unportable_field_reject_before_chat_upstream() {
     let upstream = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("unused Chat upstream binds");
@@ -273,7 +326,10 @@ async fn unary_responses_to_chat_reject_before_upstream() {
     .expect("unsupported unary Chat bridge config");
     let running = start_server(config).await;
     let request = serde_json::to_vec(&json!({
-        "model":"droid-model","input":"hello","stream":false
+        "model":"droid-model",
+        "input":"hello",
+        "stream":false,
+        "background":true
     }))
     .expect("unary request JSON");
 
@@ -283,7 +339,7 @@ async fn unary_responses_to_chat_reject_before_upstream() {
         timeout(Duration::from_millis(100), upstream.accept())
             .await
             .is_err(),
-        "unsupported unary cross-protocol request reached the upstream"
+        "lossy unary cross-protocol request reached the upstream"
     );
     running.stop().await;
 }

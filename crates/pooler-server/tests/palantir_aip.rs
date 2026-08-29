@@ -173,7 +173,7 @@ routes:
         .expect("selected provider URI");
     assert_eq!(
         uri,
-        "http://127.0.0.1:8320/v1/chat/completions?tenant=selected&stream=true"
+        "http://127.0.0.1:8320/selected/chat/completions?tenant=selected&stream=true"
     );
     assert!(!uri.to_string().contains("8319"));
 }
