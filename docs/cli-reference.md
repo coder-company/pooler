@@ -251,7 +251,7 @@ pooler auth disable <ACCOUNT>
 pooler auth switch <ACCOUNT>
 ```
 
-`refresh` and `revoke` accept an account ID, or a provider that has exactly one account. `switch` selects one account and disables its siblings for the same provider. `revoke` removes only Pooler's local credential payload and disables the account; it does not claim provider-side revocation unless the provider flow performs it.
+`refresh` and `revoke` accept an account ID, or a provider that has exactly one account. `switch` selects one account and disables its siblings for the same provider. `revoke` removes only Pooler's local credential payload and disables the account; it does not claim provider-side revocation unless the provider flow performs it. The CLI lifecycle commands update the durable store out of process. While `pooler serve` is running, use the authenticated management account endpoints instead so the mutation is published to every live runtime generation immediately; a direct CLI enable, disable, or switch is otherwise observed after the server restarts.
 
 ---
 

@@ -1464,6 +1464,39 @@ impl CredentialRegistry {
         Ok(changed)
     }
 
+    /// Apply account enablement changes as one registry-state operation.
+    ///
+    /// Callers use this when one durable control-plane mutation affects
+    /// multiple sibling credentials. Selection cannot observe a partially
+    /// applied sibling switch inside this registry.
+    pub fn set_credentials_enabled(
+        &self,
+        changes: &[(CredentialId, bool)],
+    ) -> Result<bool, SelectionError> {
+        // Selection takes the same health -> state lock order. Holding both
+        // writes makes sibling enablement and explicit-disabled health one
+        // observable transition rather than two independently visible steps.
+        let mut health = self.inner.health.write().map_err(lock_error)?;
+        let mut state = self.inner.state.write().map_err(lock_error)?;
+        let mut changed = false;
+        for (credential, enabled) in changes {
+            for entry in state
+                .entries
+                .values_mut()
+                .filter(|entry| entry.registration.credential() == credential)
+            {
+                entry.enabled = *enabled;
+                changed = true;
+            }
+            if *enabled {
+                health.enable_credential(credential.clone());
+            } else {
+                health.disable_credential(credential.clone());
+            }
+        }
+        Ok(changed)
+    }
+
     /// Enable or disable exactly one concrete binding.
     pub fn set_binding_enabled(
         &self,
@@ -3250,6 +3283,51 @@ mod tests {
             .with_capabilities(CapabilitySet::from(Capability::Text))
             .with_strategy(SelectionStrategy::RoundRobin)
             .at(now)
+    }
+
+    #[test]
+    fn batch_credential_enablement_updates_selection_and_disabled_health_together() {
+        let registry = CredentialRegistry::new();
+        registry
+            .register(binding_registration(
+                "target-a",
+                "account-a",
+                "fp-a",
+                "provider",
+                "model",
+            ))
+            .expect("first registration");
+        registry
+            .register(binding_registration(
+                "target-b",
+                "account-b",
+                "fp-b",
+                "provider",
+                "model",
+            ))
+            .expect("second registration");
+        let first = CredentialId::new("account-a").expect("first credential");
+        let second = CredentialId::new("account-b").expect("second credential");
+        registry
+            .disable(second.clone())
+            .expect("disable second health");
+
+        registry
+            .set_credentials_enabled(&[(first.clone(), false), (second.clone(), true)])
+            .expect("batch switch to second");
+        let selected = registry
+            .select(request("model", Instant::now()))
+            .expect("second is selectable");
+        assert_eq!(selected.registration().credential(), &second);
+        drop(selected);
+
+        registry
+            .set_credentials_enabled(&[(first.clone(), true), (second, false)])
+            .expect("batch switch to first");
+        let selected = registry
+            .select(request("model", Instant::now()))
+            .expect("first is selectable");
+        assert_eq!(selected.registration().credential(), &first);
     }
 
     #[test]

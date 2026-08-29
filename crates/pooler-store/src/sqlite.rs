@@ -3622,22 +3622,6 @@ fn set_credential_enabled_tx(
         .optional()
         .map_err(sqlite_error)?
         .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
-    if old.enabled == enabled {
-        return Ok(old);
-    }
-    let revision = old.revision.saturating_add(1);
-    transaction
-        .execute(
-            "UPDATE credentials SET enabled = ?1, updated_at = ?2, revision = ?3
-             WHERE credential_id = ?4",
-            params![
-                i64::from(enabled),
-                updated_at,
-                i64::try_from(revision).unwrap_or(i64::MAX),
-                credential_id
-            ],
-        )
-        .map_err(sqlite_error)?;
     if enabled {
         transaction
             .execute(
@@ -3658,6 +3642,22 @@ fn set_credential_enabled_tx(
             )
             .map_err(sqlite_error)?;
     }
+    if old.enabled == enabled {
+        return Ok(old);
+    }
+    let revision = old.revision.saturating_add(1);
+    transaction
+        .execute(
+            "UPDATE credentials SET enabled = ?1, updated_at = ?2, revision = ?3
+             WHERE credential_id = ?4",
+            params![
+                i64::from(enabled),
+                updated_at,
+                i64::try_from(revision).unwrap_or(i64::MAX),
+                credential_id
+            ],
+        )
+        .map_err(sqlite_error)?;
     Ok(CredentialState {
         enabled,
         updated_at,
@@ -4662,6 +4662,56 @@ mod tests {
                 .expect("backup state")
                 .expect("backup exists")
                 .enabled
+        );
+    }
+
+    #[test]
+    fn account_switch_reenables_selected_health_without_advancing_credential_revision() {
+        let directory = private_tempdir();
+        let path = directory.path().join("switch-health.sqlite");
+        let original_revision;
+        {
+            let store = SqliteStore::open(&path).expect("open store");
+            let selected = store
+                .upsert_credential_state(CredentialState::new("primary", "provider", true, 1))
+                .expect("primary");
+            original_revision = selected.revision;
+            store
+                .upsert_credential_state(CredentialState::new("backup", "provider", true, 1))
+                .expect("backup");
+            store
+                .upsert_credential_health(CredentialHealthState::new(
+                    "primary",
+                    CredentialHealthStatus::Disabled,
+                    2,
+                ))
+                .expect("disable health");
+
+            let states = store
+                .switch_credential("primary", &["backup".to_owned()], 3)
+                .expect("switch");
+            let primary = states
+                .iter()
+                .find(|state| state.credential_id == "primary")
+                .expect("primary state");
+            assert_eq!(primary.revision, original_revision);
+            assert!(primary.enabled);
+        }
+
+        let reopened = SqliteStore::open(&path).expect("reopen store");
+        let state = reopened
+            .credential_state("primary")
+            .expect("primary state")
+            .expect("primary exists");
+        assert!(state.enabled);
+        assert_eq!(state.revision, original_revision);
+        assert_eq!(
+            reopened
+                .credential_health("primary")
+                .expect("primary health")
+                .expect("primary health exists")
+                .status,
+            CredentialHealthStatus::Healthy
         );
     }
 

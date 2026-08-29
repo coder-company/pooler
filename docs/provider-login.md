@@ -277,7 +277,11 @@ pooler --credential-key-ref env:POOLER_STORE_KEY auth revoke work-openai
 `refresh` rotates one OAuth account with the persisted generation compare-and-
 swap contract. `switch` enables the named account and disables sibling accounts
 for the same configured provider; it does not modify the configuration or move
-credentials between providers. `revoke` accepts an account ID, or a provider
+credentials between providers. These CLI commands update the durable store out
+of process. While `pooler serve` is running, use the authenticated management
+account endpoints so every live runtime generation changes immediately; a direct
+CLI enable, disable, or switch is otherwise observed after restart. `revoke`
+accepts an account ID, or a provider
 only when exactly one matching account exists. It calls the configured
 revocation endpoint when encrypted token access is available, then removes local
 credential state. API-key values remain in their external `env:`, `file:`, or

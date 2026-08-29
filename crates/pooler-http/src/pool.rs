@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex, RwLock, Weak,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -430,10 +430,22 @@ struct RuntimeBinding {
     request_overlay: RequestOverlay,
 }
 
+type RegistryMap = RwLock<BTreeMap<String, Arc<CredentialRegistry>>>;
 type RegistryView = (
     BTreeMap<String, Arc<CredentialRegistry>>,
     BTreeMap<BindingKey, Arc<RuntimeBinding>>,
 );
+
+#[derive(Default)]
+struct AccountMutationState {
+    gate: Mutex<Vec<RegisteredRegistryView>>,
+    enablement: RwLock<BTreeMap<String, bool>>,
+}
+
+struct RegisteredRegistryView {
+    registries: Weak<RegistryMap>,
+    accounts: BTreeSet<String>,
+}
 
 impl RuntimeBinding {
     fn profile_capabilities(&self) -> CapabilitySet {
@@ -958,8 +970,9 @@ pub enum PoolError {
 /// Shared mutable account-pooling state for one compiled configuration.
 #[derive(Clone)]
 pub struct PoolingCoordinator {
-    registries: Arc<RwLock<BTreeMap<String, Arc<CredentialRegistry>>>>,
+    registries: Arc<RegistryMap>,
     binding_index: Arc<RwLock<BTreeMap<BindingKey, Arc<RuntimeBinding>>>>,
+    registry_view_gate: Arc<RwLock<()>>,
     interaction_affinity_registries: Arc<BTreeMap<String, BTreeSet<String>>>,
     accounts: Arc<BTreeMap<String, AccountPlan>>,
     config: Arc<CompiledConfig>,
@@ -969,6 +982,7 @@ pub struct PoolingCoordinator {
     disabled_models: Arc<RwLock<BTreeSet<String>>>,
     persistence: PersistenceStatus,
     telemetry: RoutingTelemetry,
+    account_mutations: Arc<AccountMutationState>,
 }
 
 /// Non-secret snapshot of the selected account and compatible registries used
@@ -1019,6 +1033,18 @@ impl PoolingCoordinator {
     /// callers can pass an `Arc<dyn Store>` here to retain account state over a
     /// process restart.
     pub fn with_store(config: &CompiledConfig, store: Arc<dyn Store>) -> Result<Self, PoolError> {
+        Self::with_store_and_account_mutations(
+            config,
+            store,
+            Arc::new(AccountMutationState::default()),
+        )
+    }
+
+    fn with_store_and_account_mutations(
+        config: &CompiledConfig,
+        store: Arc<dyn Store>,
+        account_mutations: Arc<AccountMutationState>,
+    ) -> Result<Self, PoolError> {
         let accounts = config
             .accounts()
             .values()
@@ -1082,6 +1108,7 @@ impl PoolingCoordinator {
         let coordinator = Self {
             registries: Arc::new(RwLock::new(registries)),
             binding_index: Arc::new(RwLock::new(binding_index)),
+            registry_view_gate: Arc::new(RwLock::new(())),
             interaction_affinity_registries: Arc::new(interaction_affinity_registries),
             accounts: Arc::new(accounts),
             config: Arc::new(config.clone()),
@@ -1091,8 +1118,9 @@ impl PoolingCoordinator {
             disabled_models: Arc::new(RwLock::new(BTreeSet::new())),
             persistence: PersistenceStatus::new(true),
             telemetry: RoutingTelemetry::default(),
+            account_mutations,
         };
-        coordinator.restore_account_state(config)?;
+        coordinator.register_and_restore_runtime_state()?;
         Ok(coordinator)
     }
 
@@ -1101,7 +1129,11 @@ impl PoolingCoordinator {
     /// session affinity, decisions, and owner-selected enablement therefore
     /// survive a successful configuration generation swap.
     pub fn reconfigure(&self, config: &CompiledConfig) -> Result<Self, PoolError> {
-        let mut coordinator = Self::with_store(config, Arc::clone(&self.store))?;
+        let mut coordinator = Self::with_store_and_account_mutations(
+            config,
+            Arc::clone(&self.store),
+            Arc::clone(&self.account_mutations),
+        )?;
         coordinator.catalog.clone_from(&self.catalog);
         if coordinator.catalog.is_some() {
             coordinator.sync_catalog_snapshot()?;
@@ -1149,13 +1181,27 @@ impl PoolingCoordinator {
         }
 
         let (registries, bindings) = self.build_registry_view(Some(snapshot.as_ref()))?;
+        let mut views = self
+            .account_mutations
+            .gate
+            .lock()
+            .map_err(|_| PoolError::Selection)?;
+        if self.catalog_generation.load(Ordering::Acquire) == generation {
+            return Ok(());
+        }
+        self.register_registry_view_locked(&mut views)?;
+        let _view = self
+            .registry_view_gate
+            .write()
+            .map_err(|_| PoolError::Selection)?;
         *self.registries.write().map_err(|_| PoolError::Selection)? = registries;
         *self
             .binding_index
             .write()
             .map_err(|_| PoolError::Selection)? = bindings;
+        self.restore_runtime_state_locked()?;
         self.catalog_generation.store(generation, Ordering::Release);
-        self.restore_account_state(&self.config)
+        Ok(())
     }
 
     fn build_registry_view(
@@ -1338,38 +1384,123 @@ impl PoolingCoordinator {
         let _ = self.set_account_enabled(credential.as_str(), false);
     }
 
-    /// Enable or disable one configured account in persistence and live registries.
+    /// Enable or disable one configured account in persistence and every live registry generation.
     pub fn set_account_enabled(&self, account_id: &str, enabled: bool) -> Result<(), PoolError> {
         self.sync_catalog_snapshot()?;
         if !self.accounts.contains_key(account_id) {
             return Err(PoolError::InvalidCredential);
         }
         let credential = CredentialId::new(account_id).map_err(|_| PoolError::InvalidCredential)?;
+        let changes = vec![(credential, enabled)];
+        let account_ids = BTreeSet::from([account_id.to_owned()]);
+        let mut views = self
+            .account_mutations
+            .gate
+            .lock()
+            .map_err(|_| PoolError::Selection)?;
+        self.register_registry_view_locked(&mut views)?;
+        let registries = self.live_registries_for_accounts_locked(&mut views, &account_ids)?;
+
         self.store
             .set_credential_enabled(account_id, enabled, timestamp_now())
             .map_err(|_| PoolError::Store)?;
-        let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
-        for registry in registries.values() {
-            if enabled {
-                registry
-                    .enable(&credential)
-                    .map_err(|_| PoolError::Selection)?;
-            } else {
-                registry
-                    .disable(credential.clone())
-                    .map_err(|_| PoolError::Selection)?;
-            }
-        }
-        Ok(())
+        self.publish_account_changes_locked(&registries, &changes)
     }
 
-    /// Compatibility entry point that enables one account without a
-    /// provider-wide sibling switch.
+    /// Atomically select one account and disable its same-provider siblings.
     pub fn switch_account(&self, account_id: &str) -> Result<(), PoolError> {
-        // Account choice is a target/pool concern. Keep this compatibility
-        // entry point as a scoped enable operation; never disable every other
-        // account sharing the provider origin.
-        self.set_account_enabled(account_id, true)
+        self.sync_catalog_snapshot()?;
+        let selected = self
+            .accounts
+            .get(account_id)
+            .ok_or(PoolError::InvalidCredential)?;
+        let siblings = self
+            .accounts
+            .values()
+            .filter(|account| {
+                account.provider() == selected.provider() && account.id() != selected.id()
+            })
+            .map(|account| account.id().to_owned())
+            .collect::<Vec<_>>();
+        let mut changes = Vec::with_capacity(siblings.len().saturating_add(1));
+        changes.push((
+            CredentialId::new(account_id).map_err(|_| PoolError::InvalidCredential)?,
+            true,
+        ));
+        for sibling in &siblings {
+            changes.push((
+                CredentialId::new(sibling).map_err(|_| PoolError::InvalidCredential)?,
+                false,
+            ));
+        }
+        let account_ids = changes
+            .iter()
+            .map(|(credential, _)| credential.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        let mut views = self
+            .account_mutations
+            .gate
+            .lock()
+            .map_err(|_| PoolError::Selection)?;
+        self.register_registry_view_locked(&mut views)?;
+        let registries = self.live_registries_for_accounts_locked(&mut views, &account_ids)?;
+
+        self.store
+            .switch_credential(account_id, &siblings, timestamp_now())
+            .map_err(|_| PoolError::Store)?;
+        self.publish_account_changes_locked(&registries, &changes)
+    }
+
+    fn live_registries_for_accounts_locked(
+        &self,
+        views: &mut Vec<RegisteredRegistryView>,
+        account_ids: &BTreeSet<String>,
+    ) -> Result<Vec<Arc<CredentialRegistry>>, PoolError> {
+        let mut registries = Vec::new();
+        views.retain(|view| view.registries.upgrade().is_some());
+        for view in views.iter() {
+            if view.accounts.is_disjoint(account_ids) {
+                continue;
+            }
+            let Some(registry_map) = view.registries.upgrade() else {
+                continue;
+            };
+            registries.extend(
+                registry_map
+                    .read()
+                    .map_err(|_| PoolError::Selection)?
+                    .values()
+                    .cloned(),
+            );
+        }
+        Ok(registries)
+    }
+
+    fn publish_account_changes_locked(
+        &self,
+        registries: &[Arc<CredentialRegistry>],
+        changes: &[(CredentialId, bool)],
+    ) -> Result<(), PoolError> {
+        let mut registry_failed = false;
+        for registry in registries {
+            if registry.set_credentials_enabled(changes).is_err() {
+                registry_failed = true;
+            }
+        }
+
+        let mut enablement = self
+            .account_mutations
+            .enablement
+            .write()
+            .map_err(|_| PoolError::Selection)?;
+        for (credential, enabled) in changes {
+            enablement.insert(credential.as_str().to_owned(), *enabled);
+        }
+        if registry_failed {
+            Err(PoolError::Selection)
+        } else {
+            Ok(())
+        }
     }
 
     /// Enable or disable one public model for new selections.
@@ -1642,10 +1773,20 @@ impl PoolingCoordinator {
                 ProviderId::new(static_upstream.clone()).map_err(|_| PoolError::InvalidProvider)?;
             let model_id =
                 ModelId::new(logical_model.to_owned()).map_err(|_| PoolError::InvalidModel)?;
-            let binding_target = self
+            let _view = self
+                .registry_view_gate
+                .read()
+                .map_err(|_| PoolError::Selection)?;
+            let enablement = self
+                .account_mutations
+                .enablement
+                .read()
+                .map_err(|_| PoolError::Selection)?;
+            let binding_index = self
                 .binding_index
                 .read()
-                .map_err(|_| PoolError::Selection)?
+                .map_err(|_| PoolError::Selection)?;
+            let candidates = binding_index
                 .values()
                 .filter(|target| {
                     target.model.as_str() == logical_model
@@ -1654,8 +1795,25 @@ impl PoolingCoordinator {
                             .as_deref()
                             .is_none_or(|model| target.upstream_model.as_ref() == model)
                 })
+                .cloned()
+                .collect::<Vec<_>>();
+            let binding_target = candidates
+                .iter()
+                .filter(|target| {
+                    target.account.as_ref().is_none_or(|account| {
+                        enablement
+                            .get(account.id())
+                            .copied()
+                            .unwrap_or(account.enabled())
+                    })
+                })
                 .min_by_key(|target| target.priority)
                 .cloned();
+            if binding_target.is_none() && !candidates.is_empty() {
+                return Err(PoolError::NoEligible {
+                    policy: route.id().to_owned(),
+                });
+            }
             let profile = binding_target
                 .as_ref()
                 .map_or(ModelProfile::DEFAULT, |target| target.profile);
@@ -1702,6 +1860,10 @@ impl PoolingCoordinator {
             });
         };
 
+        let _view = self
+            .registry_view_gate
+            .read()
+            .map_err(|_| PoolError::Selection)?;
         let registry_key = if requested_model.is_some() {
             logical_model.to_owned()
         } else {
@@ -1717,6 +1879,7 @@ impl PoolingCoordinator {
             .cloned();
         let Some(registry) = registry else {
             if let Some(fallback) = next_model_fallback(&policy, requested_model, context) {
+                drop(_view);
                 return self.select_with_context(
                     config,
                     route,
@@ -1792,6 +1955,7 @@ impl PoolingCoordinator {
             Ok(lease) => lease,
             Err(SelectionError::NoEligible { explanation, .. }) => {
                 if let Some(fallback) = next_model_fallback(&policy, requested_model, context) {
+                    drop(_view);
                     return self.select_with_context(
                         config,
                         route,
@@ -2355,8 +2519,53 @@ impl PoolingCoordinator {
         let _ = self.store.upsert_session_affinity(binding);
     }
 
-    fn restore_account_state(&self, _config: &CompiledConfig) -> Result<(), PoolError> {
-        let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
+    fn register_and_restore_runtime_state(&self) -> Result<(), PoolError> {
+        let mut views = self
+            .account_mutations
+            .gate
+            .lock()
+            .map_err(|_| PoolError::Selection)?;
+        self.register_registry_view_locked(&mut views)?;
+        self.restore_runtime_state_locked()
+    }
+
+    fn register_registry_view_locked(
+        &self,
+        views: &mut Vec<RegisteredRegistryView>,
+    ) -> Result<(), PoolError> {
+        views.retain(|view| view.registries.upgrade().is_some());
+        if !views
+            .iter()
+            .any(|view| Weak::ptr_eq(&view.registries, &Arc::downgrade(&self.registries)))
+        {
+            views.push(RegisteredRegistryView {
+                registries: Arc::downgrade(&self.registries),
+                accounts: self.accounts.keys().cloned().collect(),
+            });
+        }
+
+        let live_accounts = views
+            .iter()
+            .flat_map(|view| view.accounts.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        self.account_mutations
+            .enablement
+            .write()
+            .map_err(|_| PoolError::Selection)?
+            .retain(|account, _| live_accounts.contains(account));
+        Ok(())
+    }
+
+    fn restore_runtime_state_locked(&self) -> Result<(), PoolError> {
+        self.restore_account_enablement_locked()?;
+        self.restore_cooldowns()?;
+        self.restore_quota_states()?;
+        self.restore_affinities()?;
+        Ok(())
+    }
+
+    fn restore_account_enablement_locked(&self) -> Result<(), PoolError> {
+        let mut changes = Vec::with_capacity(self.accounts.len());
         for account in self.accounts.values() {
             let current = self
                 .store
@@ -2375,26 +2584,32 @@ impl PoolingCoordinator {
                     ))
                     .map_err(|_| PoolError::Store)?;
             }
-            for registry in registries.values() {
-                let id =
-                    CredentialId::new(account.id()).map_err(|_| PoolError::InvalidCredential)?;
-                registry
-                    .set_enabled(&id, enabled)
-                    .map_err(|_| PoolError::Selection)?;
-                if let Some(health) = self
-                    .store
-                    .credential_health(account.id())
-                    .map_err(|_| PoolError::Store)?
-                {
-                    if health.status == CredentialHealthStatus::Disabled {
-                        let _ = registry.disable(id.clone());
-                    }
-                }
-            }
+            let health_disabled = self
+                .store
+                .credential_health(account.id())
+                .map_err(|_| PoolError::Store)?
+                .is_some_and(|health| health.status == CredentialHealthStatus::Disabled);
+            let credential =
+                CredentialId::new(account.id()).map_err(|_| PoolError::InvalidCredential)?;
+            changes.push((credential, enabled && !health_disabled));
         }
-        self.restore_cooldowns()?;
-        self.restore_quota_states()?;
-        self.restore_affinities()?;
+
+        let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
+        for registry in registries.values() {
+            registry
+                .set_credentials_enabled(&changes)
+                .map_err(|_| PoolError::Selection)?;
+        }
+        drop(registries);
+
+        let mut enablement = self
+            .account_mutations
+            .enablement
+            .write()
+            .map_err(|_| PoolError::Selection)?;
+        for (credential, enabled) in changes {
+            enablement.insert(credential.as_str().to_owned(), enabled);
+        }
         Ok(())
     }
 
@@ -4107,6 +4322,43 @@ upstreams:
         .expect("pooling test config")
     }
 
+    fn account_mutation_config() -> CompiledConfig {
+        compile_yaml(
+            "account-mutation.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  provider-a: {url: http://127.0.0.1:1}
+  provider-b: {url: http://127.0.0.1:2}
+accounts:
+  alpha: {provider: provider-a, secret: env:POOLER_ALPHA}
+  beta: {provider: provider-a, secret: env:POOLER_BETA}
+  gamma: {provider: provider-b, secret: env:POOLER_GAMMA}
+account_pools:
+  provider-a-accounts: {provider: provider-a, strategy: ordered_fallback, accounts: [alpha, beta]}
+policies:
+  provider-a-policy:
+    selection: {strategy: ordered_fallback}
+models:
+  - id: public
+    targets:
+      - {id: public-target, provider: provider-a, account_pool: provider-a-accounts, priority: 1, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+routes:
+  - id: pooled
+    listen: local
+    match: {path: /pooled}
+    target: {provider: provider-a, policy: provider-a-policy}
+  - id: static
+    listen: local
+    match: {path: /static}
+    ingress: {mode: patch}
+    target: {provider: provider-a, model_from: request.model}
+"#,
+        )
+        .expect("account mutation config")
+    }
+
     fn request_headers(session: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if let Some(session) = session {
@@ -4168,6 +4420,416 @@ models:
             .published_models(&config, "first", CapabilitySet::new())
             .expect("published models without an eligible current account");
         assert_eq!(published.models(), &["second-model".to_owned()]);
+    }
+
+    #[test]
+    fn provider_wide_switch_updates_live_and_durable_state_only_for_siblings() {
+        let config = account_mutation_config();
+        let store = Arc::new(MemoryStore::new());
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        coordinator.switch_account("beta").expect("switch account");
+
+        let states = store
+            .credential_states()
+            .expect("credential states")
+            .into_iter()
+            .map(|state| (state.credential_id, state.enabled))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(states.get("alpha"), Some(&false));
+        assert_eq!(states.get("beta"), Some(&true));
+        assert_eq!(states.get("gamma"), Some(&true));
+
+        let selected = coordinator
+            .select(
+                &config,
+                config.route("pooled").expect("pooled route"),
+                None,
+                &HeaderMap::new(),
+                0,
+                Instant::now(),
+            )
+            .expect("selected sibling");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn failed_durable_switch_does_not_publish_live_sibling_changes() {
+        let config = account_mutation_config();
+        let store = Arc::new(MemoryStore::new());
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        assert!(store
+            .remove_credential_state("alpha")
+            .expect("remove durable sibling"));
+
+        assert!(matches!(
+            coordinator.switch_account("beta"),
+            Err(PoolError::Store)
+        ));
+        let selected = coordinator
+            .select(
+                &config,
+                config.route("pooled").expect("pooled route"),
+                None,
+                &HeaderMap::new(),
+                0,
+                Instant::now(),
+            )
+            .expect("live state remains selectable");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("alpha")
+        );
+        assert!(
+            store
+                .credential_state("beta")
+                .expect("beta state")
+                .expect("beta exists")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn policy_free_models_reject_disabled_accounts_and_recover_after_switch() {
+        let config = account_mutation_config();
+        let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
+        let route = config.route("static").expect("static route");
+        coordinator
+            .set_account_enabled("alpha", false)
+            .expect("disable alpha");
+        coordinator
+            .set_account_enabled("beta", false)
+            .expect("disable beta");
+        assert!(matches!(
+            coordinator.select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                0,
+                Instant::now(),
+            ),
+            Err(PoolError::NoEligible { .. })
+        ));
+
+        coordinator.switch_account("beta").expect("switch beta");
+        let selected = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("enabled static selection");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn policy_free_models_honor_initially_disabled_accounts() {
+        let config = compile_yaml(
+            "initial-policy-free-enablement.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {provider: {url: http://127.0.0.1:1}}
+accounts:
+  alpha: {provider: provider, secret: env:POOLER_ALPHA, enabled: false}
+  beta: {provider: provider, secret: env:POOLER_BETA}
+account_pools:
+  accounts: {provider: provider, strategy: ordered_fallback, accounts: [alpha, beta]}
+models:
+  - id: public
+    targets:
+      - {id: public-target, provider: provider, account_pool: accounts, priority: 1, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+routes:
+  - id: static
+    listen: local
+    ingress: {mode: patch}
+    target: {provider: provider, model_from: request.model}
+"#,
+        )
+        .expect("initial policy-free enablement config");
+        let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
+        let selected = coordinator
+            .select(
+                &config,
+                config.route("static").expect("static route"),
+                Some("public"),
+                &HeaderMap::new(),
+                0,
+                Instant::now(),
+            )
+            .expect("enabled policy-free sibling");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn account_mutations_propagate_between_live_runtime_generations() {
+        let config = account_mutation_config();
+        let retired = PoolingCoordinator::new(&config).expect("retired coordinator");
+        let current = retired.reconfigure(&config).expect("current coordinator");
+        let route = config.route("pooled").expect("pooled route");
+
+        retired.disable_credential(&CredentialId::new("alpha").expect("credential"));
+        let selected = current
+            .select(&config, route, None, &HeaderMap::new(), 0, Instant::now())
+            .expect("current generation observes retired disable");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("beta")
+        );
+
+        current
+            .switch_account("alpha")
+            .expect("switch from current");
+        let selected = retired
+            .select(&config, route, None, &HeaderMap::new(), 1, Instant::now())
+            .expect("retired generation observes current switch");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn concurrent_switches_leave_store_and_all_generations_consistent() {
+        let config = Arc::new(account_mutation_config());
+        let store = Arc::new(MemoryStore::new());
+        let first = Arc::new(
+            PoolingCoordinator::with_store(&config, store.clone()).expect("first coordinator"),
+        );
+        let second = Arc::new(first.reconfigure(&config).expect("second coordinator"));
+        let barrier = Arc::new(Barrier::new(3));
+        let alpha = {
+            let coordinator = Arc::clone(&first);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                coordinator.switch_account("alpha")
+            })
+        };
+        let beta = {
+            let coordinator = Arc::clone(&second);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                coordinator.switch_account("beta")
+            })
+        };
+        barrier.wait();
+        alpha.join().expect("alpha thread").expect("alpha switch");
+        beta.join().expect("beta thread").expect("beta switch");
+
+        let states = store
+            .credential_states()
+            .expect("credential states")
+            .into_iter()
+            .filter(|state| state.provider_id == "provider-a")
+            .collect::<Vec<_>>();
+        assert_eq!(states.iter().filter(|state| state.enabled).count(), 1);
+        let expected = states
+            .iter()
+            .find(|state| state.enabled)
+            .expect("one selected account")
+            .credential_id
+            .as_str();
+        for coordinator in [&first, &second] {
+            let selected = coordinator
+                .select(
+                    &config,
+                    config.route("pooled").expect("pooled route"),
+                    None,
+                    &HeaderMap::new(),
+                    0,
+                    Instant::now(),
+                )
+                .expect("consistent selection");
+            assert_eq!(
+                selected.credential().map(CredentialId::as_str),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn selections_never_observe_a_partial_provider_switch() {
+        let config = Arc::new(account_mutation_config());
+        let coordinator = Arc::new(PoolingCoordinator::new(&config).expect("coordinator"));
+        coordinator.switch_account("alpha").expect("initial switch");
+        let barrier = Arc::new(Barrier::new(3));
+        let switching = {
+            let coordinator = Arc::clone(&coordinator);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for index in 0..1_000 {
+                    coordinator
+                        .switch_account(if index % 2 == 0 { "beta" } else { "alpha" })
+                        .expect("switch account");
+                }
+            })
+        };
+        let selecting = {
+            let config = Arc::clone(&config);
+            let coordinator = Arc::clone(&coordinator);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for attempt in 0..1_000 {
+                    let selected = coordinator
+                        .select(
+                            &config,
+                            config.route("pooled").expect("pooled route"),
+                            None,
+                            &HeaderMap::new(),
+                            attempt,
+                            Instant::now(),
+                        )
+                        .expect("one sibling remains eligible");
+                    assert!(matches!(
+                        selected.credential().map(CredentialId::as_str),
+                        Some("alpha" | "beta")
+                    ));
+                }
+            })
+        };
+        barrier.wait();
+        switching.join().expect("switching thread");
+        selecting.join().expect("selecting thread");
+    }
+
+    #[test]
+    fn retired_registry_views_are_pruned_after_the_generation_drops() {
+        let config = account_mutation_config();
+        let retired = PoolingCoordinator::new(&config).expect("retired coordinator");
+        let current = retired.reconfigure(&config).expect("current coordinator");
+        assert_eq!(
+            current
+                .account_mutations
+                .gate
+                .lock()
+                .expect("account gate")
+                .len(),
+            2
+        );
+        drop(retired);
+
+        current
+            .set_account_enabled("alpha", false)
+            .expect("trigger pruning");
+        assert_eq!(
+            current
+                .account_mutations
+                .gate
+                .lock()
+                .expect("account gate")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_rebuild_racing_account_switch_restores_the_durable_winner() {
+        let config = Arc::new(account_mutation_config());
+        let catalog =
+            one_model_catalog("provider-a.models", "provider-a", "alpha", "dynamic-model").await;
+        let coordinator = Arc::new(
+            PoolingCoordinator::new(&config)
+                .expect("coordinator")
+                .with_catalog(Arc::clone(&catalog)),
+        );
+        catalog
+            .select_none("provider-a.models")
+            .expect("hide catalog models");
+        catalog.refresh(2).await.expect("refresh catalog");
+        let barrier = Arc::new(Barrier::new(3));
+        let rebuilding = {
+            let coordinator = Arc::clone(&coordinator);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                coordinator.sync_catalog_snapshot()
+            })
+        };
+        let switching = {
+            let coordinator = Arc::clone(&coordinator);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                coordinator.switch_account("beta")
+            })
+        };
+        barrier.wait();
+        rebuilding
+            .join()
+            .expect("catalog thread")
+            .expect("catalog rebuild");
+        switching
+            .join()
+            .expect("switch thread")
+            .expect("account switch");
+
+        let selected = coordinator
+            .select(
+                &config,
+                config.route("pooled").expect("pooled route"),
+                None,
+                &HeaderMap::new(),
+                0,
+                Instant::now(),
+            )
+            .expect("durable winner remains selected");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn sqlite_account_switch_restores_selected_account_after_restart() {
+        let config = account_mutation_config();
+        let directory = tempdir().expect("temporary directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("private temporary directory");
+        }
+        let path = directory.path().join("accounts.sqlite");
+        {
+            let store = Arc::new(SqliteStore::open(&path).expect("open store"));
+            let coordinator = PoolingCoordinator::with_store(&config, store).expect("coordinator");
+            coordinator.switch_account("beta").expect("switch beta");
+        }
+
+        let store = Arc::new(SqliteStore::open(&path).expect("reopen store"));
+        let coordinator = PoolingCoordinator::with_store(&config, store).expect("restart");
+        let selected = coordinator
+            .select(
+                &config,
+                config.route("pooled").expect("pooled route"),
+                None,
+                &HeaderMap::new(),
+                0,
+                Instant::now(),
+            )
+            .expect("restored selection");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("beta")
+        );
     }
 
     fn project_quota_config() -> CompiledConfig {

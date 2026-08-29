@@ -1177,6 +1177,8 @@
       return {
         ...account,
         enabled: live.enabled,
+        selected: live.selected,
+        available_actions: live.available_actions || [],
         health: {
           ...(account.health || {}),
           status: live.status || account.health?.status,
@@ -2594,10 +2596,24 @@
     return `<section class="panel oauth-panel" aria-labelledby="oauth-title"><div class="toolbar"><h2 class="panel-title" id="oauth-title">Sign in to ${esc(account.id)}</h2><span class="spacer"></span>${flow ? statusBadge(flow.status || "starting") : ""}</div><p class="muted">Choose a sign-in method supported by this provider.</p><div class="button-row">${methods.map((method) => `<button class="btn btn-outline btn-sm" type="button" data-oauth-start="${esc(method.method)}" data-oauth-account="${esc(account.id)}"${flow?.busy ? " disabled" : ""}>${esc(oauthMethodLabel(method.method))}</button>`).join("") || `<span class="muted">Loading sign-in methods…</span>`}</div>${flow ? `<div class="callout" role="status">${flow.authorizationUrl ? `<a class="btn btn-primary btn-sm" href="${esc(flow.authorizationUrl)}" target="_blank" rel="noreferrer">Open sign-in page</a>` : ""}${flow.verificationUri ? `<p>Open <a href="${esc(flow.verificationUri)}" target="_blank" rel="noreferrer">${esc(flow.verificationUri)}</a></p>` : ""}${flow.userCode ? `<p>Enter code <code class="mono">${esc(flow.userCode)}</code></p>` : ""}<p>${esc(oauthCountdown())}</p>${flow.requestId && !["succeeded", "failed", "cancelled", "expired"].includes(flow.status) ? `<button class="btn btn-ghost btn-xs" type="button" data-oauth-cancel="${esc(flow.requestId)}">Cancel</button>` : ""}</div>` : ""}</section>`;
   }
 
+  function accountActionButtons(account) {
+    const actions = new Set(account.available_actions || []);
+    const button = (action, label, style = "btn-outline") => actions.has(action)
+      ? `<button class="btn ${style} btn-xs" type="button" data-account-action="${action}" data-account-id="${esc(account.id)}">${label}</button>`
+      : "";
+    return [
+      button("switch", "Use", "btn-primary"),
+      button("enable", "Enable"),
+      button("disable", "Disable"),
+      button("refresh", "Refresh", "btn-ghost"),
+      button("revoke", "Sign out", "btn-ghost"),
+    ].join("");
+  }
+
   function renderAccounts(root) {
     const accounts = graphAccounts();
     const connectionAccount = accounts.find((account) => account.id === state.connectionAccount);
-    const grouped = accounts.map((account) => `<article class="panel account-card"><div class="toolbar"><h2 class="panel-title">${esc(account.id)}</h2><span class="spacer"></span>${statusBadge(account.health?.status || "unknown")}</div><p class="muted">Provider: ${esc(account.provider)}</p><dl class="detail-grid"><div><dt>Sign-in method</dt><dd>${account.auth_kind === "oauth" ? "OAuth" : "API key"}</dd></div><div><dt>Status</dt><dd>${account.enabled === false ? "Disabled" : "Enabled"}</dd></div><div><dt>Recent failures</dt><dd>${fmtInt(account.health?.failure_count)}</dd></div><div><dt>Available again</dt><dd>${account.health?.cooldown_until ? esc(relTime(account.health.cooldown_until)) : "Now"}</dd></div></dl><div class="button-row"><button class="btn btn-primary btn-xs" type="button" data-account-connect="${esc(account.id)}">${account.auth_kind === "oauth" ? "Sign in" : "View"}</button>${account.enabled === false ? `<button class="btn btn-outline btn-xs" type="button" data-account-action="enable" data-account-id="${esc(account.id)}">Enable</button>` : `<button class="btn btn-outline btn-xs" type="button" data-account-action="disable" data-account-id="${esc(account.id)}">Disable</button>`}<button class="btn btn-ghost btn-xs" type="button" data-account-action="refresh" data-account-id="${esc(account.id)}">Refresh</button><button class="btn btn-ghost btn-xs" type="button" data-account-action="revoke" data-account-id="${esc(account.id)}">Sign out</button></div></article>`).join("");
+    const grouped = accounts.map((account) => `<article class="panel account-card"><div class="toolbar"><h2 class="panel-title">${esc(account.id)}</h2><span class="spacer"></span>${statusBadge(account.health?.status || "unknown")}</div><p class="muted">Provider: ${esc(account.provider)}</p><dl class="detail-grid"><div><dt>Sign-in method</dt><dd>${account.auth_kind === "oauth" ? "OAuth" : "API key"}</dd></div><div><dt>Status</dt><dd>${account.selected ? "Selected" : account.enabled === false ? "Disabled" : "Enabled"}</dd></div><div><dt>Recent failures</dt><dd>${fmtInt(account.health?.failure_count)}</dd></div><div><dt>Available again</dt><dd>${account.health?.cooldown_until ? esc(relTime(account.health.cooldown_until)) : "Now"}</dd></div></dl><div class="button-row"><button class="btn btn-primary btn-xs" type="button" data-account-connect="${esc(account.id)}">${account.auth_kind === "oauth" ? "Sign in" : "View"}</button>${accountActionButtons(account)}</div></article>`).join("");
     const quotaRowsSource = (controlGraph().quota || []).length ? controlGraph().quota : (state.data.quota?.windows || []);
     const quotaRows = quotaRowsSource.filter((row) => !connectionAccount || row.identity?.credential === connectionAccount.id || row.account === connectionAccount.id).map((row) => `<li><span class="mono">${esc(row.identity?.credential || row.account || "account")}</span><span class="muted">${esc(row.state || row.unit || "quota")}</span><span class="spacer"></span>${row.remaining === undefined ? "—" : esc(fmtInt(row.remaining))}</li>`).join("");
     root.innerHTML = `${viewHeader("Accounts", views.accounts.subtitle)}${draftBar()}${accountForm()}${grouped ? `<section class="section"><div class="toolbar"><h2 class="section-title">Your accounts</h2><span class="section-hint">Each account keeps its own limits and status.</span></div><div class="grid-2">${grouped}</div></section>` : `<div class="panel empty-state"><p class="empty-title">No accounts</p><p class="empty-description">Add a provider first.</p></div>`}${connectionAccount ? accountOAuthPanel(connectionAccount) : ""}${quotaRows ? `<section class="panel"><h2 class="panel-title">Account limits</h2><ul class="check-list">${quotaRows}</ul></section>` : ""}`;
@@ -3624,7 +3640,11 @@
     }
     return runMutation(
       path,
-      { successMessage: () => `${label}d ${accountId}.` },
+      {
+        successMessage: () => action === "switch"
+          ? `Selected ${accountId}.`
+          : `${label}d ${accountId}.`,
+      },
       trigger,
     );
   }

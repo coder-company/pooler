@@ -581,6 +581,7 @@ struct RuntimeState {
     listeners: Mutex<Option<Vec<BoundListener>>>,
     dispatch: Arc<ArcSwap<RuntimeGeneration>>,
     reload_lock: Arc<AsyncMutex<()>>,
+    account_mutation_serial: Arc<Mutex<()>>,
     retired: Arc<Mutex<Vec<Arc<RuntimeGeneration>>>>,
     metrics: MetricsRegistry,
     traces: pooler_observe::TraceRecorder,
@@ -1058,6 +1059,7 @@ impl HttpProxyServer {
         let cancellation = CancellationToken::new();
         let (native_commands, native_command_receiver) = mpsc::channel(16);
         let reload_lock = Arc::new(AsyncMutex::new(()));
+        let account_mutation_serial = Arc::new(Mutex::new(()));
         let browser_oauth: Arc<dyn ManagementOAuthBroker> =
             Arc::new(NativeManagementOAuthBroker::new(
                 Arc::clone(&dispatch),
@@ -1075,6 +1077,7 @@ impl HttpProxyServer {
                     metrics: metrics.clone(),
                     traces: traces.clone(),
                     native_commands,
+                    account_mutation_serial: Arc::clone(&account_mutation_serial),
                     browser_oauth: Some(Arc::clone(&browser_oauth)),
                     management_state: management_store
                         .map(|store| Arc::new(ManagementState::new(Some(store)))),
@@ -1198,6 +1201,7 @@ impl HttpProxyServer {
                 listeners: Mutex::new(Some(listeners)),
                 dispatch,
                 reload_lock,
+                account_mutation_serial,
                 retired,
                 metrics,
                 traces,
@@ -1572,6 +1576,16 @@ impl HttpProxyServer {
 
         let previous_generation = current.config.generation();
         activation_stage(RuntimeActivationStage::Publish)?;
+        // Keep provider-topology ownership coherent with synchronous
+        // management account mutations. The management path acquires this
+        // lock before loading the active generation; holding it through
+        // publication and acknowledgement prevents either side from acting
+        // on a generation that is concurrently replaced or rolled back.
+        let _account_mutation_guard = self
+            .state
+            .account_mutation_serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut retired = self
             .state
             .retired
@@ -6109,6 +6123,135 @@ mod tests {
         std::env::remove_var(SECRET_ENV);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn account_mutations_and_reload_publication_share_one_generation_fence() {
+        const SECRET_ENV: &str = "POOLER_MANAGEMENT_ACCOUNT_FENCE_TEST_KEY";
+        std::env::set_var(SECRET_ENV, "account-fence-secret");
+        let initial = pooler_config::compile_yaml(
+            "management-account-fence.yaml",
+            r#"
+version: 2
+management: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_ACCOUNT_FENCE_TEST_KEY}}
+upstreams:
+  provider-a: {url: http://127.0.0.1:1}
+  provider-b: {url: http://127.0.0.1:2}
+accounts:
+  alpha: {provider: provider-a, secret: env:POOLER_ALPHA}
+  beta: {provider: provider-a, secret: env:POOLER_BETA}
+  gamma: {provider: provider-b, secret: env:POOLER_GAMMA}
+"#,
+        )
+        .expect("initial account topology");
+        let server = HttpProxyServer::bind(initial).await.expect("bind server");
+        let api = server.management_api().expect("management api");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer account-fence-secret"),
+        );
+
+        let guard = server
+            .state
+            .account_mutation_serial
+            .lock()
+            .expect("account mutation serial");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let blocked_api = Arc::clone(&api);
+        let blocked_headers = headers.clone();
+        let mutation = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).expect("announce mutation");
+            blocked_api.handle(
+                &http::Method::POST,
+                "/accounts/alpha/switch",
+                &blocked_headers,
+            )
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mutation started");
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            !mutation.is_finished(),
+            "mutation bypassed generation fence"
+        );
+        drop(guard);
+        let response = mutation.await.expect("mutation task");
+        assert_eq!(response.status, http::StatusCode::OK);
+        let response: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("mutation json");
+        assert_eq!(response["generation"], 1);
+
+        let replacement = pooler_config::compile_yaml(
+            "management-account-fence.yaml",
+            r#"
+version: 2
+management: {bind: 127.0.0.1:0, auth: {secret: env:POOLER_MANAGEMENT_ACCOUNT_FENCE_TEST_KEY}}
+upstreams:
+  provider-a: {url: http://127.0.0.1:1}
+  provider-b: {url: http://127.0.0.1:2}
+accounts:
+  alpha: {provider: provider-a, secret: env:POOLER_ALPHA}
+  beta: {provider: provider-b, secret: env:POOLER_BETA}
+  gamma: {provider: provider-a, secret: env:POOLER_GAMMA}
+"#,
+        )
+        .expect("replacement account topology");
+        let guard = server
+            .state
+            .account_mutation_serial
+            .lock()
+            .expect("account mutation serial");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let reload_server = server.clone();
+        let reload = tokio::spawn(async move {
+            started_tx.send(()).expect("announce reload");
+            reload_server.reload(replacement).await
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reload started");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!reload.is_finished(), "reload publication bypassed fence");
+        assert_eq!(server.state.dispatch.load().config.generation(), 1);
+        drop(guard);
+        assert_eq!(
+            reload.await.expect("reload task").expect("runtime reload"),
+            HttpReloadOutcome::Reloaded { generation: 2 }
+        );
+
+        for account in ["beta", "gamma"] {
+            let response = api.handle(
+                &http::Method::POST,
+                &format!("/accounts/{account}/enable"),
+                &headers,
+            );
+            assert_eq!(response.status, http::StatusCode::OK);
+        }
+        let response = api.handle(&http::Method::POST, "/accounts/alpha/switch", &headers);
+        assert_eq!(response.status, http::StatusCode::OK);
+        let response: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("switch json");
+        assert_eq!(response["generation"], 2);
+
+        let states = server
+            .state
+            .dispatch
+            .load_full()
+            .pooling
+            .store()
+            .credential_states()
+            .expect("credential states")
+            .into_iter()
+            .map(|state| (state.credential_id, state.enabled))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(states.get("alpha"), Some(&true));
+        assert_eq!(states.get("beta"), Some(&true));
+        assert_eq!(states.get("gamma"), Some(&false));
+
+        server.begin_drain();
+        std::env::remove_var(SECRET_ENV);
+    }
+
     #[tokio::test]
     async fn management_native_account_commands_are_bounded_and_audited() {
         std::env::set_var("POOLER_MANAGEMENT_NATIVE_TEST_KEY", "native-command-secret");
@@ -6242,6 +6385,7 @@ mod tests {
                 metrics: MetricsRegistry::default(),
                 traces: pooler_observe::TraceRecorder::default(),
                 native_commands,
+                account_mutation_serial: Arc::new(Mutex::new(())),
                 browser_oauth: Some(browser_oauth),
                 management_state: None,
             },

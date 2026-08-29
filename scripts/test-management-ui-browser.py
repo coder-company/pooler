@@ -1782,7 +1782,13 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
 
         page.locator('[data-route="accounts"]').click()
         page.wait_for_selector(".view-accounts")
-        expect(page.locator('[data-account-action="switch"]').count() == 0, "account Switch action remains")
+        expect(page.locator('[data-account-action="switch"]').count() == 1, "account switch action is missing")
+        backup_card = page.locator('[data-account-connect="backup"]').locator("xpath=ancestor::article")
+        expect(
+            backup_card.locator('[data-account-action="refresh"]').count() == 0
+            and backup_card.locator('[data-account-action="revoke"]').count() == 0,
+            "API-key account invented OAuth lifecycle actions",
+        )
         page.locator('[data-account-new-field="id"]').fill("one-time-account")
         expect(page.locator('[data-account-new-field="authKind"]').count() == 0, "single supported sign-in method was exposed as a pointless choice")
         expect("API key" in page.locator(".view-accounts").inner_text(), "API-key sign-in method is not explained")

@@ -435,7 +435,7 @@ fn management_account_action(path: &str) -> Option<(String, &str)> {
         && !account.contains('/')
         && matches!(
             action,
-            "enable" | "disable" | "refresh" | "revoke" | "oauth-device"
+            "enable" | "disable" | "switch" | "refresh" | "revoke" | "oauth-device"
         ))
     .then_some((account, action))
 }
@@ -1009,6 +1009,7 @@ pub(crate) struct ManagementRuntimeServices {
     pub(crate) metrics: pooler_observe::MetricsRegistry,
     pub(crate) traces: pooler_observe::TraceRecorder,
     pub(crate) native_commands: mpsc::Sender<NativeAccountCommand>,
+    pub(crate) account_mutation_serial: Arc<Mutex<()>>,
     pub(crate) browser_oauth: Option<Arc<dyn ManagementOAuthBroker>>,
     pub(crate) management_state: Option<Arc<ManagementState>>,
 }
@@ -1019,6 +1020,7 @@ pub struct ManagementApi {
     plan: ManagementPlan,
     state: Arc<ArcSwap<ManagementSnapshot>>,
     runtime_dispatch: Option<Arc<ArcSwap<RuntimeGeneration>>>,
+    account_mutation_serial: Option<Arc<Mutex<()>>>,
     catalog: Option<Arc<CatalogRuntime>>,
     metrics: pooler_observe::MetricsRegistry,
     traces: pooler_observe::TraceRecorder,
@@ -1101,6 +1103,7 @@ impl ManagementApi {
                 pooling,
             })),
             runtime_dispatch: None,
+            account_mutation_serial: None,
             catalog: None,
             metrics,
             traces: pooler_observe::TraceRecorder::default(),
@@ -1168,6 +1171,7 @@ impl ManagementApi {
                 pooling,
             })),
             runtime_dispatch: Some(runtime_dispatch),
+            account_mutation_serial: Some(services.account_mutation_serial),
             catalog: None,
             metrics: services.metrics,
             traces: services.traces,
@@ -3247,6 +3251,7 @@ impl ManagementApi {
         let result = match action {
             "enable" => pooling.set_account_enabled(&account, true),
             "disable" => pooling.set_account_enabled(&account, false),
+            "switch" => pooling.switch_account(&account),
             _ => unreachable!("validated account action"),
         };
         match result {
@@ -4156,6 +4161,18 @@ impl ManagementApi {
             .then(|| self.actor_from_headers(headers))
             .flatten();
 
+        // Runtime account mutations and generation publication share this
+        // short critical section. Load the immutable runtime snapshot only
+        // after acquiring it so a switch cannot use retired provider topology
+        // while a reload publishes a newer generation.
+        let _account_mutation_guard = management_account_action(path)
+            .filter(|(_, action)| matches!(*action, "enable" | "disable" | "switch"))
+            .and(self.account_mutation_serial.as_ref())
+            .map(|serial| {
+                serial
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
         let fallback = self.state.load_full();
         let runtime = self
             .runtime_dispatch
@@ -4807,6 +4824,11 @@ impl ManagementApi {
                 let mut available_actions = Vec::new();
                 if mutation_capable {
                     available_actions.push(if enabled { "disable" } else { "enable" });
+                    if snapshot.config().accounts().values().any(|other| {
+                        other.provider() == account.provider() && other.id() != account.id()
+                    }) {
+                        available_actions.push("switch");
+                    }
                     if account.auth_kind() == pooler_config::AccountAuthKind::OAuth
                         && self.native_commands.is_some()
                     {
@@ -6984,19 +7006,26 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         std::env::set_var("POOLER_MANAGEMENT_MUTATION_KEY", "mutation-secret");
         let first_secret = tempfile::NamedTempFile::new().expect("first secret");
         let second_secret = tempfile::NamedTempFile::new().expect("second secret");
+        let third_secret = tempfile::NamedTempFile::new().expect("third secret");
         std::fs::write(first_secret.path(), "first-account-secret").expect("write first");
         std::fs::write(second_secret.path(), "second-account-secret").expect("write second");
+        std::fs::write(third_secret.path(), "third-account-secret").expect("write third");
         #[cfg(unix)]
-        for path in [first_secret.path(), second_secret.path()] {
+        for path in [
+            first_secret.path(),
+            second_secret.path(),
+            third_secret.path(),
+        ] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .expect("secret permissions");
         }
         let config = pooler_config::compile_yaml(
             "management-mutation-test.yaml",
             &format!(
-                "version: 2\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:POOLER_MANAGEMENT_MUTATION_KEY}}}}\nupstreams: {{provider: {{url: http://127.0.0.1:1}}}}\naccounts:\n  alpha: {{provider: provider, secret: 'file:{}'}}\n  beta: {{provider: provider, secret: 'file:{}'}}\naccount_pools: {{accounts: {{provider: provider, strategy: ordered_fallback, accounts: [alpha, beta]}}}}\npolicies: {{accounts: {{selection: {{strategy: ordered_fallback}}}}}}\nmodels: [{{id: public, targets: [{{id: public-target, provider: provider, account_pool: accounts, priority: 1, upstream_model: public, capabilities: [text, streaming], codecs: [openai], wire_family: openai}}]}}]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nroutes: [{{id: route, listen: local, ingress: {{mode: patch}}, target: {{provider: provider, model_from: request.model, policy: accounts}}}}]\n",
+                "version: 2\nmanagement: {{bind: 127.0.0.1:0, auth: {{secret: env:POOLER_MANAGEMENT_MUTATION_KEY}}}}\nupstreams: {{provider: {{url: http://127.0.0.1:1}}, other: {{url: http://127.0.0.1:2}}}}\naccounts:\n  alpha: {{provider: provider, secret: 'file:{}'}}\n  beta: {{provider: provider, secret: 'file:{}'}}\n  gamma: {{provider: other, secret: 'file:{}'}}\naccount_pools: {{accounts: {{provider: provider, strategy: ordered_fallback, accounts: [alpha, beta]}}}}\npolicies: {{accounts: {{selection: {{strategy: ordered_fallback}}}}}}\nmodels: [{{id: public, targets: [{{id: public-target, provider: provider, account_pool: accounts, priority: 1, upstream_model: public, capabilities: [text, streaming], codecs: [openai], wire_family: openai}}]}}]\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nroutes: [{{id: route, listen: local, ingress: {{mode: patch}}, target: {{provider: provider, model_from: request.model, policy: accounts}}}}]\n",
                 first_secret.path().display(),
                 second_secret.path().display(),
+                third_secret.path().display(),
             ),
         )
         .expect("management mutation config");
@@ -7072,6 +7101,11 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             StatusCode::BAD_REQUEST
         );
 
+        let missing = api.handle(&Method::POST, "/accounts/missing/switch", &headers);
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        let missing: Value = serde_json::from_slice(&missing.body).expect("missing account json");
+        assert_eq!(missing["error"]["code"], "account_not_found");
+
         let disabled = api.handle(&Method::POST, "/accounts/alpha/disable", &headers);
         assert_eq!(disabled.status, StatusCode::OK);
         let accounts = api.handle(&Method::GET, "/accounts", &headers);
@@ -7095,11 +7129,42 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             .expect("beta");
         assert_eq!(beta["status"], "available");
         assert_eq!(beta["selected"], true);
-        assert!(alpha["available_actions"]
+        let alpha_actions = alpha["available_actions"]
             .as_array()
-            .expect("available actions")
+            .expect("available actions");
+        assert!(alpha_actions.iter().any(|action| action == "enable"));
+        assert!(alpha_actions.iter().any(|action| action == "switch"));
+        let gamma = accounts["accounts"]
+            .as_array()
+            .expect("accounts")
             .iter()
-            .any(|action| action == "enable"));
+            .find(|account| account["id"] == "gamma")
+            .expect("gamma");
+        assert!(gamma["enabled"].as_bool().expect("gamma enabled"));
+        assert!(!gamma["available_actions"]
+            .as_array()
+            .expect("gamma actions")
+            .iter()
+            .any(|action| action == "switch"));
+
+        let switched = api.handle(&Method::POST, "/accounts/alpha/switch", &headers);
+        assert_eq!(switched.status, StatusCode::OK);
+        let switched: Value = serde_json::from_slice(&switched.body).expect("switch json");
+        assert_eq!(switched["action"], "switch");
+        let accounts = api.handle(&Method::GET, "/accounts", &headers);
+        let accounts: Value = serde_json::from_slice(&accounts.body).expect("accounts json");
+        let account_enabled = |id: &str| {
+            accounts["accounts"]
+                .as_array()
+                .expect("accounts")
+                .iter()
+                .find(|account| account["id"] == id)
+                .and_then(|account| account["enabled"].as_bool())
+                .expect("account enabled state")
+        };
+        assert!(account_enabled("alpha"));
+        assert!(!account_enabled("beta"));
+        assert!(account_enabled("gamma"));
 
         let model = api.handle(&Method::POST, "/models/public/disable", &headers);
         assert_eq!(model.status, StatusCode::OK);
@@ -7171,6 +7236,7 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
             "mutation-secret",
             "first-account-secret",
             "second-account-secret",
+            "third-account-secret",
         ] {
             assert!(!export.contains(secret));
         }
