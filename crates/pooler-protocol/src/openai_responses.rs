@@ -718,8 +718,9 @@ pub fn encode_responses_request(
             request
                 .input
                 .iter()
-                .map(|item| encode_input_item(item, &mut report))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(|item| encode_input_items(item, &mut report))
+                .collect::<Result<Vec<_>, _>>()?
+                .concat(),
         ),
     );
     let tools = match take_preserved_tools(&mut object)? {
@@ -802,6 +803,45 @@ pub fn encode_responses_request(
     })
 }
 
+/// Encode one semantic input item as the Responses input items it requires.
+///
+/// One item can expand into several. Responses carries a function call and its
+/// output as top-level items, so a message holding either in its content has
+/// them hoisted into siblings; nesting them under `content` is rejected by the
+/// API, which accepts only content-part types there.
+fn encode_input_items(
+    item: &InputItem,
+    report: &mut ConversionReport,
+) -> Result<Vec<Value>, OpenAiResponsesError> {
+    let InputItem::Message(message) = item else {
+        return Ok(vec![encode_input_item(item, report)?]);
+    };
+    let mut hoisted = Vec::new();
+    let mut content = Vec::new();
+    for part in &message.content {
+        match part {
+            ContentPart::ToolCall(call) => hoisted.push(encode_tool_call(call, report)?),
+            ContentPart::ToolResult(result) => hoisted.push(encode_tool_result(result, report)?),
+            retained => content.push(retained.clone()),
+        }
+    }
+    if hoisted.is_empty() {
+        return Ok(vec![encode_message(message, report)?]);
+    }
+    let mut items = Vec::with_capacity(hoisted.len() + 1);
+    // The remaining prose precedes the calls it introduced. A message left with
+    // no content is dropped rather than sent as an empty turn.
+    if !content.is_empty() {
+        let trimmed = Message {
+            content,
+            ..message.clone()
+        };
+        items.push(encode_message(&trimmed, report)?);
+    }
+    items.extend(hoisted);
+    Ok(items)
+}
+
 fn encode_input_item(
     item: &InputItem,
     report: &mut ConversionReport,
@@ -812,6 +852,11 @@ fn encode_input_item(
         InputItem::ToolResult(result) => encode_tool_result(result, report),
         InputItem::Content(part) => match part {
             ContentPart::Reasoning(reasoning) => encode_reasoning_item(reasoning, report),
+            // A function call and its output are top-level items in Responses.
+            // Wrapping either in a message would nest it under `content`, which
+            // accepts only content-part types.
+            ContentPart::ToolCall(call) => encode_tool_call(call, report),
+            ContentPart::ToolResult(result) => encode_tool_result(result, report),
             _ => Ok(serde_json::json!({
                 "role":"user",
                 "content":[encode_content_part(part, Role::User, report)?]
@@ -3038,9 +3083,68 @@ mod tests {
         OpenAiResponsesEventDecoder, OpenAiResponsesEventEncoder,
     };
     use crate::{
-        encode_chat_request, FinishReason, LossPolicy, OpenAiChatError, OpenAiChatEventEncoder,
-        ReasoningBlock, StreamEvent, StreamEventKind, StreamValidator, Usage,
+        encode_chat_request, FinishReason, LossPolicy, OpenAiChatCodec, OpenAiChatError,
+        OpenAiChatEventEncoder, ReasoningBlock, StreamEvent, StreamEventKind, StreamValidator,
+        Usage,
     };
+
+    #[test]
+    fn chat_tool_call_continuation_becomes_top_level_responses_items() {
+        // A Chat client sends the assistant turn with `tool_calls` on the
+        // message and the result as a `tool` message. Responses accepts neither
+        // inside `content`, so both must arrive as top-level input items or the
+        // provider rejects the whole continuation.
+        let chat = json!({
+            "model":"gpt-test",
+            "messages":[
+                {"role":"user","content":"read sample.txt"},
+                {
+                    "role":"assistant",
+                    "content":null,
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"read_file","arguments":"{\"path\":\"sample.txt\"}"}
+                    }]
+                },
+                {"role":"tool","tool_call_id":"call_1","content":"alpha"}
+            ]
+        });
+        let request = OpenAiChatCodec::decode_request(
+            serde_json::to_vec(&chat).expect("chat request").as_slice(),
+        )
+        .expect("chat decodes");
+        let encoded = encode_responses_request(&request, LossPolicy::Reject).expect("encodes");
+        let value: Value = serde_json::from_slice(&encoded.body).expect("responses JSON");
+        let input = value["input"].as_array().expect("input array");
+
+        let kinds = input
+            .iter()
+            .map(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec!["message", "function_call", "function_call_output"],
+            "input: {input:#?}"
+        );
+        for item in input {
+            let Some(content) = item.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for part in content {
+                let part_type = part.get("type").and_then(Value::as_str);
+                assert_ne!(part_type, Some("function_call"), "input: {input:#?}");
+                assert_ne!(part_type, Some("function_call_output"), "input: {input:#?}");
+            }
+        }
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["name"], "read_file");
+        assert_eq!(input[2]["call_id"], "call_1");
+    }
 
     #[test]
     fn droid_responses_request_preserves_tools_reasoning_and_tool_follow_up() {

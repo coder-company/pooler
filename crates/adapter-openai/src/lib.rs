@@ -2050,6 +2050,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chat_tool_continuation_converts_to_top_level_responses_items() {
+        // A Chat client resumes a tool call by sending the assistant turn with
+        // `tool_calls` and the result as a `tool` message. Responses carries
+        // both as top-level input items; nesting either under `content` makes
+        // the provider reject the whole continuation, which strands any client
+        // that uses tools.
+        let route = route(
+            OPENAI_CHAT_REQUEST_DECODER,
+            OPENAI_CHAT_EVENT_DECODER,
+            OPENAI_CHAT_EVENT_ENCODER,
+        );
+        let request = json!({
+            "model":"openai-model",
+            "stream":false,
+            "messages":[
+                {"role":"user","content":"read sample.txt"},
+                {
+                    "role":"assistant",
+                    "content":null,
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"read_file","arguments":"{\"path\":\"sample.txt\"}"}
+                    }]
+                },
+                {"role":"tool","tool_call_id":"call_1","content":"alpha"}
+            ],
+            "tools":[{
+                "type":"function",
+                "function":{"name":"read_file","parameters":{"type":"object"}}
+            }]
+        });
+        let encoded = OpenAiSemanticAdapter
+            .reencode_request_for_wire(
+                &route,
+                &serde_json::to_vec(&request).expect("Chat request JSON"),
+                SemanticWire::OpenAiResponses,
+            )
+            .expect("Chat tool continuation converts to Responses");
+        let encoded: Value = serde_json::from_slice(&encoded).expect("Responses request JSON");
+        let input = encoded["input"].as_array().expect("input array");
+
+        for item in input {
+            let Some(content) = item.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for part in content {
+                let part_type = part.get("type").and_then(Value::as_str);
+                assert_ne!(part_type, Some("function_call"), "input: {input:#?}");
+                assert_ne!(part_type, Some("function_call_output"), "input: {input:#?}");
+            }
+        }
+        let call = input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .expect("function_call is a top-level item");
+        assert_eq!(call["call_id"], "call_1");
+        assert_eq!(call["name"], "read_file");
+        let output = input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .expect("function_call_output is a top-level item");
+        assert_eq!(output["call_id"], "call_1");
+    }
+
     #[tokio::test]
     async fn unary_chat_round_trips_through_streaming_responses() {
         let route = route(
