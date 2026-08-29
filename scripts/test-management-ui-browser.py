@@ -1854,7 +1854,7 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
             expect(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), f"model controls overflow at {width}px")
 
         page.locator('[data-route="pools"]').click()
-        page.wait_for_selector(".view-pools")
+        page.wait_for_selector(".view-pools #pool-create-title")
         expect("failover group" in page.locator(".view-pools").inner_text().lower(), "plain-language failover surface missing")
         page.locator('[data-pool-field="id"]').fill("OpenAI accounts")
         pool_accounts = page.locator("[data-pool-account]")
@@ -1869,7 +1869,7 @@ def run_browser(playwright, scenario: str = "full", evidence_dir: Path | None = 
             "failover save did not update both the account group and matching model bindings",
         )
         page.locator('[data-route="endpoints"]').click()
-        page.wait_for_selector(".view-endpoints")
+        page.wait_for_selector(".view-endpoints #connect-tools-title")
         endpoint_text = page.locator(".view-endpoints").inner_text()
         for label in ("Factory Droid", "Vercel fx", "Devin", "Codex", "Claude Code", "Cursor", "generic SDK"):
             expect(label in endpoint_text, f"optional Connect tools omitted {label}")
