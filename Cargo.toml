@@ -46,7 +46,7 @@ tokio = { version = "1.43", features = ["full"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio-util = "0.7"
 tempfile = "=3.27.0"
-tokio-tungstenite = { version = "=0.27.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
