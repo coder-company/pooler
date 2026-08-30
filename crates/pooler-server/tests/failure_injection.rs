@@ -106,6 +106,234 @@ async fn full_fault_corpus_runs_through_the_real_runtime() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replay_safe_connection_refusal_rotates_to_distinct_healthy_provider() {
+    let counters = LeakCounters::new();
+    let refused_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve refused address");
+    let refused_address = refused_listener
+        .local_addr()
+        .expect("reserved refused address");
+    drop(refused_listener);
+
+    let healthy = spawn_http_upstream(HttpFault::Success, counters.clone(), None).await;
+    let (config, secrets) =
+        cross_provider_network_retry_config(refused_address, healthy.address, 2, &counters);
+    let running = start_server(config, secrets, &counters).await;
+    let response = send_http_request(
+        running.tcp_address(),
+        "/fault",
+        "application/json",
+        br#"{"model":"public-model"}"#,
+        true,
+    )
+    .await;
+    let events = running
+        .server
+        .pooling()
+        .request_events()
+        .expect("network-failover request history");
+
+    assert_eq!(
+        response_status(&response),
+        200,
+        "response={}, events={events:?}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(decoded_http_body(&response), b"ok");
+    wait_for_attempts(&healthy.attempts, 1, "network-failover healthy target").await;
+
+    let selections = events
+        .iter()
+        .filter(|event| event.kind == pooler_store::RequestEventKind::Selection)
+        .collect::<Vec<_>>();
+    assert_eq!(selections.len(), 2, "selection events: {events:?}");
+    assert_eq!(selections[0].attempt, Some(1));
+    assert_eq!(selections[0].provider.as_deref(), Some("refused"));
+    assert_eq!(
+        selections[0].target_binding_id.as_deref(),
+        Some("public-model/refused-target")
+    );
+    assert_eq!(selections[1].attempt, Some(2));
+    assert_eq!(selections[1].provider.as_deref(), Some("healthy"));
+    assert_eq!(
+        selections[1].target_binding_id.as_deref(),
+        Some("public-model/healthy-target")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.kind == pooler_store::RequestEventKind::Retry
+                    && event
+                        .retry_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("AlternateProvider"))
+            })
+            .count(),
+        1,
+        "network retry events: {events:?}"
+    );
+    let decisions = running
+        .server
+        .pooling()
+        .recent_decisions(16)
+        .expect("network-failover decisions");
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|decision| {
+                decision
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("failure=Network"))
+            })
+            .count(),
+        1,
+        "network failure decisions: {decisions:?}"
+    );
+    let commitments = events
+        .iter()
+        .filter(|event| event.kind == pooler_store::RequestEventKind::Commitment)
+        .collect::<Vec<_>>();
+    assert_eq!(commitments.len(), 1, "commitment events: {events:?}");
+    assert_eq!(commitments[0].attempt, Some(2));
+    assert_eq!(
+        commitments[0].commitment.as_deref(),
+        Some("response_headers")
+    );
+    assert_eq!(commitments[0].status, Some(200));
+    assert!(!credential_cooldown_present(&running.server));
+
+    sleep(RETRY_GRACE).await;
+    assert_eq!(healthy.stop().await, 1);
+    running.stop().await;
+    counters
+        .assert_zero()
+        .expect("network-failover test released every tracked resource");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_retry_preserves_distinct_credential_budget() {
+    let counters = LeakCounters::new();
+    let refused_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve refused address");
+    let refused_address = refused_listener
+        .local_addr()
+        .expect("reserved refused address");
+    drop(refused_listener);
+
+    let healthy = spawn_http_upstream(HttpFault::Success, counters.clone(), None).await;
+    let (config, secrets) =
+        cross_provider_network_retry_config(refused_address, healthy.address, 1, &counters);
+    let running = start_server(config, secrets, &counters).await;
+    let response = send_http_request(
+        running.tcp_address(),
+        "/fault",
+        "application/json",
+        br#"{"model":"public-model"}"#,
+        true,
+    )
+    .await;
+    assert_eq!(response_status(&response), 502);
+
+    let events = running
+        .server
+        .pooling()
+        .request_events()
+        .expect("credential-budget request history");
+    let selections = events
+        .iter()
+        .filter(|event| event.kind == pooler_store::RequestEventKind::Selection)
+        .collect::<Vec<_>>();
+    assert_eq!(selections.len(), 2, "selection events: {events:?}");
+    assert!(selections.iter().all(|event| {
+        event.provider.as_deref() == Some("refused")
+            && event.target_binding_id.as_deref() == Some("public-model/refused-target")
+    }));
+    assert_eq!(
+        selections[0].account_pseudonym, selections[1].account_pseudonym,
+        "credential budget must force reuse of the already-counted account"
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == pooler_store::RequestEventKind::Completion && event.status == Some(502)
+    }));
+    assert!(!credential_cooldown_present(&running.server));
+
+    sleep(RETRY_GRACE).await;
+    assert_eq!(healthy.stop().await, 0);
+    running.stop().await;
+    counters
+        .assert_zero()
+        .expect("credential-budget test released every tracked resource");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_retry_reuses_prior_targets_at_distinct_target_limits() {
+    let counters = LeakCounters::new();
+    let first_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve first refused address");
+    let first_address = first_listener.local_addr().expect("first refused address");
+    drop(first_listener);
+    let second_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve second refused address");
+    let second_address = second_listener
+        .local_addr()
+        .expect("second refused address");
+    drop(second_listener);
+
+    let (config, secrets) =
+        reused_provider_network_retry_config(first_address, second_address, &counters);
+    let running = start_server(config, secrets, &counters).await;
+    let response = send_http_request(
+        running.tcp_address(),
+        "/fault",
+        "application/json",
+        br#"{"model":"public-model"}"#,
+        true,
+    )
+    .await;
+    assert_eq!(response_status(&response), 502);
+
+    let events = running
+        .server
+        .pooling()
+        .request_events()
+        .expect("target-reuse request history");
+    let selections = events
+        .iter()
+        .filter(|event| event.kind == pooler_store::RequestEventKind::Selection)
+        .collect::<Vec<_>>();
+    assert_eq!(selections.len(), 3, "selection events: {events:?}");
+    assert_eq!(selections[0].provider.as_deref(), Some("first"));
+    assert_eq!(selections[1].provider.as_deref(), Some("second"));
+    assert_eq!(selections[2].provider.as_deref(), Some("first"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.kind == pooler_store::RequestEventKind::Retry
+                    && event
+                        .retry_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("AlternateProvider"))
+            })
+            .count(),
+        2,
+        "target-reuse retry events: {events:?}"
+    );
+    assert!(!credential_cooldown_present(&running.server));
+
+    running.stop().await;
+    counters
+        .assert_zero()
+        .expect("target-reuse test released every tracked resource");
+}
+
 #[test]
 fn runtime_case_rejects_unknown_fields() {
     let error = serde_json::from_str::<Case>(
@@ -597,6 +825,110 @@ fn pooled_config(
         second.reference(),
     );
     let config = compile_yaml("fault-corpus.yaml", &yaml).expect("fault config compiles");
+    (config, vec![first, second])
+}
+
+fn cross_provider_network_retry_config(
+    refused_address: SocketAddr,
+    healthy_address: SocketAddr,
+    maximum_credentials: u32,
+    counters: &LeakCounters,
+) -> (CompiledConfig, Vec<TestSecret>) {
+    let refused_first = TestSecret::new("refused-first-token", counters);
+    let refused_second = TestSecret::new("refused-second-token", counters);
+    let healthy = TestSecret::new("healthy-token", counters);
+    let yaml = format!(
+        r#"version: 2
+listeners:
+  local:
+    bind: 127.0.0.1:0
+upstreams:
+  refused:
+    url: http://{refused_address}
+    transport: {{connect_timeout: 500ms, request_timeout: 3s}}
+  healthy:
+    url: http://{healthy_address}
+    transport: {{connect_timeout: 500ms, request_timeout: 3s}}
+accounts:
+  refused-first: {{provider: refused, secret: {}}}
+  refused-second: {{provider: refused, secret: {}}}
+  healthy-account: {{provider: healthy, secret: {}}}
+account_pools:
+  refused-pool: {{provider: refused, accounts: [refused-first, refused-second]}}
+  healthy-pool: {{provider: healthy, accounts: [healthy-account]}}
+models:
+  - id: public-model
+    targets:
+      - {{id: refused-target, provider: refused, account_pool: refused-pool, priority: 1, upstream_model: refused-private, capabilities: [text], codecs: [], wire_family: openai}}
+      - {{id: healthy-target, provider: healthy, account_pool: healthy-pool, priority: 2, upstream_model: healthy-private, capabilities: [text], codecs: [], wire_family: openai}}
+policies:
+  faults:
+    selection: {{strategy: ordered_fallback}}
+    retry: {{maximum_attempts: 2, maximum_credentials: {maximum_credentials}, maximum_upstreams: 2, statuses: [429, 500, 502, 503, 504], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s, maximum_elapsed: 3s, maximum_recovery_wait: 2s}}
+routes:
+  - id: fault
+    listen: local
+    match: {{method: POST, path: /fault, content_types: [application/json]}}
+    ingress: {{mode: patch}}
+    target: {{provider: refused, model_from: request.model, policy: faults}}
+    response: {{mode: opaque}}
+"#,
+        refused_first.reference(),
+        refused_second.reference(),
+        healthy.reference(),
+    );
+    let config = compile_yaml("network-failover.yaml", &yaml)
+        .expect("cross-provider network-failover config compiles");
+    (config, vec![refused_first, refused_second, healthy])
+}
+
+fn reused_provider_network_retry_config(
+    first_address: SocketAddr,
+    second_address: SocketAddr,
+    counters: &LeakCounters,
+) -> (CompiledConfig, Vec<TestSecret>) {
+    let first = TestSecret::new("first-token", counters);
+    let second = TestSecret::new("second-token", counters);
+    let yaml = format!(
+        r#"version: 2
+listeners:
+  local:
+    bind: 127.0.0.1:0
+upstreams:
+  first:
+    url: http://{first_address}
+    transport: {{connect_timeout: 500ms, request_timeout: 3s}}
+  second:
+    url: http://{second_address}
+    transport: {{connect_timeout: 500ms, request_timeout: 3s}}
+accounts:
+  first-account: {{provider: first, secret: {}}}
+  second-account: {{provider: second, secret: {}}}
+account_pools:
+  first-pool: {{provider: first, accounts: [first-account]}}
+  second-pool: {{provider: second, accounts: [second-account]}}
+models:
+  - id: public-model
+    targets:
+      - {{id: first-target, provider: first, account_pool: first-pool, priority: 1, upstream_model: first-private, capabilities: [text], codecs: [], wire_family: openai}}
+      - {{id: second-target, provider: second, account_pool: second-pool, priority: 2, upstream_model: second-private, capabilities: [text], codecs: [], wire_family: openai}}
+policies:
+  faults:
+    selection: {{strategy: ordered_fallback}}
+    retry: {{maximum_attempts: 3, maximum_credentials: 2, maximum_upstreams: 2, statuses: [429, 500, 502, 503, 504], before_commit_only: true, base_delay: 0ms, maximum_delay: 1s, maximum_total_delay: 2s, maximum_elapsed: 3s, maximum_recovery_wait: 2s}}
+routes:
+  - id: fault
+    listen: local
+    match: {{method: POST, path: /fault, content_types: [application/json]}}
+    ingress: {{mode: patch}}
+    target: {{provider: first, model_from: request.model, policy: faults}}
+    response: {{mode: opaque}}
+"#,
+        first.reference(),
+        second.reference(),
+    );
+    let config = compile_yaml("network-target-reuse.yaml", &yaml)
+        .expect("network target-reuse config compiles");
     (config, vec![first, second])
 }
 

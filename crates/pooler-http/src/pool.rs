@@ -33,8 +33,8 @@ use pooler_policy::{
     HealthMutation, HealthSubject, HttpFailureClassifier, ObservedFailure, PersistedQuotaSnapshot,
     ProviderNeutralQuotaClassifier, QuotaClassification, QuotaClassifier, QuotaObservation,
     QuotaProjectKey, QuotaScope, QuotaSignal, QuotaUnit, ReplayCheck, RetryContext, RetryDecision,
-    RetryPolicy, RoutingRequirements, RoutingTelemetry, SelectionError, SelectionExplanation,
-    SelectionLease, SelectionRequest, TelemetrySample,
+    RetryPolicy, RetryStopReason, RetryTargetChange, RoutingRequirements, RoutingTelemetry,
+    SelectionError, SelectionExplanation, SelectionLease, SelectionRequest, TelemetrySample,
 };
 use pooler_store::{
     AffinityBindingIdentity, CooldownState, CredentialHealthState, CredentialHealthStatus,
@@ -476,6 +476,19 @@ pub struct PoolSelection {
     affinity_scope_seed: Option<Arc<str>>,
     registry_key: Option<Arc<str>>,
     selection_request: Option<SelectionRequest>,
+    /// Exclusions inserted only for the immediately preceding transport retry.
+    /// They are removed before rebuilding the next canonical selection request.
+    network_retry_exclusions: BTreeSet<BindingKey>,
+}
+
+impl PoolSelection {
+    fn retry_selection_request(&self) -> Option<SelectionRequest> {
+        let mut request = self.selection_request.clone()?;
+        request
+            .excluded_bindings
+            .retain(|binding| !self.network_retry_exclusions.contains(binding));
+        Some(request)
+    }
 }
 
 #[derive(Clone)]
@@ -915,7 +928,7 @@ pub struct PoolFailure {
 }
 
 impl PoolFailure {
-    /// Take the atomically reserved alternate selected for a quota retry.
+    /// Take the request-local alternate reserved for this retry.
     pub(crate) fn take_replacement(&mut self) -> Option<PoolSelection> {
         self.replacement.take()
     }
@@ -936,11 +949,31 @@ pub(crate) struct FailureInput<'a> {
     pub commitment: CommitmentState,
     pub idempotency_key_present: bool,
     pub attempt: u32,
-    pub credentials_used: u32,
-    pub providers_used: u32,
+    pub credentials_used: &'a BTreeSet<CredentialId>,
+    pub providers_used: &'a BTreeSet<ProviderId>,
     pub elapsed_retry_delay: Duration,
     pub elapsed_recovery_wait: Duration,
     pub started: Instant,
+}
+
+struct NetworkRetryInput<'a> {
+    config: &'a CompiledConfig,
+    route: &'a RoutePlan,
+    failed: &'a mut PoolSelection,
+    registry: &'a CredentialRegistry,
+    retry_policy: &'a RetryPolicy,
+    classification: &'a FailureClassification,
+    fallback_decision: RetryDecision,
+    retry_context: RetryContext,
+    credentials_used: &'a BTreeSet<CredentialId>,
+    providers_used: &'a BTreeSet<ProviderId>,
+    attempt: u32,
+    now: Instant,
+}
+
+struct NetworkRetryOutcome {
+    replacement: Option<PoolSelection>,
+    decision: RetryDecision,
 }
 
 /// Runtime pooling errors are deliberately sanitized before they cross the
@@ -1857,6 +1890,7 @@ impl PoolingCoordinator {
                 affinity_scope_seed: None,
                 registry_key: None,
                 selection_request: None,
+                network_retry_exclusions: BTreeSet::new(),
             });
         };
 
@@ -2030,6 +2064,7 @@ impl PoolingCoordinator {
             affinity_scope_seed: Some(Arc::from(affinity_scope_seed)),
             registry_key: Some(Arc::from(registry_key)),
             selection_request: Some(selection_request),
+            network_retry_exclusions: BTreeSet::new(),
         })
     }
 
@@ -2090,7 +2125,10 @@ impl PoolingCoordinator {
         let retry_policy = policy.as_ref().map(configured_retry_policy);
         let retry_context = RetryContext::new(attempt, commitment, replay)
             .with_elapsed(started.elapsed())
-            .with_used_targets(credentials_used, providers_used)
+            .with_used_targets(
+                u32::try_from(credentials_used.len()).unwrap_or(u32::MAX),
+                u32::try_from(providers_used.len()).unwrap_or(u32::MAX),
+            )
             .with_elapsed_retry_delay(elapsed_retry_delay)
             .with_elapsed_recovery_wait(elapsed_recovery_wait)
             .with_idempotency_key(idempotency_key_present);
@@ -2121,7 +2159,7 @@ impl PoolingCoordinator {
                 registry.as_ref(),
                 quota.as_ref(),
                 retry_policy.as_ref(),
-                selection.selection_request.clone(),
+                selection.retry_selection_request(),
             ) {
                 request.attempt = attempt.saturating_add(1);
                 request.now = now;
@@ -2145,7 +2183,14 @@ impl PoolingCoordinator {
                             self.persist_quota_classification(selection, observed, registry, now);
                         }
                         replacement = recovery.into_selection().map(|lease| {
-                            self.selection_from_recovery(config, route, selection, request, lease)
+                            self.selection_from_recovery(
+                                config,
+                                route,
+                                selection,
+                                request,
+                                lease,
+                                BTreeSet::new(),
+                            )
                         });
                         recovered = Some((mutation, decision));
                     }
@@ -2153,7 +2198,7 @@ impl PoolingCoordinator {
             }
         }
 
-        let (mutation, decision) = recovered.unwrap_or_else(|| {
+        let (mutation, mut decision) = recovered.unwrap_or_else(|| {
             if let (Some(registry), Some(credential)) = (registry.as_ref(), selection.credential())
             {
                 for quota in &quotas {
@@ -2184,6 +2229,38 @@ impl PoolingCoordinator {
             };
             (mutation, decision)
         });
+        let network_retry_can_reconsider_target_budget = decision.is_retry()
+            || matches!(
+                decision,
+                RetryDecision::DoNotRetry {
+                    reason: RetryStopReason::ProvidersExhausted
+                }
+            );
+        if replacement.is_none()
+            && classification.classification.class == ErrorClass::Network
+            && network_retry_can_reconsider_target_budget
+        {
+            if let (Some(registry), Some(retry_policy)) = (registry.as_ref(), retry_policy.as_ref())
+            {
+                if let Some(outcome) = self.network_retry_replacement(NetworkRetryInput {
+                    config,
+                    route,
+                    failed: selection,
+                    registry,
+                    retry_policy,
+                    classification: &classification,
+                    fallback_decision: decision,
+                    retry_context,
+                    credentials_used,
+                    providers_used,
+                    attempt,
+                    now,
+                }) {
+                    replacement = outcome.replacement;
+                    decision = outcome.decision;
+                }
+            }
+        }
         self.persist_failure(&classification, &subject, &mutation);
         self.record_failure(
             route,
@@ -2201,6 +2278,141 @@ impl PoolingCoordinator {
         }
     }
 
+    fn insert_network_retry_exclusions(
+        request: &mut SelectionRequest,
+        exclusions: impl IntoIterator<Item = BindingKey>,
+    ) -> BTreeSet<BindingKey> {
+        exclusions
+            .into_iter()
+            .filter(|binding| request.excluded_bindings.insert(binding.clone()))
+            .collect()
+    }
+
+    fn network_retry_replacement(
+        &self,
+        input: NetworkRetryInput<'_>,
+    ) -> Option<NetworkRetryOutcome> {
+        let NetworkRetryInput {
+            config,
+            route,
+            failed,
+            registry,
+            retry_policy,
+            classification,
+            fallback_decision,
+            retry_context,
+            credentials_used,
+            providers_used,
+            attempt,
+            now,
+        } = input;
+        let failed_provider = failed.provider().clone();
+        let mut base_request = failed.retry_selection_request()?;
+        base_request.attempt = attempt.saturating_add(1);
+        base_request.now = now;
+
+        let credential_budget_full = retry_context.credentials_used >= retry_policy.max_credentials;
+        let provider_budget_full = retry_context.providers_used >= retry_policy.max_providers;
+        let bindings = self.binding_index.read().ok()?;
+        let budget_exclusions = bindings
+            .values()
+            .filter(|binding| {
+                (credential_budget_full && !credentials_used.contains(binding.binding.account_id()))
+                    || (provider_budget_full && !providers_used.contains(&binding.provider))
+            })
+            .map(|binding| binding.binding.clone())
+            .collect::<BTreeSet<_>>();
+        let failed_provider_exclusions = bindings
+            .values()
+            .filter(|binding| binding.provider == failed_provider)
+            .map(|binding| binding.binding.clone())
+            .collect::<BTreeSet<_>>();
+        let alternate_provider_exclusions = bindings
+            .values()
+            .filter(|binding| binding.provider != failed_provider)
+            .map(|binding| binding.binding.clone())
+            .collect::<BTreeSet<_>>();
+        drop(bindings);
+        drop(failed.take_lease()?);
+
+        let mut alternate_request = base_request.clone();
+        let alternate_exclusions = Self::insert_network_retry_exclusions(
+            &mut alternate_request,
+            budget_exclusions
+                .iter()
+                .chain(&failed_provider_exclusions)
+                .cloned(),
+        );
+        if let Ok(lease) = registry.select(alternate_request.clone()) {
+            let candidate_provider = lease.registration().provider();
+            if candidate_provider != &failed_provider {
+                let credential_was_used =
+                    credentials_used.contains(lease.registration().credential());
+                let provider_was_used = providers_used.contains(candidate_provider);
+                let decision_context = retry_context
+                    .with_used_targets(
+                        if credential_was_used {
+                            retry_context.credentials_used.saturating_sub(1)
+                        } else {
+                            retry_context.credentials_used
+                        },
+                        if provider_was_used {
+                            retry_context.providers_used.saturating_sub(1)
+                        } else {
+                            retry_context.providers_used
+                        },
+                    )
+                    .with_target_change(RetryTargetChange::DifferentProvider);
+                let decision = retry_policy.decide(classification, decision_context);
+                if decision.is_retry() {
+                    return Some(NetworkRetryOutcome {
+                        replacement: Some(self.selection_from_recovery(
+                            config,
+                            route,
+                            failed,
+                            alternate_request,
+                            lease,
+                            alternate_exclusions,
+                        )),
+                        decision,
+                    });
+                }
+            }
+        }
+
+        if fallback_decision.is_retry() {
+            let mut fallback_request = base_request;
+            let fallback_exclusions = Self::insert_network_retry_exclusions(
+                &mut fallback_request,
+                budget_exclusions
+                    .into_iter()
+                    .chain(alternate_provider_exclusions),
+            );
+            if let Ok(lease) = registry.select(fallback_request.clone()) {
+                if lease.registration().provider() == &failed_provider {
+                    return Some(NetworkRetryOutcome {
+                        replacement: Some(self.selection_from_recovery(
+                            config,
+                            route,
+                            failed,
+                            fallback_request,
+                            lease,
+                            fallback_exclusions,
+                        )),
+                        decision: fallback_decision,
+                    });
+                }
+            }
+            return Some(NetworkRetryOutcome {
+                replacement: None,
+                decision: RetryDecision::DoNotRetry {
+                    reason: RetryStopReason::NoAlternateTarget,
+                },
+            });
+        }
+        None
+    }
+
     fn selection_from_recovery(
         &self,
         config: &CompiledConfig,
@@ -2208,6 +2420,7 @@ impl PoolingCoordinator {
         failed: &PoolSelection,
         request: SelectionRequest,
         lease: SelectionLease,
+        network_retry_exclusions: BTreeSet<BindingKey>,
     ) -> PoolSelection {
         let registration = lease.registration().clone();
         let explanation = lease.explanation().clone();
@@ -2278,6 +2491,7 @@ impl PoolingCoordinator {
             affinity_scope_seed: failed.affinity_scope_seed.clone(),
             registry_key: failed.registry_key.clone(),
             selection_request: Some(request),
+            network_retry_exclusions,
         }
     }
 
@@ -4858,6 +5072,38 @@ routes:
         .expect("project quota config")
     }
 
+    fn used_target_sets(
+        selection: &PoolSelection,
+    ) -> (BTreeSet<CredentialId>, BTreeSet<ProviderId>) {
+        let credentials = selection.credential().cloned().into_iter().collect();
+        let providers = [selection.provider().clone()].into_iter().collect();
+        (credentials, providers)
+    }
+
+    #[test]
+    fn network_retry_tracks_only_new_request_local_exclusions() {
+        let existing = BindingKey::new(
+            "existing-target",
+            "existing-account",
+            "existing-fingerprint",
+        )
+        .expect("existing binding");
+        let inserted =
+            BindingKey::new("new-target", "new-account", "new-fingerprint").expect("new binding");
+        let mut request =
+            SelectionRequest::new(ModelId::new("public-model").expect("public model"));
+        request.excluded_bindings.insert(existing.clone());
+
+        let transient = PoolingCoordinator::insert_network_retry_exclusions(
+            &mut request,
+            [existing.clone(), inserted.clone()],
+        );
+
+        assert_eq!(transient, BTreeSet::from([inserted.clone()]));
+        assert!(request.excluded_bindings.contains(&existing));
+        assert!(request.excluded_bindings.contains(&inserted));
+    }
+
     fn classify_quota_failure(
         coordinator: &PoolingCoordinator,
         config: &CompiledConfig,
@@ -4865,6 +5111,7 @@ routes:
         commitment: CommitmentState,
         replay: ReplayCheck,
     ) -> PoolFailure {
+        let (credentials_used, providers_used) = used_target_sets(selection);
         coordinator.classify_failure(FailureInput {
             config,
             route: config.route("pooled").expect("route"),
@@ -4879,8 +5126,8 @@ routes:
             commitment,
             idempotency_key_present: true,
             attempt: 1,
-            credentials_used: 1,
-            providers_used: 1,
+            credentials_used: &credentials_used,
+            providers_used: &providers_used,
             elapsed_retry_delay: Duration::ZERO,
             elapsed_recovery_wait: Duration::ZERO,
             started: Instant::now(),
@@ -5338,6 +5585,7 @@ routes:
                 Instant::now(),
             )
             .expect("first selection");
+        let (credentials_used, providers_used) = used_target_sets(&selection);
         let failure = coordinator.classify_failure(FailureInput {
             config: &config,
             route,
@@ -5352,8 +5600,8 @@ routes:
             commitment: CommitmentState::Uncommitted,
             idempotency_key_present: false,
             attempt: 1,
-            credentials_used: 1,
-            providers_used: 1,
+            credentials_used: &credentials_used,
+            providers_used: &providers_used,
             elapsed_retry_delay: Duration::ZERO,
             elapsed_recovery_wait: Duration::ZERO,
             started: Instant::now(),
@@ -5383,6 +5631,7 @@ routes:
                 Instant::now(),
             )
             .expect("first selection");
+        let (credentials_used, providers_used) = used_target_sets(&first);
         let failure = coordinator.classify_failure(FailureInput {
             config: &config,
             route,
@@ -5397,8 +5646,8 @@ routes:
             commitment: CommitmentState::Uncommitted,
             idempotency_key_present: true,
             attempt: 1,
-            credentials_used: 1,
-            providers_used: 1,
+            credentials_used: &credentials_used,
+            providers_used: &providers_used,
             elapsed_retry_delay: Duration::ZERO,
             elapsed_recovery_wait: Duration::ZERO,
             started: Instant::now(),
@@ -5438,6 +5687,7 @@ routes:
             .select(&config, route, None, &headers, 1, Instant::now())
             .expect("first selection");
         let first_credential = first.credential().expect("first credential").clone();
+        let (credentials_used, providers_used) = used_target_sets(&first);
         let mut failure = coordinator.classify_failure(FailureInput {
             config: &config,
             route,
@@ -5452,8 +5702,8 @@ routes:
             commitment: CommitmentState::Uncommitted,
             idempotency_key_present: true,
             attempt: 1,
-            credentials_used: 1,
-            providers_used: 1,
+            credentials_used: &credentials_used,
+            providers_used: &providers_used,
             elapsed_retry_delay: Duration::ZERO,
             elapsed_recovery_wait: Duration::ZERO,
             started: Instant::now(),
@@ -5490,6 +5740,7 @@ routes:
             .expect("first selection");
         let first_credential = first.credential().expect("credential").clone();
         coordinator.persist_affinity(&first, timestamp_now());
+        let (credentials_used, providers_used) = used_target_sets(&first);
         let failure = coordinator.classify_failure(FailureInput {
             config: &config,
             route,
@@ -5504,8 +5755,8 @@ routes:
             commitment: CommitmentState::Uncommitted,
             idempotency_key_present: true,
             attempt: 1,
-            credentials_used: 1,
-            providers_used: 1,
+            credentials_used: &credentials_used,
+            providers_used: &providers_used,
             elapsed_retry_delay: Duration::ZERO,
             elapsed_recovery_wait: Duration::ZERO,
             started: Instant::now(),
@@ -5601,6 +5852,7 @@ routes:
             .select(&config, route, None, &HeaderMap::new(), 1, Instant::now())
             .expect("first project account");
         let failed_credential = failed.credential().expect("credential").clone();
+        let (credentials_used, providers_used) = used_target_sets(&failed);
         let observations = [
             QuotaObservation::new(
                 QuotaSignal::Snapshot,
@@ -5631,8 +5883,8 @@ routes:
             commitment: CommitmentState::Uncommitted,
             idempotency_key_present: true,
             attempt: 1,
-            credentials_used: 1,
-            providers_used: 1,
+            credentials_used: &credentials_used,
+            providers_used: &providers_used,
             elapsed_retry_delay: Duration::ZERO,
             elapsed_recovery_wait: Duration::ZERO,
             started: Instant::now(),

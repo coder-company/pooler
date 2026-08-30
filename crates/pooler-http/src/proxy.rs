@@ -2593,10 +2593,8 @@ where
                                 commitment: CommitmentState::Uncommitted,
                                 idempotency_key_present,
                                 attempt,
-                                credentials_used: u32::try_from(credentials_used.len())
-                                    .unwrap_or(u32::MAX),
-                                providers_used: u32::try_from(providers_used.len())
-                                    .unwrap_or(u32::MAX),
+                                credentials_used: &credentials_used,
+                                providers_used: &providers_used,
                                 elapsed_retry_delay,
                                 elapsed_recovery_wait,
                                 started,
@@ -2733,8 +2731,8 @@ where
                     commitment: CommitmentState::Uncommitted,
                     idempotency_key_present,
                     attempt,
-                    credentials_used: u32::try_from(credentials_used.len()).unwrap_or(u32::MAX),
-                    providers_used: u32::try_from(providers_used.len()).unwrap_or(u32::MAX),
+                    credentials_used: &credentials_used,
+                    providers_used: &providers_used,
                     elapsed_retry_delay,
                     elapsed_recovery_wait,
                     started,
