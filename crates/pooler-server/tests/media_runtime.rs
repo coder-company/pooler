@@ -78,6 +78,16 @@ async fn opaque_chunked_upload_limits_return_413_and_preserve_exact_limit_succes
     .await;
     assert_eq!(response_status(&frame), 413);
 
+    let queue = send_chunked_request(
+        running.address,
+        "/queue",
+        "application/octet-stream",
+        &[b"12345"],
+        "",
+    )
+    .await;
+    assert_eq!(response_status(&queue), 413);
+
     let exact = send_chunked_request(
         running.address,
         "/exact",
@@ -643,7 +653,7 @@ fn streaming_limit_config(upstream: SocketAddr, request_timeout: &str) -> Compil
     compile_yaml(
         "streaming-limit-runtime.yaml",
         &format!(
-            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  local:\n    url: http://{upstream}\n    transport: {{request_timeout: {request_timeout}}}\nroutes:\n  - {{id: aggregate, listen: local, match: {{method: POST, path: /aggregate}}, limits: {{max_request_body_bytes: 8, max_frame_bytes: 8}}, ingress: {{mode: opaque}}, target: local, response: {{mode: opaque}}}}\n  - {{id: frame, listen: local, match: {{method: POST, path: /frame}}, limits: {{max_request_body_bytes: 16, max_frame_bytes: 4}}, ingress: {{mode: opaque}}, target: local, response: {{mode: opaque}}}}\n  - {{id: exact, listen: local, match: {{method: POST, path: /exact}}, limits: {{max_request_body_bytes: 8, max_frame_bytes: 8}}, ingress: {{mode: opaque}}, target: local, response: {{mode: opaque}}}}\n  - {{id: early, listen: local, match: {{method: POST, path: /early}}, limits: {{max_request_body_bytes: 8, max_frame_bytes: 8, request_timeout: {request_timeout}}}, ingress: {{mode: opaque}}, target: local, response: {{mode: opaque}}}}\n"
+            "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  local:\n    url: http://{upstream}\n    transport: {{request_timeout: {request_timeout}}}\nroutes:\n  - {{id: aggregate, listen: local, match: {{method: POST, path: /aggregate}}, limits: {{max_request_body_bytes: 8, max_frame_bytes: 8}}, ingress: {{mode: opaque}}, target: local, response: {{mode: opaque}}}}\n  - {{id: frame, listen: local, match: {{method: POST, path: /frame}}, limits: {{max_request_body_bytes: 16, max_frame_bytes: 4}}, ingress: {{mode: opaque}}, target: local, response: {{mode: opaque}}}}\n  - {{id: queue, listen: local, match: {{method: POST, path: /queue}}, limits: {{max_request_body_bytes: 8, max_frame_bytes: 8, max_queue_bytes: 4}}, ingress: {{mode: opaque}}, target: local, response: {{mode: opaque}}}}\n  - {{id: exact, listen: local, match: {{method: POST, path: /exact}}, limits: {{max_request_body_bytes: 8, max_frame_bytes: 8}}, ingress: {{mode: opaque}}, target: local, response: {{mode: opaque}}}}\n  - {{id: early, listen: local, match: {{method: POST, path: /early}}, limits: {{max_request_body_bytes: 8, max_frame_bytes: 8, request_timeout: {request_timeout}}}, ingress: {{mode: opaque}}, target: local, response: {{mode: opaque}}}}\n"
         ),
     )
     .expect("streaming limit config")

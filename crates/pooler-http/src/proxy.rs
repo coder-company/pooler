@@ -1936,6 +1936,7 @@ where
                             incoming,
                             bounded_usize(limits.max_request_body_bytes),
                             bounded_usize(limits.max_frame_bytes),
+                            bounded_usize(limits.max_queue_bytes),
                         );
                         (
                             PreparedBody::Streaming(Some(body)),
@@ -3600,16 +3601,23 @@ struct StreamingUpload {
     size_hint: SizeHint,
     max_body_bytes: usize,
     max_frame_bytes: usize,
+    max_queue_bytes: usize,
 }
 
 impl StreamingUpload {
-    fn new(inner: Incoming, max_body_bytes: usize, max_frame_bytes: usize) -> Self {
+    fn new(
+        inner: Incoming,
+        max_body_bytes: usize,
+        max_frame_bytes: usize,
+        max_queue_bytes: usize,
+    ) -> Self {
         let size_hint = inner.size_hint();
         Self {
             inner: Box::pin(inner),
             size_hint,
             max_body_bytes,
             max_frame_bytes,
+            max_queue_bytes,
         }
     }
 
@@ -3625,7 +3633,7 @@ impl StreamingUpload {
             let frame = match frame.into_data() {
                 Ok(data) => {
                     let frame_bytes = data.len();
-                    if frame_bytes > self.max_frame_bytes {
+                    if frame_bytes > self.max_frame_bytes || frame_bytes > self.max_queue_bytes {
                         return Err(ProxyError::RequestBodyTooLarge);
                     }
                     if frame_bytes > self.max_body_bytes.saturating_sub(seen) {
