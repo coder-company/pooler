@@ -4,15 +4,15 @@
 //! limit, apply the compiled transforms, and keep responses opaque.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     convert::Infallible,
     error::Error,
-    future::Future,
+    future::{poll_fn, Future},
     io,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
+        Arc, Mutex, OnceLock,
     },
     task::{Context, Poll, Waker},
     time::{Duration, Instant as StdInstant},
@@ -26,6 +26,7 @@ use adapter_providers::{
 };
 use base64::Engine;
 use bytes::Bytes;
+use futures_util::{task::AtomicWaker, FutureExt};
 use http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Full};
@@ -58,6 +59,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream,
+    sync::mpsc,
     time::{self, Instant},
 };
 use tokio_rustls::TlsConnector;
@@ -1930,12 +1932,11 @@ where
                             SemanticResponseHint::default(),
                         )
                     } else {
-                        let body = LimitedBody::new(
+                        let body = StreamingUpload::new(
                             incoming,
                             bounded_usize(limits.max_request_body_bytes),
-                        )
-                        .map_err(box_error)
-                        .boxed();
+                            bounded_usize(limits.max_frame_bytes),
+                        );
                         (
                             PreparedBody::Streaming(Some(body)),
                             None,
@@ -2389,6 +2390,7 @@ where
                 .upstream_uri_for(upstream, route, &downstream_uri)
                 .map_err(pool_error)?;
             let attempt_started = StdInstant::now();
+            let upstream_headers_duration = OnceLock::new();
             let attempt_request = AttemptRequest {
                 route,
                 method: &method,
@@ -2403,6 +2405,8 @@ where
                 connection_generation,
                 cancellation: &cancellation,
                 started,
+                attempt_started,
+                upstream_headers_duration: &upstream_headers_duration,
             };
             let response = match (websocket_transport, websocket_attempt) {
                 (Some(transport), true) => {
@@ -2436,9 +2440,11 @@ where
                             )
                             .and_then(|bytes| force_responses_streaming_request(&bytes, limits))
                             .map(|bytes| {
-                                Full::new(bytes)
-                                    .map_err(|never: Infallible| match never {})
-                                    .boxed()
+                                AttemptBody::Prepared(
+                                    Full::new(bytes)
+                                        .map_err(|never: Infallible| match never {})
+                                        .boxed(),
+                                )
                             })
                     } else {
                         prepared.body_for_attempt(
@@ -2464,7 +2470,9 @@ where
             let attempt_duration = attempt_started.elapsed();
             lifecycle.attempt(attempt, attempt_result, attempt_duration);
             if let Some(binding) = selection.binding_key().cloned() {
-                let latency_ms = duration_to_history_millis(attempt_duration);
+                let provider_latency =
+                    upstream_headers_latency(&upstream_headers_duration, attempt_duration);
+                let latency_ms = duration_to_history_millis(provider_latency);
                 self.pooling.record_routing_telemetry(
                     binding,
                     TelemetrySample {
@@ -2806,7 +2814,7 @@ where
     async fn send_attempt(
         &self,
         request: AttemptRequest<'_>,
-        body: ProxyBody,
+        body: AttemptBody,
     ) -> Result<Response<ProxyBody>, ProxyError> {
         let AttemptRequest {
             route,
@@ -2822,6 +2830,8 @@ where
             connection_generation: _,
             cancellation,
             started,
+            attempt_started,
+            upstream_headers_duration,
         } = request;
         let mut headers = request_headers.clone();
         strip_caller_credentials_when_authenticating(
@@ -2873,9 +2883,6 @@ where
             );
             headers.insert(header::CONNECTION, HeaderValue::from_static("Keep-Alive"));
         }
-        let body = FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
-            .map_err(box_error)
-            .boxed();
         let uri = upstream_uri;
         let uri = self
             .semantic
@@ -2898,7 +2905,6 @@ where
                     http::Version::HTTP_11
                 });
         *builder.headers_mut().expect("request builder headers") = headers;
-        let upstream_request = builder.body(body)?;
         let request_deadline = started + effective_request_timeout(route.limits(), upstream);
         let connection_timeout = connect_timeout(route.limits(), upstream);
         let client = if upstream.http2() {
@@ -2910,12 +2916,129 @@ where
         .ok_or_else(|| {
             ProxyError::InvalidLimits("upstream connect timeout client is unavailable".to_owned())
         })?;
+        let request = match body {
+            AttemptBody::Streaming(upload) => {
+                let (sender, receiver) = mpsc::channel(1);
+                let failure = Arc::new(UploadBodyFailure::default());
+                let body =
+                    UploadChannelBody::new(receiver, upload.size_hint(), Arc::clone(&failure))
+                        .boxed();
+                let upstream_request = builder.body(body)?;
+                let request = client.request(upstream_request);
+                let sender = UploadChannelSender::new(sender, failure);
+                let pump = upload.pump(sender);
+                let max_response_body = bounded_usize(route.limits().max_response_body_bytes);
+                let max_response_frame = bounded_usize(route.limits().max_frame_bytes);
+                let max_response_queue_bytes = bounded_usize(route.limits().max_queue_bytes);
+                let max_response_queue_items =
+                    usize::try_from(route.limits().max_queue_items).unwrap_or(usize::MAX);
+                async move {
+                    tokio::pin!(request);
+                    tokio::pin!(pump);
+                    let mut response = None;
+                    let mut upload_complete = false;
+                    let mut response_complete = false;
+                    let mut prefetched = VecDeque::new();
+                    let mut prefetched_bytes = 0_usize;
+                    loop {
+                        if response.is_none() {
+                            tokio::select! {
+                                biased;
+                                result = &mut pump, if !upload_complete => {
+                                    result?;
+                                    upload_complete = true;
+                                }
+                                result = &mut request => {
+                                    let upstream_response = result.map_err(upstream_client_error)?;
+                                    let _ = upstream_headers_duration.set(attempt_started.elapsed());
+                                    // Hyper may return headers before it finishes polling the upload.
+                                    // Hold them until the downstream body reaches validated EOS.
+                                    response = Some(upstream_response);
+                                }
+                            }
+                        } else if !upload_complete && !response_complete {
+                            let upstream_response = response.as_mut().expect("response is present");
+                            tokio::select! {
+                                biased;
+                                result = &mut pump => {
+                                    result?;
+                                    upload_complete = true;
+                                }
+                                frame = poll_fn(|context| Pin::new(upstream_response.body_mut()).poll_frame(context)) => {
+                                    match frame {
+                                        Some(Ok(frame)) => {
+                                            if prefetched.len() >= max_response_queue_items {
+                                                return Err(ProxyError::InvalidLimits(
+                                                    "early upstream response exceeds queue limits".to_owned(),
+                                                ));
+                                            }
+                                            if let Some(data) = frame.data_ref() {
+                                                let frame_bytes = data.len();
+                                                if frame_bytes > max_response_frame
+                                                    || frame_bytes > max_response_body.saturating_sub(prefetched_bytes)
+                                                {
+                                                    return Err(ProxyError::InvalidLimits(
+                                                        "upstream response body exceeds limits".to_owned(),
+                                                    ));
+                                                }
+                                                if frame_bytes
+                                                    > max_response_queue_bytes.saturating_sub(prefetched_bytes)
+                                                {
+                                                    return Err(ProxyError::InvalidLimits(
+                                                        "early upstream response exceeds queue limits".to_owned(),
+                                                    ));
+                                                }
+                                                prefetched_bytes += frame_bytes;
+                                            }
+                                            prefetched.push_back(frame);
+                                        }
+                                        Some(Err(error)) => {
+                                            return Err(ProxyError::Upstream(Box::new(error)));
+                                        }
+                                        None => response_complete = true,
+                                    }
+                                }
+                            }
+                        } else if !upload_complete {
+                            pump.as_mut().await?;
+                            upload_complete = true;
+                        }
+
+                        if upload_complete {
+                            if let Some(response) = response.take() {
+                                let (parts, body) = response.into_parts();
+                                return Ok::<_, ProxyError>(Response::from_parts(
+                                    parts,
+                                    PrefixedBody::new(prefetched, body),
+                                ));
+                            }
+                        }
+                    }
+                }
+                .left_future()
+            }
+            AttemptBody::Prepared(body) => {
+                let body =
+                    FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
+                        .map_err(box_error)
+                        .boxed();
+                let upstream_request = builder.body(body)?;
+                async move {
+                    let response = client
+                        .request(upstream_request)
+                        .await
+                        .map_err(upstream_client_error)?;
+                    let _ = upstream_headers_duration.set(attempt_started.elapsed());
+                    Ok::<_, ProxyError>(
+                        response.map(|body| PrefixedBody::new(VecDeque::new(), body)),
+                    )
+                }
+                .right_future()
+            }
+        };
         let response = tokio::select! {
-            result = time::timeout_at(
-                Instant::from_std(request_deadline),
-                client.request(upstream_request),
-            ) => {
-                result.map_err(|_| ProxyError::Timeout)?.map_err(upstream_client_error)?
+            result = time::timeout_at(Instant::from_std(request_deadline), request) => {
+                result.map_err(|_| ProxyError::Timeout)??
             }
             () = cancellation.cancelled() => {
                 return Err(ProxyError::Timeout);
@@ -2966,6 +3089,8 @@ where
             connection_generation,
             cancellation,
             started,
+            attempt_started: _,
+            upstream_headers_duration: _,
         } = request;
         let mut headers = request_headers.clone();
         strip_caller_credentials_when_authenticating(
@@ -3403,8 +3528,311 @@ where
 }
 
 enum PreparedBody {
-    Streaming(Option<ProxyBody>),
+    Streaming(Option<StreamingUpload>),
     Buffered { bytes: Bytes, patch_model: bool },
+}
+
+enum AttemptBody {
+    Streaming(StreamingUpload),
+    Prepared(ProxyBody),
+}
+
+struct PrefixedBody<B> {
+    prefix: VecDeque<Frame<Bytes>>,
+    prefix_bytes: u64,
+    inner: Pin<Box<B>>,
+}
+
+impl<B> PrefixedBody<B> {
+    fn new(prefix: VecDeque<Frame<Bytes>>, inner: B) -> Self {
+        let prefix_bytes = prefix
+            .iter()
+            .filter_map(Frame::data_ref)
+            .map(|data| u64::try_from(data.len()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
+        Self {
+            prefix,
+            prefix_bytes,
+            inner: Box::pin(inner),
+        }
+    }
+}
+
+impl<B> Body for PrefixedBody<B>
+where
+    B: Body<Data = Bytes>,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(frame) = self.prefix.pop_front() {
+            if let Some(data) = frame.data_ref() {
+                self.prefix_bytes = self
+                    .prefix_bytes
+                    .saturating_sub(u64::try_from(data.len()).unwrap_or(u64::MAX));
+            }
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        self.inner.as_mut().poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.prefix.is_empty() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let inner = self.inner.size_hint();
+        let mut hint = SizeHint::new();
+        hint.set_lower(inner.lower().saturating_add(self.prefix_bytes));
+        if let Some(upper) = inner.upper() {
+            hint.set_upper(upper.saturating_add(self.prefix_bytes));
+        }
+        hint
+    }
+}
+
+struct StreamingUpload {
+    inner: Pin<Box<Incoming>>,
+    size_hint: SizeHint,
+    max_body_bytes: usize,
+    max_frame_bytes: usize,
+}
+
+impl StreamingUpload {
+    fn new(inner: Incoming, max_body_bytes: usize, max_frame_bytes: usize) -> Self {
+        let size_hint = inner.size_hint();
+        Self {
+            inner: Box::pin(inner),
+            size_hint,
+            max_body_bytes,
+            max_frame_bytes,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.size_hint
+    }
+
+    async fn pump(mut self, mut sender: UploadChannelSender) -> Result<(), ProxyError> {
+        let mut seen = 0_usize;
+        let mut forwarding = true;
+        while let Some(frame) = poll_fn(|context| self.inner.as_mut().poll_frame(context)).await {
+            let frame = frame.map_err(|error| ProxyError::Upstream(Box::new(error)))?;
+            let frame = match frame.into_data() {
+                Ok(data) => {
+                    let frame_bytes = data.len();
+                    if frame_bytes > self.max_frame_bytes {
+                        return Err(ProxyError::RequestBodyTooLarge);
+                    }
+                    if frame_bytes > self.max_body_bytes.saturating_sub(seen) {
+                        return Err(ProxyError::RequestBodyTooLarge);
+                    }
+                    seen += frame_bytes;
+                    Frame::data(data)
+                }
+                Err(frame) => match frame.into_trailers() {
+                    Ok(trailers) => Frame::trailers(trailers),
+                    Err(_) => {
+                        return Err(ProxyError::Upstream(Box::new(io::Error::other(
+                            "request body yielded an invalid frame",
+                        ))));
+                    }
+                },
+            };
+            if forwarding && sender.send(frame).await.is_err() {
+                // HTTP/1.1 peers may stop consuming an upload after responding.
+                // Continue draining and validating the downstream request body.
+                forwarding = false;
+            }
+        }
+        sender.complete();
+        Ok(())
+    }
+}
+
+struct UploadChannelSender {
+    sender: mpsc::Sender<Frame<Bytes>>,
+    failure: Arc<UploadBodyFailure>,
+    completed: bool,
+}
+
+impl UploadChannelSender {
+    fn new(sender: mpsc::Sender<Frame<Bytes>>, failure: Arc<UploadBodyFailure>) -> Self {
+        Self {
+            sender,
+            failure,
+            completed: false,
+        }
+    }
+
+    async fn send(&self, frame: Frame<Bytes>) -> Result<(), mpsc::error::SendError<Frame<Bytes>>> {
+        self.sender.send(frame).await
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for UploadChannelSender {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Timeout, cancellation, and validation errors must abort the upstream
+            // body rather than turn the forwarded prefix into clean EOS.
+            self.failure.fail();
+        }
+    }
+}
+
+const UPLOAD_BODY_OPEN: u8 = 0;
+const UPLOAD_BODY_FAILED: u8 = 1;
+const UPLOAD_BODY_FAILURE_DELIVERED: u8 = 2;
+
+// A validation failure must surface as an upstream body error. Closing the channel
+// normally would look like clean EOS and let Hyper reuse a poisoned connection.
+#[derive(Default)]
+struct UploadBodyFailure {
+    state: AtomicU8,
+    waker: AtomicWaker,
+}
+
+impl UploadBodyFailure {
+    fn fail(&self) {
+        if self
+            .state
+            .compare_exchange(
+                UPLOAD_BODY_OPEN,
+                UPLOAD_BODY_FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.waker.wake();
+        }
+    }
+
+    fn take(&self) -> bool {
+        self.state
+            .compare_exchange(
+                UPLOAD_BODY_FAILED,
+                UPLOAD_BODY_FAILURE_DELIVERED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+}
+
+struct UploadChannelBody {
+    receiver: mpsc::Receiver<Frame<Bytes>>,
+    size_hint: SizeHint,
+    failure: Arc<UploadBodyFailure>,
+}
+
+impl UploadChannelBody {
+    fn new(
+        receiver: mpsc::Receiver<Frame<Bytes>>,
+        size_hint: SizeHint,
+        failure: Arc<UploadBodyFailure>,
+    ) -> Self {
+        Self {
+            receiver,
+            size_hint,
+            failure,
+        }
+    }
+}
+
+impl UploadChannelBody {
+    fn upload_failure(&mut self) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        self.size_hint = SizeHint::with_exact(0);
+        Poll::Ready(Some(Err(Box::new(io::Error::other(
+            "request upload validation failed",
+        )))))
+    }
+
+    fn consume_size_hint(&mut self, frame: &Frame<Bytes>) {
+        let Some(data) = frame.data_ref() else {
+            return;
+        };
+        let consumed = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let lower = self.size_hint.lower().saturating_sub(consumed);
+        let upper = self
+            .size_hint
+            .upper()
+            .map(|upper| upper.saturating_sub(consumed));
+        self.size_hint.set_lower(lower);
+        if let Some(upper) = upper {
+            self.size_hint.set_upper(upper);
+        }
+    }
+}
+
+impl Body for UploadChannelBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.failure.take() {
+            return self.upload_failure();
+        }
+        if self.failure.state() == UPLOAD_BODY_FAILURE_DELIVERED {
+            return Poll::Ready(None);
+        }
+        self.failure.waker.register(context.waker());
+        if self.failure.take() {
+            return self.upload_failure();
+        }
+
+        let frame = self.receiver.poll_recv(context);
+        // The producer records failure before dropping the sender. Rechecking after
+        // observing the channel closes the race that could otherwise yield clean EOS.
+        if self.failure.take() {
+            return self.upload_failure();
+        }
+        if self.failure.state() == UPLOAD_BODY_FAILURE_DELIVERED {
+            return Poll::Ready(None);
+        }
+        match frame {
+            Poll::Ready(Some(frame)) => {
+                self.consume_size_hint(&frame);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        if self.failure.state() == UPLOAD_BODY_FAILURE_DELIVERED {
+            return true;
+        }
+        let closed = self.receiver.is_closed() && self.receiver.is_empty();
+        closed && self.failure.state() == UPLOAD_BODY_OPEN
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.size_hint
+    }
+}
+
+fn upstream_headers_latency(
+    upstream_headers_duration: &OnceLock<Duration>,
+    fallback: Duration,
+) -> Duration {
+    upstream_headers_duration.get().copied().unwrap_or(fallback)
 }
 
 struct AttemptRequest<'a> {
@@ -3421,6 +3849,8 @@ struct AttemptRequest<'a> {
     connection_generation: Option<CredentialGeneration>,
     cancellation: &'a CancellationToken,
     started: StdInstant,
+    attempt_started: StdInstant,
+    upstream_headers_duration: &'a OnceLock<Duration>,
 }
 
 struct FinishResponseContext {
@@ -3475,10 +3905,11 @@ impl PreparedBody {
         upstream: &UpstreamPlan,
         semantic: &S,
         lifecycle: &RequestLifecycle,
-    ) -> Result<ProxyBody, ProxyError> {
+    ) -> Result<AttemptBody, ProxyError> {
         match self {
             Self::Streaming(body) => {
                 body.take()
+                    .map(AttemptBody::Streaming)
                     .ok_or(ProxyError::Upstream(Box::new(io::Error::other(
                         "streaming request body was already used",
                     ))))
@@ -3495,9 +3926,11 @@ impl PreparedBody {
                 } else {
                     bytes.clone()
                 };
-                Ok(Full::new(bytes)
-                    .map_err(|never: Infallible| match never {})
-                    .boxed())
+                Ok(AttemptBody::Prepared(
+                    Full::new(bytes)
+                        .map_err(|never: Infallible| match never {})
+                        .boxed(),
+                ))
             }
         }
     }
@@ -6407,6 +6840,94 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    #[tokio::test]
+    async fn prefetched_response_body_preserves_prefix_order_and_size_hint() {
+        let mut prefix = VecDeque::new();
+        prefix.push_back(Frame::data(Bytes::from_static(b"first")));
+        prefix.push_back(Frame::data(Bytes::from_static(b"second")));
+        let body = PrefixedBody::new(prefix, Full::new(Bytes::from_static(b"tail")));
+        assert_eq!(body.size_hint().exact(), Some(15));
+
+        let bytes = body
+            .collect()
+            .await
+            .expect("prefetched response body")
+            .to_bytes();
+        assert_eq!(bytes, Bytes::from_static(b"firstsecondtail"));
+    }
+
+    #[test]
+    fn routing_latency_uses_upstream_headers_instead_of_upload_drain_time() {
+        let upstream_headers_duration = OnceLock::new();
+        upstream_headers_duration
+            .set(Duration::from_millis(20))
+            .expect("record upstream response headers");
+        assert_eq!(
+            upstream_headers_latency(&upstream_headers_duration, Duration::from_secs(10)),
+            Duration::from_millis(20)
+        );
+
+        let missing_headers_duration = OnceLock::new();
+        assert_eq!(
+            upstream_headers_latency(&missing_headers_duration, Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_upload_sender_surfaces_one_terminal_body_error() {
+        let (sender, receiver) = mpsc::channel(1);
+        let failure = Arc::new(UploadBodyFailure::default());
+        let guarded = UploadChannelSender::new(sender, Arc::clone(&failure));
+        let mut body = UploadChannelBody::new(receiver, SizeHint::with_exact(4), failure);
+
+        drop(guarded);
+        assert!(body.frame().await.expect("upload failure frame").is_err());
+        assert!(body.is_end_stream());
+        assert!(body.frame().await.is_none());
+        assert_eq!(body.size_hint().exact(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn upload_failure_overtakes_an_already_queued_frame() {
+        let (sender, receiver) = mpsc::channel(1);
+        let failure = Arc::new(UploadBodyFailure::default());
+        let guarded = UploadChannelSender::new(sender, Arc::clone(&failure));
+        guarded
+            .send(Frame::data(Bytes::from_static(b"data")))
+            .await
+            .expect("queue upload frame");
+        let mut body = UploadChannelBody::new(receiver, SizeHint::with_exact(4), failure);
+
+        drop(guarded);
+        assert!(body.frame().await.expect("upload failure frame").is_err());
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_body_tracks_remaining_size_and_clean_eos() {
+        let (sender, receiver) = mpsc::channel(1);
+        let failure = Arc::new(UploadBodyFailure::default());
+        let mut guarded = UploadChannelSender::new(sender, Arc::clone(&failure));
+        guarded
+            .send(Frame::data(Bytes::from_static(b"data")))
+            .await
+            .expect("queue upload frame");
+        guarded.complete();
+        drop(guarded);
+        let mut body = UploadChannelBody::new(receiver, SizeHint::with_exact(8), failure);
+
+        let frame = body
+            .frame()
+            .await
+            .expect("upload data frame")
+            .expect("valid upload frame");
+        assert_eq!(frame.into_data().expect("data frame"), b"data"[..]);
+        assert_eq!(body.size_hint().exact(), Some(4));
+        assert!(body.frame().await.is_none());
+        assert!(body.is_end_stream());
     }
 
     #[test]
