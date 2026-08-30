@@ -9,8 +9,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
-use std::net::SocketAddr;
-use std::path::Path;
+use std::fs;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -3302,6 +3303,16 @@ pub enum ConfigError {
         /// Reference label.
         label: SourceLabel,
     },
+    /// Two concrete listener binds overlap in one socket namespace.
+    #[error("listener bind `{bind}` at {second} conflicts with another listener at {first}")]
+    DuplicateBind {
+        /// Conflicting bind as written by the later validation entry.
+        bind: String,
+        /// Other declaration overlapping the same socket namespace.
+        first: Box<SourceLabel>,
+        /// Conflicting declaration.
+        second: Box<SourceLabel>,
+    },
     /// Duplicate route ID.
     #[error("duplicate route `{id}` at {second}; first declaration is at {first}")]
     DuplicateRoute {
@@ -3449,6 +3460,7 @@ fn compile_config(
     };
     let extensions = compile_extensions(config, source)?;
     let management = compile_management(&config.management, source)?;
+    validate_unique_listener_binds(&listeners, management.as_ref())?;
 
     let mut routes = Vec::with_capacity(config.routes.len());
     let mut route_ids = BTreeMap::new();
@@ -7007,12 +7019,134 @@ fn validate_bind(value: &str, label: &SourceLabel) -> Result<(), ConfigError> {
         return Err(invalid(label, "listener bind must not be empty"));
     }
     if value.starts_with('/') || value.starts_with("unix:") {
+        let path = value.strip_prefix("unix:").unwrap_or(value);
+        if path.is_empty() {
+            return Err(invalid(label, "Unix listener bind path must not be empty"));
+        }
+        if Path::new(path)
+            .components()
+            .any(|component| component == Component::ParentDir)
+        {
+            return Err(invalid(
+                label,
+                "Unix listener bind path must not contain parent-directory components",
+            ));
+        }
         return Ok(());
     }
     value
         .parse::<SocketAddr>()
         .map(|_| ())
         .map_err(|_| invalid(label, "listener bind must be a socket address or Unix path"))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ListenerBindIdentity {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
+impl ListenerBindIdentity {
+    fn conflicts_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Tcp(first), Self::Tcp(second)) => tcp_binds_conflict(first, second),
+            (Self::Unix(first), Self::Unix(second)) => first == second,
+            (Self::Tcp(_), Self::Unix(_)) | (Self::Unix(_), Self::Tcp(_)) => false,
+        }
+    }
+}
+
+fn tcp_binds_conflict(first: &SocketAddr, second: &SocketAddr) -> bool {
+    if first.port() != second.port() {
+        return false;
+    }
+    match (first, second) {
+        (SocketAddr::V4(first), SocketAddr::V4(second)) => ipv4_binds_conflict(first, second),
+        (SocketAddr::V6(first), SocketAddr::V6(second)) => ipv6_binds_conflict(first, second),
+        (SocketAddr::V4(ipv4), SocketAddr::V6(ipv6))
+        | (SocketAddr::V6(ipv6), SocketAddr::V4(ipv4)) => ipv4_and_ipv6_binds_conflict(ipv4, ipv6),
+    }
+}
+
+fn ipv4_binds_conflict(first: &SocketAddrV4, second: &SocketAddrV4) -> bool {
+    first.ip() == second.ip() || first.ip().is_unspecified() || second.ip().is_unspecified()
+}
+
+fn ipv6_binds_conflict(first: &SocketAddrV6, second: &SocketAddrV6) -> bool {
+    match (first.ip().to_ipv4_mapped(), second.ip().to_ipv4_mapped()) {
+        (Some(first), Some(second)) => {
+            first == second || first.is_unspecified() || second.is_unspecified()
+        }
+        (Some(_), None) => second.ip().is_unspecified(),
+        (None, Some(_)) => first.ip().is_unspecified(),
+        (None, None) => {
+            first.ip() == second.ip() || first.ip().is_unspecified() || second.ip().is_unspecified()
+        }
+    }
+}
+
+fn ipv4_and_ipv6_binds_conflict(ipv4: &SocketAddrV4, ipv6: &SocketAddrV6) -> bool {
+    if let Some(mapped) = ipv6.ip().to_ipv4_mapped() {
+        return ipv4.ip() == &mapped || ipv4.ip().is_unspecified() || mapped.is_unspecified();
+    }
+    // Tokio currently inherits each platform's dual-stack default. Conservatively
+    // treat the IPv6 wildcard as overlapping IPv4 until the server explicitly
+    // creates IPv6-only sockets on every supported platform.
+    ipv6.ip().is_unspecified()
+}
+
+fn listener_bind_identity(value: &str) -> Option<ListenerBindIdentity> {
+    let value = value.trim();
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return (address.port() != 0).then_some(ListenerBindIdentity::Tcp(address));
+    }
+    let path = value.strip_prefix("unix:").unwrap_or(value);
+    Some(ListenerBindIdentity::Unix(unix_bind_identity(path)))
+}
+
+fn unix_bind_identity(path: &str) -> PathBuf {
+    let normalized: PathBuf = Path::new(path).components().collect();
+    let Some(file_name) = normalized.file_name() else {
+        return normalized;
+    };
+    let parent = normalized
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // The socket itself normally does not exist yet, but its parent generally
+    // does. Canonicalizing that existing parent detects symlink and
+    // relative/absolute aliases without requiring the socket path to exist.
+    fs::canonicalize(parent)
+        .map(|parent| parent.join(file_name))
+        .unwrap_or(normalized)
+}
+
+fn validate_unique_listener_binds(
+    listeners: &BTreeMap<Arc<str>, ListenerPlan>,
+    management: Option<&ManagementPlan>,
+) -> Result<(), ConfigError> {
+    let mut seen: Vec<(ListenerBindIdentity, SourceLabel)> = Vec::new();
+    for (bind, source) in listeners
+        .values()
+        .map(|listener| (listener.bind(), listener.source()))
+        .chain(management.map(|plan| (plan.bind(), plan.source())))
+    {
+        let Some(identity) = listener_bind_identity(bind) else {
+            continue;
+        };
+        if let Some((_, first)) = seen
+            .iter()
+            .find(|(other, _)| identity.conflicts_with(other))
+        {
+            return Err(ConfigError::DuplicateBind {
+                bind: bind.to_owned(),
+                first: Box::new(first.clone()),
+                second: Box::new(source.clone()),
+            });
+        }
+        seen.push((identity, source.clone()));
+    }
+    Ok(())
 }
 
 fn validate_id(kind: &str, value: &str, label: &SourceLabel) -> Result<(), ConfigError> {
@@ -7410,6 +7544,140 @@ routes:
         let text = "version: 2\nlisteners: {local: {bind: invalid}}\n";
         let bind = compile_yaml("bind.yaml", text).expect_err("bind");
         assert!(bind.to_string().contains("bind.yaml"));
+    }
+
+    #[test]
+    fn rejects_duplicate_concrete_listener_binds_but_allows_ephemeral_ports() {
+        let fixed = compile_yaml(
+            "duplicate-bind.yaml",
+            "version: 2\nlisteners: {one: {bind: 127.0.0.1:8400}, two: {bind: 127.0.0.1:8400}}\n",
+        )
+        .expect_err("duplicate fixed bind");
+        assert!(matches!(fixed, ConfigError::DuplicateBind { .. }));
+        let rendered = fixed.to_string();
+        assert!(rendered.contains("127.0.0.1:8400"), "{rendered}");
+        assert!(rendered.contains("listeners.one"), "{rendered}");
+        assert!(rendered.contains("listeners.two"), "{rendered}");
+
+        let ephemeral = compile_yaml(
+            "ephemeral-bind.yaml",
+            "version: 2\nmanagement: {bind: 127.0.0.1:0}\nlisteners: {one: {bind: 127.0.0.1:0}, two: {bind: 127.0.0.1:0}}\n",
+        )
+        .expect("port zero requests independent ephemeral listeners");
+        assert_eq!(ephemeral.listeners().len(), 2);
+        assert_eq!(
+            ephemeral.management().expect("management listener").bind(),
+            "127.0.0.1:0"
+        );
+    }
+
+    #[test]
+    fn rejects_canonical_tcp_and_unix_bind_aliases() {
+        let ipv6 = compile_yaml(
+            "ipv6-bind-alias.yaml",
+            "version: 2\nlisteners:\n  one: {bind: '[::1]:8400'}\n  two: {bind: '[0:0:0:0:0:0:0:1]:8400'}\n",
+        )
+        .expect_err("canonical IPv6 duplicate");
+        assert!(matches!(ipv6, ConfigError::DuplicateBind { .. }));
+
+        let unix = compile_yaml(
+            "unix-bind-alias.yaml",
+            "version: 2\nlisteners:\n  one: {bind: /tmp/pooler-bind.sock}\n  two: {bind: 'unix:/tmp/./pooler-bind.sock'}\n",
+        )
+        .expect_err("Unix path alias duplicate");
+        assert!(matches!(unix, ConfigError::DuplicateBind { .. }));
+    }
+
+    #[test]
+    fn rejects_same_family_wildcard_bind_overlaps() {
+        for (name, first, second) in [
+            ("ipv4", "0.0.0.0:8400", "127.0.0.1:8400"),
+            ("ipv6", "[::]:8400", "[::1]:8400"),
+        ] {
+            let text = format!(
+                "version: 2\nlisteners:\n  wildcard: {{bind: '{first}'}}\n  specific: {{bind: '{second}'}}\n"
+            );
+            let error = compile_yaml(format!("{name}-wildcard.yaml"), &text)
+                .expect_err("wildcard bind overlap");
+            assert!(matches!(error, ConfigError::DuplicateBind { .. }));
+        }
+    }
+
+    #[test]
+    fn rejects_cross_family_os_bind_aliases_in_both_orders() {
+        for (name, first, second) in [
+            ("mapped", "[::ffff:127.0.0.1]:8400", "127.0.0.1:8400"),
+            ("dual-specific", "[::]:8400", "127.0.0.1:8400"),
+            ("dual-wildcard", "[::]:8400", "0.0.0.0:8400"),
+        ] {
+            for (order, first, second) in [("forward", first, second), ("reverse", second, first)] {
+                let text = format!(
+                    "version: 2\nlisteners:\n  one: {{bind: '{first}'}}\n  two: {{bind: '{second}'}}\n"
+                );
+                let error = compile_yaml(format!("{name}-{order}.yaml"), &text)
+                    .expect_err("cross-family bind overlap");
+                assert!(matches!(error, ConfigError::DuplicateBind { .. }));
+            }
+        }
+
+        compile_yaml(
+            "separate-loopbacks.yaml",
+            "version: 2\nlisteners:\n  ipv4: {bind: '127.0.0.1:8400'}\n  ipv6: {bind: '[::1]:8400'}\n",
+        )
+        .expect("IPv4 and IPv6 loopback listeners are independent");
+        compile_yaml(
+            "cross-family-ephemeral.yaml",
+            "version: 2\nlisteners:\n  ipv4: {bind: '0.0.0.0:0'}\n  ipv6: {bind: '[::]:0'}\n",
+        )
+        .expect("port zero requests independent ephemeral listeners");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_unix_bind_aliases_through_symlinked_parents() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let real = directory.path().join("real");
+        let link = directory.path().join("link");
+        fs::create_dir(&real).expect("real socket directory");
+        symlink(&real, &link).expect("socket directory symlink");
+        let first = link.join("pooler.sock");
+        let second = real.join("pooler.sock");
+        let text = format!(
+            "version: 2\nlisteners:\n  one: {{bind: '{}'}}\n  two: {{bind: 'unix:{}'}}\n",
+            first.display(),
+            second.display()
+        );
+        let error = compile_yaml("unix-symlink-alias.yaml", &text)
+            .expect_err("symlinked Unix bind parent alias");
+        assert!(matches!(error, ConfigError::DuplicateBind { .. }));
+    }
+
+    #[test]
+    fn rejects_ambiguous_unix_bind_paths() {
+        for (name, bind, expected) in [
+            ("empty", "unix:", "must not be empty"),
+            ("parent", "unix:/tmp/sub/../pooler.sock", "parent-directory"),
+        ] {
+            let text = format!("version: 2\nlisteners: {{local: {{bind: '{bind}'}}}}\n");
+            let error = compile_yaml(format!("unix-{name}.yaml"), &text)
+                .expect_err("invalid Unix bind path");
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_management_and_inference_bind_collision() {
+        let error = compile_yaml(
+            "management-bind-collision.yaml",
+            "version: 2\nmanagement: {bind: 127.0.0.1:8400}\nlisteners: {local: {bind: 127.0.0.1:8400}}\n",
+        )
+        .expect_err("management collision");
+        assert!(matches!(error, ConfigError::DuplicateBind { .. }));
+        let rendered = error.to_string();
+        assert!(rendered.contains("management"), "{rendered}");
+        assert!(rendered.contains("listeners.local"), "{rendered}");
     }
 
     #[test]

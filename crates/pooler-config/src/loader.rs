@@ -2621,6 +2621,30 @@ version: 2
     }
 
     #[test]
+    fn bind_conflicts_retain_import_and_overlay_sources() {
+        let dir = TestDir::new();
+        dir.write(
+            "base.yaml",
+            "version: 2\nlisteners: {base: {bind: 127.0.0.1:18470}}\n",
+        );
+        dir.write(
+            "overlay.yaml",
+            "version: 2\nlisteners: {overlay: {bind: 127.0.0.1:18470}}\n",
+        );
+        let root = dir.write(
+            "root.yaml",
+            "imports: [{file: base.yaml}, {overlay: overlay.yaml}]\nversion: 2\n",
+        );
+        let error = load_path(root)
+            .expect("resolved config")
+            .compile()
+            .expect_err("conflicting listener binds");
+        let rendered = error.to_string();
+        assert!(rendered.contains("base.yaml"), "{rendered}");
+        assert!(rendered.contains("overlay.yaml"), "{rendered}");
+    }
+
+    #[test]
     fn imported_schema_errors_report_the_imported_source_and_field() {
         let dir = TestDir::new();
         dir.write(

@@ -1,6 +1,5 @@
 //! Read-only, redacted health checks for a Pooler installation.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -223,34 +222,23 @@ fn check_dependencies(report: &mut DoctorReport, dependencies: &[PathBuf]) {
 }
 
 fn check_binds(report: &mut DoctorReport, config: &CompiledConfig) {
-    let mut seen = BTreeSet::new();
     for listener in config.listeners().values() {
         check_bind(
             report,
             format!("listeners.bind.{}", listener.id()),
             listener.bind(),
-            &mut seen,
         );
     }
     if let Some(management) = config.management() {
-        check_bind(
-            report,
-            "management.bind".to_owned(),
-            management.bind(),
-            &mut seen,
-        );
+        check_bind(report, "management.bind".to_owned(), management.bind());
     }
     if config.listeners().is_empty() && config.management().is_none() {
         report.check("listeners.bind", "skipped", "no listeners are configured");
     }
 }
 
-fn check_bind(report: &mut DoctorReport, name: String, bind: &str, seen: &mut BTreeSet<String>) {
+fn check_bind(report: &mut DoctorReport, name: String, bind: &str) {
     let bind = bind.trim();
-    if !seen.insert(bind.to_owned()) {
-        report.check(name, "failed", "bind is duplicated by another listener");
-        return;
-    }
     if let Ok(address) = bind.parse::<SocketAddr>() {
         match TcpListener::bind(address) {
             Ok(listener) => {
@@ -736,16 +724,19 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_binds_are_reported_without_leaving_a_listener() {
+    fn ephemeral_binds_are_probed_independently() {
         let (_directory, path) = config(
             "version: 2\nlisteners: {one: {bind: '127.0.0.1:0'}, two: {bind: '127.0.0.1:0'}}\nroutes: []\n",
         );
         let report = diagnose(&path, None, None);
-        assert_eq!(report.status, "failed");
-        assert!(report
+        assert_eq!(report.status, "ok");
+        let bind_checks = report
             .checks
             .iter()
-            .any(|check| check.detail.contains("duplicated")));
+            .filter(|check| check.name.starts_with("listeners.bind."))
+            .collect::<Vec<_>>();
+        assert_eq!(bind_checks.len(), 2);
+        assert!(bind_checks.iter().all(|check| check.status == "passed"));
     }
 
     #[test]
