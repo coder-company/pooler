@@ -1932,12 +1932,7 @@ where
                             SemanticResponseHint::default(),
                         )
                     } else {
-                        let body = StreamingUpload::new(
-                            incoming,
-                            bounded_usize(limits.max_request_body_bytes),
-                            bounded_usize(limits.max_frame_bytes),
-                            bounded_usize(limits.max_queue_bytes),
-                        );
+                        let body = StreamingUpload::new(incoming, limits.clone());
                         (
                             PreparedBody::Streaming(Some(body)),
                             None,
@@ -2927,12 +2922,10 @@ where
                 let upstream_request = builder.body(body)?;
                 let request = client.request(upstream_request);
                 let sender = UploadChannelSender::new(sender, failure);
-                let pump = upload.pump(sender);
-                let max_response_body = bounded_usize(route.limits().max_response_body_bytes);
-                let max_response_frame = bounded_usize(route.limits().max_frame_bytes);
-                let max_response_queue_bytes = bounded_usize(route.limits().max_queue_bytes);
-                let max_response_queue_items =
-                    usize::try_from(route.limits().max_queue_items).unwrap_or(usize::MAX);
+                let upload_forwarding_cancel = CancellationToken::new();
+                let pump = upload.pump(sender, upload_forwarding_cancel.clone());
+                let response_limits = route.limits().clone();
+                let cancel_http1_upload = !upstream.http2();
                 async move {
                     tokio::pin!(request);
                     tokio::pin!(pump);
@@ -2940,7 +2933,8 @@ where
                     let mut upload_complete = false;
                     let mut response_complete = false;
                     let mut prefetched = VecDeque::new();
-                    let mut prefetched_bytes = 0_usize;
+                    let mut prefetched_body_bytes = 0_u64;
+                    let mut prefetched_queue_bytes = 0_u64;
                     loop {
                         if response.is_none() {
                             tokio::select! {
@@ -2952,6 +2946,13 @@ where
                                 result = &mut request => {
                                     let upstream_response = result.map_err(upstream_client_error)?;
                                     let _ = upstream_headers_duration.set(attempt_started.elapsed());
+                                    validate_upstream_response_head(
+                                        &response_limits,
+                                        upstream_response.headers(),
+                                    )?;
+                                    if cancel_http1_upload && !upload_complete {
+                                        upload_forwarding_cancel.cancel();
+                                    }
                                     // Hyper may return headers before it finishes polling the upload.
                                     // Hold them until the downstream body reaches validated EOS.
                                     response = Some(upstream_response);
@@ -2968,29 +2969,45 @@ where
                                 frame = poll_fn(|context| Pin::new(upstream_response.body_mut()).poll_frame(context)) => {
                                     match frame {
                                         Some(Ok(frame)) => {
-                                            if prefetched.len() >= max_response_queue_items {
-                                                return Err(ProxyError::InvalidLimits(
-                                                    "early upstream response exceeds queue limits".to_owned(),
-                                                ));
-                                            }
-                                            if let Some(data) = frame.data_ref() {
-                                                let frame_bytes = data.len();
-                                                if frame_bytes > max_response_frame
-                                                    || frame_bytes > max_response_body.saturating_sub(prefetched_bytes)
-                                                {
-                                                    return Err(ProxyError::InvalidLimits(
+                                            let frame_bytes = if let Some(data) = frame.data_ref() {
+                                                let frame_bytes =
+                                                    u64::try_from(data.len()).unwrap_or(u64::MAX);
+                                                prefetched_body_bytes = prefetched_body_bytes
+                                                    .saturating_add(frame_bytes);
+                                                response_limits
+                                                    .check_response_body(prefetched_body_bytes)
+                                                    .map_err(|_| ProxyError::InvalidLimits(
                                                         "upstream response body exceeds limits".to_owned(),
-                                                    ));
-                                                }
-                                                if frame_bytes
-                                                    > max_response_queue_bytes.saturating_sub(prefetched_bytes)
-                                                {
-                                                    return Err(ProxyError::InvalidLimits(
-                                                        "early upstream response exceeds queue limits".to_owned(),
-                                                    ));
-                                                }
-                                                prefetched_bytes += frame_bytes;
-                                            }
+                                                    ))?;
+                                                frame_bytes
+                                            } else if let Some(trailers) = frame.trailers_ref() {
+                                                validate_response_trailers(
+                                                    &response_limits,
+                                                    trailers,
+                                                )?
+                                            } else {
+                                                return Err(ProxyError::Upstream(Box::new(
+                                                    io::Error::other(
+                                                        "response body yielded an invalid frame",
+                                                    ),
+                                                )));
+                                            };
+                                            response_limits
+                                                .check_frame(frame_bytes)
+                                                .map_err(|_| ProxyError::InvalidLimits(
+                                                    "upstream response frame exceeds limits".to_owned(),
+                                                ))?;
+                                            prefetched_queue_bytes = prefetched_queue_bytes
+                                                .saturating_add(frame_bytes);
+                                            response_limits
+                                                .check_queue(
+                                                    prefetched_queue_bytes,
+                                                    u32::try_from(prefetched.len().saturating_add(1))
+                                                        .unwrap_or(u32::MAX),
+                                                )
+                                                .map_err(|_| ProxyError::InvalidLimits(
+                                                    "early upstream response exceeds queue limits".to_owned(),
+                                                ))?;
                                             prefetched.push_back(frame);
                                         }
                                         Some(Err(error)) => {
@@ -3030,6 +3047,7 @@ where
                         .await
                         .map_err(upstream_client_error)?;
                     let _ = upstream_headers_duration.set(attempt_started.elapsed());
+                    validate_upstream_response_head(route.limits(), response.headers())?;
                     Ok::<_, ProxyError>(
                         response.map(|body| PrefixedBody::new(VecDeque::new(), body)),
                     )
@@ -3045,28 +3063,10 @@ where
                 return Err(ProxyError::Timeout);
             }
         };
-        route
-            .limits()
-            .check_headers(
-                u32::try_from(response.headers().len()).unwrap_or(u32::MAX),
-                header_bytes(response.headers()),
-            )
-            .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
-        if response
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|length| route.limits().check_response_body(length).is_err())
-        {
-            return Err(ProxyError::InvalidLimits(
-                "upstream response body exceeds limits".to_owned(),
-            ));
-        }
         let (parts, body) = response.into_parts();
         let body = FrameLimitedBody::new(body, bounded_usize(route.limits().max_frame_bytes))
-            .map_err(box_error)
-            .boxed();
+            .map_err(box_error);
+        let body = TrailerLimitedBody::new(body, route.limits().clone()).boxed();
         Ok(Response::from_parts(parts, body))
     }
 
@@ -3538,6 +3538,67 @@ enum AttemptBody {
     Prepared(ProxyBody),
 }
 
+struct TrailerLimitedBody<B> {
+    inner: Pin<Box<B>>,
+    limits: RouteLimits,
+    failed: bool,
+}
+
+impl<B> TrailerLimitedBody<B> {
+    fn new(inner: B, limits: RouteLimits) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            limits,
+            failed: false,
+        }
+    }
+}
+
+impl<B> Body for TrailerLimitedBody<B>
+where
+    B: Body<Data = Bytes, Error = BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.failed {
+            return Poll::Ready(None);
+        }
+        match self.inner.as_mut().poll_frame(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(trailers) = frame.trailers_ref() {
+                    if validate_response_trailers(&self.limits, trailers).is_err() {
+                        self.failed = true;
+                        return Poll::Ready(Some(Err(Box::new(io::Error::other(
+                            "upstream response trailers exceed limits",
+                        )))));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.failed || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.failed {
+            SizeHint::with_exact(0)
+        } else {
+            self.inner.size_hint()
+        }
+    }
+}
+
 struct PrefixedBody<B> {
     prefix: VecDeque<Frame<Bytes>>,
     prefix_bytes: u64,
@@ -3599,25 +3660,16 @@ where
 struct StreamingUpload {
     inner: Pin<Box<Incoming>>,
     size_hint: SizeHint,
-    max_body_bytes: usize,
-    max_frame_bytes: usize,
-    max_queue_bytes: usize,
+    limits: RouteLimits,
 }
 
 impl StreamingUpload {
-    fn new(
-        inner: Incoming,
-        max_body_bytes: usize,
-        max_frame_bytes: usize,
-        max_queue_bytes: usize,
-    ) -> Self {
+    fn new(inner: Incoming, limits: RouteLimits) -> Self {
         let size_hint = inner.size_hint();
         Self {
             inner: Box::pin(inner),
             size_hint,
-            max_body_bytes,
-            max_frame_bytes,
-            max_queue_bytes,
+            limits,
         }
     }
 
@@ -3625,25 +3677,56 @@ impl StreamingUpload {
         self.size_hint
     }
 
-    async fn pump(mut self, mut sender: UploadChannelSender) -> Result<(), ProxyError> {
-        let mut seen = 0_usize;
-        let mut forwarding = true;
-        while let Some(frame) = poll_fn(|context| self.inner.as_mut().poll_frame(context)).await {
+    async fn pump(
+        mut self,
+        sender: UploadChannelSender,
+        forwarding_cancel: CancellationToken,
+    ) -> Result<(), ProxyError> {
+        let mut seen = 0_u64;
+        let mut sender = Some(sender);
+        loop {
+            let next = if sender.is_some() {
+                tokio::select! {
+                    biased;
+                    () = forwarding_cancel.cancelled() => {
+                        sender.take();
+                        continue;
+                    }
+                    frame = poll_fn(|context| self.inner.as_mut().poll_frame(context)) => frame,
+                }
+            } else {
+                poll_fn(|context| self.inner.as_mut().poll_frame(context)).await
+            };
+            let Some(frame) = next else {
+                break;
+            };
             let frame = frame.map_err(|error| ProxyError::Upstream(Box::new(error)))?;
             let frame = match frame.into_data() {
                 Ok(data) => {
-                    let frame_bytes = data.len();
-                    if frame_bytes > self.max_frame_bytes || frame_bytes > self.max_queue_bytes {
-                        return Err(ProxyError::RequestBodyTooLarge);
-                    }
-                    if frame_bytes > self.max_body_bytes.saturating_sub(seen) {
-                        return Err(ProxyError::RequestBodyTooLarge);
-                    }
-                    seen += frame_bytes;
+                    let frame_bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                    self.limits
+                        .check_frame(frame_bytes)
+                        .and_then(|_| self.limits.check_queue(frame_bytes, 1))
+                        .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                    seen = seen.saturating_add(frame_bytes);
+                    self.limits
+                        .check_request_body(seen)
+                        .map_err(|_| ProxyError::RequestBodyTooLarge)?;
                     Frame::data(data)
                 }
                 Err(frame) => match frame.into_trailers() {
-                    Ok(trailers) => Frame::trailers(trailers),
+                    Ok(trailers) => {
+                        let trailer_bytes = header_bytes(&trailers);
+                        self.limits
+                            .check_headers(
+                                u32::try_from(trailers.len()).unwrap_or(u32::MAX),
+                                trailer_bytes,
+                            )
+                            .and_then(|_| self.limits.check_frame(trailer_bytes))
+                            .and_then(|_| self.limits.check_queue(trailer_bytes, 1))
+                            .map_err(|_| ProxyError::RequestBodyTooLarge)?;
+                        Frame::trailers(trailers)
+                    }
                     Err(_) => {
                         return Err(ProxyError::Upstream(Box::new(io::Error::other(
                             "request body yielded an invalid frame",
@@ -3651,13 +3734,24 @@ impl StreamingUpload {
                     }
                 },
             };
-            if forwarding && sender.send(frame).await.is_err() {
+            let Some(active_sender) = sender.as_ref() else {
+                continue;
+            };
+            let send_result = tokio::select! {
+                biased;
+                () = forwarding_cancel.cancelled() => None,
+                result = active_sender.send(frame) => Some(result),
+            };
+            if !matches!(send_result, Some(Ok(()))) {
                 // HTTP/1.1 peers may stop consuming an upload after responding.
-                // Continue draining and validating the downstream request body.
-                forwarding = false;
+                // Drop the relay to publish a body failure, then keep draining and
+                // validating the downstream request independently.
+                sender.take();
             }
         }
-        sender.complete();
+        if let Some(mut sender) = sender {
+            sender.complete();
+        }
         Ok(())
     }
 }
@@ -6462,6 +6556,48 @@ fn resolve_secret(secret: &SecretRef) -> Result<SecretValue, ProxyError> {
     Ok(secret)
 }
 
+fn validate_upstream_response_head(
+    limits: &RouteLimits,
+    headers: &HeaderMap,
+) -> Result<(), ProxyError> {
+    limits
+        .check_headers(
+            u32::try_from(headers.len()).unwrap_or(u32::MAX),
+            header_bytes(headers),
+        )
+        .map_err(|_| ProxyError::InvalidLimits("upstream headers exceed limits".to_owned()))?;
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| limits.check_response_body(length).is_err())
+    {
+        return Err(ProxyError::InvalidLimits(
+            "upstream response body exceeds limits".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_response_trailers(
+    limits: &RouteLimits,
+    trailers: &HeaderMap,
+) -> Result<u64, ProxyError> {
+    let trailer_bytes = header_bytes(trailers);
+    limits
+        .check_headers(
+            u32::try_from(trailers.len()).unwrap_or(u32::MAX),
+            trailer_bytes,
+        )
+        .map_err(|_| {
+            ProxyError::InvalidLimits("upstream response trailers exceed limits".to_owned())
+        })?;
+    limits.check_frame(trailer_bytes).map_err(|_| {
+        ProxyError::InvalidLimits("upstream response trailers exceed frame limits".to_owned())
+    })?;
+    Ok(trailer_bytes)
+}
+
 fn header_bytes(headers: &HeaderMap) -> u64 {
     headers
         .iter()
@@ -6864,6 +7000,25 @@ mod tests {
             .expect("prefetched response body")
             .to_bytes();
         assert_eq!(bytes, Bytes::from_static(b"firstsecondtail"));
+    }
+
+    #[tokio::test]
+    async fn response_trailers_obey_route_frame_limits_after_upload_completion() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            "x-audit-trailer",
+            HeaderValue::from_static("0123456789abcdef"),
+        );
+        let stream = stream::iter(vec![Ok::<_, BoxError>(Frame::trailers(trailers))]);
+        let limits = RouteLimits {
+            max_frame_bytes: 1,
+            ..RouteLimits::default()
+        };
+        let mut body = TrailerLimitedBody::new(StreamBody::new(stream), limits);
+
+        assert!(body.frame().await.expect("trailer limit frame").is_err());
+        assert!(body.is_end_stream());
+        assert!(body.frame().await.is_none());
     }
 
     #[test]

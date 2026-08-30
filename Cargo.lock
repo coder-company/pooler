@@ -1693,6 +1693,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",

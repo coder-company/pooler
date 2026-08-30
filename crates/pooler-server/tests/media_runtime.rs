@@ -394,6 +394,205 @@ async fn upload_deadline_aborts_the_truncated_upstream_connection() {
 }
 
 #[tokio::test]
+async fn oversized_early_response_is_rejected_before_upload_eos() {
+    let (upstream_address, response_written, upstream_task) =
+        spawn_oversized_early_response_upstream().await;
+    let running = start_server(
+        compile_yaml(
+            "oversized-early-response.yaml",
+            &format!(
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: early\n    listen: local\n    match: {{method: POST, path: /early}}\n    limits: {{max_request_body_bytes: 8, max_response_body_bytes: 4, max_frame_bytes: 8, request_timeout: 3s}}\n    ingress: {{mode: opaque}}\n    target: local\n    response: {{mode: opaque}}\n"
+            ),
+        )
+        .expect("oversized early response config"),
+    )
+    .await;
+    let mut downstream = timeout(TEST_TIMEOUT, TcpStream::connect(running.address))
+        .await
+        .expect("proxy connect timeout")
+        .expect("proxy connection");
+    downstream
+        .write_all(
+            b"POST /early HTTP/1.1\r\nHost: media.test\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nheld\r\n",
+        )
+        .await
+        .expect("partial request chunk");
+    timeout(TEST_TIMEOUT, response_written)
+        .await
+        .expect("oversized response signal timeout")
+        .expect("oversized response signal");
+
+    let mut response = Vec::new();
+    timeout(
+        Duration::from_secs(1),
+        downstream.read_to_end(&mut response),
+    )
+    .await
+    .expect("invalid response head waited for upload EOS")
+    .expect("invalid response head rejection");
+    assert_eq!(
+        response_status(&response),
+        502,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("oversized response upstream timeout")
+        .expect("oversized response upstream task");
+    running.wait_for_request_idle().await;
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn early_http1_response_stops_forwarding_but_drains_the_downstream_upload() {
+    let (upstream_address, response_written, upstream_task) =
+        spawn_nonreading_early_response_upstream().await;
+    let running = start_server(
+        compile_yaml(
+            "nonreading-early-response.yaml",
+            &format!(
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}, transport: {{request_timeout: 1s}}}}}}\nroutes:\n  - id: early\n    listen: local\n    match: {{method: POST, path: /early}}\n    limits: {{max_request_body_bytes: 33554432, max_frame_bytes: 65536, request_timeout: 1s}}\n    ingress: {{mode: opaque}}\n    target: local\n    response: {{mode: opaque}}\n"
+            ),
+        )
+        .expect("nonreading early response config"),
+    )
+    .await;
+    let mut downstream = timeout(TEST_TIMEOUT, TcpStream::connect(running.address))
+        .await
+        .expect("proxy connect timeout")
+        .expect("proxy connection");
+    downstream
+        .write_all(
+            b"POST /early HTTP/1.1\r\nHost: media.test\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nheld\r\n",
+        )
+        .await
+        .expect("early response request marker");
+    timeout(TEST_TIMEOUT, response_written)
+        .await
+        .expect("early response signal timeout")
+        .expect("early response signal");
+
+    let mut body = Vec::with_capacity(8 * 1024 * 1024 + 2048);
+    for _ in 0..128 {
+        body.extend_from_slice(b"10000\r\n");
+        body.extend(std::iter::repeat_n(b'x', 65536));
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(b"0\r\n\r\n");
+    timeout(Duration::from_secs(2), downstream.write_all(&body))
+        .await
+        .expect("downstream upload drain stalled")
+        .expect("downstream upload");
+    let mut response = Vec::new();
+    timeout(TEST_TIMEOUT, downstream.read_to_end(&mut response))
+        .await
+        .expect("early response timeout")
+        .expect("early response");
+    assert_eq!(
+        response_status(&response),
+        200,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(http_body(&response), b"ok");
+
+    let healthy = send_request(
+        running.address,
+        "/early",
+        "application/octet-stream",
+        b"",
+        "",
+    )
+    .await;
+    assert_eq!(response_status(&healthy), 200);
+
+    timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("nonreading upstream timeout")
+        .expect("nonreading upstream task");
+    running.wait_for_request_idle().await;
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn oversized_early_response_trailers_are_rejected_before_upload_eos() {
+    let (upstream_address, response_written, upstream_task) = spawn_early_trailer_upstream().await;
+    let running = start_server(
+        compile_yaml(
+            "oversized-early-trailer.yaml",
+            &format!(
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams: {{local: {{url: http://{upstream_address}}}}}\nroutes:\n  - id: early-trailer\n    listen: local\n    match: {{method: POST, path: /trailers}}\n    limits: {{max_request_body_bytes: 2, max_response_body_bytes: 1, max_frame_bytes: 1, max_queue_bytes: 1, max_queue_items: 8, request_timeout: 3s}}\n    ingress: {{mode: opaque}}\n    target: local\n    response: {{mode: opaque}}\n"
+            ),
+        )
+        .expect("oversized early trailer config"),
+    )
+    .await;
+    let mut downstream = timeout(TEST_TIMEOUT, TcpStream::connect(running.address))
+        .await
+        .expect("proxy connect timeout")
+        .expect("proxy connection");
+    downstream
+        .write_all(
+            b"POST /trailers HTTP/1.1\r\nHost: media.test\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n",
+        )
+        .await
+        .expect("early trailer request prefix");
+    timeout(TEST_TIMEOUT, response_written)
+        .await
+        .expect("early trailer response timeout")
+        .expect("early trailer response signal");
+
+    let mut response = Vec::new();
+    timeout(
+        Duration::from_secs(1),
+        downstream.read_to_end(&mut response),
+    )
+    .await
+    .expect("invalid response trailer waited for upload EOS")
+    .expect("invalid response trailer rejection");
+    assert_eq!(
+        response_status(&response),
+        502,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    timeout(TEST_TIMEOUT, upstream_task)
+        .await
+        .expect("early trailer upstream timeout")
+        .expect("early trailer upstream task");
+    running.wait_for_request_idle().await;
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn oversized_request_trailers_are_rejected() {
+    let upstream = RecordingUpstream::start(200, b"stored").await;
+    let running = start_server(streaming_limit_config(upstream.address, "3s")).await;
+    let response = send_chunked_request_with_trailers(
+        running.address,
+        "/frame",
+        "application/octet-stream",
+        &[b"x"],
+        "",
+        b"X-Large: 0123456789abcdef\r\n",
+    )
+    .await;
+    assert_eq!(
+        response_status(&response),
+        413,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    running.wait_for_request_idle().await;
+    running.stop().await;
+    upstream.stop().await;
+}
+
+#[tokio::test]
 async fn unconsumed_early_http2_response_does_not_block_other_upstream_streams() {
     let (upstream_address, first_started, upstream_task) = spawn_h2_flow_control_upstream().await;
     let running = start_server(h2_flow_control_config(upstream_address)).await;
@@ -822,6 +1021,131 @@ impl RecordingUpstream {
     }
 }
 
+async fn spawn_oversized_early_response_upstream(
+) -> (SocketAddr, oneshot::Receiver<()>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("oversized-response upstream binds");
+    let address = listener.local_addr().expect("oversized-response address");
+    let (response_written, response_observed) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("oversized-response upstream accepts");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while !request
+            .windows(b"held".len())
+            .any(|window| window == b"held")
+        {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .expect("oversized-response request read");
+            assert_ne!(read, 0, "upstream closed before request marker");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .expect("oversized response head");
+        let _ = response_written.send(());
+        let _ = timeout(TEST_TIMEOUT, stream.read_to_end(&mut request)).await;
+    });
+    (address, response_observed, task)
+}
+
+async fn spawn_nonreading_early_response_upstream(
+) -> (SocketAddr, oneshot::Receiver<()>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("nonreading upstream binds");
+    let address = listener.local_addr().expect("nonreading upstream address");
+    let (response_written, response_observed) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("nonreading upstream accepts");
+        let std_stream = stream.into_std().expect("nonreading std stream");
+        let socket = socket2::Socket::from(std_stream);
+        socket
+            .set_recv_buffer_size(1024)
+            .expect("nonreading receive buffer");
+        let std_stream = socket.into();
+        let mut stream = TcpStream::from_std(std_stream).expect("nonreading tokio stream");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while !request
+            .windows(b"held".len())
+            .any(|window| window == b"held")
+        {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .expect("nonreading request read");
+            assert_ne!(read, 0, "upstream closed before request marker");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok")
+            .await
+            .expect("nonreading early response");
+        let _ = response_written.send(());
+
+        let (mut second, _) = timeout(TEST_TIMEOUT, listener.accept())
+            .await
+            .expect("truncated first connection was reused")
+            .expect("healthy upstream accepts");
+        let request = read_request(&mut second)
+            .await
+            .expect("healthy upstream request");
+        assert!(request.starts_with(b"POST /early HTTP/1.1"));
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .expect("healthy upstream response");
+    });
+    (address, response_observed, task)
+}
+
+async fn spawn_early_trailer_upstream() -> (SocketAddr, oneshot::Receiver<()>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("early-trailer upstream binds");
+    let address = listener.local_addr().expect("early-trailer address");
+    let (response_written, response_observed) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("early-trailer upstream accepts");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while !request
+            .windows(b"1\r\nx\r\n".len())
+            .any(|window| window == b"1\r\nx\r\n")
+        {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .expect("early-trailer request read");
+            assert_ne!(read, 0, "upstream closed before request prefix");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Audit-Trailer\r\nConnection: keep-alive\r\n\r\n0\r\nX-Audit-Trailer: 0123456789abcdef\r\n\r\n",
+            )
+            .await
+            .expect("early-trailer response");
+        let _ = response_written.send(());
+        let _ = timeout(TEST_TIMEOUT, stream.read_to_end(&mut request)).await;
+    });
+    (address, response_observed, task)
+}
+
 async fn spawn_h2_flow_control_upstream() -> (SocketAddr, oneshot::Receiver<()>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1160,6 +1484,18 @@ async fn send_chunked_request(
     chunks: &[&[u8]],
     extra_headers: &str,
 ) -> Vec<u8> {
+    send_chunked_request_with_trailers(address, path, content_type, chunks, extra_headers, b"")
+        .await
+}
+
+async fn send_chunked_request_with_trailers(
+    address: SocketAddr,
+    path: &str,
+    content_type: &str,
+    chunks: &[&[u8]],
+    extra_headers: &str,
+    trailers: &[u8],
+) -> Vec<u8> {
     let mut stream = timeout(TEST_TIMEOUT, TcpStream::connect(address))
         .await
         .expect("proxy connect timeout")
@@ -1180,9 +1516,14 @@ async fn send_chunked_request(
         stream.write_all(b"\r\n").await.expect("chunk terminator");
     }
     stream
-        .write_all(b"0\r\n\r\n")
+        .write_all(b"0\r\n")
         .await
         .expect("final request chunk");
+    stream.write_all(trailers).await.expect("request trailers");
+    stream
+        .write_all(b"\r\n")
+        .await
+        .expect("request trailer terminator");
     let mut response = Vec::new();
     timeout(TEST_TIMEOUT, stream.read_to_end(&mut response))
         .await
