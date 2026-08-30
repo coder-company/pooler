@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Validate documentation against the shipped binary.
 
-Two checks run. Every fenced yaml block that declares a top-level `version:` is
-compiled with `pooler check`; blocks without one are deliberate fragments and
-are skipped. Every documented "N known providers" claim is compared against
-`pooler providers --json` so the advertised count cannot drift from the build.
+Three checks run. Every fenced yaml block that declares a top-level `version:`
+is compiled with `pooler check`; blocks without one are deliberate fragments
+and are skipped. Every documented "N known providers" claim is compared
+against `pooler providers --json`. The schema's preset inventory must also be
+represented in the README table, preset reference, and detailed preset sections.
 """
 from __future__ import annotations
 
@@ -19,6 +20,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FENCE = re.compile(r"```ya?ml\n(.*?)```", re.DOTALL)
 PROVIDER_CLAIM = re.compile(r"\*{0,2}(\d[\d,]*)\*{0,2}\s+known providers")
+README_PRESET = re.compile(r"^\| \[`([^`]+)`\]", re.MULTILINE)
+REFERENCE_PRESET = re.compile(r"^\| `([^`]+)` \|", re.MULTILINE)
+PRESET_HEADING = re.compile(r"^## `([^`]+)`$", re.MULTILINE)
 
 
 def documented_sources() -> list[Path]:
@@ -57,6 +61,78 @@ def check_provider_count(binary: Path) -> list[str]:
     return failures
 
 
+def markdown_section(text: str, heading: str) -> str:
+    """Return one level-two Markdown section without neighboring tables."""
+    marker = f"## {heading}"
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    start += len(marker)
+    end = text.find("\n## ", start)
+    return text[start:] if end < 0 else text[start:end]
+
+
+def markdown_range(text: str, first_heading: str, final_heading: str) -> str:
+    """Return text between two exact headings, excluding the final heading."""
+    start = text.find(first_heading)
+    if start < 0:
+        return ""
+    end = text.find(final_heading, start + len(first_heading))
+    return text[start:] if end < 0 else text[start:end]
+
+
+def preset_inventory_failures(
+    presets: set[str], readme: str, guide: str
+) -> list[str]:
+    """Compare schema presets exactly with the three public inventories."""
+    inventories = {
+        "README preset table": set(
+            README_PRESET.findall(markdown_section(readme, "Presets"))
+        ),
+        "preset reference table": set(
+            REFERENCE_PRESET.findall(markdown_section(guide, "Preset reference"))
+        ),
+        "detailed preset sections": set(
+            PRESET_HEADING.findall(
+                markdown_range(guide, "## Client prerequisites", "## Verify a preset")
+            )
+        ),
+    }
+    failures = []
+    for label, documented in inventories.items():
+        missing = sorted(presets - documented)
+        stale = sorted(documented - presets)
+        if missing:
+            failures.append(f"{label} omits schema presets: {', '.join(missing)}")
+        if stale:
+            failures.append(f"{label} advertises unknown presets: {', '.join(stale)}")
+    return failures
+
+
+def check_preset_inventory(binary: Path) -> list[str]:
+    """Require every schema-advertised preset in each public inventory."""
+    result = subprocess.run(
+        [str(binary), "config", "schema"], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return [f"pooler config schema failed: {result.stderr.strip()}"]
+    try:
+        schema = json.loads(result.stdout)
+        values = schema["$defs"]["import"]["oneOf"][2]["properties"]["preset"]["enum"]
+        presets = {value for value in values if isinstance(value, str)}
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        return [f"could not read preset inventory from config schema: {error}"]
+    if not presets:
+        return ["config schema advertises no presets"]
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    guide = (ROOT / "docs/adapters-and-presets.md").read_text(encoding="utf-8")
+    failures = preset_inventory_failures(presets, readme, guide)
+    if not failures:
+        print(f"verified {len(presets)} schema presets across public inventories")
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -78,6 +154,7 @@ def main() -> int:
     sources = documented_sources()
     checked = 0
     failures: list[str] = check_provider_count(binary)
+    failures.extend(check_preset_inventory(binary))
 
     with tempfile.TemporaryDirectory() as directory:
         for source in sources:

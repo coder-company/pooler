@@ -223,6 +223,7 @@ A preset mounts the listeners, routes, and translations one client expects, so y
 | [`factory`](docs/adapters-and-presets.md#factory) | Factory Droid | `127.0.0.1:18474` | `bind`, `upstream_url`, `secret` |
 | [`fx`](docs/fx.md) | Vercel Labs fx | `127.0.0.1:18475` | `bind`, `upstream_url`, `secret` |
 | [`xai`](docs/adapters-and-presets.md#xai) | xAI Grok | `127.0.0.1:18476` | `bind`, `rest_url`, `websocket_url`, `secret` |
+| [`media`](docs/adapters-and-presets.md#media) | Media surfaces | `127.0.0.1:18476` | `bind`, `upstream_url`, `secret` |
 | [`gateway`](docs/gateway.md) | OpenAI, Anthropic, Gemini SDKs | `127.0.0.1:8400` | `bind`, `provider`, `upstream_url`, `websocket_url`, `secret` |
 
 ```yaml

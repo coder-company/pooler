@@ -6706,6 +6706,12 @@ routes:
         assert!(value["listeners"][0]["routes"].is_array());
         assert_eq!(value["connect_tools"]["optional"], true);
         assert_eq!(value["connect_tools"]["routing_effect"], "none");
+        let namespace = value["connect_tools"]["namespace"]
+            .as_str()
+            .expect("connect-tools namespace");
+        assert_eq!(namespace, "/management/control-plane/connect-tools");
+        let tools = api().handle(&Method::GET, namespace, &loopback_headers());
+        assert_eq!(tools.status, StatusCode::OK);
     }
 
     #[test]

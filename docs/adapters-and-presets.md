@@ -186,6 +186,24 @@ imports:
       secret: env:XAI_API_KEY
 ```
 
+## `media`
+
+Mounts bounded OpenAI-style image, audio, file, embedding, and batch surfaces without claiming cross-provider translation. Most provider-native request and response bodies stay opaque. Multipart image edits, audio transcriptions, and file uploads are decoded only for strict validation and capability-aware selection; Pooler forwards the original boundary, headers, field order, and body bytes unchanged.
+
+```yaml
+version: 2
+
+imports:
+  - preset: media
+    as: media
+    with:
+      bind: 127.0.0.1:18476
+      upstream_url: http://127.0.0.1:8319
+      secret: env:POOLER_UPSTREAM_KEY
+```
+
+The preset caps image, audio, and file requests at 32 MiB and embedding and batch requests at 8 MiB. Opaque bodies stream once and cannot be replayed. Multipart bodies are buffered within the configured limit for validation; the normal method/idempotency, commitment, and retry budgets determine whether a buffered request can be retried. The default bind is also used by `xai`; change one `bind` if both presets are imported.
+
 ## `gateway`
 
 Mounts the endpoint families a general OpenAI, Anthropic, or Gemini client expects. The upstream is declared with `known_provider`, so its base URL, discovery parser, model aliases, and exclusions come from the shipped provider catalog.

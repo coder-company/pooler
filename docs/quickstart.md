@@ -177,7 +177,7 @@ Then set the tool's base URL:
 
 Some clients require a non-empty API-key field even when they do not need one. Use a non-secret placeholder; Pooler selects the real upstream credential server-side.
 
-Confirm what is actually listening:
+Confirm the configured routes and endpoints:
 
 ```sh
 pooler routes

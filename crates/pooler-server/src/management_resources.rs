@@ -711,7 +711,7 @@ pub(crate) fn endpoint_inventory(config: &CompiledConfig) -> Value {
         "connect_tools": {
             "optional": true,
             "routing_effect": "none",
-            "namespace": "/management/connect-tools",
+            "namespace": "/management/control-plane/connect-tools",
             "requires_confirmation_for_route_draft": true,
         },
     })

@@ -339,7 +339,10 @@ pub fn run(cli: Cli) -> Result<()> {
             credential_key_ref.as_deref(),
             json,
         ),
-        Command::EndpointInventory { json: _ } => {
+        Command::EndpointInventory { json } => {
+            // `--json` is a compatibility alias: endpoint inventory has always
+            // been machine-readable JSON in both forms.
+            let _json_compatibility_alias = json;
             let config = load(&config_path::resolve(config.as_deref())?)?;
             println!(
                 "{}",

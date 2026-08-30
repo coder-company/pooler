@@ -58,19 +58,19 @@ pooler check [--config <PATH>]
 
 ```sh
 pooler config render
-pooler config schema
+pooler config schema [--output <PATH>]
 pooler config recovery
 ```
 
 | Subcommand | Description |
 | :--- | :--- |
 | `render` | Print the source after validating it, with imports and presets expanded. Secrets are not resolved. |
-| `schema` | Print the deterministic source-configuration JSON Schema. |
+| `schema` | Print the deterministic source-configuration JSON Schema, or write it to `--output <PATH>`. |
 | `recovery` | Inspect and safely recover a blocked managed-configuration transaction. |
 
 ### `pooler routes`
 
-List compiled routes in match order, with their listener, methods, path, and target upstream.
+List compiled route IDs in match order. Use `pooler endpoint-inventory` for listener, method, path, protocol, and target details.
 
 ```sh
 pooler routes [--config <PATH>]
@@ -96,7 +96,7 @@ pooler providers [--search <TEXT>] [--json]
 
 ### `pooler endpoint-inventory`
 
-Print every configured listener and management endpoint without using a named client profile. Output is JSON for scripting.
+Print every configured listener and management endpoint without using a named client profile. Output is JSON for scripting; `--json` is a compatibility alias and produces identical output.
 
 ```sh
 pooler endpoint-inventory [--json]
