@@ -4139,6 +4139,19 @@ impl ManagementApi {
                 false,
             );
         }
+        if mutation && !self.bearer_authorized(headers) {
+            self.record_audit(path, None, "unauthorized");
+            let mut response = ManagementResponse::error_code(
+                ManagementErrorCode::AuthenticationRequired,
+                "management bearer authentication required",
+                false,
+            );
+            response.headers.insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Bearer"),
+            );
+            return response;
+        }
         if !local_ui_shell && !self.authorized(headers) {
             if mutation {
                 self.record_audit(path, None, "unauthorized");
@@ -4399,11 +4412,11 @@ impl ManagementApi {
                 false,
             ));
         }
-        if self.actor_from_headers(headers).is_none() {
+        if !self.bearer_authorized(headers) {
             self.record_audit(path, None, "unauthorized");
             let mut response = ManagementResponse::error_code(
                 ManagementErrorCode::AuthenticationRequired,
-                "management authentication required",
+                "management bearer authentication required",
                 false,
             );
             response.headers.insert(
@@ -7310,6 +7323,72 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
     }
 
     #[test]
+    fn management_session_cookies_are_read_only() {
+        const SECRET_ENV: &str = "POOLER_MANAGEMENT_SESSION_READ_ONLY_TEST_KEY";
+        std::env::set_var(SECRET_ENV, "read-only-key");
+        let api = authenticated_api(SECRET_ENV);
+        let mut bearer_headers = loopback_headers();
+        bearer_headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://localhost"),
+        );
+        bearer_headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer read-only-key"),
+        );
+
+        let session = api.handle(&Method::POST, "/session", &bearer_headers);
+        assert_eq!(session.status, StatusCode::NO_CONTENT);
+        let cookie = session
+            .headers
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .expect("management session cookie");
+        let mut session_headers = loopback_headers();
+        session_headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://localhost"),
+        );
+        session_headers.insert(
+            header::COOKIE,
+            header::HeaderValue::from_str(cookie).expect("valid management session cookie"),
+        );
+
+        assert_eq!(
+            api.handle(&Method::GET, "/health", &session_headers).status,
+            StatusCode::OK
+        );
+        for path in ["/reload", "/models/public-model/disable", "/session/revoke"] {
+            let response = api.handle(&Method::POST, path, &session_headers);
+            assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(
+                response.headers.get(header::WWW_AUTHENTICATE),
+                Some(&header::HeaderValue::from_static("Bearer")),
+                "{path}"
+            );
+        }
+        let draft = api.handle_with_body(&Method::POST, "/config/drafts", &session_headers, &[]);
+        assert_eq!(draft.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            draft.headers.get(header::WWW_AUTHENTICATE),
+            Some(&header::HeaderValue::from_static("Bearer"))
+        );
+
+        let mut revoke_headers = session_headers;
+        revoke_headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer read-only-key"),
+        );
+        assert_eq!(
+            api.handle(&Method::POST, "/session/revoke", &revoke_headers)
+                .status,
+            StatusCode::NO_CONTENT
+        );
+        std::env::remove_var(SECRET_ENV);
+    }
+
+    #[test]
     fn remote_management_is_rejected_without_tls() {
         let error = pooler_config::compile_yaml(
             "management-remote-no-tls.yaml",
@@ -8444,6 +8523,107 @@ accounts: {account-a: {provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}
         .expect("bounded body deadline elapses")
         .expect("body timeout response reads");
         assert!(String::from_utf8_lossy(&timed_out).contains("408 Request Timeout"));
+
+        server.begin_shutdown();
+        runner
+            .await
+            .expect("management task does not panic")
+            .expect("management task shuts down");
+        std::env::remove_var(SECRET_ENV);
+    }
+
+    #[tokio::test]
+    async fn management_listener_rejects_session_only_mutations_before_body_read() {
+        const SECRET_ENV: &str = "POOLER_MANAGEMENT_SESSION_BOUNDARY_TEST_KEY";
+        std::env::set_var(SECRET_ENV, "boundary-key");
+        let server = ManagementHttpServer::bind(Arc::new(authenticated_api(SECRET_ENV)))
+            .await
+            .expect("management listener binds");
+        let address: SocketAddr = server
+            .address()
+            .parse()
+            .expect("ephemeral management address");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+
+        let session_response = raw_management_request(
+            address,
+            format!(
+                "POST /management/session HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nAuthorization: Bearer boundary-key\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(
+            session_response.contains("204 No Content"),
+            "{session_response}"
+        );
+        let cookie = session_response
+            .split("\r\n")
+            .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value.trim())
+            .and_then(|value| value.split(';').next())
+            .expect("management session cookie")
+            .to_owned();
+
+        let read = raw_management_request(
+            address,
+            format!(
+                "GET /management/health HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(read.contains("200 OK"), "{read}");
+
+        for path in [
+            "/management/reload",
+            "/management/accounts/missing/oauth-browser",
+        ] {
+            let rejected = raw_management_request(
+                address,
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nCookie: {cookie}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await;
+            assert!(rejected.contains("401 Unauthorized"), "{path}: {rejected}");
+            assert!(
+                rejected
+                    .to_ascii_lowercase()
+                    .contains("www-authenticate: bearer"),
+                "{path}: {rejected}"
+            );
+        }
+
+        let mut slow = TcpStream::connect(address)
+            .await
+            .expect("session-only management client connects");
+        slow.write_all(
+            format!(
+                "PATCH /management/config/drafts/1 HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nCookie: {cookie}\r\nIf-Match: ignored\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("session-only mutation headers write");
+        let mut rejected = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), slow.read_to_end(&mut rejected))
+            .await
+            .expect("session-only mutation is rejected before its body is read")
+            .expect("session-only mutation response reads");
+        let rejected = String::from_utf8(rejected).expect("management response is UTF-8");
+        assert!(rejected.contains("401 Unauthorized"), "{rejected}");
+        assert!(
+            rejected
+                .to_ascii_lowercase()
+                .contains("www-authenticate: bearer"),
+            "{rejected}"
+        );
 
         server.begin_shutdown();
         runner
