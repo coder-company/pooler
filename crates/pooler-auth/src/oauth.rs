@@ -2409,20 +2409,18 @@ async fn renew_store_generation(
             lease_fingerprint,
             cancellation,
             || async move {
-                let snapshot = match operation_fingerprint.as_deref() {
-                    Some(fingerprint) => {
-                        store
-                            .load_for_fingerprint(&operation_credential, fingerprint)
-                            .await
-                    }
-                    None => store.load(&operation_credential).await,
-                }
+                let snapshot = load_store_snapshot(
+                    store,
+                    &operation_credential,
+                    operation_fingerprint.as_deref(),
+                )
+                .await
                 .map_err(|error| RefreshError::OAuth(OAuthError::Store(error)))?
                 .ok_or(RefreshError::OAuth(OAuthError::NoRefreshToken))?;
                 if expected_generation.is_some_and(|expected| snapshot.generation() != expected) {
                     return Ok(snapshot.tokens().clone());
                 }
-                let tokens = match strategy {
+                let renewal = match strategy {
                     RenewalStrategy::RefreshToken => {
                         let refresh_token = snapshot
                             .tokens()
@@ -2438,8 +2436,28 @@ async fn renew_store_generation(
                             .renew(snapshot.tokens(), operation_cancellation.clone())
                             .await
                     }
-                }
-                .map_err(refresh_error)?;
+                };
+                let tokens = match renewal {
+                    Ok(tokens) => tokens,
+                    Err(OAuthError::NeedsReauth) => {
+                        // A concurrent login may replace a revoked token while the
+                        // provider request is in flight. Only the generation that
+                        // actually received invalid_grant may require reauthorization.
+                        let current = load_store_snapshot(
+                            store,
+                            &operation_credential,
+                            operation_fingerprint.as_deref(),
+                        )
+                        .await
+                        .map_err(|error| RefreshError::OAuth(OAuthError::Store(error)))?
+                        .ok_or(RefreshError::OAuth(OAuthError::NoRefreshToken))?;
+                        if current.generation() != snapshot.generation() {
+                            return Ok(current.tokens().clone());
+                        }
+                        return Err(RefreshError::NeedsReauth);
+                    }
+                    Err(error) => return Err(refresh_error(error)),
+                };
                 let result = match operation_fingerprint.as_deref() {
                     Some(fingerprint) => {
                         store
@@ -2476,6 +2494,17 @@ async fn renew_store_generation(
     }
     .map_err(OAuthError::Store)?
     .ok_or(OAuthError::NoRefreshToken)
+}
+
+async fn load_store_snapshot(
+    store: &dyn OAuthTokenStore,
+    credential: &CredentialId,
+    fingerprint: Option<&str>,
+) -> Result<Option<TokenSnapshot>, OAuthStoreError> {
+    match fingerprint {
+        Some(fingerprint) => store.load_for_fingerprint(credential, fingerprint).await,
+        None => store.load(credential).await,
+    }
 }
 
 fn refresh_error(error: OAuthError) -> RefreshError {
@@ -2542,6 +2571,26 @@ mod tests {
                 } else {
                     response
                 }
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingNeedsReauthRefresher {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl OAuthRefresher for BlockingNeedsReauthRefresher {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a SecretValue,
+            _cancellation: CancellationToken,
+        ) -> OAuthFuture<'a, OAuthTokens> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                Err(OAuthError::NeedsReauth)
             })
         }
     }
@@ -3058,6 +3107,54 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_eq!(result, Err(OAuthError::InvalidResponse));
+    }
+
+    #[tokio::test]
+    async fn stale_invalid_grant_preserves_newer_login_generation() {
+        let coordinator = RefreshCoordinator::new();
+        let provider = Arc::new(BlockingNeedsReauthRefresher::default());
+        let store = Arc::new(MemoryOAuthTokenStore::new());
+        let credential = CredentialId::new("oauth-concurrent-login").unwrap();
+        store.insert(
+            credential.clone(),
+            OAuthTokens::bearer("old-access", Some("old-refresh"), None),
+        );
+
+        let refresh = tokio::spawn({
+            let provider = Arc::clone(&provider);
+            let store = Arc::clone(&store);
+            let credential = credential.clone();
+            async move {
+                refresh_with_store_if_generation(
+                    &coordinator,
+                    provider.as_ref(),
+                    store.as_ref(),
+                    credential,
+                    Some(0),
+                    CancellationToken::new(),
+                )
+                .await
+            }
+        });
+        provider.started.notified().await;
+
+        let login = store
+            .compare_and_swap(
+                &credential,
+                0,
+                OAuthTokens::bearer("new-access", Some("new-refresh"), None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.generation(), 1);
+        provider.release.notify_one();
+
+        let refreshed = refresh.await.unwrap().unwrap();
+        assert_eq!(refreshed.generation(), 1);
+        assert_eq!(
+            refreshed.tokens().access_token().expose_secret(),
+            "new-access"
+        );
     }
 
     #[tokio::test]

@@ -96,6 +96,8 @@ fn project_exhaustion_rotates_atomically_rebinds_affinity_and_restores() {
         recovery.retry_decision(),
         RetryDecision::Retry {
             delay: Duration::ZERO,
+            retry_delay: Duration::ZERO,
+            recovery_wait: Duration::ZERO,
             reason: RetryReason::AlternateCredential,
         }
     );

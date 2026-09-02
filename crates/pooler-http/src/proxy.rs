@@ -49,7 +49,7 @@ use pooler_observe::{
     TraceRecorder, TraceStage, Usage as ObservedUsage,
 };
 use pooler_policy::{
-    CommitmentState, QuotaObservation, ReplayCheck, SelectionLease, TelemetrySample,
+    CommitmentState, QuotaObservation, ReplayCheck, RetryDecision, SelectionLease, TelemetrySample,
 };
 use pooler_protocol::{JsonPatchLimits, PreservedJson};
 use pooler_store::{CostProvenance, RequestEvent, RequestEventKind, Store, UsageRecord};
@@ -1639,110 +1639,177 @@ where
             headers.insert("sec-websocket-protocol", protocols);
         }
 
-        let mut selection =
-            match self
-                .pooling
-                .select(&self.config, route, None, &headers, 1, started)
-            {
-                Ok(selection) => selection,
-                Err(error) => {
-                    lifecycle.record(RequestEventKind::Selection, |event| {
-                        event.attempt = Some(1);
-                        event.eligible = Some(false);
-                        event.error_class = Some(error.to_string());
-                    });
-                    return Err(pool_selection_error(error));
+        let base_headers = headers;
+        let mut credentials_used = BTreeSet::new();
+        let mut providers_used = BTreeSet::new();
+        let mut elapsed_retry_delay = Duration::ZERO;
+        let mut elapsed_recovery_wait = Duration::ZERO;
+        let mut forced_selection = None;
+        let (mut selection, upstream, headers) = loop {
+            let mut selection = if let Some(selection) = forced_selection.take() {
+                selection
+            } else {
+                match self
+                    .pooling
+                    .select(&self.config, route, None, &base_headers, 1, started)
+                {
+                    Ok(selection) => selection,
+                    Err(error) => {
+                        lifecycle.record(RequestEventKind::Selection, |event| {
+                            event.attempt = Some(1);
+                            event.eligible = Some(false);
+                            event.error_class = Some(error.to_string());
+                        });
+                        return Err(pool_selection_error(error));
+                    }
                 }
             };
-        lifecycle.selected(&selection, 1);
-        let selected_upstream = self
-            .config
-            .upstreams()
-            .get(selection.upstream_id())
-            .ok_or_else(|| ProxyError::MissingUpstream {
-                route: route.id().to_owned(),
-                upstream: selection.upstream_id().to_owned(),
-            })?;
-        let upstream = route.target().transport_upstream().map_or(
-            Ok(selected_upstream),
-            |transport_upstream| {
-                self.config
-                    .upstreams()
-                    .get(transport_upstream)
-                    .ok_or_else(|| ProxyError::MissingUpstream {
-                        route: route.id().to_owned(),
-                        upstream: transport_upstream.to_owned(),
-                    })
-            },
-        )?;
-        if !matches!(upstream.transport(), "ws" | "wss") {
-            return Err(ProxyError::InvalidWebSocketHandshake(
-                "the selected upstream does not use ws or wss".to_owned(),
-            ));
-        }
-        let _secret = (upstream.native().is_some()
-            || selection.account_secret().is_some()
-            || upstream.auth().is_some())
-        .then(|| self.resources.secret_material());
-        let native_auth = self
-            .native
-            .authorize_selected_attempt(NativeAuthorizationRequest::new(
+            lifecycle.selected(&selection, 1);
+            if let Some(credential) = selection.credential() {
+                credentials_used.insert(credential.clone());
+            }
+            providers_used.insert(selection.provider().clone());
+
+            let (upstream, _) =
+                selected_transport_upstream(&self.config, route, selection.upstream_id())?;
+            if !matches!(upstream.transport(), "ws" | "wss") {
+                return Err(ProxyError::InvalidWebSocketHandshake(
+                    "the selected upstream does not use ws or wss".to_owned(),
+                ));
+            }
+            let _secret = (upstream.native().is_some()
+                || selection.account_secret().is_some()
+                || upstream.auth().is_some())
+            .then(|| self.resources.secret_material());
+            let request_deadline =
+                deadline_after(started, effective_request_timeout(route.limits(), upstream))?;
+            let authorization_deadline = Instant::from_std(request_deadline);
+            let retry_deadline = retry_deadline(started, request_deadline, selection.policy());
+            let native_auth = bounded_native_operation(
+                authorization_deadline,
+                &cancellation,
+                self.native
+                    .authorize_selected_attempt(NativeAuthorizationRequest::new(
+                        upstream,
+                        selection.account_auth_kind(),
+                        selection.credential(),
+                        selection.account_secret(),
+                        upstream.auth(),
+                        &base_headers,
+                        cancellation.clone(),
+                    )),
+            )
+            .await?;
+            let native_auth = match native_auth {
+                Ok(authorization) => authorization,
+                Err(NativeRuntimeError::NeedsReauth { generation }) => {
+                    let mut failure = self
+                        .pooling
+                        .classify_native_reauth(crate::pool::NativeReauthInput {
+                            config: &self.config,
+                            route,
+                            selection: &mut selection,
+                            replay: ReplayCheck::safe(),
+                            commitment: CommitmentState::Uncommitted,
+                            idempotency_key_present: false,
+                            attempt: 1,
+                            failed_generation: generation,
+                            generation_fenced: self.pooling.shares_credential_generation_domain(
+                                self.native.sqlite_token_store(),
+                            ),
+                            native_runtime: Some(&self.native),
+                            outbound_attempt_consumed: false,
+                            credentials_used: &credentials_used,
+                            providers_used: &providers_used,
+                            elapsed_retry_delay,
+                            elapsed_recovery_wait,
+                            started,
+                        })
+                        .map_err(pool_error)?;
+                    self.observe_failure(route, &selection, &failure);
+                    if failure.decision.is_retry() {
+                        let delay = failure.decision.delay();
+                        let health_reason = failure.health_mutation_reason().map(str::to_owned);
+                        forced_selection = failure.take_replacement();
+                        lifecycle.retry(
+                            1,
+                            "native_account_requires_reauthentication",
+                            delay,
+                            None,
+                            health_reason,
+                        );
+                        wait_for_policy_retry(
+                            failure.decision,
+                            retry_deadline,
+                            &cancellation,
+                            &mut elapsed_retry_delay,
+                            &mut elapsed_recovery_wait,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    return Err(native_error(NativeRuntimeError::NeedsReauth { generation }));
+                }
+                Err(error) => return Err(native_error(error)),
+            };
+            let mut attempt_headers = base_headers.clone();
+            strip_caller_credentials_when_authenticating(
+                &mut attempt_headers,
+                native_auth.is_some(),
+                &selection,
                 upstream,
-                selection.account_auth_kind(),
-                selection.credential(),
-                selection.account_secret(),
-                upstream.auth(),
-                &headers,
-                cancellation.clone(),
-            ))
-            .await
-            .map_err(native_error)?;
-        strip_caller_credentials_when_authenticating(
-            &mut headers,
-            native_auth.is_some(),
-            &selection,
-            upstream,
-        );
-        if let Some(native_auth) = native_auth {
-            native_auth.apply_once(&mut headers).map_err(native_error)?;
-        } else if let Some(account_secret) = selection.account_secret() {
-            if !self
-                .native
-                .apply_managed_account_auth(
-                    &mut headers,
-                    account_secret,
-                    upstream.auth(),
-                    upstream,
-                    selection.credential(),
-                )
-                .map_err(native_error)?
-            {
-                crate::pool::apply_configured_account_auth(
-                    &mut headers,
-                    Some(account_secret),
-                    upstream.auth(),
-                )
-                .map_err(pool_error)?;
+            );
+            if let Some(native_auth) = native_auth {
+                native_auth
+                    .apply_once(&mut attempt_headers)
+                    .map_err(native_error)?;
+            } else if let Some(account_secret) = selection.account_secret() {
+                if !self
+                    .native
+                    .apply_managed_account_auth(
+                        &mut attempt_headers,
+                        account_secret,
+                        upstream.auth(),
+                        upstream,
+                        selection.credential(),
+                    )
+                    .map_err(native_error)?
+                {
+                    crate::pool::apply_configured_account_auth(
+                        &mut attempt_headers,
+                        Some(account_secret),
+                        upstream.auth(),
+                    )
+                    .map_err(pool_error)?;
+                }
+            } else if let Some(auth) = upstream.auth() {
+                if !self
+                    .native
+                    .apply_managed_account_auth(
+                        &mut attempt_headers,
+                        auth.secret(),
+                        Some(auth),
+                        upstream,
+                        None,
+                    )
+                    .map_err(native_error)?
+                {
+                    apply_configured_upstream_auth(&mut attempt_headers, upstream)?;
+                }
+            } else {
+                apply_configured_upstream_auth(&mut attempt_headers, upstream)?;
             }
-        } else if let Some(auth) = upstream.auth() {
-            if !self
-                .native
-                .apply_managed_account_auth(&mut headers, auth.secret(), Some(auth), upstream, None)
-                .map_err(native_error)?
-            {
-                apply_configured_upstream_auth(&mut headers, upstream)?;
-            }
-        } else {
-            apply_configured_upstream_auth(&mut headers, upstream)?;
-        }
+            break (selection, upstream, attempt_headers);
+        };
 
         let uri = selection
             .upstream_uri_for(upstream, route, &downstream_uri)
             .map_err(pool_error)?
             .to_string();
         let upstream_key = generate_websocket_key()?;
-        let hard_deadline = websocket_hard_deadline(started, route.limits(), upstream);
-        let connect_deadline = StdInstant::now() + connect_timeout(route.limits(), upstream);
+        let hard_deadline = websocket_hard_deadline(started, route.limits(), upstream)?;
+        let connect_deadline =
+            deadline_after(StdInstant::now(), connect_timeout(route.limits(), upstream))?;
         let connect_deadline =
             hard_deadline.map_or(connect_deadline, |hard| connect_deadline.min(hard));
         let connect = connect_websocket(&uri, &headers, &upstream_key, &offered_protocols);
@@ -1862,9 +1929,10 @@ where
                 route: route.id().to_owned(),
                 upstream: route.target().upstream().to_owned(),
             })?;
-        let buffer_deadline = Instant::from_std(
-            started + patch_buffer_timeout(&self.config, route, fallback_upstream),
-        );
+        let buffer_deadline = Instant::from_std(deadline_after(
+            started,
+            patch_buffer_timeout(&self.config, route, fallback_upstream),
+        )?);
         let cancellation = guard.cancellation_token();
         let method = request.method().clone();
         let downstream_uri = request.uri().clone();
@@ -2238,8 +2306,9 @@ where
         let mut credentials_used = BTreeSet::new();
         let mut providers_used = BTreeSet::new();
         let mut forced_selection = None;
-        let mut native_refresh_attempted = false;
-        let mut websocket_http_fallback_attempted = false;
+        let mut native_refresh_attempts = BTreeSet::new();
+        let mut policy_free_refreshed_credentials = BTreeSet::new();
+        let mut websocket_http_fallback_attempts = BTreeSet::new();
 
         loop {
             let mut selection = if let Some(selection) = forced_selection.take() {
@@ -2283,6 +2352,13 @@ where
                 credentials_used.insert(credential.clone());
             }
             providers_used.insert(selection.provider().clone());
+            // Transport compatibility belongs to the selected upstream, not
+            // to one credential. Once an upstream has rejected the Responses
+            // WebSocket transport, credential failover on that same upstream
+            // must stay on HTTP; a different upstream gets its own probe.
+            let transport_attempt_key = selection.upstream_id().to_owned();
+            let websocket_http_fallback_attempted =
+                websocket_http_fallback_attempts.contains(&transport_attempt_key);
             let selected_upstream = self
                 .config
                 .upstreams()
@@ -2299,30 +2375,30 @@ where
                 && !websocket_http_fallback_attempted)
                 .then(|| {
                     self.semantic.websocket_transport(route).or_else(|| {
-                        selected_upstream
-                            .native()
-                            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
-                            .then_some(SemanticWebSocketTransport::OpenAiResponses)
+                        (!matches!(
+                            downstream_uri.path(),
+                            "/v1/models"
+                                | adapter_codex::CODEX_MODELS_PATH
+                                | "/v1/responses/compact"
+                                | adapter_codex::CODEX_RESPONSES_COMPACT_PATH
+                        ) && route
+                            .target()
+                            .endpoint_family()
+                            .is_none_or(|family| family == "responses")
+                            && selected_upstream
+                                .native()
+                                .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex")))
+                        .then_some(SemanticWebSocketTransport::OpenAiResponses)
                     })
                 })
                 .flatten();
             // Semantic Responses selection uses the REST provider identity so
             // catalog aliases and account state match the discovered target.
-            // An explicit target transport binding supplies the WebSocket
-            // endpoint only for the transport attempt.
+            // A route transport override is scoped to that original upstream.
+            let (websocket_upstream, route_transport_override) =
+                selected_transport_upstream(&self.config, route, selection.upstream_id())?;
             let upstream = if websocket_transport.is_some() {
-                route.target().transport_upstream().map_or(
-                    Ok(selected_upstream),
-                    |transport_upstream| {
-                        self.config
-                            .upstreams()
-                            .get(transport_upstream)
-                            .ok_or_else(|| ProxyError::MissingUpstream {
-                                route: route.id().to_owned(),
-                                upstream: transport_upstream.to_owned(),
-                            })
-                    },
-                )?
+                websocket_upstream
             } else {
                 selected_upstream
             };
@@ -2333,7 +2409,7 @@ where
                 &semantic_response_hint,
             );
             if websocket_transport.is_some()
-                && route.target().transport_upstream().is_some()
+                && route_transport_override
                 && !matches!(upstream.transport(), "ws" | "wss")
             {
                 return Err(ProxyError::InvalidWebSocketHandshake(
@@ -2345,24 +2421,82 @@ where
                     || upstream
                         .native()
                         .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex")));
-            let retry_deadline = retry_deadline(started, limits, upstream, selection.policy());
+            let request_deadline =
+                deadline_after(started, effective_request_timeout(limits, upstream))?;
+            let retry_deadline = retry_deadline(started, request_deadline, selection.policy());
             let _secret = (upstream.native().is_some()
                 || selection.account_secret().is_some()
                 || upstream.auth().is_some())
             .then(|| self.resources.secret_material());
-            let native_auth = self
-                .native
-                .authorize_selected_attempt(NativeAuthorizationRequest::new(
-                    upstream,
-                    selection.account_auth_kind(),
-                    selection.credential(),
-                    selection.account_secret(),
-                    upstream.auth(),
-                    &headers,
-                    cancellation.clone(),
-                ))
-                .await
-                .map_err(native_error)?;
+            // Authorization is part of the active first attempt. The retry
+            // admission horizon only governs recovery after a provider send.
+            let native_auth = bounded_native_operation(
+                Instant::from_std(request_deadline),
+                &cancellation,
+                self.native
+                    .authorize_selected_attempt(NativeAuthorizationRequest::new(
+                        upstream,
+                        selection.account_auth_kind(),
+                        selection.credential(),
+                        selection.account_secret(),
+                        upstream.auth(),
+                        &headers,
+                        cancellation.clone(),
+                    )),
+            )
+            .await?;
+            let native_auth = match native_auth {
+                Ok(authorization) => authorization,
+                Err(NativeRuntimeError::NeedsReauth { generation }) => {
+                    let mut failure = self
+                        .pooling
+                        .classify_native_reauth(crate::pool::NativeReauthInput {
+                            config: &self.config,
+                            route,
+                            selection: &mut selection,
+                            replay: ReplayCheck::safe(),
+                            commitment: CommitmentState::Uncommitted,
+                            idempotency_key_present,
+                            attempt,
+                            failed_generation: generation,
+                            generation_fenced: self.pooling.shares_credential_generation_domain(
+                                self.native.sqlite_token_store(),
+                            ),
+                            native_runtime: Some(&self.native),
+                            outbound_attempt_consumed: false,
+                            credentials_used: &credentials_used,
+                            providers_used: &providers_used,
+                            elapsed_retry_delay,
+                            elapsed_recovery_wait,
+                            started,
+                        })
+                        .map_err(pool_error)?;
+                    self.observe_failure(route, &selection, &failure);
+                    if failure.decision.is_retry() {
+                        let delay = failure.decision.delay();
+                        let health_reason = failure.health_mutation_reason().map(str::to_owned);
+                        forced_selection = failure.take_replacement();
+                        lifecycle.retry(
+                            attempt,
+                            "native_account_requires_reauthentication",
+                            delay,
+                            None,
+                            health_reason,
+                        );
+                        wait_for_policy_retry(
+                            failure.decision,
+                            retry_deadline,
+                            &cancellation,
+                            &mut elapsed_retry_delay,
+                            &mut elapsed_recovery_wait,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    return Err(native_error(NativeRuntimeError::NeedsReauth { generation }));
+                }
+                Err(error) => return Err(native_error(error)),
+            };
             // Keep only non-secret identity state after the authorization is
             // moved into this one-shot attempt.
             let native_profile = native_auth
@@ -2401,6 +2535,7 @@ where
                 connection_generation,
                 cancellation: &cancellation,
                 started,
+                request_deadline,
                 attempt_started,
                 upstream_headers_duration: &upstream_headers_duration,
             };
@@ -2517,60 +2652,117 @@ where
                         ProxyError::WebSocketHandshakeStatus(status) => Some(*status),
                         _ => None,
                     };
-                    // A rejected handshake is only evidence that the upstream
-                    // will not speak WebSocket once its credential is known to
-                    // be current. A 401 is an authentication signal, so the one
-                    // permitted pre-commit refresh is evaluated first and the
-                    // retry keeps the same transport. Downgrading here instead
-                    // would replay the request over HTTP with the stale token.
-                    if failure_status == Some(401)
-                        && is_buffered
-                        && native_profile
-                        && !native_refresh_attempted
-                    {
-                        native_refresh_attempted = true;
-                        let credential = selection.credential().ok_or_else(|| {
+                    // A native 401 is an authentication signal, not evidence
+                    // that HTTP transport will accept the same rejected token.
+                    // Refresh each credential generation at most once, including
+                    // on the final outbound attempt so invalid credentials can be
+                    // discovered and disabled for subsequent requests.
+                    if failure_status == Some(401) && is_buffered && native_profile {
+                        let credential = selection.credential().cloned().ok_or_else(|| {
                             ProxyError::Native("credential is not configured".to_owned())
                         })?;
                         let generation = native_generation.ok_or_else(|| {
                             ProxyError::Native("authorization is unavailable".to_owned())
                         })?;
-                        match self
-                            .native
-                            .refresh(upstream, credential, generation, cancellation.clone())
-                            .await
+                        let policy_free_refresh_allowed = selection.has_policy()
+                            || policy_free_refreshed_credentials.insert(credential.clone());
+                        if !policy_free_refresh_allowed
+                            || !native_refresh_attempts.insert((credential.clone(), generation))
                         {
+                            return Err(error);
+                        }
+                        let refresh = bounded_native_operation(
+                            retry_deadline,
+                            &cancellation,
+                            self.native.refresh(
+                                upstream,
+                                &credential,
+                                generation,
+                                cancellation.clone(),
+                            ),
+                        )
+                        .await?;
+                        match refresh {
                             Ok(_) => {
-                                lifecycle.retry(
-                                    attempt,
-                                    "native_authorization_refresh",
-                                    Duration::ZERO,
-                                    None,
-                                    None,
-                                );
-                                forced_selection = Some(selection);
-                                attempt = attempt.saturating_add(1);
-                                continue;
+                                if additional_attempt_allowed(&selection, attempt, retry_deadline) {
+                                    lifecycle.retry(
+                                        attempt,
+                                        "native_authorization_refresh",
+                                        Duration::ZERO,
+                                        None,
+                                        None,
+                                    );
+                                    forced_selection = Some(selection);
+                                    attempt = attempt.saturating_add(1);
+                                    continue;
+                                }
+                                return Err(error);
                             }
-                            Err(NativeRuntimeError::NeedsReauth) => {
-                                self.pooling.disable_credential(credential);
+                            Err(NativeRuntimeError::NeedsReauth { generation }) => {
+                                let mut failure = self
+                                    .pooling
+                                    .classify_native_reauth(crate::pool::NativeReauthInput {
+                                        config: &self.config,
+                                        route,
+                                        selection: &mut selection,
+                                        replay: ReplayCheck::safe(),
+                                        commitment: CommitmentState::Uncommitted,
+                                        idempotency_key_present,
+                                        attempt,
+                                        failed_generation: generation,
+                                        generation_fenced: self
+                                            .pooling
+                                            .shares_credential_generation_domain(
+                                                self.native.sqlite_token_store(),
+                                            ),
+                                        native_runtime: Some(&self.native),
+                                        outbound_attempt_consumed: true,
+                                        credentials_used: &credentials_used,
+                                        providers_used: &providers_used,
+                                        elapsed_retry_delay,
+                                        elapsed_recovery_wait,
+                                        started,
+                                    })
+                                    .map_err(pool_error)?;
+                                self.observe_failure(route, &selection, &failure);
+                                if failure.decision.is_retry() {
+                                    let delay = failure.decision.delay();
+                                    let health_reason =
+                                        failure.health_mutation_reason().map(str::to_owned);
+                                    forced_selection = failure.take_replacement();
+                                    lifecycle.retry(
+                                        attempt,
+                                        "native_account_requires_reauthentication",
+                                        delay,
+                                        None,
+                                        health_reason,
+                                    );
+                                    wait_for_policy_retry(
+                                        failure.decision,
+                                        retry_deadline,
+                                        &cancellation,
+                                        &mut elapsed_retry_delay,
+                                        &mut elapsed_recovery_wait,
+                                    )
+                                    .await?;
+                                    attempt = attempt.saturating_add(1);
+                                    continue;
+                                }
+                                return Err(error);
                             }
-                            Err(_) => {}
+                            Err(refresh_error) => return Err(native_error(refresh_error)),
                         }
                     }
-                    // Downgrading this request from WebSocket to HTTP keeps the
-                    // same selection, credential, and upstream, so it is one
-                    // logical attempt carried over a second transport rather
-                    // than a retry. Counting it against the policy would spend
-                    // a retry the operator budgeted for a different credential
-                    // or upstream, and can exhaust the budget before any
-                    // failover is possible. It can only happen once per
-                    // request.
+                    // A WebSocket-to-HTTP transport fallback is another
+                    // outbound attempt. It therefore consumes the configured
+                    // attempt budget and may not begin after the request retry
+                    // deadline.
                     if websocket_attempt
                         && !websocket_http_fallback_attempted
-                        && websocket_http_fallback_safe(&error)
+                        && websocket_http_fallback_safe(&error, replay)
+                        && additional_attempt_allowed(&selection, attempt, retry_deadline)
                     {
-                        websocket_http_fallback_attempted = true;
+                        websocket_http_fallback_attempts.insert(transport_attempt_key);
                         lifecycle.retry(
                             attempt,
                             "responses_websocket_http_fallback",
@@ -2579,6 +2771,7 @@ where
                             None,
                         );
                         forced_selection = Some(selection);
+                        attempt = attempt.saturating_add(1);
                         continue;
                     }
                     if is_buffered && selection.has_policy() {
@@ -2618,19 +2811,14 @@ where
                                     .as_ref()
                                     .map(|cooldown| format!("{:?}", cooldown.scope)),
                             );
-                            if delay > retry_deadline.saturating_duration_since(Instant::now()) {
-                                return Err(ProxyError::Timeout);
-                            }
-                            crate::wait_for_retry(delay, &cancellation)
-                                .await
-                                .map_err(|_| ProxyError::Timeout)?;
-                            elapsed_retry_delay = elapsed_retry_delay.saturating_add(delay);
-                            if let Some(recovery) =
-                                failure.classification.classification.recovery_after
-                            {
-                                elapsed_recovery_wait =
-                                    elapsed_recovery_wait.saturating_add(recovery);
-                            }
+                            wait_for_policy_retry(
+                                failure.decision,
+                                retry_deadline,
+                                &cancellation,
+                                &mut elapsed_retry_delay,
+                                &mut elapsed_recovery_wait,
+                            )
+                            .await?;
                             attempt = attempt.saturating_add(1);
                             continue;
                         }
@@ -2651,7 +2839,11 @@ where
                 provider_code = None;
             }
 
-            if is_buffered && should_classify(Some(status)) && selection.has_policy() {
+            let mut response_body_inspected = false;
+            if is_buffered
+                && should_classify(Some(status))
+                && (selection.has_policy() || (status == 401 && native_profile))
+            {
                 let inspected = self
                     .inspect_failure_response(
                         response,
@@ -2668,59 +2860,133 @@ where
                 }
                 retry_after = retry_after.or(inspected.retry_after);
                 quota_observations = inspected.quota_observations;
+                response_body_inspected = true;
             }
 
-            // A native OAuth 401 is eligible for exactly one pre-commit refresh. The
-            // response is still buffered and no downstream headers have been
-            // sent, so retrying remains safe. A failed refresh is returned as
-            // the provider response unless invalid_grant disables this account
-            // and the configured pool has another eligible target.
-            if status == 401 && is_buffered && native_profile && !native_refresh_attempted {
-                native_refresh_attempted = true;
+            let mut native_reauth_classified = false;
+            // Refresh each rejected credential generation once. Health
+            // discovery is allowed on the final attempt; sending again is a
+            // separate decision that still requires replay safety and budget.
+            if status == 401 && is_buffered && native_profile {
                 let credential = selection
                     .credential()
+                    .cloned()
                     .ok_or_else(|| ProxyError::Native("credential is not configured".to_owned()))?;
                 let generation = native_generation
                     .ok_or_else(|| ProxyError::Native("authorization is unavailable".to_owned()))?;
-                match self
-                    .native
-                    .refresh(upstream, credential, generation, cancellation.clone())
-                    .await
+                let policy_free_refresh_allowed = selection.has_policy()
+                    || policy_free_refreshed_credentials.insert(credential.clone());
+                if policy_free_refresh_allowed
+                    && native_refresh_attempts.insert((credential.clone(), generation))
                 {
-                    Ok(_) => {
-                        lifecycle.retry(
-                            attempt,
-                            "native_authorization_refresh",
-                            Duration::ZERO,
-                            None,
-                            None,
-                        );
-                        forced_selection = Some(selection);
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    Err(NativeRuntimeError::NeedsReauth) => {
-                        self.pooling.disable_credential(credential);
-                        let can_fail_over = selection
-                            .policy()
-                            .is_some_and(|policy| attempt < policy.retry().maximum_attempts());
-                        if can_fail_over {
-                            lifecycle.retry(
-                                attempt,
-                                "native_account_requires_reauthentication",
-                                Duration::ZERO,
-                                None,
-                                Some("credential_disabled".to_owned()),
-                            );
-                            attempt = attempt.saturating_add(1);
-                            continue;
+                    let refresh = bounded_native_operation(
+                        retry_deadline,
+                        &cancellation,
+                        self.native.refresh(
+                            upstream,
+                            &credential,
+                            generation,
+                            cancellation.clone(),
+                        ),
+                    )
+                    .await?;
+                    match refresh {
+                        Ok(_) => {
+                            if replay.is_safe()
+                                && additional_attempt_allowed(&selection, attempt, retry_deadline)
+                            {
+                                if !response_body_inspected {
+                                    self.drain_retry_response(
+                                        response,
+                                        limits,
+                                        &cancellation,
+                                        retry_deadline,
+                                    )
+                                    .await?;
+                                }
+                                lifecycle.retry(
+                                    attempt,
+                                    "native_authorization_refresh",
+                                    Duration::ZERO,
+                                    None,
+                                    None,
+                                );
+                                forced_selection = Some(selection);
+                                attempt = attempt.saturating_add(1);
+                                continue;
+                            }
                         }
+                        Err(NativeRuntimeError::NeedsReauth { generation }) => {
+                            native_reauth_classified = true;
+                            let mut failure = self
+                                .pooling
+                                .classify_native_reauth(crate::pool::NativeReauthInput {
+                                    config: &self.config,
+                                    route,
+                                    selection: &mut selection,
+                                    replay,
+                                    commitment: CommitmentState::Uncommitted,
+                                    idempotency_key_present,
+                                    attempt,
+                                    failed_generation: generation,
+                                    generation_fenced: self
+                                        .pooling
+                                        .shares_credential_generation_domain(
+                                            self.native.sqlite_token_store(),
+                                        ),
+                                    native_runtime: Some(&self.native),
+                                    outbound_attempt_consumed: true,
+                                    credentials_used: &credentials_used,
+                                    providers_used: &providers_used,
+                                    elapsed_retry_delay,
+                                    elapsed_recovery_wait,
+                                    started,
+                                })
+                                .map_err(pool_error)?;
+                            self.observe_failure(route, &selection, &failure);
+                            if failure.decision.is_retry() {
+                                if !response_body_inspected {
+                                    self.drain_retry_response(
+                                        response,
+                                        limits,
+                                        &cancellation,
+                                        retry_deadline,
+                                    )
+                                    .await?;
+                                }
+                                let delay = failure.decision.delay();
+                                let health_reason =
+                                    failure.health_mutation_reason().map(str::to_owned);
+                                forced_selection = failure.take_replacement();
+                                lifecycle.retry(
+                                    attempt,
+                                    "native_account_requires_reauthentication",
+                                    delay,
+                                    None,
+                                    health_reason,
+                                );
+                                wait_for_policy_retry(
+                                    failure.decision,
+                                    retry_deadline,
+                                    &cancellation,
+                                    &mut elapsed_retry_delay,
+                                    &mut elapsed_recovery_wait,
+                                )
+                                .await?;
+                                attempt = attempt.saturating_add(1);
+                                continue;
+                            }
+                        }
+                        Err(_) => {}
                     }
-                    Err(_) => {}
                 }
             }
 
-            if is_buffered && should_classify(Some(status)) && selection.has_policy() {
+            if is_buffered
+                && should_classify(Some(status))
+                && selection.has_policy()
+                && !native_reauth_classified
+            {
                 let mut failure = self.pooling.classify_failure(crate::pool::FailureInput {
                     config: &self.config,
                     route,
@@ -2758,16 +3024,14 @@ where
                             .as_ref()
                             .map(|cooldown| format!("{:?}", cooldown.scope)),
                     );
-                    if delay > retry_deadline.saturating_duration_since(Instant::now()) {
-                        return Err(ProxyError::Timeout);
-                    }
-                    crate::wait_for_retry(delay, &cancellation)
-                        .await
-                        .map_err(|_| ProxyError::Timeout)?;
-                    elapsed_retry_delay = elapsed_retry_delay.saturating_add(delay);
-                    if let Some(recovery) = failure.classification.classification.recovery_after {
-                        elapsed_recovery_wait = elapsed_recovery_wait.saturating_add(recovery);
-                    }
+                    wait_for_policy_retry(
+                        failure.decision,
+                        retry_deadline,
+                        &cancellation,
+                        &mut elapsed_retry_delay,
+                        &mut elapsed_recovery_wait,
+                    )
+                    .await?;
                     attempt = attempt.saturating_add(1);
                     continue;
                 }
@@ -2826,6 +3090,7 @@ where
             connection_generation: _,
             cancellation,
             started,
+            request_deadline,
             attempt_started,
             upstream_headers_duration,
         } = request;
@@ -2901,7 +3166,10 @@ where
                     http::Version::HTTP_11
                 });
         *builder.headers_mut().expect("request builder headers") = headers;
-        let request_deadline = started + effective_request_timeout(route.limits(), upstream);
+        let request_deadline = request_deadline.min(deadline_after(
+            started,
+            effective_request_timeout(route.limits(), upstream),
+        )?);
         let connection_timeout = connect_timeout(route.limits(), upstream);
         let client = if upstream.http2() {
             &self.h2c_clients
@@ -3090,6 +3358,7 @@ where
             connection_generation,
             cancellation,
             started,
+            request_deadline,
             attempt_started: _,
             upstream_headers_duration: _,
         } = request;
@@ -3165,12 +3434,17 @@ where
         let session = downstream_session_identity(request_headers, &body);
         let identity = ConnectionIdentity::new(profile, account, endpoint, generation, session);
         let request_timeout = effective_request_timeout(route.limits(), upstream);
-        let request_deadline = started + request_timeout;
+        let request_deadline = request_deadline.min(deadline_after(
+            started,
+            effective_request_timeout(route.limits(), upstream),
+        )?);
         let connect_deadline =
-            (StdInstant::now() + connect_timeout(route.limits(), upstream)).min(request_deadline);
+            deadline_after(StdInstant::now(), connect_timeout(route.limits(), upstream))?
+                .min(request_deadline);
         let first_event_deadline = selection
             .policy()
-            .map(|policy| started + policy.stream().bootstrap_timeout())
+            .map(|policy| deadline_after(started, policy.stream().bootstrap_timeout()))
+            .transpose()?
             .unwrap_or(request_deadline)
             .min(request_deadline);
         let body = self
@@ -3395,8 +3669,10 @@ where
         let body = LimitedBody::new(body, bounded_usize(route.limits().max_response_body_bytes))
             .map_err(box_error)
             .boxed();
-        let response_deadline =
-            Instant::from_std(started + effective_request_timeout(route.limits(), upstream));
+        let response_deadline = Instant::from_std(deadline_after(
+            started,
+            effective_request_timeout(route.limits(), upstream),
+        )?);
         observation.mark_headers();
         let mut body = if route.response().mode() == BodyMode::Semantic && parts.status.is_success()
         {
@@ -3951,6 +4227,8 @@ struct AttemptRequest<'a> {
     connection_generation: Option<CredentialGeneration>,
     cancellation: &'a CancellationToken,
     started: StdInstant,
+    /// Deadline for active request work; retry admission uses a separate bound.
+    request_deadline: StdInstant,
     attempt_started: StdInstant,
     upstream_headers_duration: &'a OnceLock<Duration>,
 }
@@ -4713,12 +4991,22 @@ fn openai_websocket_error(error: OpenAiResponsesWebSocketError) -> ProxyError {
     )
 }
 
-fn websocket_http_fallback_safe(error: &ProxyError) -> bool {
+fn websocket_http_fallback_safe(error: &ProxyError, replay: ReplayCheck) -> bool {
     match error {
-        ProxyError::WebSocketHandshakeStatus(_) => true,
-        ProxyError::Upstream(error) => error
-            .downcast_ref::<OpenAiResponsesWebSocketError>()
-            .is_some_and(|error| matches!(error, OpenAiResponsesWebSocketError::Connect)),
+        // Explicit endpoint/method incompatibility occurs before the operation
+        // is sent, so HTTP fallback is safe even for a non-idempotent request.
+        // Authentication, quota, and provider statuses must instead flow
+        // through policy classification.
+        ProxyError::WebSocketHandshakeStatus(status) => matches!(*status, 404 | 405 | 501),
+        // `Connect` also covers send/flush failures after the request frame may
+        // have reached the provider. Fail closed unless request replay safety
+        // independently proves the operation repeatable.
+        ProxyError::Upstream(error) => {
+            replay.is_safe()
+                && error
+                    .downcast_ref::<OpenAiResponsesWebSocketError>()
+                    .is_some_and(|error| matches!(error, OpenAiResponsesWebSocketError::Connect))
+        }
         _ => false,
     }
 }
@@ -5083,10 +5371,9 @@ fn normalize_codex_responses_request(bytes: &Bytes) -> Result<Bytes, ProxyError>
 
     object.insert("stream".to_owned(), serde_json::Value::Bool(true));
     object.insert("store".to_owned(), serde_json::Value::Bool(false));
-    object.insert(
-        "parallel_tool_calls".to_owned(),
-        serde_json::Value::Bool(true),
-    );
+    object
+        .entry("parallel_tool_calls")
+        .or_insert(serde_json::Value::Bool(true));
     object.insert(
         "include".to_owned(),
         serde_json::json!(["reasoning.encrypted_content"]),
@@ -5248,6 +5535,9 @@ fn rewrite_native_upstream_uri(
         let path = match upstream_uri.path() {
             "/v1/responses" | "/v1/chat/completions" | adapter_codex::CODEX_RESPONSES_PATH => {
                 adapter_codex::CODEX_RESPONSES_PATH
+            }
+            "/v1/responses/compact" | adapter_codex::CODEX_RESPONSES_COMPACT_PATH => {
+                adapter_codex::CODEX_RESPONSES_COMPACT_PATH
             }
             "/v1/models" | adapter_codex::CODEX_MODELS_PATH => {
                 adapter_codex::CODEX_MODELS_PATH_AND_QUERY
@@ -6609,6 +6899,35 @@ fn bounded_usize(value: u64) -> usize {
     value.min(usize::MAX as u64) as usize
 }
 
+fn selected_transport_upstream<'a>(
+    config: &'a CompiledConfig,
+    route: &RoutePlan,
+    selected_upstream_id: &str,
+) -> Result<(&'a UpstreamPlan, bool), ProxyError> {
+    let selected = config
+        .upstreams()
+        .get(selected_upstream_id)
+        .ok_or_else(|| ProxyError::MissingUpstream {
+            route: route.id().to_owned(),
+            upstream: selected_upstream_id.to_owned(),
+        })?;
+    if selected_upstream_id != route.target().upstream() {
+        return Ok((selected, false));
+    }
+    let Some(transport) = route.target().transport_upstream() else {
+        return Ok((selected, false));
+    };
+    let upstream =
+        config
+            .upstreams()
+            .get(transport)
+            .ok_or_else(|| ProxyError::MissingUpstream {
+                route: route.id().to_owned(),
+                upstream: transport.to_owned(),
+            })?;
+    Ok((upstream, true))
+}
+
 fn request_timeout(limits: &RouteLimits, upstream: &UpstreamPlan) -> Option<Duration> {
     [limits.request_timeout, upstream.request_timeout()]
         .into_iter()
@@ -6620,25 +6939,72 @@ fn effective_request_timeout(limits: &RouteLimits, upstream: &UpstreamPlan) -> D
     request_timeout(limits, upstream).unwrap_or(DEFAULT_REQUEST_TIMEOUT)
 }
 
+fn deadline_after(started: StdInstant, duration: Duration) -> Result<StdInstant, ProxyError> {
+    started.checked_add(duration).ok_or_else(|| {
+        ProxyError::InvalidLimits(
+            "configured timeout exceeds the platform deadline range".to_owned(),
+        )
+    })
+}
+
 fn websocket_hard_deadline(
     started: StdInstant,
     limits: &RouteLimits,
     upstream: &UpstreamPlan,
-) -> Option<StdInstant> {
-    request_timeout(limits, upstream).map(|timeout| started + timeout)
+) -> Result<Option<StdInstant>, ProxyError> {
+    request_timeout(limits, upstream)
+        .map(|timeout| deadline_after(started, timeout))
+        .transpose()
+}
+
+fn additional_attempt_allowed(selection: &PoolSelection, attempt: u32, deadline: Instant) -> bool {
+    Instant::now() < deadline
+        && selection
+            .policy()
+            .is_none_or(|policy| attempt < policy.retry().maximum_attempts())
+}
+
+async fn bounded_native_operation<T>(
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    operation: impl Future<Output = Result<T, NativeRuntimeError>>,
+) -> Result<Result<T, NativeRuntimeError>, ProxyError> {
+    tokio::select! {
+        result = time::timeout_at(deadline, operation) => {
+            result.map_err(|_| ProxyError::Timeout)
+        }
+        () = cancellation.cancelled() => Err(ProxyError::Timeout),
+    }
+}
+
+async fn wait_for_policy_retry(
+    decision: RetryDecision,
+    retry_deadline: Instant,
+    cancellation: &CancellationToken,
+    elapsed_retry_delay: &mut Duration,
+    elapsed_recovery_wait: &mut Duration,
+) -> Result<(), ProxyError> {
+    let delay = decision.delay();
+    if delay > retry_deadline.saturating_duration_since(Instant::now()) {
+        return Err(ProxyError::Timeout);
+    }
+    crate::wait_for_retry(delay, cancellation)
+        .await
+        .map_err(|_| ProxyError::Timeout)?;
+    *elapsed_retry_delay = elapsed_retry_delay.saturating_add(decision.retry_delay());
+    *elapsed_recovery_wait = elapsed_recovery_wait.saturating_add(decision.recovery_wait());
+    Ok(())
 }
 
 fn retry_deadline(
     started: StdInstant,
-    limits: &RouteLimits,
-    upstream: &UpstreamPlan,
+    request_deadline: StdInstant,
     policy: Option<&pooler_config::PolicyPlan>,
 ) -> Instant {
-    let request_deadline = started + effective_request_timeout(limits, upstream);
     let retry_deadline = policy
         .and_then(|policy| policy.retry().maximum_elapsed())
         .map_or(request_deadline, |elapsed| {
-            request_deadline.min(started + elapsed)
+            request_deadline.min(started.checked_add(elapsed).unwrap_or(request_deadline))
         });
     Instant::from_std(retry_deadline)
 }
@@ -6957,6 +7323,38 @@ mod tests {
 
     use super::*;
     use pooler_config::compile_yaml;
+
+    #[tokio::test]
+    async fn policy_retry_wait_honors_cancellation_during_nonzero_backoff() {
+        let cancellation = CancellationToken::new();
+        let cancel_wait = cancellation.clone();
+        let cancellation_task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel_wait.cancel();
+        });
+        let mut elapsed_retry_delay = Duration::ZERO;
+        let mut elapsed_recovery_wait = Duration::ZERO;
+        let decision = RetryDecision::Retry {
+            delay: Duration::from_secs(60),
+            retry_delay: Duration::from_secs(1),
+            recovery_wait: Duration::from_secs(60),
+            reason: pooler_policy::RetryReason::ReplaySafeBeforeCommit,
+        };
+
+        let result = wait_for_policy_retry(
+            decision,
+            Instant::now() + Duration::from_secs(120),
+            &cancellation,
+            &mut elapsed_retry_delay,
+            &mut elapsed_recovery_wait,
+        )
+        .await;
+
+        cancellation_task.await.expect("cancellation task");
+        assert!(matches!(result, Err(ProxyError::Timeout)));
+        assert_eq!(elapsed_retry_delay, Duration::ZERO);
+        assert_eq!(elapsed_recovery_wait, Duration::ZERO);
+    }
 
     struct DropCounter(Arc<AtomicUsize>);
 
@@ -7501,6 +7899,29 @@ upstreams: {subscription: {known_provider: openai, native: {kind: codex}}}
     }
 
     #[test]
+    fn codex_server_compaction_rewrites_to_the_subscription_endpoint() {
+        let config = compile_yaml(
+            "codex-compact.yaml",
+            r#"
+version: 2
+upstreams: {subscription: {known_provider: openai, native: {kind: codex}}}
+"#,
+        )
+        .expect("Codex config");
+        let upstream = &config.upstreams()["subscription"];
+        let downstream: Uri = "/v1/responses/compact".parse().expect("downstream URI");
+        let upstream_uri: Uri = "https://chatgpt.com/v1/responses/compact"
+            .parse()
+            .expect("upstream URI");
+        let rewritten = rewrite_native_upstream_uri(upstream, &downstream, None, upstream_uri)
+            .expect("rewritten Codex compact URI");
+        assert_eq!(
+            rewritten,
+            "https://chatgpt.com/backend-api/codex/responses/compact"
+        );
+    }
+
+    #[test]
     fn codex_responses_normalization_matches_subscription_constraints() {
         let input = Bytes::from_static(
             br#"{"model":"gpt-5.4","stream":false,"store":true,"parallel_tool_calls":false,"include":["file_search_call.results"],"max_output_tokens":4096,"temperature":0.2,"service_tier":"standard","truncation":"auto","prompt_cache_retention":"24h","user":"owner","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"hello","prompt_cache_breakpoint":{"type":"ephemeral"}}]}]}"#,
@@ -7511,7 +7932,7 @@ upstreams: {subscription: {known_provider: openai, native: {kind: codex}}}
 
         assert_eq!(value["stream"], true);
         assert_eq!(value["store"], false);
-        assert_eq!(value["parallel_tool_calls"], true);
+        assert_eq!(value["parallel_tool_calls"], false);
         assert_eq!(
             value["include"],
             serde_json::json!(["reasoning.encrypted_content"])
@@ -7834,6 +8255,33 @@ routes:
     }
 
     #[test]
+    fn websocket_http_fallback_requires_transport_incompatibility_or_safe_replay() {
+        let unsafe_post = ReplayCheck::for_http_method("POST", false);
+        for status in [404, 405, 501] {
+            assert!(websocket_http_fallback_safe(
+                &ProxyError::WebSocketHandshakeStatus(status),
+                unsafe_post,
+            ));
+        }
+        for status in [400, 401, 403, 408, 426, 429, 500, 503] {
+            assert!(
+                !websocket_http_fallback_safe(
+                    &ProxyError::WebSocketHandshakeStatus(status),
+                    ReplayCheck::safe(),
+                ),
+                "status {status} must be classified before any transport fallback",
+            );
+        }
+
+        let ambiguous_send = ProxyError::Upstream(Box::new(OpenAiResponsesWebSocketError::Connect));
+        assert!(!websocket_http_fallback_safe(&ambiguous_send, unsafe_post));
+        assert!(websocket_http_fallback_safe(
+            &ambiguous_send,
+            ReplayCheck::safe(),
+        ));
+    }
+
+    #[test]
     fn connect_and_request_timeouts_are_independent() {
         let config = compile_yaml(
             "timeout.yaml",
@@ -7862,6 +8310,40 @@ routes:
     }
 
     #[test]
+    fn route_websocket_transport_override_is_scoped_to_original_upstream() {
+        let config = compile_yaml(
+            "websocket-transport-scope.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  original: {url: http://127.0.0.1:8319}
+  original-socket: {url: ws://127.0.0.1:8320}
+  replacement: {url: ws://127.0.0.1:8321}
+routes:
+  - id: route
+    listen: local
+    match: {path: /socket, websocket: true}
+    target: {provider: original, transport_upstream: original-socket}
+    ingress: {mode: opaque}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("WebSocket transport scope config");
+        let route = &config.routes()[0];
+
+        let (original, overridden) =
+            selected_transport_upstream(&config, route, "original").expect("original transport");
+        assert_eq!(original.id(), "original-socket");
+        assert!(overridden);
+
+        let (replacement, overridden) = selected_transport_upstream(&config, route, "replacement")
+            .expect("replacement transport");
+        assert_eq!(replacement.id(), "replacement");
+        assert!(!overridden);
+    }
+
+    #[test]
     fn explicitly_managed_websocket_null_timeout_has_no_hidden_hard_deadline() {
         let config = compile_yaml(
             "managed-websocket-timeout.yaml",
@@ -7884,7 +8366,8 @@ routes:
         let upstream = &config.upstreams()["local"];
         assert_eq!(request_timeout(route.limits(), upstream), None);
         assert_eq!(
-            websocket_hard_deadline(StdInstant::now(), route.limits(), upstream),
+            websocket_hard_deadline(StdInstant::now(), route.limits(), upstream)
+                .expect("managed WebSocket deadline"),
             None
         );
         assert_eq!(
@@ -7895,6 +8378,35 @@ routes:
             effective_request_timeout(route.limits(), upstream),
             DEFAULT_REQUEST_TIMEOUT,
         );
+    }
+
+    #[test]
+    fn websocket_deadline_rejects_unrepresentable_timeout_without_panicking() {
+        let config = compile_yaml(
+            "unrepresentable-websocket-timeout.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams: {local: {url: ws://127.0.0.1:8319}}
+routes:
+  - id: route
+    listen: local
+    match: {path: /socket, websocket: true}
+    limits: {request_timeout: 18446744073709551615s}
+    target: local
+    ingress: {mode: opaque}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("large WebSocket timeout remains syntactically valid");
+        let route = &config.routes()[0];
+        let upstream = &config.upstreams()["local"];
+
+        assert!(matches!(
+            websocket_hard_deadline(StdInstant::now(), route.limits(), upstream),
+            Err(ProxyError::InvalidLimits(message))
+                if message == "configured timeout exceeds the platform deadline range"
+        ));
     }
 
     #[test]

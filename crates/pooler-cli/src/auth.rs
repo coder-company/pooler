@@ -23,6 +23,9 @@ use pooler_auth::{HyperOAuthTransport, OAuthClientConfig, StandardOAuthProvider}
 use pooler_config::{
     AccountAuthKind, AccountPlan, CompiledConfig, Config, OAuthPlan, DEFAULT_OAUTH_CALLBACK,
 };
+use pooler_http::{
+    account_configuration_fingerprint, account_configuration_fingerprint_migration_candidates,
+};
 use pooler_store::{CredentialState, MasterKey, SqliteOAuthTokenStore, SqliteStore, Store};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -339,10 +342,21 @@ fn login(request: LoginRequest<'_>) -> Result<()> {
     let account = resolve_oauth_account(&config, &configured_provider, request.account)?;
     let credential_id = CredentialId::new(account.id().to_owned())
         .map_err(|_| anyhow::anyhow!("account ID is invalid"))?;
-    let oauth = config
+    let upstream = config
         .upstreams()
         .get(configured_provider.as_str())
-        .and_then(|upstream| upstream.oauth());
+        .ok_or_else(|| anyhow::anyhow!("provider `{configured_provider}` is not configured"))?;
+    let oauth = upstream.oauth();
+    let configuration_fingerprint =
+        account_configuration_fingerprint(upstream, account.id(), account.auth_kind())
+            .context("could not fingerprint OAuth account configuration")?;
+    let configuration_fingerprint_migration_candidates =
+        account_configuration_fingerprint_migration_candidates(
+            upstream,
+            account.id(),
+            account.auth_kind(),
+        )
+        .context("could not fingerprint historical OAuth account configuration")?;
     let callback = validate_loopback_callback(request.callback)?;
     if let Some(oauth) = oauth {
         if callback != *oauth.callback() {
@@ -360,6 +374,7 @@ fn login(request: LoginRequest<'_>) -> Result<()> {
             ResolvedOAuthSettings::from_cli_overrides(callback.clone(), request.oauth)?
         }
     };
+    resolved.validate_persistable(oauth, request.oauth)?;
     let provider_client =
         build_login_provider(&configured_provider, profile, request.method, &resolved)?;
     let store_path = credential_store_path(request.explicit_store_path)?;
@@ -392,6 +407,8 @@ fn login(request: LoginRequest<'_>) -> Result<()> {
         &credential_id,
         &configured_provider,
         provider_profile,
+        &configuration_fingerprint,
+        &configuration_fingerprint_migration_candidates,
         tokens,
         identity,
     )?;
@@ -459,32 +476,11 @@ fn persist_login(
     credential_id: &CredentialId,
     provider_id: &str,
     provider_profile: &str,
+    configuration_fingerprint: &str,
+    configuration_fingerprint_migration_candidates: &[String],
     tokens: OAuthTokens,
     identity: Option<OAuthIdentity>,
 ) -> Result<()> {
-    let expected_revision = match store
-        .credential_state(credential_id.as_str())
-        .context("could not read credential metadata")?
-    {
-        Some(state) => {
-            if state.provider_id != provider_id {
-                bail!("stored account provider does not match configuration");
-            }
-            state.revision
-        }
-        None => {
-            store
-                .upsert_credential_state(CredentialState::new(
-                    credential_id.as_str(),
-                    provider_id,
-                    true,
-                    now_millis(),
-                ))
-                .context("could not record credential metadata")?
-                .revision
-        }
-    };
-    let token_store = SqliteOAuthTokenStore::new(store.clone());
     let id_token = tokens.id_token().cloned();
     let mut profile =
         OAuthCredentialProfile::new(provider_profile, tokens).with_id_token(id_token.clone());
@@ -499,8 +495,55 @@ fn persist_login(
     if let Some(identity) = identity {
         profile = profile.with_identity(identity);
     }
-    token_store.compare_and_swap_profile(credential_id, expected_revision, &profile)?;
+
+    let (expected_fingerprint, expected_generation) = login_persistence_expectation(
+        store,
+        credential_id.as_str(),
+        provider_id,
+        configuration_fingerprint,
+        configuration_fingerprint_migration_candidates,
+    )?;
+    SqliteOAuthTokenStore::new(store.clone()).replace_login_profile_for_fingerprint(
+        credential_id,
+        provider_id,
+        expected_fingerprint.as_deref(),
+        expected_generation,
+        configuration_fingerprint,
+        &profile,
+    )?;
     Ok(())
+}
+
+fn login_persistence_expectation(
+    store: &SqliteStore,
+    credential_id: &str,
+    provider_id: &str,
+    configuration_fingerprint: &str,
+    configuration_fingerprint_migration_candidates: &[String],
+) -> Result<(Option<String>, Option<u64>)> {
+    let Some(state) = store
+        .credential_state(credential_id)
+        .context("could not read credential metadata")?
+    else {
+        return Ok((None, None));
+    };
+    if state.provider_id != provider_id {
+        bail!("stored account provider does not match configuration");
+    }
+    if state.configuration_fingerprint != configuration_fingerprint
+        && !state.configuration_fingerprint.is_empty()
+        && !configuration_fingerprint_migration_candidates
+            .contains(&state.configuration_fingerprint)
+    {
+        bail!("stored account configuration does not match the compiled configuration");
+    }
+    let generation = store
+        .credential_payload_compare_generation_for_fingerprint(
+            credential_id,
+            &state.configuration_fingerprint,
+        )
+        .context("could not snapshot OAuth token generation")?;
+    Ok((Some(state.configuration_fingerprint), Some(generation)))
 }
 
 fn resolve_oauth_account<'a>(
@@ -558,22 +601,32 @@ fn import_openai_profile(
         bail!("account `{account_id}` is not configured with auth_kind: oauth");
     }
     let upstream = &config.upstreams()[account.provider()];
-    if upstream.oauth().is_none()
-        || !upstream
-            .native()
-            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
+    if !upstream
+        .native()
+        .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"))
     {
-        bail!(
-            "OpenAI subscription import requires explicit upstream oauth and native.kind: codex configuration"
-        );
+        bail!("OpenAI subscription import requires native.kind: codex configuration");
     }
+    let configuration_fingerprint =
+        account_configuration_fingerprint(upstream, account.id(), account.auth_kind())
+            .context("could not fingerprint OAuth account configuration")?;
+    let configuration_fingerprint_migration_candidates =
+        account_configuration_fingerprint_migration_candidates(
+            upstream,
+            account.id(),
+            account.auth_kind(),
+        )
+        .context("could not fingerprint historical OAuth account configuration")?;
 
     let imported = CodexCredential::from_file(from_file)
         .context("could not read owner-private OpenAI Codex credential profile")?;
     if imported.is_disabled() || imported.is_expired() {
         bail!("imported OpenAI Codex credential is disabled or expired");
     }
-    if !matches!(imported.auth_type(), "oauth" | "oauth2" | "codex") {
+    if !matches!(
+        imported.auth_type(),
+        "oauth" | "oauth2" | "codex" | "chatgpt"
+    ) {
         bail!("imported OpenAI Codex credential type is unsupported");
     }
     let provider_account_id = imported
@@ -590,31 +643,19 @@ fn import_openai_profile(
         .context("could not open encrypted credential store")?;
     let credential = CredentialId::new(account.id().to_owned())
         .map_err(|_| anyhow::anyhow!("account ID is invalid"))?;
-    let expected_revision = match store
-        .credential_state(account.id())
-        .context("could not read credential metadata")?
-    {
-        Some(state) => {
-            if state.provider_id != account.provider() {
-                bail!("stored account provider does not match configuration");
-            }
-            state.revision
-        }
-        None => {
-            store
-                .upsert_credential_state(CredentialState::new(
-                    account.id(),
-                    account.provider(),
-                    account.enabled(),
-                    now_millis(),
-                ))
-                .context("could not record credential metadata")?
-                .revision
-        }
-    };
-    SqliteOAuthTokenStore::new(store).compare_and_swap_profile(
+    let (expected_fingerprint, expected_generation) = login_persistence_expectation(
+        &store,
+        account.id(),
+        account.provider(),
+        &configuration_fingerprint,
+        &configuration_fingerprint_migration_candidates,
+    )?;
+    SqliteOAuthTokenStore::new(store.clone()).replace_login_profile_for_fingerprint(
         &credential,
-        expected_revision,
+        account.provider(),
+        expected_fingerprint.as_deref(),
+        expected_generation,
+        &configuration_fingerprint,
         &profile,
     )?;
     println!(
@@ -982,6 +1023,200 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn successful_login_reenables_matching_disabled_generation() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"cli-login-reenable-key").expect("master key"),
+        )
+        .expect("store");
+        let fingerprint = "a".repeat(64);
+        let credential = CredentialId::new("oauth-account").expect("credential");
+        let state = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                credential.as_str(),
+                "provider",
+                &fingerprint,
+                false,
+                1,
+            ))
+            .expect("disabled credential state");
+        assert_eq!(state.revision, 1);
+
+        persist_login(
+            &store,
+            &credential,
+            "provider",
+            "provider-profile",
+            &fingerprint,
+            std::slice::from_ref(&fingerprint),
+            OAuthTokens::bearer("new-access", Some("new-refresh"), None),
+            None,
+        )
+        .expect("successful login persists and enables");
+
+        let enabled = store
+            .credential_state(credential.as_str())
+            .expect("credential state")
+            .expect("credential exists");
+        assert!(enabled.enabled);
+        assert_eq!(enabled.revision, 2);
+        let metadata = SqliteOAuthTokenStore::new(store)
+            .profile_metadata(&credential)
+            .expect("profile metadata")
+            .expect("profile exists");
+        assert_eq!(metadata.generation, 2);
+        assert_eq!(metadata.provider_profile, "provider-profile");
+    }
+
+    #[test]
+    fn builtin_codex_cli_and_runtime_share_fingerprint_migration_identity() {
+        let config = pooler_config::compile_yaml(
+            "cli-builtin-codex-fingerprint-test.yaml",
+            r#"
+version: 2
+upstreams:
+  codex:
+    url: https://chatgpt.com/backend-api/codex
+    native: {kind: codex}
+accounts:
+  codex-account: {provider: codex, auth_kind: oauth}
+"#,
+        )
+        .expect("built-in Codex config");
+        let account = &config.accounts()["codex-account"];
+        let upstream = &config.upstreams()[account.provider()];
+        let current =
+            account_configuration_fingerprint(upstream, account.id(), account.auth_kind())
+                .expect("current fingerprint");
+        let migration_candidates = account_configuration_fingerprint_migration_candidates(
+            upstream,
+            account.id(),
+            account.auth_kind(),
+        )
+        .expect("migration candidates");
+        let legacy = pooler_http::legacy_account_configuration_fingerprint(
+            upstream,
+            account.id(),
+            account.auth_kind(),
+        )
+        .expect("legacy fingerprint");
+        let prior_v2 = migration_candidates
+            .iter()
+            .find(|candidate| *candidate != &legacy)
+            .expect("pre-effective version-two fingerprint")
+            .clone();
+
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"cli-runtime-codex-fingerprint-key").expect("master key"),
+        )
+        .expect("store");
+        let state = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                account.id(),
+                account.provider(),
+                &prior_v2,
+                true,
+                1,
+            ))
+            .expect("prior credential state");
+        let credential = CredentialId::new(account.id()).expect("credential");
+        SqliteOAuthTokenStore::new(store.clone())
+            .compare_and_swap_profile_for_fingerprint(
+                &credential,
+                &prior_v2,
+                state.revision,
+                &OAuthCredentialProfile::new(
+                    "openai",
+                    OAuthTokens::bearer("prior-access", Some("prior-refresh"), None),
+                )
+                .with_account_id("prior-chatgpt-account"),
+            )
+            .expect("prior OAuth payload");
+
+        let (expected_fingerprint, expected_generation) = login_persistence_expectation(
+            &store,
+            account.id(),
+            account.provider(),
+            &current,
+            &migration_candidates,
+        )
+        .expect("CLI accepts exact prior identity");
+        assert_eq!(expected_fingerprint.as_deref(), Some(prior_v2.as_str()));
+        assert!(expected_generation.is_some_and(|generation| generation > state.revision));
+
+        let token_store = Arc::new(SqliteOAuthTokenStore::new(store));
+        pooler_http::NativeRuntime::new_with_sqlite(&config, Arc::clone(&token_store))
+            .expect("runtime accepts and retires the same prior identity");
+        let migrated = token_store
+            .store()
+            .credential_state(account.id())
+            .expect("credential state")
+            .expect("credential exists");
+        assert_eq!(migrated.configuration_fingerprint, current);
+        assert!(!migrated.enabled);
+        assert!(!token_store
+            .store()
+            .credential_payload_exists(account.id())
+            .expect("payload existence"));
+    }
+
+    #[tokio::test]
+    async fn invalid_openai_login_preserves_a_usable_legacy_credential() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"cli-login-validation-rollback-key").expect("master key"),
+        )
+        .expect("store");
+        let legacy = "a".repeat(64);
+        let current = "b".repeat(64);
+        let credential = CredentialId::new("oauth-account").expect("credential");
+        let state = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                credential.as_str(),
+                "provider",
+                &legacy,
+                true,
+                1,
+            ))
+            .expect("legacy credential state");
+        let token_store = SqliteOAuthTokenStore::new(store.clone());
+        token_store
+            .compare_and_swap_profile_for_fingerprint(
+                &credential,
+                &legacy,
+                state.revision,
+                &OAuthCredentialProfile::new(
+                    "openai",
+                    OAuthTokens::bearer("old-access", Some("old-refresh"), None),
+                ),
+            )
+            .expect("legacy profile");
+
+        let error = persist_login(
+            &store,
+            &credential,
+            "provider",
+            "openai",
+            &current,
+            std::slice::from_ref(&legacy),
+            OAuthTokens::bearer("new-access", Some("new-refresh"), None),
+            None,
+        )
+        .expect_err("missing ID token must fail before persistence");
+        assert!(error.to_string().contains("did not include an ID token"));
+        let unchanged = store
+            .credential_state(credential.as_str())
+            .expect("credential state")
+            .expect("credential exists");
+        assert_eq!(unchanged.configuration_fingerprint, legacy);
+        assert!(unchanged.enabled);
+        let loaded = token_store
+            .load_for_fingerprint(&credential, &legacy)
+            .await
+            .expect("load old profile")
+            .expect("old profile exists");
+        assert_eq!(loaded.tokens().access_token().expose_secret(), "old-access");
+    }
+
+    #[test]
     fn callback_requires_ip_loopback_and_explicit_port() {
         assert!(validate_loopback_callback(DEFAULT_CALLBACK).is_ok());
         assert!(validate_loopback_callback("http://localhost:8765/callback").is_ok());
@@ -1343,6 +1578,68 @@ upstreams:
             None,
         )
         .expect("explicit custom endpoint trust");
+    }
+
+    #[test]
+    fn persistent_oauth_overrides_must_match_compiled_configuration() {
+        let config = pooler_config::compile_yaml(
+            "persistable-overrides.yaml",
+            r#"
+version: 2
+upstreams:
+  custom:
+    url: https://api.operator.example
+    oauth:
+      authorization_endpoint: https://identity.operator.example/authorize
+      token_endpoint: https://identity.operator.example/token
+      client_id: registered-client
+      scopes: [scope-a, scope-b]
+"#,
+        )
+        .expect("custom provider config");
+        let oauth = configured_oauth(&config, "custom").expect("OAuth config");
+        let callback = validate_loopback_callback(DEFAULT_CALLBACK).expect("callback");
+        let equivalent = OAuthOverrideArgs {
+            client_id: Some("registered-client".to_owned()),
+            scopes: vec!["scope-b".to_owned(), "scope-a".to_owned()],
+            ..OAuthOverrideArgs::default()
+        };
+        ResolvedOAuthSettings::new(oauth, callback.clone(), &equivalent, None)
+            .expect("equivalent settings")
+            .validate_persistable(Some(oauth), &equivalent)
+            .expect("equivalent overrides are reproducible");
+
+        let mismatched = OAuthOverrideArgs {
+            client_id: Some("one-off-client".to_owned()),
+            ..OAuthOverrideArgs::default()
+        };
+        let error = ResolvedOAuthSettings::new(oauth, callback.clone(), &mismatched, None)
+            .expect("safe resolved settings")
+            .validate_persistable(Some(oauth), &mismatched)
+            .expect_err("one-off client identity must not be persisted");
+        assert!(error.to_string().contains("durable provider configuration"));
+        assert!(!error.to_string().contains("one-off-client"));
+
+        let unconfigured = OAuthOverrideArgs {
+            client_id: Some("one-off-client".to_owned()),
+            scopes: vec!["scope-a".to_owned()],
+            authorization_endpoint: Some("https://identity.operator.example/authorize".to_owned()),
+            token_endpoint: Some("https://identity.operator.example/token".to_owned()),
+            ..OAuthOverrideArgs::default()
+        };
+        let error = ResolvedOAuthSettings::from_cli_overrides(callback, &unconfigured)
+            .expect("resolved one-off settings")
+            .validate_persistable(None, &unconfigured)
+            .expect_err("unconfigured overrides cannot be reproduced");
+        assert!(error.to_string().contains("cannot be persisted"));
+
+        let custom_callback =
+            validate_loopback_callback("http://127.0.0.1:1455/callback").expect("callback");
+        let error = ResolvedOAuthSettings::from_cli_overrides(custom_callback, &unconfigured)
+            .expect("resolved settings with custom callback")
+            .validate_persistable(None, &OAuthOverrideArgs::default())
+            .expect_err("a one-off callback cannot be reconstructed by the runtime");
+        assert!(error.to_string().contains("durable provider configuration"));
     }
 
     #[test]

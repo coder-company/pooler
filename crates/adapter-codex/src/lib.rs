@@ -42,6 +42,8 @@ pub const CODEX_PROVIDER_ID: &str = "codex";
 pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 /// Relative native response endpoint observed in the local bridge logs.
 pub const CODEX_RESPONSES_PATH: &str = "/backend-api/codex/responses";
+/// Relative native server-compaction endpoint used by Codex subscriptions.
+pub const CODEX_RESPONSES_COMPACT_PATH: &str = "/backend-api/codex/responses/compact";
 /// Native model discovery endpoint used by the Codex bridge.
 pub const CODEX_MODELS_PATH: &str = "/backend-api/codex/models";
 /// Catalog-manager version used to request every currently available model.
@@ -357,17 +359,31 @@ impl CodexCredential {
     }
 
     fn from_stored(record: StoredCodexCredential) -> Result<Self, CodexCredentialError> {
-        let access_token = non_empty_string(record.access_token, "access_token")?;
-        let auth_type = record.auth_type.unwrap_or_else(|| "oauth".to_owned());
+        let nested = record.tokens.unwrap_or_default();
+        let access_token = non_empty_string(
+            record
+                .access_token
+                .or(nested.access_token)
+                .unwrap_or_default(),
+            "access_token",
+        )?;
+        let auth_type = record
+            .auth_type
+            .or(record.auth_mode)
+            .unwrap_or_else(|| "oauth".to_owned());
         if auth_type.trim().is_empty() {
             return Err(CodexCredentialError::InvalidField {
                 field: "type",
                 reason: "must not be empty",
             });
         }
-        let explicit_account_id = record.account_id.filter(|value| !value.trim().is_empty());
+        let explicit_account_id = record
+            .account_id
+            .or(nested.account_id)
+            .filter(|value| !value.trim().is_empty());
         let id_token = record
             .id_token
+            .or(nested.id_token)
             .filter(|value| !value.trim().is_empty())
             .map(SecretValue::new);
         let claimed_account_id = id_token
@@ -384,6 +400,7 @@ impl CodexCredential {
             access_token,
             record
                 .refresh_token
+                .or(nested.refresh_token)
                 .filter(|value| !value.trim().is_empty()),
             None,
         );
@@ -506,7 +523,8 @@ fn non_empty_string(value: String, field: &'static str) -> Result<String, CodexC
 
 #[derive(Debug, Deserialize)]
 struct StoredCodexCredential {
-    access_token: String,
+    #[serde(default)]
+    access_token: Option<String>,
     #[serde(default)]
     refresh_token: Option<String>,
     #[serde(default)]
@@ -518,11 +536,27 @@ struct StoredCodexCredential {
     #[serde(rename = "type", default)]
     auth_type: Option<String>,
     #[serde(default)]
+    auth_mode: Option<String>,
+    #[serde(default)]
+    tokens: Option<StoredCodexTokens>,
+    #[serde(default)]
     expired: Value,
     #[serde(default)]
     disabled: bool,
     #[serde(default)]
     last_refresh: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StoredCodexTokens {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 fn parse_timestamp(value: Value) -> Option<SystemTime> {
@@ -1917,6 +1951,38 @@ mod tests {
         assert_eq!(
             headers[header::USER_AGENT],
             HeaderValue::from_static("codex-tui/0.144.0")
+        );
+    }
+
+    #[test]
+    fn loads_current_codex_cli_nested_auth_file() {
+        let current = br#"{
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": "id-secret",
+                "access_token": "access-secret",
+                "refresh_token": "refresh-secret",
+                "account_id": "account-123"
+            },
+            "last_refresh": "2026-09-02T00:00:00Z"
+        }"#;
+        let credential = CodexCredential::from_json(current).expect("current credential");
+        assert_eq!(credential.account_id(), Some("account-123"));
+        assert_eq!(credential.auth_type(), "chatgpt");
+        assert!(credential.last_refresh().is_some());
+
+        let authorization = credential
+            .materialize(CodexRequestMetadata::default())
+            .expect("authorization");
+        let mut headers = HeaderMap::new();
+        authorization.apply_to(&mut headers).expect("headers");
+        assert_eq!(
+            headers[header::AUTHORIZATION],
+            HeaderValue::from_static("Bearer access-secret")
+        );
+        assert_eq!(
+            headers[CHATGPT_ACCOUNT_ID_HEADER],
+            HeaderValue::from_static("account-123")
         );
     }
 

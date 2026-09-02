@@ -760,7 +760,13 @@ pub enum RetryReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryDecision {
     Retry {
+        /// Wall-clock wait before the next attempt. Ordinary backoff and a
+        /// provider recovery window overlap, so this is the larger component.
         delay: Duration,
+        /// Ordinary exponential-backoff charge applied to `max_total_delay`.
+        retry_delay: Duration,
+        /// Provider recovery-window charge applied to `max_recovery_wait`.
+        recovery_wait: Duration,
         reason: RetryReason,
     },
     DoNotRetry {
@@ -775,11 +781,29 @@ impl RetryDecision {
         matches!(self, Self::Retry { .. })
     }
 
-    /// The wait before a retry, or zero when stopped.
+    /// The wall-clock wait before a retry, or zero when stopped.
     #[must_use]
     pub const fn delay(self) -> Duration {
         match self {
             Self::Retry { delay, .. } => delay,
+            Self::DoNotRetry { .. } => Duration::ZERO,
+        }
+    }
+
+    /// The ordinary retry-delay budget charge, or zero when stopped.
+    #[must_use]
+    pub const fn retry_delay(self) -> Duration {
+        match self {
+            Self::Retry { retry_delay, .. } => retry_delay,
+            Self::DoNotRetry { .. } => Duration::ZERO,
+        }
+    }
+
+    /// The provider recovery-wait budget charge, or zero when stopped.
+    #[must_use]
+    pub const fn recovery_wait(self) -> Duration {
+        match self {
+            Self::Retry { recovery_wait, .. } => recovery_wait,
             Self::DoNotRetry { .. } => Duration::ZERO,
         }
     }
@@ -850,11 +874,7 @@ impl RetryPolicy {
         max_total_delay: Duration,
         max_recovery_wait: Duration,
     ) -> Result<Self, PolicyError> {
-        if max_attempts == 0
-            || max_credentials == 0
-            || max_providers == 0
-            || base_delay > max_delay
-            || max_recovery_wait > max_total_delay
+        if max_attempts == 0 || max_credentials == 0 || max_providers == 0 || base_delay > max_delay
         {
             return Err(PolicyError::InvalidRetryBudget);
         }
@@ -932,7 +952,9 @@ impl RetryPolicy {
             };
         }
         let avoids_failed_scope = context.target_change.avoids(failure.classification.scope);
-        let delay = self.delay_for(failure, context.attempt, avoids_failed_scope);
+        let (retry_delay, recovery_wait) =
+            self.delay_components(failure, context.attempt, avoids_failed_scope);
+        let delay = retry_delay.max(recovery_wait);
         if self
             .max_elapsed
             .is_some_and(|limit| context.elapsed.saturating_add(delay) > limit)
@@ -941,24 +963,20 @@ impl RetryPolicy {
                 reason: RetryStopReason::RetryBudgetExhausted,
             };
         }
-        if let Some(recovery) = failure
-            .classification
-            .recovery_after
-            .filter(|_| !avoids_failed_scope)
-        {
-            if context.elapsed_recovery_wait.saturating_add(recovery) > self.max_recovery_wait {
-                return RetryDecision::DoNotRetry {
-                    reason: RetryStopReason::RecoveryWaitExhausted,
-                };
-            }
+        if context.elapsed_recovery_wait.saturating_add(recovery_wait) > self.max_recovery_wait {
+            return RetryDecision::DoNotRetry {
+                reason: RetryStopReason::RecoveryWaitExhausted,
+            };
         }
-        if context.elapsed_retry_delay.saturating_add(delay) > self.max_total_delay {
+        if context.elapsed_retry_delay.saturating_add(retry_delay) > self.max_total_delay {
             return RetryDecision::DoNotRetry {
                 reason: RetryStopReason::RetryBudgetExhausted,
             };
         }
         RetryDecision::Retry {
             delay,
+            retry_delay,
+            recovery_wait,
             reason: match context.target_change {
                 RetryTargetChange::SameTarget => RetryReason::ReplaySafeBeforeCommit,
                 RetryTargetChange::DifferentCredential => RetryReason::AlternateCredential,
@@ -973,25 +991,25 @@ impl RetryPolicy {
         self.decide(failure, context).is_retry()
     }
 
-    fn delay_for(
+    fn delay_components(
         &self,
         failure: &FailureClassification,
         attempt: u32,
         avoids_failed_scope: bool,
-    ) -> Duration {
+    ) -> (Duration, Duration) {
         if avoids_failed_scope {
-            return Duration::ZERO;
+            return (Duration::ZERO, Duration::ZERO);
         }
         let multiplier = 1_u32 << attempt.saturating_sub(1).min(31);
-        let exponential = self.base_delay.saturating_mul(multiplier);
-        exponential
-            .max(
-                failure
-                    .classification
-                    .recovery_after
-                    .unwrap_or(Duration::ZERO),
-            )
-            .min(self.max_delay)
+        let retry_delay = self
+            .base_delay
+            .saturating_mul(multiplier)
+            .min(self.max_delay);
+        let recovery_wait = failure
+            .classification
+            .recovery_after
+            .unwrap_or(Duration::ZERO);
+        (retry_delay, recovery_wait)
     }
 }
 
@@ -1235,6 +1253,9 @@ pub enum HealthMutationReason {
     MissingCooldownTarget,
     ZeroCooldown,
     CredentialDisabled,
+    CredentialDisableNotPersisted,
+    CredentialGenerationChanged,
+    CredentialUnavailable,
 }
 
 /// Result of applying one classification to health.
@@ -2074,6 +2095,19 @@ mod tests {
 
     #[test]
     fn retry_budget_limits_credentials_and_recovery_wait() {
+        let independent = RetryPolicy::with_bounds(
+            2,
+            2,
+            2,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        )
+        .expect("recovery horizon is independent from retry delay budget");
+        assert_eq!(independent.max_total_delay, Duration::from_secs(1));
+        assert_eq!(independent.max_recovery_wait, Duration::from_secs(30));
+
         let failure = ProviderFailureClassifier.classify(
             &ObservedFailure::new(FailureSource::Upstream, Some(429))
                 .with_provider_code("insufficient_quota")
@@ -2130,6 +2164,86 @@ mod tests {
             ),
             RetryDecision::DoNotRetry {
                 reason: RetryStopReason::RetryBudgetExhausted,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_recovery_wait_is_not_capped_by_ordinary_maximum_delay() {
+        let policy = RetryPolicy::with_bounds(
+            3,
+            3,
+            3,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .expect("valid independent retry bounds")
+        .with_max_elapsed(None);
+        let failure = ProviderFailureClassifier.classify(
+            &ObservedFailure::new(FailureSource::Upstream, Some(503))
+                .with_retry_after(Duration::from_secs(10)),
+        );
+
+        assert_eq!(
+            policy.decide(
+                &failure,
+                RetryContext::new(1, CommitmentState::Uncommitted, ReplayCheck::safe()),
+            ),
+            RetryDecision::Retry {
+                delay: Duration::from_secs(10),
+                retry_delay: Duration::from_millis(100),
+                recovery_wait: Duration::from_secs(10),
+                reason: RetryReason::ReplaySafeBeforeCommit,
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_wait_does_not_consume_ordinary_retry_delay_budget() {
+        let policy = RetryPolicy::with_bounds(
+            3,
+            3,
+            3,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        )
+        .expect("valid independent retry bounds")
+        .with_max_elapsed(None);
+        let failure = ProviderFailureClassifier.classify(
+            &ObservedFailure::new(FailureSource::Upstream, Some(503))
+                .with_retry_after(Duration::from_millis(600)),
+        );
+        let first = policy.decide(
+            &failure,
+            RetryContext::new(1, CommitmentState::Uncommitted, ReplayCheck::safe()),
+        );
+        assert_eq!(
+            first,
+            RetryDecision::Retry {
+                delay: Duration::from_millis(600),
+                retry_delay: Duration::from_millis(100),
+                recovery_wait: Duration::from_millis(600),
+                reason: RetryReason::ReplaySafeBeforeCommit,
+            }
+        );
+
+        assert_eq!(
+            policy.decide(
+                &failure,
+                RetryContext::new(2, CommitmentState::Uncommitted, ReplayCheck::safe())
+                    .with_elapsed_retry_delay(first.retry_delay())
+                    .with_elapsed_recovery_wait(first.recovery_wait())
+                    .with_elapsed(first.delay()),
+            ),
+            RetryDecision::Retry {
+                delay: Duration::from_millis(600),
+                retry_delay: Duration::from_millis(200),
+                recovery_wait: Duration::from_millis(600),
+                reason: RetryReason::ReplaySafeBeforeCommit,
             }
         );
     }

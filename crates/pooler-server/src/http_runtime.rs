@@ -510,6 +510,11 @@ pub enum HttpProxyServerError {
     /// A generation could not construct its native provider resources.
     #[error("native runtime activation failed: {0}")]
     NativeRuntimeActivation(String),
+    /// Native OAuth and account pooling were backed by unrelated stores.
+    #[error(
+        "native OAuth token storage and account pooling must share one credential generation domain"
+    )]
+    CredentialGenerationDomainMismatch,
     /// The configured management listener could not be started.
     #[error(transparent)]
     Management(#[from] ManagementServerError),
@@ -677,6 +682,38 @@ impl NativeManagementOAuthBroker {
         None
     }
 
+    fn enable_oauth_generation(
+        generation: &RuntimeGeneration,
+        credential: &str,
+        token_generation: u64,
+    ) -> Result<(), ManagementOAuthError> {
+        let enabled = generation
+            .pooling
+            .set_oauth_account_enabled_if_current(
+                generation.config.as_ref(),
+                credential,
+                token_generation,
+                true,
+            )
+            .map_err(|_| ManagementOAuthError::Unavailable)?;
+        if !enabled {
+            return Err(ManagementOAuthError::StaleGeneration);
+        }
+        Ok(())
+    }
+
+    fn persist_and_enable_oauth_login(
+        generation: &RuntimeGeneration,
+        result: pooler_http::NativeOAuthLoginResult,
+    ) -> Result<(), ManagementOAuthError> {
+        let credential = result.credential().as_str().to_owned();
+        let snapshot = generation
+            .native
+            .persist_oauth_login(result)
+            .map_err(map_management_oauth_error)?;
+        Self::enable_oauth_generation(generation, &credential, snapshot.generation())
+    }
+
     fn callback_for(config: &CompiledConfig, account_id: &str) -> Option<url::Url> {
         let account = config.accounts().get(account_id)?;
         let callback = config
@@ -708,7 +745,7 @@ fn map_management_oauth_error(error: NativeRuntimeError) -> ManagementOAuthError
         NativeRuntimeError::Unsupported | NativeRuntimeError::Configuration => {
             ManagementOAuthError::Unsupported
         }
-        NativeRuntimeError::Authorization | NativeRuntimeError::NeedsReauth => {
+        NativeRuntimeError::Authorization | NativeRuntimeError::NeedsReauth { .. } => {
             ManagementOAuthError::Authorization
         }
         NativeRuntimeError::CredentialUnavailable | NativeRuntimeError::Refresh => {
@@ -906,11 +943,7 @@ impl ManagementOAuthBroker for NativeManagementOAuthBroker {
             if self.dispatch.load().config.generation() != generation {
                 return Err(ManagementOAuthError::StaleGeneration);
             }
-            session_generation
-                .native
-                .persist_oauth_login(result)
-                .map(|_| ())
-                .map_err(map_management_oauth_error)
+            Self::persist_and_enable_oauth_login(&session_generation, result)
         })
     }
 
@@ -934,11 +967,7 @@ impl ManagementOAuthBroker for NativeManagementOAuthBroker {
             if self.dispatch.load().config.generation() != generation {
                 return Err(ManagementOAuthError::StaleGeneration);
             }
-            runtime
-                .native
-                .persist_oauth_login(result)
-                .map(|_| ())
-                .map_err(map_management_oauth_error)
+            Self::persist_and_enable_oauth_login(&runtime, result)
         })
     }
 
@@ -1007,7 +1036,7 @@ impl HttpProxyServer {
         native: Arc<NativeRuntime>,
     ) -> Result<Self, HttpProxyServerError> {
         let pooling =
-            Arc::new(PoolingCoordinator::new(&config).map_err(|error| {
+            Arc::new(native.pooling_coordinator(&config).map_err(|error| {
                 HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string()))
             })?);
         Self::bind_inner(config, native, pooling, None).await
@@ -1032,6 +1061,9 @@ impl HttpProxyServer {
         pooling: Arc<PoolingCoordinator>,
         management_store: Option<Arc<SqliteStore>>,
     ) -> Result<Self, HttpProxyServerError> {
+        if !native.pooling_generation_domain_is_compatible(pooling.as_ref()) {
+            return Err(HttpProxyServerError::CredentialGenerationDomainMismatch);
+        }
         let catalog = prepare_catalog(&config, Arc::clone(&native)).await?;
         let pooling = Arc::new(
             pooling
@@ -1534,24 +1566,24 @@ impl HttpProxyServer {
         let generation = current.config.generation().saturating_add(1);
         let config = Arc::new(candidate.with_generation(generation));
         activation_stage(RuntimeActivationStage::Native)?;
-        let native = Arc::new(
-            current
-                .native
-                .rebuild_for_config(&config)
-                .map_err(|error| {
-                    HttpProxyServerError::NativeRuntimeActivation(error.to_string())
-                })?,
-        );
+        let prepared_native = current
+            .native
+            .prepare_rebuild_for_config(&current.config, &config)
+            .map_err(|error| HttpProxyServerError::NativeRuntimeActivation(error.to_string()))?;
+        let native_retirements = prepared_native.retirements().to_vec();
+        let native = Arc::new(prepared_native.into_runtime());
         activation_stage(RuntimeActivationStage::Catalog)?;
         let catalog = prepare_catalog(&config, Arc::clone(&native)).await?;
         activation_stage(RuntimeActivationStage::Pooling)?;
-        let pooling = Arc::new(
-            current
-                .pooling
-                .reconfigure(&config)
-                .map_err(|error| HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string())))?
-                .with_optional_catalog(catalog.as_ref().map(|catalog| catalog.service())),
-        );
+        let prepared_pooling = current
+            .pooling
+            .prepare_reconfigure(
+                &config,
+                &native_retirements,
+                catalog.as_ref().map(|catalog| catalog.service()),
+            )
+            .map_err(|error| HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string())))?;
+        let pooling = prepared_pooling.coordinator();
         let mut proxies = BTreeMap::new();
         activation_stage(RuntimeActivationStage::Proxy)?;
         let extensions = extension_registry(&config)?;
@@ -1573,19 +1605,22 @@ impl HttpProxyServer {
             proxies.insert(id, proxy);
         }
         activation_stage(RuntimeActivationStage::Session)?;
-
-        let previous_generation = current.config.generation();
+        // Acknowledgement is the final failure-injection and external
+        // readiness boundary. It must run before any durable identity change.
+        activation_stage(RuntimeActivationStage::Acknowledge)?;
         activation_stage(RuntimeActivationStage::Publish)?;
         // Keep provider-topology ownership coherent with synchronous
-        // management account mutations. The management path acquires this
-        // lock before loading the active generation; holding it through
-        // publication and acknowledgement prevents either side from acting
-        // on a generation that is concurrently replaced or rolled back.
+        // management account mutations. After activation succeeds every
+        // remaining operation is an in-memory publication with no fallible
+        // candidate work left.
         let _account_mutation_guard = self
             .state
             .account_mutation_serial
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prepared_pooling
+            .activate()
+            .map_err(|error| HttpProxyServerError::Proxy(ProxyError::Pool(error.to_string())))?;
         let mut retired = self
             .state
             .retired
@@ -1604,21 +1639,6 @@ impl HttpProxyServer {
             native,
             oauth_sessions: Arc::new(GenerationOAuthSessions::new()),
         }));
-        if let Err(error) = activation_stage(RuntimeActivationStage::Acknowledge) {
-            self.state.dispatch.store(current);
-            let mut retired = self
-                .state
-                .retired
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if retired
-                .last()
-                .is_some_and(|generation| generation.config.generation() == previous_generation)
-            {
-                retired.pop();
-            }
-            return Err(error);
-        }
         Ok(HttpReloadOutcome::Reloaded { generation })
     }
 
@@ -1873,14 +1893,20 @@ async fn run_native_account_commands(
                                             != expected_generation
                                         {
                                             "stale_generation"
-                                        } else if generation
-                                            .native
-                                            .persist_device_login(result)
-                                            .is_ok()
-                                        {
-                                            "succeeded"
                                         } else {
-                                            "failed"
+                                            match generation.native.persist_device_login(result) {
+                                                Ok(snapshot)
+                                                    if NativeManagementOAuthBroker::enable_oauth_generation(
+                                                        &generation,
+                                                        &account,
+                                                        snapshot.generation(),
+                                                    )
+                                                    .is_ok() =>
+                                                {
+                                                    "succeeded"
+                                                }
+                                                _ => "failed",
+                                            }
                                         }
                                     }
                                     Err(_) => "failed",
@@ -2429,13 +2455,14 @@ mod tests {
             atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc,
         },
+        time::SystemTime,
     };
 
     use http::Response;
     use http_body_util::{BodyExt as _, Full};
     use pooler_auth::{
-        OAuthCredentialProfile, OAuthFuture, OAuthRefresher, OAuthTokenStore, OAuthTokens,
-        SecretValue,
+        OAuthCredentialProfile, OAuthError, OAuthFuture, OAuthRefresher, OAuthTokenStore,
+        OAuthTokens, SecretValue,
     };
     use pooler_store::{CredentialState, MasterKey, SqliteOAuthTokenStore, SqliteStore, Store};
     use pooler_testkit::{normalize_json_value, Fixture, ScriptedChunk, ScriptedResult};
@@ -2458,6 +2485,148 @@ mod tests {
             http::HeaderValue::from_static("localhost"),
         );
         headers
+    }
+
+    fn native_oauth_constructor_config(bind: &str, enabled: bool) -> CompiledConfig {
+        pooler_config::compile_yaml(
+            "native-oauth-constructor.yaml",
+            &format!(
+                "version: 2\nlisteners: {{local: {{bind: {bind}}}}}\nupstreams:\n  codex:\n    url: https://api.openai.com\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  account-a: {{provider: codex, auth_kind: oauth, enabled: {enabled}}}\n"
+            ),
+        )
+        .expect("native OAuth constructor config")
+    }
+
+    #[tokio::test]
+    async fn native_runtime_constructor_shares_sqlite_login_generation_with_pooling() {
+        let config = native_oauth_constructor_config("127.0.0.1:0", false);
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"native constructor shared SQLite key").expect("master key"),
+        )
+        .expect("encrypted credential store");
+        let token_store = Arc::new(SqliteOAuthTokenStore::new(store));
+        let native = Arc::new(
+            NativeRuntime::new_with_sqlite(&config, Arc::clone(&token_store))
+                .expect("native runtime"),
+        );
+
+        let server = HttpProxyServer::bind_with_native_runtime(config.clone(), Arc::clone(&native))
+            .await
+            .expect("server binds with the native SQLite store");
+        assert!(native.pooling_generation_domain_is_compatible(&server.pooling()));
+
+        let current = token_store
+            .store()
+            .credential_state("account-a")
+            .expect("credential state")
+            .expect("configured account state");
+        assert!(!current.enabled);
+        let fingerprint = pooler_http::account_configuration_fingerprint(
+            &config.upstreams()["codex"],
+            "account-a",
+            pooler_config::AccountAuthKind::OAuth,
+        )
+        .expect("OAuth account fingerprint");
+        let prepared = token_store
+            .store()
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "account-a",
+                "codex",
+                &fingerprint,
+                false,
+                current.updated_at,
+            ))
+            .expect("login adopts the compiled credential identity");
+        let credential = pooler_auth::CredentialId::new("account-a").expect("credential ID");
+        let profile = OAuthCredentialProfile::new(
+            "codex",
+            OAuthTokens::bearer("new-access", Some("new-refresh"), None),
+        );
+        let snapshot = token_store
+            .compare_and_swap_profile_for_fingerprint(
+                &credential,
+                &fingerprint,
+                prepared.revision,
+                &profile,
+            )
+            .expect("SQLite login persists");
+
+        let generation = server.state.dispatch.load_full();
+        NativeManagementOAuthBroker::enable_oauth_generation(
+            &generation,
+            "account-a",
+            snapshot.generation(),
+        )
+        .expect("persisted login enables live pooling");
+        let enabled = server
+            .pooling()
+            .store()
+            .credential_state("account-a")
+            .expect("pooling credential state")
+            .expect("pooling account");
+        assert!(enabled.enabled);
+        assert_eq!(
+            token_store
+                .profile_metadata(&credential)
+                .expect("profile metadata")
+                .expect("persisted profile")
+                .generation,
+            snapshot.generation()
+        );
+        server.begin_drain();
+    }
+
+    #[tokio::test]
+    async fn explicit_native_and_pooling_store_mismatch_is_rejected_before_binding() {
+        let reservation = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener reservation");
+        let address = reservation.local_addr().expect("reserved address");
+        let config = native_oauth_constructor_config(&address.to_string(), false);
+        let native_store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"native constructor first SQLite key").expect("master key"),
+        )
+        .expect("native credential store");
+        let pooling_store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"native constructor second SQLite key").expect("master key"),
+        )
+        .expect("pooling credential store");
+        let native = Arc::new(
+            NativeRuntime::new_with_sqlite(
+                &config,
+                Arc::new(SqliteOAuthTokenStore::new(native_store)),
+            )
+            .expect("native runtime"),
+        );
+        let pooling = Arc::new(
+            PoolingCoordinator::with_store(&config, Arc::new(pooling_store))
+                .expect("pooling coordinator"),
+        );
+
+        let result =
+            HttpProxyServer::bind_with_native_runtime_and_pooling(config, native, pooling).await;
+        assert!(matches!(
+            result,
+            Err(HttpProxyServerError::CredentialGenerationDomainMismatch)
+        ));
+        assert_eq!(
+            reservation.local_addr().expect("reservation remains bound"),
+            address
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_native_runtime_remains_compatible_with_memory_pooling() {
+        let config = native_oauth_constructor_config("127.0.0.1:0", true);
+        let native = Arc::new(
+            NativeRuntime::new(&config, Arc::new(pooler_auth::MemoryOAuthTokenStore::new()))
+                .expect("memory native runtime"),
+        );
+        let pooling = Arc::new(PoolingCoordinator::new(&config).expect("memory pooling"));
+        let server = HttpProxyServer::bind_with_native_runtime_and_pooling(config, native, pooling)
+            .await
+            .expect("memory runtimes remain supported");
+        server.begin_drain();
     }
 
     #[test]
@@ -2539,6 +2708,14 @@ mod tests {
     }
 
     async fn send_request(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+        send_request_with_timeout(address, request, TEST_TIMEOUT).await
+    }
+
+    async fn send_request_with_timeout(
+        address: SocketAddr,
+        request: &[u8],
+        timeout: Duration,
+    ) -> Vec<u8> {
         let mut stream = TcpStream::connect(address)
             .await
             .expect("downstream connects");
@@ -2546,7 +2723,7 @@ mod tests {
             .write_all(request)
             .await
             .expect("downstream request bytes");
-        tokio::time::timeout(TEST_TIMEOUT, read_response(&mut stream))
+        tokio::time::timeout(timeout, read_response(&mut stream))
             .await
             .expect("downstream response arrives before timeout")
             .expect("downstream response bytes")
@@ -5421,6 +5598,615 @@ mod tests {
         }
     }
 
+    struct NeedsReauthRefresher {
+        calls: AtomicUsize,
+    }
+
+    impl OAuthRefresher for NeedsReauthRefresher {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a SecretValue,
+            _cancellation: CancellationToken,
+        ) -> OAuthFuture<'a, OAuthTokens> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Err(OAuthError::NeedsReauth) })
+        }
+    }
+
+    struct PendingCodexRefresher {
+        calls: AtomicUsize,
+    }
+
+    impl OAuthRefresher for PendingCodexRefresher {
+        fn refresh<'a>(
+            &'a self,
+            _refresh_token: &'a SecretValue,
+            _cancellation: CancellationToken,
+        ) -> OAuthFuture<'a, OAuthTokens> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn native_reauth_config(
+        upstream_address: SocketAddr,
+        maximum_attempts: u32,
+        maximum_credentials: u32,
+        request_timeout: &str,
+        maximum_elapsed: Option<&str>,
+    ) -> CompiledConfig {
+        let maximum_elapsed = maximum_elapsed
+            .map(|value| format!(", maximum_elapsed: {value}"))
+            .unwrap_or_default();
+        pooler_config::compile_yaml(
+            "native-reauth-e2e.yaml",
+            &format!(
+                "version: 2
+listeners: {{local: {{bind: 127.0.0.1:0}}}}
+upstreams:
+  codex:
+    url: http://{upstream_address}
+    native: {{kind: codex}}
+    oauth:
+      authorization_endpoint: https://oauth.example/authorize
+      token_endpoint: https://oauth.example/token
+      identity_endpoint: https://oauth.example/me
+      client_id: pooler-test
+      scopes: [openid]
+accounts:
+  account-a: {{provider: codex, auth_kind: oauth}}
+  account-b: {{provider: codex, auth_kind: oauth}}
+models:
+  - id: gpt-test
+    targets:
+      - {{id: first, provider: codex, account: account-a, priority: 1, upstream_model: gpt-test, capabilities: [text], codecs: [openai], wire_family: openai}}
+      - {{id: second, provider: codex, account: account-b, priority: 2, upstream_model: gpt-test, capabilities: [text], codecs: [openai], wire_family: openai}}
+policies:
+  codex:
+    selection: {{strategy: ordered_fallback}}
+    retry: {{maximum_attempts: {maximum_attempts}, maximum_credentials: {maximum_credentials}, maximum_upstreams: 1, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s{maximum_elapsed}}}
+routes:
+  - id: codex
+    listen: local
+    match: {{method: POST, path: /native, content_types: [application/json]}}
+    limits: {{request_timeout: {request_timeout}}}
+    ingress: {{mode: patch}}
+    target: {{provider: codex, model_from: request.model, policy: codex}}
+    response: {{mode: opaque}}
+"
+            ),
+        )
+        .expect("native reauthentication config")
+    }
+
+    fn expiring_tokens(access: &str, refresh: &str) -> OAuthTokens {
+        OAuthTokens::bearer(
+            access,
+            Some(refresh),
+            SystemTime::now().checked_sub(Duration::from_secs(60)),
+        )
+    }
+
+    #[tokio::test]
+    async fn proactive_native_reauth_stays_request_local_and_uses_bounded_alternate() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener.local_addr().expect("upstream address");
+        let upstream = tokio::spawn(async move {
+            let (mut handshake_stream, _) = upstream_listener
+                .accept()
+                .await
+                .expect("upstream accepts handshake");
+            let handshake = read_headers(&mut handshake_stream)
+                .await
+                .expect("handshake bytes");
+            handshake_stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("handshake rejection writes");
+            drop(handshake_stream);
+
+            let (mut stream, _) = upstream_listener
+                .accept()
+                .await
+                .expect("upstream accepts HTTP");
+            let request = read_request(&mut stream).await.expect("request bytes");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("response writes");
+            drop(stream);
+            let extra_send =
+                tokio::time::timeout(Duration::from_millis(75), upstream_listener.accept())
+                    .await
+                    .is_ok();
+            (handshake, request, extra_send)
+        });
+
+        // The local authorization failure happens before any provider send, so
+        // the alternate starts at physical attempt one. The second attempt is
+        // reserved for the WebSocket-to-HTTP transport fallback.
+        let config = native_reauth_config(upstream_address, 2, 2, "1s", None);
+        let token_store = Arc::new(pooler_auth::MemoryOAuthTokenStore::new());
+        token_store.insert(
+            pooler_auth::CredentialId::new("account-a").expect("first credential"),
+            expiring_tokens("expired-access", "expired-refresh"),
+        );
+        token_store.insert(
+            pooler_auth::CredentialId::new("account-b").expect("second credential"),
+            OAuthTokens::bearer("alternate-access", Some("alternate-refresh"), None),
+        );
+        let refresher = Arc::new(NeedsReauthRefresher {
+            calls: AtomicUsize::new(0),
+        });
+        let native = Arc::new(
+            NativeRuntime::with_codex_provider(token_store, "codex", refresher.clone())
+                .with_account_id("account-a", "provider-account-a")
+                .with_account_id("account-b", "provider-account-b"),
+        );
+        let server = HttpProxyServer::bind_with_native_runtime(config, native)
+            .await
+            .expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#;
+        let request = format!(
+            "POST /native HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response = send_request(address, request.as_bytes()).await;
+        assert_eq!(
+            status(&response),
+            200,
+            "response={}, decisions={:?}, states={:?}",
+            String::from_utf8_lossy(&response),
+            server.pooling().recent_decisions(8),
+            server.pooling().credential_states()
+        );
+        assert_eq!(response_body(&response), b"ok");
+        assert_eq!(refresher.calls.load(Ordering::Relaxed), 1);
+
+        let (handshake, upstream_request, extra_send) = upstream.await.expect("upstream task");
+        assert!(
+            !extra_send,
+            "the request-local failed credential must not reach the upstream"
+        );
+        for attempt_request in [&handshake, &upstream_request] {
+            assert_eq!(
+                request_header(attempt_request, "authorization"),
+                Some("Bearer alternate-access")
+            );
+            assert_eq!(
+                request_header(attempt_request, "chatgpt-account-id"),
+                Some("provider-account-b")
+            );
+        }
+        let states = server
+            .pooling()
+            .credential_states()
+            .expect("credential states remain readable");
+        assert!(states
+            .iter()
+            .any(|state| { state.credential_id == "account-a" && state.enabled }));
+        assert!(states
+            .iter()
+            .any(|state| { state.credential_id == "account-b" && state.enabled }));
+        let events = server
+            .pooling()
+            .request_events()
+            .expect("request events remain readable");
+        assert!(events.iter().any(|event| {
+            event.kind == pooler_store::RequestEventKind::Selection && event.attempt == Some(2)
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == pooler_store::RequestEventKind::Retry && event.attempt == Some(1)
+        }));
+        let history = serde_json::to_string(&events).expect("events serialize");
+        for secret in [
+            "expired-access",
+            "expired-refresh",
+            "alternate-access",
+            "alternate-refresh",
+            "provider-account-a",
+            "provider-account-b",
+            "hello",
+        ] {
+            assert!(!history.contains(secret));
+            assert!(!String::from_utf8_lossy(&response).contains(secret));
+        }
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn responses_websocket_http_fallback_obeys_maximum_attempts() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener.local_addr().expect("upstream address");
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.expect("handshake accepts");
+            let handshake = read_headers(&mut stream).await.expect("handshake bytes");
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("handshake rejection writes");
+            drop(stream);
+            let extra_send =
+                tokio::time::timeout(Duration::from_millis(75), upstream_listener.accept())
+                    .await
+                    .is_ok();
+            (handshake, extra_send)
+        });
+
+        let config = native_reauth_config(upstream_address, 1, 1, "1s", None);
+        let token_store = Arc::new(pooler_auth::MemoryOAuthTokenStore::new());
+        token_store.insert(
+            pooler_auth::CredentialId::new("account-a").expect("credential"),
+            OAuthTokens::bearer("attempt-access", Some("attempt-refresh"), None),
+        );
+        let refresher = Arc::new(NeedsReauthRefresher {
+            calls: AtomicUsize::new(0),
+        });
+        let native = Arc::new(
+            NativeRuntime::with_codex_provider(token_store, "codex", refresher.clone())
+                .with_account_id("account-a", "provider-first"),
+        );
+        let server = HttpProxyServer::bind_with_native_runtime(config, native)
+            .await
+            .expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"gpt-test","input":"attempt budget"}"#;
+        let request = format!(
+            "POST /native HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            send_request(address, request.as_bytes()),
+        )
+        .await
+        .expect("attempt exhaustion returns a bounded response");
+        assert_eq!(status(&response), 502);
+        assert_eq!(refresher.calls.load(Ordering::Relaxed), 0);
+        let (handshake, extra_send) = tokio::time::timeout(Duration::from_secs(3), upstream)
+            .await
+            .expect("upstream attempt occurs")
+            .expect("upstream task");
+        assert!(
+            !extra_send,
+            "an exhausted attempt budget must block HTTP fallback"
+        );
+        assert_eq!(
+            request_header(&handshake, "authorization"),
+            Some("Bearer attempt-access")
+        );
+        for secret in ["attempt-access", "attempt-refresh", "attempt budget"] {
+            assert!(!String::from_utf8_lossy(&response).contains(secret));
+        }
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_reauth_never_reuses_the_disabled_credential() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener.local_addr().expect("upstream address");
+        let upstream = tokio::spawn(async move {
+            let mut handshakes = Vec::new();
+            for response in [
+                &b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+                &b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..],
+            ] {
+                let (mut stream, _) = upstream_listener.accept().await.expect("handshake accepts");
+                handshakes.push(read_headers(&mut stream).await.expect("handshake bytes"));
+                stream
+                    .write_all(response)
+                    .await
+                    .expect("handshake response writes");
+                drop(stream);
+            }
+            let (mut stream, _) = upstream_listener
+                .accept()
+                .await
+                .expect("HTTP fallback accepts");
+            let request = read_request(&mut stream).await.expect("HTTP request bytes");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("HTTP response writes");
+            (handshakes, request)
+        });
+
+        let config = native_reauth_config(upstream_address, 3, 2, "1s", None);
+        let token_store = Arc::new(pooler_auth::MemoryOAuthTokenStore::new());
+        token_store.insert(
+            pooler_auth::CredentialId::new("account-a").expect("first credential"),
+            OAuthTokens::bearer("handshake-first", Some("handshake-refresh"), None),
+        );
+        token_store.insert(
+            pooler_auth::CredentialId::new("account-b").expect("second credential"),
+            OAuthTokens::bearer("handshake-second", Some("second-refresh"), None),
+        );
+        let refresher = Arc::new(NeedsReauthRefresher {
+            calls: AtomicUsize::new(0),
+        });
+        let native = Arc::new(
+            NativeRuntime::with_codex_provider(token_store, "codex", refresher.clone())
+                .with_account_id("account-a", "provider-first")
+                .with_account_id("account-b", "provider-second"),
+        );
+        let server = HttpProxyServer::bind_with_native_runtime(config, native)
+            .await
+            .expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"gpt-test","input":"handshake reauth"}"#;
+        let request = format!(
+            "POST /native HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nIdempotency-Key: handshake-reauth-e2e\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response = send_request(address, request.as_bytes()).await;
+        assert_eq!(
+            status(&response),
+            200,
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(refresher.calls.load(Ordering::Relaxed), 1);
+        let (handshakes, http_request) = upstream.await.expect("upstream task");
+        assert_eq!(
+            request_header(&handshakes[0], "authorization"),
+            Some("Bearer handshake-first")
+        );
+        for attempt_request in [&handshakes[1], &http_request] {
+            assert_eq!(
+                request_header(attempt_request, "authorization"),
+                Some("Bearer handshake-second")
+            );
+            assert_eq!(
+                request_header(attempt_request, "chatgpt-account-id"),
+                Some("provider-second")
+            );
+        }
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn http_refresh_reauth_drains_response_and_uses_the_alternate() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener.local_addr().expect("upstream address");
+        let refresher = Arc::new(NeedsReauthRefresher {
+            calls: AtomicUsize::new(0),
+        });
+        let upstream_refresher = Arc::clone(&refresher);
+        let upstream = tokio::spawn(async move {
+            let (mut handshake_stream, _) =
+                upstream_listener.accept().await.expect("handshake accepts");
+            let handshake = read_headers(&mut handshake_stream)
+                .await
+                .expect("handshake bytes");
+            handshake_stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("handshake rejection writes");
+            drop(handshake_stream);
+
+            let (mut first_http, _) = upstream_listener
+                .accept()
+                .await
+                .expect("first HTTP accepts");
+            let first_request = read_request(&mut first_http)
+                .await
+                .expect("first HTTP request bytes");
+            first_http
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nrevoked-",
+                )
+                .await
+                .expect("partial 401 response writes");
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            assert_eq!(
+                upstream_refresher.calls.load(Ordering::Relaxed),
+                0,
+                "refresh must wait until the rejected response body is drained",
+            );
+            first_http
+                .write_all(b"token")
+                .await
+                .expect("remaining 401 body writes");
+
+            // The first WebSocket rejection applies to this upstream, not
+            // only this credential. Credential failover therefore stays on
+            // HTTP. The transport may either reuse this fully drained HTTP/1
+            // connection or open an isolated one for the new generation.
+            let (second_request, mut response_stream) =
+                tokio::time::timeout(TEST_TIMEOUT.saturating_mul(4), async {
+                    async fn read_candidate(
+                        mut stream: TcpStream,
+                    ) -> io::Result<Option<(Vec<u8>, TcpStream)>> {
+                        match read_request(&mut stream).await {
+                            Ok(request) => Ok(Some((request, stream))),
+                            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+                            Err(error) => Err(error),
+                        }
+                    }
+
+                    // Hyper may establish an idle speculative connection while
+                    // dispatching the retry on the drained keep-alive socket.
+                    // Keep every candidate reader alive and race complete
+                    // requests, not accepted sockets.
+                    let mut readers = tokio::task::JoinSet::new();
+                    readers.spawn(read_candidate(first_http));
+                    loop {
+                        tokio::select! {
+                            result = readers.join_next(), if !readers.is_empty() => {
+                                let result = result
+                                    .expect("candidate reader exists")
+                                    .expect("candidate reader task completes")
+                                    .expect("alternate HTTP request reads");
+                                if let Some(request) = result {
+                                    readers.abort_all();
+                                    break request;
+                                }
+                            }
+                            accepted = upstream_listener.accept() => {
+                                let (stream, _) = accepted.expect("alternate HTTP accepts");
+                                readers.spawn(read_candidate(stream));
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("alternate HTTP attempt follows the drained 401");
+            response_stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("alternate response writes");
+            (handshake, first_request, second_request)
+        });
+
+        let config = native_reauth_config(upstream_address, 3, 2, "30s", None);
+        let token_store = Arc::new(pooler_auth::MemoryOAuthTokenStore::new());
+        token_store.insert(
+            pooler_auth::CredentialId::new("account-a").expect("first credential"),
+            OAuthTokens::bearer("http-first", Some("http-refresh"), None),
+        );
+        token_store.insert(
+            pooler_auth::CredentialId::new("account-b").expect("second credential"),
+            OAuthTokens::bearer("http-second", Some("second-refresh"), None),
+        );
+        let native = Arc::new(
+            NativeRuntime::with_codex_provider(token_store, "codex", refresher.clone())
+                .with_account_id("account-a", "provider-first")
+                .with_account_id("account-b", "provider-second"),
+        );
+        let server = HttpProxyServer::bind_with_native_runtime(config, native)
+            .await
+            .expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"gpt-test","input":"http reauth"}"#;
+        let request = format!(
+            "POST /native HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nIdempotency-Key: http-reauth-e2e\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let response =
+            send_request_with_timeout(address, request.as_bytes(), TEST_TIMEOUT.saturating_mul(4))
+                .await;
+        assert_eq!(
+            status(&response),
+            200,
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(refresher.calls.load(Ordering::Relaxed), 1);
+        let (handshake, first_request, second_request) = upstream.await.expect("upstream task");
+        for attempt_request in [&handshake, &first_request] {
+            assert_eq!(
+                request_header(attempt_request, "authorization"),
+                Some("Bearer http-first")
+            );
+        }
+        for attempt_request in [&second_request] {
+            assert_eq!(
+                request_header(attempt_request, "authorization"),
+                Some("Bearer http-second")
+            );
+            assert_eq!(
+                request_header(attempt_request, "chatgpt-account-id"),
+                Some("provider-second")
+            );
+        }
+        stop_server(&server, runner).await;
+    }
+
+    #[tokio::test]
+    async fn native_refresh_deadline_releases_shared_refresh_for_the_next_request() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream binds");
+        let upstream_address = upstream_listener.local_addr().expect("upstream address");
+        let config = native_reauth_config(upstream_address, 1, 1, "150ms", Some("40ms"));
+        let token_store = Arc::new(pooler_auth::MemoryOAuthTokenStore::new());
+        token_store.insert(
+            pooler_auth::CredentialId::new("account-a").expect("credential"),
+            expiring_tokens("deadline-access", "deadline-refresh"),
+        );
+        let refresher = Arc::new(PendingCodexRefresher {
+            calls: AtomicUsize::new(0),
+        });
+        let native = Arc::new(NativeRuntime::with_codex_provider(
+            token_store,
+            "codex",
+            refresher.clone(),
+        ));
+        let server = HttpProxyServer::bind_with_native_runtime(config, native)
+            .await
+            .expect("proxy binds");
+        let address = listener_address(&server, "local");
+        let runner = {
+            let server = server.clone();
+            tokio::spawn(async move { server.run().await })
+        };
+        let body = br#"{"model":"gpt-test","messages":[{"role":"user","content":"deadline"}]}"#;
+        let request = format!(
+            "POST /native HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+
+        for _ in 0..2 {
+            let request_started = std::time::Instant::now();
+            let response = send_request(address, request.as_bytes()).await;
+            assert_eq!(status(&response), 504);
+            assert!(
+                request_started.elapsed() >= Duration::from_millis(100),
+                "initial authorization must use the active request deadline, not maximum_elapsed",
+            );
+            assert!(!String::from_utf8_lossy(&response).contains("deadline-access"));
+            assert!(!String::from_utf8_lossy(&response).contains("deadline-refresh"));
+        }
+        assert_eq!(
+            refresher.calls.load(Ordering::Relaxed),
+            2,
+            "a timed-out leader must release the refresh entry"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), upstream_listener.accept())
+                .await
+                .is_err(),
+            "authorization must time out before an upstream send"
+        );
+        stop_server(&server, runner).await;
+    }
+
     #[tokio::test]
     async fn native_codex_materializes_headers_refreshes_once_and_replays_before_commit() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
@@ -5469,7 +6255,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "native-codex-e2e.yaml",
             &format!(
-                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{upstream_address}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  account-a:\n    provider: codex\n    secret: env:CODEX_TEST_SECRET\naccount_pools:\n  codex-pool: {{provider: codex, accounts: [account-a]}}\npolicies:\n  codex:\n    selection: {{strategy: fill_first}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 1, statuses: [429], before_commit_only: true}}\nroutes:\n  - id: codex\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: codex, policy: codex}}\n    response: {{mode: opaque}}\n"
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{upstream_address}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  account-a:\n    provider: codex\n    secret: env:CODEX_TEST_SECRET\naccount_pools:\n  codex-pool: {{provider: codex, accounts: [account-a]}}\npolicies:\n  codex:\n    selection: {{strategy: fill_first}}\n    retry: {{maximum_attempts: 3, maximum_credentials: 1, statuses: [429], before_commit_only: true}}\nroutes:\n  - id: codex\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: codex, policy: codex}}\n    response: {{mode: opaque}}\n"
             ),
         )
         .expect("native route config");
@@ -5539,8 +6325,9 @@ mod tests {
         let subscription_upstream = tokio::spawn(async move {
             // The codex subscription upstream is tried over WebSocket first.
             // Rejecting that handshake with a non-401 status downgrades the
-            // request to HTTP without spending the pre-commit refresh, leaving
-            // the policy retry budget available for the quota failover below.
+            // request to HTTP without spending the pre-commit refresh. The HTTP
+            // fallback is a second outbound attempt, and the policy reserves a
+            // third attempt for the quota failover below.
             let (mut handshake_stream, _) = subscription_listener
                 .accept()
                 .await
@@ -5608,7 +6395,7 @@ mod tests {
         let config = pooler_config::compile_yaml(
             "mixed-openai-auth-e2e.yaml",
             &format!(
-                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  subscription:\n    url: http://{subscription_address}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\n  api:\n    url: http://{api_address}\naccounts:\n  a-subscription-account:\n    provider: subscription\n    auth_kind: oauth\n  b-api-account:\n    provider: api\n    auth_kind: api_key\n    secret: {}\nmodels:\n  - id: gpt-test\n    targets:\n      - {{id: subscription-target, provider: subscription, account: a-subscription-account, priority: 1, upstream_model: gpt-test, capabilities: [text], codecs: [], wire_family: openai}}\n      - {{id: api-target, provider: api, account: b-api-account, priority: 2, upstream_model: gpt-test, capabilities: [text], codecs: [], wire_family: openai}}\npolicies:\n  mixed:\n    selection: {{strategy: ordered_fallback}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 2, maximum_upstreams: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}}\nroutes:\n  - id: mixed\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: subscription, model_from: request.model, policy: mixed}}\n    response: {{mode: opaque}}\n",
+                "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  subscription:\n    url: http://{subscription_address}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\n  api:\n    url: http://{api_address}\naccounts:\n  a-subscription-account:\n    provider: subscription\n    auth_kind: oauth\n  b-api-account:\n    provider: api\n    auth_kind: api_key\n    secret: {}\nmodels:\n  - id: gpt-test\n    targets:\n      - {{id: subscription-target, provider: subscription, account: a-subscription-account, priority: 1, upstream_model: gpt-test, capabilities: [text], codecs: [], wire_family: openai}}\n      - {{id: api-target, provider: api, account: b-api-account, priority: 2, upstream_model: gpt-test, capabilities: [text], codecs: [], wire_family: openai}}\npolicies:\n  mixed:\n    selection: {{strategy: ordered_fallback}}\n    retry: {{maximum_attempts: 3, maximum_credentials: 2, maximum_upstreams: 2, statuses: [429], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}}\nroutes:\n  - id: mixed\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: subscription, model_from: request.model, policy: mixed}}\n    response: {{mode: opaque}}\n",
                 api_secret.reference()
             ),
         )
@@ -5728,7 +6515,7 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.kind == pooler_store::RequestEventKind::Selection
                 && event.provider.as_deref() == Some("api")
-                && event.attempt == Some(2)
+                && event.attempt == Some(3)
         }));
         assert!(events
             .iter()
@@ -5883,6 +6670,141 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn acknowledge_failure_preserves_candidate_credential_identity_and_dependents() {
+        let initial = pooler_config::compile_yaml(
+            "credential-activation-rollback.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  provider-a: {url: http://127.0.0.1:1}
+  provider-b: {url: http://127.0.0.1:2}
+accounts:
+  alpha: {provider: provider-a, secret: env:POOLER_ALPHA}
+"#,
+        )
+        .expect("initial account configuration");
+        let store = SqliteStore::open_in_memory().expect("store");
+        let pooling = Arc::new(
+            PoolingCoordinator::with_store(&initial, Arc::new(store.clone()))
+                .expect("initial pooling"),
+        );
+        let server = HttpProxyServer::bind_with_pooling(initial, pooling)
+            .await
+            .expect("bind server");
+        store
+            .upsert_credential_health(pooler_store::CredentialHealthState::new(
+                "alpha",
+                pooler_store::CredentialHealthStatus::CoolingDown,
+                2,
+            ))
+            .expect("health");
+        store
+            .upsert_cooldown(pooler_store::CooldownState::new(
+                "credential",
+                "alpha",
+                100,
+                2,
+            ))
+            .expect("cooldown");
+        store
+            .upsert_session_affinity(pooler_store::SessionAffinity::new(
+                "session",
+                "provider-a",
+                "alpha",
+                "model",
+                2,
+                100,
+            ))
+            .expect("affinity");
+        let credential_before = store
+            .credential_state("alpha")
+            .expect("credential")
+            .expect("credential");
+        let health_before = store
+            .credential_health("alpha")
+            .expect("health")
+            .expect("health");
+        let cooldown_before = store
+            .cooldown("credential", "alpha", 2)
+            .expect("cooldown")
+            .expect("cooldown");
+        let affinity_before = store
+            .session_affinity("session", 2)
+            .expect("affinity")
+            .expect("affinity");
+
+        let candidate = pooler_config::compile_yaml(
+            "credential-activation-rollback.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  provider-a: {url: http://127.0.0.1:1}
+  provider-b: {url: http://127.0.0.1:2}
+accounts:
+  alpha: {provider: provider-b, secret: env:POOLER_ALPHA}
+"#,
+        )
+        .expect("candidate account configuration");
+        fail_activation_at(RuntimeActivationStage::Acknowledge);
+        let result = server.reload(candidate).await;
+        clear_activation_failure();
+
+        assert!(matches!(
+            result,
+            Err(HttpProxyServerError::NativeRuntimeActivation(_))
+        ));
+        assert_eq!(server.config_generation(), 1);
+        assert_eq!(
+            store
+                .credential_state("alpha")
+                .expect("credential after failure")
+                .expect("credential after failure"),
+            credential_before
+        );
+        assert_eq!(
+            store
+                .credential_health("alpha")
+                .expect("health after failure")
+                .expect("health after failure"),
+            health_before
+        );
+        assert_eq!(
+            store
+                .cooldown("credential", "alpha", 2)
+                .expect("cooldown after failure")
+                .expect("cooldown after failure"),
+            cooldown_before
+        );
+        assert_eq!(
+            store
+                .session_affinity("session", 2)
+                .expect("affinity after failure")
+                .expect("affinity after failure"),
+            affinity_before
+        );
+
+        // The rejected candidate never entered shared topology; management on
+        // the still-active generation can continue mutating its exact identity.
+        server
+            .pooling()
+            .set_account_enabled("alpha", false)
+            .expect("disable old generation");
+        assert!(
+            !store
+                .credential_state("alpha")
+                .expect("disabled state")
+                .expect("disabled state")
+                .enabled
+        );
+        server
+            .pooling()
+            .set_account_enabled("alpha", true)
+            .expect("re-enable old generation");
     }
 
     #[tokio::test]

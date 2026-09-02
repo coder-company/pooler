@@ -8,7 +8,7 @@ use pooler_auth::{
     ProviderLoginDefinition, ProviderLoginMethod, ProviderLoginRegistry, ProviderLoginSupport,
     ProviderOAuthClient, ProviderOAuthSettings, StandardOAuthProvider,
 };
-use pooler_config::{CompiledConfig, OAuthPlan};
+use pooler_config::{CompiledConfig, OAuthPlan, DEFAULT_OAUTH_CALLBACK};
 use url::Url;
 
 use super::{require_response_state, AuthLoginMethod, OAuthEncodingArgument, OAuthOverrideArgs};
@@ -251,6 +251,52 @@ impl ResolvedOAuthSettings {
             )?,
             request_encoding: overrides.request_encoding,
         })
+    }
+
+    pub(super) fn validate_persistable(
+        &self,
+        oauth: Option<&OAuthPlan>,
+        overrides: &OAuthOverrideArgs,
+    ) -> Result<()> {
+        if oauth.is_none() && self.callback.as_str() != DEFAULT_OAUTH_CALLBACK {
+            bail!(
+                "OAuth callback differs from durable provider configuration; configure the provider instead"
+            );
+        }
+        if !overrides.any_explicit_value() {
+            return Ok(());
+        }
+        let Some(oauth) = oauth else {
+            bail!(
+                "OAuth login overrides cannot be persisted without equivalent provider configuration"
+            );
+        };
+        let mut resolved_scopes = self.scopes.clone();
+        resolved_scopes.sort();
+        resolved_scopes.dedup();
+        let mut configured_scopes = oauth
+            .scopes()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        configured_scopes.sort();
+        configured_scopes.dedup();
+        let reproducible = self.client_id == oauth.client_id()
+            && self.callback == *oauth.callback()
+            && resolved_scopes == configured_scopes
+            && self.authorization_endpoint.as_ref() == Some(oauth.authorization_endpoint())
+            && self.token_endpoint.as_ref() == Some(oauth.token_endpoint())
+            && self.device_authorization_endpoint.is_none()
+            && self.revocation_endpoint.as_ref() == oauth.revocation_endpoint()
+            && self.identity_endpoint.as_ref() == oauth.identity_endpoint()
+            && self.request_encoding == OAuthEncodingArgument::Form
+            && !overrides.dangerously_allow_custom_oauth_endpoints;
+        if !reproducible {
+            bail!(
+                "OAuth login overrides differ from durable provider configuration; configure the provider instead"
+            );
+        }
+        Ok(())
     }
 
     fn standard_config(&self, method: AuthLoginMethod) -> Result<OAuthClientConfig> {

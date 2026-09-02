@@ -3269,12 +3269,11 @@ impl ManagementApi {
                 )
             }
             Err(PoolError::InvalidCredential) => {
-                self.record_audit(action, Some(&account), "not_found");
-                ManagementResponse::error_code(
-                    ManagementErrorCode::AccountNotFound,
-                    "configured account not found",
-                    false,
-                )
+                // The compiled account was checked above. Reaching this branch
+                // means its durable identity is stale or missing, not that the
+                // public account path is unknown.
+                self.record_audit(action, Some(&account), "state_conflict");
+                state_unavailable()
             }
             Err(_) => {
                 self.record_audit(action, Some(&account), "failed");
@@ -6205,9 +6204,10 @@ mod tests {
     use super::*;
     use pooler_core::ConfigGeneration;
     use pooler_store::{
-        CooldownState, CredentialHealthState, CredentialState, DecisionRecord, MemoryStore,
-        PruneReport, RequestEvent, RetentionPolicy, SessionAffinity, Store, StoreError,
-        StoreResult, Timestamp, UsageRecord,
+        ActivatedCredentialState, CooldownState, CredentialConfigurationActivation,
+        CredentialHealthState, CredentialState, DecisionRecord, MemoryStore, PruneReport,
+        RequestEvent, RetentionPolicy, SessionAffinity, Store, StoreError, StoreResult, Timestamp,
+        UsageRecord,
     };
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicBool;
@@ -6415,6 +6415,13 @@ mod tests {
             self.inner.upsert_credential_state(state)
         }
 
+        fn activate_credential_configurations(
+            &self,
+            activations: &[CredentialConfigurationActivation],
+        ) -> StoreResult<Vec<ActivatedCredentialState>> {
+            self.inner.activate_credential_configurations(activations)
+        }
+
         fn credential_state(&self, credential_id: &str) -> StoreResult<Option<CredentialState>> {
             if self.should_fail() {
                 self.unavailable()
@@ -6441,6 +6448,52 @@ mod tests {
                 .set_credential_enabled(credential_id, enabled, updated_at)
         }
 
+        fn set_credential_enabled_if_identity(
+            &self,
+            identity: &pooler_store::CredentialConfigurationIdentity,
+            enabled: bool,
+            updated_at: Timestamp,
+        ) -> StoreResult<pooler_store::ConditionalCredentialMutation> {
+            self.inner
+                .set_credential_enabled_if_identity(identity, enabled, updated_at)
+        }
+
+        fn set_credential_enabled_if_current(
+            &self,
+            credential_id: &str,
+            expected_revision: u64,
+            expected_provider_id: &str,
+            expected_configuration_fingerprint: &str,
+            enabled: bool,
+            updated_at: Timestamp,
+        ) -> StoreResult<pooler_store::ConditionalCredentialMutation> {
+            self.inner.set_credential_enabled_if_current(
+                credential_id,
+                expected_revision,
+                expected_provider_id,
+                expected_configuration_fingerprint,
+                enabled,
+                updated_at,
+            )
+        }
+
+        fn set_credential_enabled_if_newer_payload(
+            &self,
+            identity: &pooler_store::CredentialConfigurationIdentity,
+            expected_metadata_revision: u64,
+            previous_generation: u64,
+            enabled: bool,
+            updated_at: Timestamp,
+        ) -> StoreResult<pooler_store::ConditionalCredentialMutation> {
+            self.inner.set_credential_enabled_if_newer_payload(
+                identity,
+                expected_metadata_revision,
+                previous_generation,
+                enabled,
+                updated_at,
+            )
+        }
+
         fn switch_credential(
             &self,
             selected: &str,
@@ -6448,6 +6501,16 @@ mod tests {
             updated_at: Timestamp,
         ) -> StoreResult<Vec<CredentialState>> {
             self.inner.switch_credential(selected, siblings, updated_at)
+        }
+
+        fn switch_credential_if_identities(
+            &self,
+            selected: &pooler_store::CredentialConfigurationIdentity,
+            siblings: &[pooler_store::CredentialConfigurationIdentity],
+            updated_at: Timestamp,
+        ) -> StoreResult<Option<Vec<CredentialState>>> {
+            self.inner
+                .switch_credential_if_identities(selected, siblings, updated_at)
         }
 
         fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool> {
@@ -6505,6 +6568,14 @@ mod tests {
             }
         }
 
+        fn cooldowns_snapshot(&self, now: Timestamp) -> StoreResult<Vec<CooldownState>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.cooldowns_snapshot(now)
+            }
+        }
+
         fn remove_cooldown(&self, scope: &str, key: &str) -> StoreResult<bool> {
             self.inner.remove_cooldown(scope, key)
         }
@@ -6526,6 +6597,14 @@ mod tests {
 
         fn session_affinities(&self, now: Timestamp) -> StoreResult<Vec<SessionAffinity>> {
             self.inner.session_affinities(now)
+        }
+
+        fn session_affinities_snapshot(&self, now: Timestamp) -> StoreResult<Vec<SessionAffinity>> {
+            if self.should_fail() {
+                self.unavailable()
+            } else {
+                self.inner.session_affinities_snapshot(now)
+            }
         }
 
         fn remove_session_affinity(&self, key: &str) -> StoreResult<bool> {
@@ -6935,6 +7014,69 @@ routes:
         assert!(listeners.contains("route_count"));
         let metrics = api.handle(&Method::GET, "/metrics", &headers);
         assert!(String::from_utf8_lossy(&metrics.body).contains("dropped_series"));
+    }
+
+    #[test]
+    fn configured_account_identity_conflict_is_not_reported_as_missing() {
+        let secret = tempfile::NamedTempFile::new().expect("management secret");
+        std::fs::write(secret.path(), "management-mutation-secret").expect("write secret");
+        #[cfg(unix)]
+        std::fs::set_permissions(secret.path(), std::fs::Permissions::from_mode(0o600))
+            .expect("secret permissions");
+        let config = pooler_config::compile_yaml(
+            "management-account-identity-conflict.yaml",
+            &format!(
+                "version: 2
+management: {{bind: 127.0.0.1:0, auth: {{secret: 'file:{}'}}}}
+upstreams: {{provider-a: {{url: http://127.0.0.1:1}}}}
+accounts: {{account-a: {{provider: provider-a, secret: env:POOLER_ACCOUNT_KEY}}}}
+",
+                secret.path().display(),
+            ),
+        )
+        .expect("identity-conflict config compiles");
+        let plan = config.management().cloned().expect("management plan");
+        let store = Arc::new(MemoryStore::new());
+        let pooling = Arc::new(
+            PoolingCoordinator::with_store(&config, store.clone()).expect("pooling coordinator"),
+        );
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "account-a",
+                "provider-a",
+                "f".repeat(64),
+                true,
+                2,
+            ))
+            .expect("inject stale durable identity");
+        let api = ManagementApi::new(
+            plan,
+            Arc::new(ConfigStore::with_generation(
+                ConfigGeneration::new(config.generation()),
+                config,
+            )),
+            pooling,
+            ActiveCounts::new(),
+        );
+        let mut headers = loopback_headers();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer management-mutation-secret"),
+        );
+
+        let conflict = api.handle(&Method::POST, "/accounts/account-a/disable", &headers);
+        assert_eq!(conflict.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_value(conflict)["error"]["code"],
+            "state_unavailable"
+        );
+
+        let missing = api.handle(&Method::POST, "/accounts/missing/disable", &headers);
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_value(missing)["error"]["code"],
+            "account_not_found"
+        );
     }
 
     #[test]

@@ -43,13 +43,15 @@ pub use media::{
     MediaSemanticAdapter, MediaSemanticAdapterError, MEDIA_BINARY_DECODER, MEDIA_MULTIPART_DECODER,
 };
 pub use native::{
-    account_configuration_fingerprint, NativeAuthorization, NativeAuthorizationRequest,
+    account_configuration_fingerprint, account_configuration_fingerprint_migration_candidates,
+    legacy_account_configuration_fingerprint, NativeAuthorization, NativeAuthorizationRequest,
     NativeBrowserAuthorization, NativeBrowserLoginSession, NativeOAuthLoginResult, NativeRuntime,
-    NativeRuntimeError,
+    NativeRuntimeError, PreparedNativeRuntime,
 };
 pub use pool::{
     apply_configured_account_auth, PersistenceStatus, PersistenceStream, PoolError, PoolFailure,
-    PoolSelection, PoolingCoordinator, SelectionContext, SelectionTiming,
+    PoolSelection, PoolingCoordinator, PreparedPoolingCoordinator, SelectionContext,
+    SelectionTiming,
 };
 pub use proxy::{
     apply_configured_upstream_auth, apply_configured_upstream_headers, BoxError, HttpProxy,

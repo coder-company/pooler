@@ -4375,6 +4375,12 @@ fn compile_retry(
             "retry elapsed and recovery budgets must be greater than zero",
         ));
     }
+    // Recovery hints and ordinary retry sleeps have independent budgets.
+    // A caller may allow a long provider recovery horizon while keeping
+    // exponential retry delays tightly bounded.
+    let maximum_recovery_wait = declaration
+        .maximum_recovery_wait
+        .unwrap_or(DEFAULT_RETRY_TOTAL_DELAY);
     let mut statuses = declaration.statuses;
     for status in &statuses {
         if !matches!(*status, 408 | 425 | 429 | 500..=599) {
@@ -4393,9 +4399,7 @@ fn compile_retry(
         maximum_elapsed: declaration
             .maximum_elapsed
             .or(Some(DEFAULT_RETRY_TOTAL_DELAY)),
-        maximum_recovery_wait: declaration
-            .maximum_recovery_wait
-            .or(Some(DEFAULT_RETRY_TOTAL_DELAY)),
+        maximum_recovery_wait: Some(maximum_recovery_wait),
         base_delay,
         maximum_delay,
         maximum_total_delay,
@@ -8994,6 +8998,14 @@ routes:
         assert!(policy.retry().before_commit_only());
         assert_eq!(policy.retry().maximum_attempts(), 3);
         assert_eq!(policy.retry().maximum_credentials(), 2);
+        assert_eq!(
+            policy.retry().maximum_elapsed(),
+            Some(DEFAULT_RETRY_TOTAL_DELAY)
+        );
+        assert_eq!(
+            policy.retry().maximum_recovery_wait(),
+            Some(DEFAULT_RETRY_TOTAL_DELAY)
+        );
         assert!(policy.retry().allows_status(503));
         assert!(!policy.retry().allows_status(400));
         assert_eq!(policy.stream().bootstrap_bytes(), 64 * 1024);
@@ -9031,6 +9043,28 @@ policies:
         let error = compile_yaml("invalid-status.yaml", invalid_status)
             .expect_err("invalid status must not retry");
         assert!(error.to_string().contains("retry statuses"));
+    }
+
+    #[test]
+    fn retry_recovery_horizon_is_independent_from_retry_delay_budget() {
+        let text = r#"
+version: 2
+policies:
+  default:
+    retry:
+      maximum_attempts: 2
+      maximum_credentials: 2
+      before_commit_only: true
+      statuses: [503]
+      maximum_delay: 1s
+      maximum_total_delay: 1s
+      maximum_recovery_wait: 30s
+"#;
+        let config = compile_yaml("independent-recovery.yaml", text)
+            .expect("independent recovery horizon compiles");
+        let retry = config.policies()["default"].retry();
+        assert_eq!(retry.maximum_total_delay(), Duration::from_secs(1));
+        assert_eq!(retry.maximum_recovery_wait(), Some(Duration::from_secs(30)));
     }
 
     #[test]

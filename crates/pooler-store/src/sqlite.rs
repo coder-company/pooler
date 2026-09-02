@@ -5,6 +5,7 @@
 //! transaction boundary explicit while still allowing callers to share the
 //! store safely across worker threads.
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -16,16 +17,17 @@ use rusqlite::{
 
 use crate::{
     encrypted::{CredentialCipher, CredentialPayload, CREDENTIAL_IDENTITY_AAD_VERSION},
-    hex_digest, non_empty, validate_fingerprint, AffinityBindingIdentity, AuditRecord,
-    CooldownState, CredentialHealthState, CredentialHealthStatus, CredentialState, DecisionRecord,
-    DraftRecord, ManagedSecretRecord, ManagementSessionRecord, MasterKey, MemoryStore,
-    OAuthFlowRecord, OAuthFlowStatus, PruneReport, ReloadRecord, RequestEvent, RetentionPolicy,
-    SecretPayload, SessionAffinity, Store, StoreError, StoreLengths, StoreResult, Timestamp,
-    UsageRecord, MAX_REQUEST_EVENTS_PER_REQUEST,
+    hex_digest, non_empty, validate_fingerprint, ActivatedCredentialState, AffinityBindingIdentity,
+    AuditRecord, ConditionalCredentialMutation, CooldownState, CredentialConfigurationActivation,
+    CredentialConfigurationIdentity, CredentialFingerprintRetirement, CredentialHealthState,
+    CredentialHealthStatus, CredentialState, DecisionRecord, DraftRecord, ManagedSecretRecord,
+    ManagementSessionRecord, MasterKey, MemoryStore, OAuthFlowRecord, OAuthFlowStatus, PruneReport,
+    ReloadRecord, RequestEvent, RetentionPolicy, SecretPayload, SessionAffinity, Store, StoreError,
+    StoreLengths, StoreResult, Timestamp, UsageRecord, MAX_REQUEST_EVENTS_PER_REQUEST,
 };
 
 const MAX_COOLDOWNS: usize = 4_096;
-const LATEST_SCHEMA_VERSION: i64 = 10;
+const LATEST_SCHEMA_VERSION: i64 = 14;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("migrations/001_initial.sql")),
     (2, include_str!("migrations/002_health_and_cooldowns.sql")),
@@ -40,7 +42,38 @@ const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("migrations/009_reload_completion_generation.sql"),
     ),
     (10, include_str!("migrations/010_reload_kind.sql")),
+    (
+        11,
+        include_str!("migrations/011_credential_revision_clock.sql"),
+    ),
+    (
+        12,
+        include_str!("migrations/012_credential_payload_generation.sql"),
+    ),
+    (
+        13,
+        include_str!("migrations/013_credential_payload_reencryption.sql"),
+    ),
+    (
+        14,
+        include_str!("migrations/014_credential_revision_write_guard.sql"),
+    ),
 ];
+
+/// Credential metadata paired with the generation and decrypted payload, when present.
+pub type CredentialPayloadState = (CredentialState, Option<(u64, CredentialPayload)>);
+
+/// Stable identity of one open file-backed SQLite generation domain.
+///
+/// The database's persisted metadata cannot establish this identity because a
+/// raw filesystem copy preserves every row. Unix device/inode and Windows
+/// volume/file-index metadata identify the actual file opened by this process.
+/// Other platforms fail closed and require one cloned store handle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileGenerationDomain {
+    device: u64,
+    inode: u64,
+}
 
 /// A transactional, WAL-backed SQLite [`Store`].
 #[derive(Clone)]
@@ -48,6 +81,7 @@ pub struct SqliteStore {
     retention: RetentionPolicy,
     connection: Arc<Mutex<Connection>>,
     path: Option<PathBuf>,
+    file_generation_domain: Option<FileGenerationDomain>,
     encryption: Arc<RwLock<Option<Arc<CredentialCipher>>>>,
 }
 
@@ -276,7 +310,7 @@ impl SqliteStore {
             .encryption_read()?
             .clone()
             .ok_or(StoreError::EncryptionRequired)?;
-        self.with_transaction(|transaction| {
+        self.with_immediate_transaction(|transaction| {
             assert_cipher_current_transaction(transaction, &cipher)?;
             let current: CredentialState = transaction
                 .query_row(
@@ -294,28 +328,66 @@ impl SqliteStore {
                     return Err(StoreError::CredentialFingerprintConflict);
                 }
             }
-            if let Some(existing_envelope) = transaction
+            let existing = transaction
                 .query_row(
-                    "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
+                    "SELECT envelope, generation FROM credential_payloads
+                     WHERE credential_id = ?1",
                     [credential_id],
-                    |row| row.get::<_, Vec<u8>>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            u64::try_from(row.get::<_, i64>(1)?).unwrap_or(u64::MAX),
+                        ))
+                    },
                 )
                 .optional()
-                .map_err(sqlite_error)?
-            {
+                .map_err(sqlite_error)?;
+            if let Some((existing_envelope, _)) = &existing {
                 let aad = credential_payload_aad(credential_id, &current.configuration_fingerprint);
-                cipher.open_for(&existing_envelope, &aad)?;
+                cipher.open_for(existing_envelope, &aad)?;
             }
             let aad = credential_payload_aad(credential_id, &current.configuration_fingerprint);
             let envelope = cipher.seal_for(payload, &aad)?;
+            let allocation_revision = existing
+                .as_ref()
+                .map_or(current.revision, |(_, generation)| {
+                    current.revision.max(*generation)
+                });
+            let generation =
+                next_credential_revision(transaction, credential_id, allocation_revision)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE credentials SET updated_at = ?1, revision = ?2
+                     WHERE credential_id = ?3 AND revision = ?4",
+                    params![
+                        updated_at,
+                        i64::try_from(generation)
+                            .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                        credential_id,
+                        i64::try_from(current.revision)
+                            .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            if changed != 1 {
+                return Err(StoreError::CredentialRevisionConflict);
+            }
             transaction
                 .execute(
-                    "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
-                     VALUES (?1, ?2, ?3)
+                    "INSERT INTO credential_payloads
+                       (credential_id, envelope, updated_at, generation)
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(credential_id) DO UPDATE SET
                        envelope = excluded.envelope,
-                       updated_at = excluded.updated_at",
-                    params![credential_id, envelope, updated_at],
+                       updated_at = excluded.updated_at,
+                       generation = excluded.generation",
+                    params![
+                        credential_id,
+                        envelope,
+                        updated_at,
+                        i64::try_from(generation)
+                            .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                    ],
                 )
                 .map_err(sqlite_error)?;
             Ok(())
@@ -393,23 +465,32 @@ impl SqliteStore {
                 .optional()
                 .map_err(sqlite_error)?
                 .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
-            if current.revision != expected_revision {
-                return Err(StoreError::CredentialRevisionConflict);
-            }
             if let Some(expected) = expected_fingerprint {
                 if current.configuration_fingerprint != expected {
                     return Err(StoreError::CredentialFingerprintConflict);
                 }
             }
-            if let Some(existing_envelope) = transaction
+            let existing = transaction
                 .query_row(
-                    "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
+                    "SELECT envelope, generation FROM credential_payloads
+                     WHERE credential_id = ?1",
                     [credential_id],
-                    |row| row.get::<_, Vec<u8>>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            u64::try_from(row.get::<_, i64>(1)?).unwrap_or(u64::MAX),
+                        ))
+                    },
                 )
                 .optional()
-                .map_err(sqlite_error)?
-            {
+                .map_err(sqlite_error)?;
+            let current_generation = existing
+                .as_ref()
+                .map_or(current.revision, |(_, generation)| *generation);
+            if current_generation != expected_revision {
+                return Err(StoreError::CredentialRevisionConflict);
+            }
+            if let Some((existing_envelope, _)) = existing {
                 // Authenticate the old value before changing either the
                 // metadata revision or the encrypted payload. A wrong key
                 // must fail closed rather than overwrite an unreadable token.
@@ -418,7 +499,11 @@ impl SqliteStore {
             }
             let aad = credential_payload_aad(credential_id, &current.configuration_fingerprint);
             let envelope = cipher.seal_for(payload, &aad)?;
-            let revision = current.revision.saturating_add(1);
+            let revision = next_credential_revision(
+                transaction,
+                credential_id,
+                current.revision.max(current_generation),
+            )?;
             let changed = transaction
                 .execute(
                     "UPDATE credentials SET updated_at = ?1, revision = ?2
@@ -427,7 +512,7 @@ impl SqliteStore {
                         updated_at,
                         i64::try_from(revision).unwrap_or(i64::MAX),
                         credential_id,
-                        i64::try_from(expected_revision).unwrap_or(i64::MAX),
+                        i64::try_from(current.revision).unwrap_or(i64::MAX),
                     ],
                 )
                 .map_err(sqlite_error)?;
@@ -436,18 +521,204 @@ impl SqliteStore {
             }
             transaction
                 .execute(
-                    "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
-                     VALUES (?1, ?2, ?3)
+                    "INSERT INTO credential_payloads
+                       (credential_id, envelope, updated_at, generation)
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(credential_id) DO UPDATE SET
                        envelope = excluded.envelope,
-                       updated_at = excluded.updated_at",
-                    params![credential_id, envelope, updated_at],
+                       updated_at = excluded.updated_at,
+                       generation = excluded.generation",
+                    params![
+                        credential_id,
+                        envelope,
+                        updated_at,
+                        i64::try_from(revision)
+                            .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                    ],
                 )
                 .map_err(sqlite_error)?;
             Ok(CredentialState {
                 updated_at,
                 revision,
                 ..current
+            })
+        })
+    }
+
+    /// Atomically install a validated login profile, adopting an allowed
+    /// prior fingerprint and enabling the account in the same transaction.
+    ///
+    /// `expected_fingerprint` and `expected_generation` are both absent only
+    /// when the caller observed no credential row. Any concurrent state or
+    /// payload change aborts without retiring the previous usable payload.
+    #[allow(clippy::too_many_arguments)] // Inputs define one atomic login-replacement fence.
+    pub(crate) fn replace_credential_payload_for_login(
+        &self,
+        credential_id: &str,
+        provider_id: &str,
+        expected_fingerprint: Option<&str>,
+        expected_generation: Option<u64>,
+        configuration_fingerprint: &str,
+        payload: &CredentialPayload,
+        updated_at: Timestamp,
+    ) -> StoreResult<CredentialState> {
+        non_empty("credential_id", credential_id)?;
+        non_empty("provider_id", provider_id)?;
+        validate_fingerprint(configuration_fingerprint)?;
+        if configuration_fingerprint.is_empty()
+            || expected_fingerprint.is_some() != expected_generation.is_some()
+        {
+            return Err(StoreError::InvalidCredentialFingerprint);
+        }
+        if let Some(fingerprint) = expected_fingerprint {
+            validate_fingerprint(fingerprint)?;
+        }
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        self.with_immediate_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
+            let current: Option<CredentialState> = transaction
+                .query_row(
+                    "SELECT credential_id, provider_id, configuration_fingerprint,
+                            enabled, updated_at, revision
+                     FROM credentials WHERE credential_id = ?1",
+                    [credential_id],
+                    credential_from_row,
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            let existing = transaction
+                .query_row(
+                    "SELECT envelope, generation FROM credential_payloads
+                     WHERE credential_id = ?1",
+                    [credential_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            u64::try_from(row.get::<_, i64>(1)?).unwrap_or(u64::MAX),
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+
+            let current_revision = match (&current, expected_fingerprint, expected_generation) {
+                (None, None, None) => 0,
+                (None, Some(_), Some(_)) => {
+                    return Err(StoreError::CredentialNotFound(credential_id.to_owned()));
+                }
+                (Some(_), None, None) => {
+                    return Err(StoreError::CredentialRevisionConflict);
+                }
+                (Some(current), Some(expected_fingerprint), Some(expected_generation)) => {
+                    if current.provider_id != provider_id
+                        || current.configuration_fingerprint != expected_fingerprint
+                    {
+                        return Err(StoreError::CredentialFingerprintConflict);
+                    }
+                    let current_generation = existing
+                        .as_ref()
+                        .map_or(current.revision, |(_, generation)| *generation);
+                    if current_generation != expected_generation {
+                        return Err(StoreError::CredentialRevisionConflict);
+                    }
+                    current.revision
+                }
+                _ => return Err(StoreError::InvalidCredentialFingerprint),
+            };
+
+            if let (Some(current), Some((envelope, _))) = (&current, &existing) {
+                let aad = credential_payload_aad(credential_id, &current.configuration_fingerprint);
+                cipher.open_for(envelope, &aad)?;
+            }
+            let envelope = cipher.seal_for(
+                payload,
+                &credential_payload_aad(credential_id, configuration_fingerprint),
+            )?;
+            let allocation_revision = existing
+                .as_ref()
+                .map_or(current_revision, |(_, generation)| {
+                    current_revision.max(*generation)
+                });
+            let revision =
+                next_credential_revision(transaction, credential_id, allocation_revision)?;
+            let revision_i64 =
+                i64::try_from(revision).map_err(|_| StoreError::CredentialRevisionConflict)?;
+            let identity_changed = current
+                .as_ref()
+                .is_some_and(|state| state.configuration_fingerprint != configuration_fingerprint);
+            if identity_changed {
+                delete_credential_dependents(transaction, credential_id)?;
+            }
+            let changed = if current.is_some() {
+                transaction
+                    .execute(
+                        "UPDATE credentials
+                         SET configuration_fingerprint = ?1, enabled = 1,
+                             updated_at = ?2, revision = ?3
+                         WHERE credential_id = ?4 AND revision = ?5",
+                        params![
+                            configuration_fingerprint,
+                            updated_at,
+                            revision_i64,
+                            credential_id,
+                            i64::try_from(current_revision)
+                                .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                        ],
+                    )
+                    .map_err(sqlite_error)?
+            } else {
+                transaction
+                    .execute(
+                        "INSERT INTO credentials
+                         (credential_id, provider_id, configuration_fingerprint,
+                          enabled, updated_at, revision)
+                         VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                        params![
+                            credential_id,
+                            provider_id,
+                            configuration_fingerprint,
+                            updated_at,
+                            revision_i64,
+                        ],
+                    )
+                    .map_err(sqlite_error)?
+            };
+            if changed != 1 {
+                return Err(StoreError::CredentialRevisionConflict);
+            }
+            if !identity_changed {
+                transaction
+                    .execute(
+                        "UPDATE credential_health
+                         SET status = 'healthy', cooldown_until = NULL, updated_at = ?1
+                         WHERE credential_id = ?2 AND status = 'disabled'",
+                        params![updated_at, credential_id],
+                    )
+                    .map_err(sqlite_error)?;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO credential_payloads
+                       (credential_id, envelope, updated_at, generation)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(credential_id) DO UPDATE SET
+                       envelope = excluded.envelope,
+                       updated_at = excluded.updated_at,
+                       generation = excluded.generation",
+                    params![credential_id, envelope, updated_at, revision_i64],
+                )
+                .map_err(sqlite_error)?;
+            evict_credentials(transaction, self.retention.max_credentials)?;
+            Ok(CredentialState {
+                credential_id: credential_id.to_owned(),
+                provider_id: provider_id.to_owned(),
+                configuration_fingerprint: configuration_fingerprint.to_owned(),
+                enabled: true,
+                updated_at,
+                revision,
             })
         })
     }
@@ -527,13 +798,53 @@ impl SqliteStore {
         row.1.map(|value| cipher.open_for(&value, &aad)).transpose()
     }
 
+    /// Return the generation a payload compare-and-swap must own for one
+    /// immutable credential identity. Before the first payload is written,
+    /// the metadata revision fences concurrent identity and state changes.
+    pub fn credential_payload_compare_generation_for_fingerprint(
+        &self,
+        credential_id: &str,
+        configuration_fingerprint: &str,
+    ) -> StoreResult<u64> {
+        non_empty("credential_id", credential_id)?;
+        validate_fingerprint(configuration_fingerprint)?;
+        let encryption = self.encryption_read()?;
+        let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
+        let connection = self.connection()?;
+        assert_cipher_current_connection(&connection, cipher)?;
+        let row = connection
+            .query_row(
+                "SELECT c.configuration_fingerprint, c.revision, p.generation
+                 FROM credentials AS c
+                 LEFT JOIN credential_payloads AS p
+                   ON p.credential_id = c.credential_id
+                 WHERE c.credential_id = ?1",
+                [credential_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
+        if row.0 != configuration_fingerprint {
+            return Err(StoreError::CredentialFingerprintConflict);
+        }
+        let generation = row.2.unwrap_or(row.1);
+        u64::try_from(generation).map_err(|_| StoreError::CredentialRevisionConflict)
+    }
+
     /// Load credential metadata and its encrypted payload under one SQLite
     /// connection lock. This prevents an OAuth reader from pairing a newer
     /// revision with an older payload while a refresh transaction commits.
     pub fn credential_payload_with_state(
         &self,
         credential_id: &str,
-    ) -> StoreResult<Option<(CredentialState, Option<CredentialPayload>)>> {
+    ) -> StoreResult<Option<CredentialPayloadState>> {
         non_empty("credential_id", credential_id)?;
         let encryption = self.encryption_read()?;
         let cipher = encryption.as_ref().ok_or(StoreError::EncryptionRequired)?;
@@ -542,7 +853,8 @@ impl SqliteStore {
         let row = connection
             .query_row(
                 "SELECT c.credential_id, c.provider_id, c.configuration_fingerprint,
-                        c.enabled, c.updated_at, c.revision, p.envelope
+                        c.enabled, c.updated_at, c.revision,
+                        p.generation, p.envelope
                  FROM credentials AS c
                  LEFT JOIN credential_payloads AS p
                    ON p.credential_id = c.credential_id
@@ -557,16 +869,23 @@ impl SqliteStore {
                         updated_at: row.get(4)?,
                         revision: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(u64::MAX),
                     };
-                    let envelope = row.get::<_, Option<Vec<u8>>>(6)?;
-                    Ok((state, envelope))
+                    let generation = row
+                        .get::<_, Option<i64>>(6)?
+                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX));
+                    let envelope = row.get::<_, Option<Vec<u8>>>(7)?;
+                    Ok((state, generation.zip(envelope)))
                 },
             )
             .optional()
             .map_err(sqlite_error)?;
-        row.map(|(state, envelope)| {
+        row.map(|(state, payload)| {
             let aad = credential_payload_aad(credential_id, &state.configuration_fingerprint);
-            envelope
-                .map(|value| cipher.open_for(&value, &aad))
+            payload
+                .map(|(generation, value)| {
+                    cipher
+                        .open_for(&value, &aad)
+                        .map(|payload| (generation, payload))
+                })
                 .transpose()
                 .map(|payload| (state, payload))
         })
@@ -581,7 +900,7 @@ impl SqliteStore {
         &self,
         credential_id: &str,
         configuration_fingerprint: &str,
-    ) -> StoreResult<Option<(CredentialState, Option<CredentialPayload>)>> {
+    ) -> StoreResult<Option<CredentialPayloadState>> {
         non_empty("credential_id", credential_id)?;
         validate_fingerprint(configuration_fingerprint)?;
         let encryption = self.encryption_read()?;
@@ -591,7 +910,8 @@ impl SqliteStore {
         let row = connection
             .query_row(
                 "SELECT c.credential_id, c.provider_id, c.configuration_fingerprint,
-                        c.enabled, c.updated_at, c.revision, p.envelope
+                        c.enabled, c.updated_at, c.revision,
+                        p.generation, p.envelope
                  FROM credentials AS c
                  LEFT JOIN credential_payloads AS p
                    ON p.credential_id = c.credential_id
@@ -606,21 +926,28 @@ impl SqliteStore {
                         updated_at: row.get(4)?,
                         revision: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(u64::MAX),
                     };
-                    let envelope = row.get::<_, Option<Vec<u8>>>(6)?;
-                    Ok((state, envelope))
+                    let generation = row
+                        .get::<_, Option<i64>>(6)?
+                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX));
+                    let envelope = row.get::<_, Option<Vec<u8>>>(7)?;
+                    Ok((state, generation.zip(envelope)))
                 },
             )
             .optional()
             .map_err(sqlite_error)?;
-        let Some((state, envelope)) = row else {
+        let Some((state, payload)) = row else {
             return Ok(None);
         };
         if state.configuration_fingerprint != configuration_fingerprint {
             return Err(StoreError::CredentialFingerprintConflict);
         }
         let aad = credential_payload_aad(credential_id, &state.configuration_fingerprint);
-        envelope
-            .map(|value| cipher.open_for(&value, &aad))
+        payload
+            .map(|(generation, value)| {
+                cipher
+                    .open_for(&value, &aad)
+                    .map(|payload| (generation, payload))
+            })
             .transpose()
             .map(|payload| Some((state, payload)))
     }
@@ -666,19 +993,32 @@ impl SqliteStore {
             let new_aad = credential_payload_aad(credential_id, new_fingerprint);
             let replacement = transaction
                 .query_row(
-                    "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
+                    "SELECT envelope, generation FROM credential_payloads
+                     WHERE credential_id = ?1",
                     [credential_id],
-                    |row| row.get::<_, Vec<u8>>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            u64::try_from(row.get::<_, i64>(1)?).unwrap_or(u64::MAX),
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(sqlite_error)?
-                .map(|envelope| {
+                .map(|(envelope, generation)| {
                     cipher
                         .open_for(&envelope, &old_aad)
                         .and_then(|payload| cipher.seal_for(&payload, &new_aad))
+                        .map(|replacement| (replacement, generation))
                 })
                 .transpose()?;
-            let revision = current.revision.saturating_add(1);
+            let allocation_revision = replacement
+                .as_ref()
+                .map_or(current.revision, |(_, generation)| {
+                    current.revision.max(*generation)
+                });
+            let revision =
+                next_credential_revision(transaction, credential_id, allocation_revision)?;
             let changed = transaction
                 .execute(
                     "UPDATE credentials
@@ -696,12 +1036,19 @@ impl SqliteStore {
             if changed != 1 {
                 return Err(StoreError::CredentialRevisionConflict);
             }
-            if let Some(envelope) = replacement {
+            if let Some((envelope, _)) = replacement {
                 transaction
                     .execute(
-                        "UPDATE credential_payloads SET envelope = ?1, updated_at = ?2
-                         WHERE credential_id = ?3",
-                        params![envelope, updated_at, credential_id],
+                        "UPDATE credential_payloads
+                         SET envelope = ?1, updated_at = ?2, generation = ?3
+                         WHERE credential_id = ?4",
+                        params![
+                            envelope,
+                            updated_at,
+                            i64::try_from(revision)
+                                .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                            credential_id,
+                        ],
                     )
                     .map_err(sqlite_error)?;
             }
@@ -711,6 +1058,165 @@ impl SqliteStore {
                 revision,
                 ..current
             })
+        })
+    }
+
+    /// Replace a legacy credential identity while deliberately discarding its
+    /// encrypted payload. The credential is disabled and the metadata change,
+    /// payload removal, and revision advance commit atomically.
+    ///
+    /// This is the fail-closed migration path when a newer fingerprint covers
+    /// identity fields that the legacy fingerprint omitted. Preserving or
+    /// re-encrypting the old payload would incorrectly bless it for the newer
+    /// identity.
+    pub fn retire_credential_fingerprint(
+        &self,
+        credential_id: &str,
+        expected_old_fingerprint: &str,
+        new_fingerprint: &str,
+        updated_at: Timestamp,
+    ) -> StoreResult<CredentialState> {
+        let current = self
+            .credential_state(credential_id)?
+            .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
+        let retirement = CredentialFingerprintRetirement::new(
+            credential_id,
+            current.provider_id,
+            expected_old_fingerprint,
+            new_fingerprint,
+        )?;
+        self.retire_credential_fingerprints_atomically(&[retirement], updated_at)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))
+    }
+
+    /// Retire a batch of legacy credential fingerprints in one transaction.
+    ///
+    /// Every provider and fingerprint is validated before any payload is
+    /// removed. A stale, missing, duplicate, unreadable, or otherwise invalid
+    /// member aborts the entire batch, preserving every prior credential.
+    pub fn retire_credential_fingerprints_atomically(
+        &self,
+        retirements: &[CredentialFingerprintRetirement],
+        updated_at: Timestamp,
+    ) -> StoreResult<Vec<CredentialState>> {
+        let mut credential_ids = BTreeSet::new();
+        for retirement in retirements {
+            if !credential_ids.insert(retirement.credential_id()) {
+                return Err(StoreError::CredentialFingerprintConflict);
+            }
+        }
+        if retirements.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cipher = self
+            .encryption_read()?
+            .clone()
+            .ok_or(StoreError::EncryptionRequired)?;
+        self.with_immediate_transaction(|transaction| {
+            assert_cipher_current_transaction(transaction, &cipher)?;
+            let mut current_states = Vec::with_capacity(retirements.len());
+            for retirement in retirements {
+                let current: CredentialState = transaction
+                    .query_row(
+                        "SELECT credential_id, provider_id, configuration_fingerprint,
+                                enabled, updated_at, revision
+                         FROM credentials WHERE credential_id = ?1",
+                        [retirement.credential_id()],
+                        credential_from_row,
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?
+                    .ok_or_else(|| {
+                        StoreError::CredentialNotFound(retirement.credential_id().to_owned())
+                    })?;
+                if current.provider_id != retirement.provider_id() {
+                    return Err(StoreError::CredentialFingerprintConflict);
+                }
+                if current.configuration_fingerprint == retirement.replacement_fingerprint() {
+                    current_states.push(current);
+                    continue;
+                }
+                if current.configuration_fingerprint != retirement.expected_fingerprint() {
+                    return Err(StoreError::CredentialFingerprintConflict);
+                }
+                if let Some(envelope) = transaction
+                    .query_row(
+                        "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
+                        [retirement.credential_id()],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?
+                {
+                    let aad = credential_payload_aad(
+                        retirement.credential_id(),
+                        retirement.expected_fingerprint(),
+                    );
+                    cipher.open_for(&envelope, &aad)?;
+                }
+                current_states.push(current);
+            }
+
+            let mut retired = Vec::with_capacity(retirements.len());
+            for (retirement, current) in retirements.iter().zip(current_states) {
+                if current.configuration_fingerprint == retirement.replacement_fingerprint() {
+                    retired.push(current);
+                    continue;
+                }
+                let revision = next_credential_revision(
+                    transaction,
+                    retirement.credential_id(),
+                    current.revision,
+                )?;
+                delete_credential_dependents(transaction, retirement.credential_id())?;
+                transaction
+                    .execute(
+                        "DELETE FROM credential_payloads WHERE credential_id = ?1",
+                        [retirement.credential_id()],
+                    )
+                    .map_err(sqlite_error)?;
+                let changed = transaction
+                    .execute(
+                        "UPDATE credentials
+                         SET configuration_fingerprint = ?1, enabled = 0,
+                             updated_at = ?2, revision = ?3
+                         WHERE credential_id = ?4 AND revision = ?5",
+                        params![
+                            retirement.replacement_fingerprint(),
+                            updated_at,
+                            i64::try_from(revision)
+                                .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                            retirement.credential_id(),
+                            i64::try_from(current.revision)
+                                .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                        ],
+                    )
+                    .map_err(sqlite_error)?;
+                if changed != 1 {
+                    return Err(StoreError::CredentialRevisionConflict);
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO credential_health
+                         (credential_id, status, failure_count, cooldown_until, updated_at)
+                         VALUES (?1, 'disabled', 0, NULL, ?2)
+                         ON CONFLICT(credential_id) DO UPDATE SET
+                           status = 'disabled', failure_count = 0,
+                           cooldown_until = NULL, updated_at = excluded.updated_at",
+                        params![retirement.credential_id(), updated_at],
+                    )
+                    .map_err(sqlite_error)?;
+                retired.push(CredentialState {
+                    configuration_fingerprint: retirement.replacement_fingerprint().to_owned(),
+                    enabled: false,
+                    updated_at,
+                    revision,
+                    ..current
+                });
+            }
+            Ok(retired)
         })
     }
 
@@ -748,21 +1254,33 @@ impl SqliteStore {
         if self.encryption_read()?.is_none() {
             return Err(StoreError::EncryptionRequired);
         }
-        self.with_transaction(|transaction| {
-            let current_revision: Option<i64> = transaction
+        self.with_immediate_transaction(|transaction| {
+            let current: Option<(u64, Option<u64>)> = transaction
                 .query_row(
-                    "SELECT revision FROM credentials WHERE credential_id = ?1",
+                    "SELECT c.revision, p.generation
+                     FROM credentials AS c
+                     LEFT JOIN credential_payloads AS p
+                       ON p.credential_id = c.credential_id
+                     WHERE c.credential_id = ?1",
                     [credential_id],
-                    |row| row.get(0),
+                    |row| {
+                        Ok((
+                            u64::try_from(row.get::<_, i64>(0)?).unwrap_or(u64::MAX),
+                            row.get::<_, Option<i64>>(1)?
+                                .map(|generation| u64::try_from(generation).unwrap_or(u64::MAX)),
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(sqlite_error)?;
-            let Some(current_revision) = current_revision else {
+            let Some((current_revision, payload_generation)) = current else {
                 return Ok(false);
             };
-            let next_revision = current_revision
-                .checked_add(1)
-                .ok_or(StoreError::CredentialRevisionConflict)?;
+            let allocation_revision = payload_generation.map_or(current_revision, |generation| {
+                current_revision.max(generation)
+            });
+            let next_revision =
+                next_credential_revision(transaction, credential_id, allocation_revision)?;
             let removed = transaction
                 .execute(
                     "DELETE FROM credential_payloads WHERE credential_id = ?1",
@@ -773,7 +1291,13 @@ impl SqliteStore {
                 .execute(
                     "UPDATE credentials SET revision = ?1
                      WHERE credential_id = ?2 AND revision = ?3",
-                    params![next_revision, credential_id, current_revision],
+                    params![
+                        i64::try_from(next_revision)
+                            .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                        credential_id,
+                        i64::try_from(current_revision)
+                            .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                    ],
                 )
                 .map_err(sqlite_error)?;
             if advanced != 1 {
@@ -801,7 +1325,8 @@ impl SqliteStore {
         let credential_rows = {
             let mut statement = transaction
                 .prepare(
-                    "SELECT p.credential_id, c.configuration_fingerprint, p.envelope
+                    "SELECT p.credential_id, c.configuration_fingerprint, p.envelope,
+                            p.generation
                      FROM credential_payloads AS p
                      JOIN credentials AS c ON c.credential_id = p.credential_id
                      ORDER BY p.credential_id ASC",
@@ -813,23 +1338,62 @@ impl SqliteStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
+                        u64::try_from(row.get::<_, i64>(3)?).unwrap_or(u64::MAX),
                     ))
                 })
                 .map_err(sqlite_error)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?
         };
+        let payload_reencryption_armed = !credential_rows.is_empty();
+        if payload_reencryption_armed {
+            let armed = transaction
+                .execute(
+                    "UPDATE credential_payload_reencryption_guard SET active = 1
+                     WHERE singleton = 1 AND active = 0",
+                    [],
+                )
+                .map_err(sqlite_error)?;
+            if armed != 1 {
+                return Err(StoreError::Sqlite(
+                    "credential payload re-encryption guard is unavailable".to_owned(),
+                ));
+            }
+        }
         let mut rotated = 0_usize;
-        for (credential_id, fingerprint, envelope) in credential_rows {
+        for (credential_id, fingerprint, envelope, payload_generation) in credential_rows {
             let aad = credential_payload_aad(&credential_id, &fingerprint);
             let payload = current.open_for(&envelope, &aad)?;
             let replacement = next.seal_for(&payload, &aad)?;
-            transaction
+            let changed = transaction
                 .execute(
-                    "UPDATE credential_payloads SET envelope = ?1 WHERE credential_id = ?2",
-                    params![replacement, credential_id],
+                    "UPDATE credential_payloads SET envelope = ?1
+                     WHERE credential_id = ?2 AND generation = ?3",
+                    params![
+                        replacement,
+                        credential_id,
+                        i64::try_from(payload_generation)
+                            .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                    ],
                 )
                 .map_err(sqlite_error)?;
+            if changed != 1 {
+                return Err(StoreError::CredentialRevisionConflict);
+            }
             rotated += 1;
+        }
+        if payload_reencryption_armed {
+            let disarmed = transaction
+                .execute(
+                    "UPDATE credential_payload_reencryption_guard SET active = 0
+                     WHERE singleton = 1 AND active = 1",
+                    [],
+                )
+                .map_err(sqlite_error)?;
+            if disarmed != 1 {
+                return Err(StoreError::Sqlite(
+                    "credential payload re-encryption guard could not be cleared".to_owned(),
+                ));
+            }
         }
 
         // Request IDs remain encrypted inside the event envelope. Rebuild the
@@ -2212,6 +2776,11 @@ fn initialize_connection(
             .map_err(sqlite_error)?;
     }
     migrate(&mut connection)?;
+    let file_generation_domain = path
+        .as_deref()
+        .map(database_file_generation_domain)
+        .transpose()?
+        .flatten();
     if let Some(path) = &path {
         ensure_private_sidecars(path)?;
     }
@@ -2223,6 +2792,7 @@ fn initialize_connection(
         retention,
         connection: Arc::new(Mutex::new(connection)),
         path,
+        file_generation_domain,
         encryption: Arc::new(RwLock::new(encryption)),
     })
 }
@@ -2294,6 +2864,12 @@ fn checkpoint_and_backup_quiesced(source: &Path, destination: &Path) -> StoreRes
                 "SQLite backup integrity check reported `{integrity}`"
             )));
         }
+        destination_connection
+            .execute(
+                "UPDATE store_identity SET identity = randomblob(16) WHERE singleton = 1",
+                [],
+            )
+            .map_err(sqlite_error)?;
         drop(destination_connection);
         #[cfg(unix)]
         {
@@ -2328,6 +2904,36 @@ fn checkpoint_connection(connection: &Connection) -> StoreResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn database_file_generation_domain(path: &Path) -> StoreResult<Option<FileGenerationDomain>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(path).map_err(io_error)?;
+    Ok(Some(FileGenerationDomain {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }))
+}
+
+#[cfg(windows)]
+fn database_file_generation_domain(path: &Path) -> StoreResult<Option<FileGenerationDomain>> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(path).map_err(io_error)?;
+    Ok(metadata
+        .volume_serial_number()
+        .zip(metadata.file_index())
+        .map(|(volume, index)| FileGenerationDomain {
+            device: u64::from(volume),
+            inode: index,
+        }))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn database_file_generation_domain(_path: &Path) -> StoreResult<Option<FileGenerationDomain>> {
+    Ok(None)
 }
 
 fn migrate(connection: &mut Connection) -> StoreResult<()> {
@@ -3605,6 +4211,50 @@ fn evict_decisions(transaction: &Transaction<'_>, limit: usize) -> StoreResult<u
         .map_err(sqlite_error)
 }
 
+fn next_credential_revision(
+    transaction: &Transaction<'_>,
+    _credential_id: &str,
+    current_revision: u64,
+) -> StoreResult<u64> {
+    let minimum = current_revision
+        .checked_add(1)
+        .ok_or(StoreError::CredentialRevisionConflict)?;
+    let minimum = i64::try_from(minimum).map_err(|_| StoreError::CredentialRevisionConflict)?;
+    let advanced = transaction
+        .execute(
+            "UPDATE credential_revision_clock
+             SET revision = CASE
+                 WHEN revision < ?1 THEN ?1
+                 ELSE revision + 1
+             END
+             WHERE singleton = 1 AND revision < ?2",
+            params![minimum, i64::MAX],
+        )
+        .map_err(sqlite_error)?;
+    if advanced != 1 {
+        return Err(StoreError::CredentialRevisionConflict);
+    }
+    let revision = transaction
+        .query_row(
+            "SELECT revision FROM credential_revision_clock WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(sqlite_error)?;
+    let revision = u64::try_from(revision).map_err(|_| StoreError::CredentialRevisionConflict)?;
+    let armed = transaction
+        .execute(
+            "UPDATE credential_revision_write_guard SET revision = ?1
+             WHERE singleton = 1 AND revision IS NULL",
+            [i64::try_from(revision).map_err(|_| StoreError::CredentialRevisionConflict)?],
+        )
+        .map_err(sqlite_error)?;
+    if armed != 1 {
+        return Err(StoreError::CredentialRevisionConflict);
+    }
+    Ok(revision)
+}
+
 fn set_credential_enabled_tx(
     transaction: &Transaction<'_>,
     credential_id: &str,
@@ -3645,7 +4295,7 @@ fn set_credential_enabled_tx(
     if old.enabled == enabled {
         return Ok(old);
     }
-    let revision = old.revision.saturating_add(1);
+    let revision = next_credential_revision(transaction, credential_id, old.revision)?;
     transaction
         .execute(
             "UPDATE credentials SET enabled = ?1, updated_at = ?2, revision = ?3
@@ -3664,6 +4314,97 @@ fn set_credential_enabled_tx(
         revision,
         ..old
     })
+}
+
+fn set_credential_enabled_if_current_tx(
+    transaction: &Transaction<'_>,
+    credential_id: &str,
+    expected_revision: u64,
+    expected_provider_id: &str,
+    expected_configuration_fingerprint: &str,
+    enabled: bool,
+    updated_at: Timestamp,
+) -> StoreResult<ConditionalCredentialMutation> {
+    let current = transaction
+        .query_row(
+            "SELECT c.credential_id, c.provider_id, c.configuration_fingerprint,
+                    c.enabled, c.updated_at, c.revision, p.generation
+             FROM credentials c
+             LEFT JOIN credential_payloads p
+               ON p.credential_id = c.credential_id
+             WHERE c.credential_id = ?1",
+            [credential_id],
+            |row| {
+                Ok((
+                    credential_from_row(row)?,
+                    row.get::<_, Option<i64>>(6)?
+                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((current, credential_payload_generation)) = current else {
+        return Ok(ConditionalCredentialMutation::Missing);
+    };
+    let compare_generation = credential_payload_generation.unwrap_or(current.revision);
+    if compare_generation != expected_revision
+        || current.provider_id != expected_provider_id
+        || current.configuration_fingerprint != expected_configuration_fingerprint
+    {
+        return Ok(ConditionalCredentialMutation::Stale {
+            current,
+            credential_payload_present: Some(credential_payload_generation.is_some()),
+            credential_payload_generation,
+        });
+    }
+    set_credential_enabled_tx(transaction, credential_id, enabled, updated_at)
+        .map(ConditionalCredentialMutation::Applied)
+}
+
+fn set_credential_enabled_if_newer_payload_tx(
+    transaction: &Transaction<'_>,
+    identity: &CredentialConfigurationIdentity,
+    expected_metadata_revision: u64,
+    previous_generation: u64,
+    enabled: bool,
+    updated_at: Timestamp,
+) -> StoreResult<ConditionalCredentialMutation> {
+    let current = transaction
+        .query_row(
+            "SELECT c.credential_id, c.provider_id, c.configuration_fingerprint,
+                    c.enabled, c.updated_at, c.revision, p.generation
+             FROM credentials c
+             LEFT JOIN credential_payloads p
+               ON p.credential_id = c.credential_id
+             WHERE c.credential_id = ?1",
+            [identity.credential_id()],
+            |row| {
+                Ok((
+                    credential_from_row(row)?,
+                    row.get::<_, Option<i64>>(6)?
+                        .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((current, credential_payload_generation)) = current else {
+        return Ok(ConditionalCredentialMutation::Missing);
+    };
+    let payload_is_newer =
+        credential_payload_generation.is_some_and(|generation| generation > previous_generation);
+    let metadata_is_fenced = current.revision == expected_metadata_revision
+        || credential_payload_generation == Some(current.revision);
+    if !identity.matches(&current) || !payload_is_newer || !metadata_is_fenced {
+        return Ok(ConditionalCredentialMutation::Stale {
+            current,
+            credential_payload_present: Some(credential_payload_generation.is_some()),
+            credential_payload_generation,
+        });
+    }
+    set_credential_enabled_tx(transaction, identity.credential_id(), enabled, updated_at)
+        .map(ConditionalCredentialMutation::Applied)
 }
 
 fn credential_payload_aad(credential_id: &str, fingerprint: &str) -> Vec<u8> {
@@ -3850,11 +4591,19 @@ impl Store for SqliteStore {
         self.retention
     }
 
+    fn shares_credential_generation_domain(&self, store: &SqliteStore) -> bool {
+        Arc::ptr_eq(&self.connection, &store.connection)
+            || self
+                .file_generation_domain
+                .zip(store.file_generation_domain)
+                .is_some_and(|(left, right)| left == right)
+    }
+
     fn upsert_credential_state(&self, state: CredentialState) -> StoreResult<CredentialState> {
         non_empty("credential_id", &state.credential_id)?;
         non_empty("provider_id", &state.provider_id)?;
         validate_fingerprint(&state.configuration_fingerprint)?;
-        let (revision, configuration_fingerprint) = self.with_transaction(|transaction| {
+        let (revision, configuration_fingerprint) = self.with_immediate_transaction(|transaction| {
             let existing: Option<(String, i64, String, bool)> = transaction
                 .query_row(
                     "SELECT provider_id, revision, configuration_fingerprint,
@@ -3882,12 +4631,28 @@ impl Store for SqliteStore {
             } else {
                 state.configuration_fingerprint.clone()
             };
-            let revision = existing
+            let current_revision = existing
+                .as_ref()
                 .map(|(_, value, _, _)| {
-                    u64::try_from(value).unwrap_or(u64::MAX).saturating_add(1)
+                    u64::try_from(*value).map_err(|_| StoreError::CredentialRevisionConflict)
                 })
-                .unwrap_or(1);
-            let revision_i64 = i64::try_from(revision).unwrap_or(i64::MAX);
+                .transpose()?
+                .unwrap_or(0);
+            let revision = next_credential_revision(
+                transaction,
+                &state.credential_id,
+                current_revision,
+            )?;
+            let revision_i64 = i64::try_from(revision)
+                .map_err(|_| StoreError::CredentialRevisionConflict)?;
+            let identity_changed = existing.as_ref().is_some_and(
+                |(provider, _, fingerprint, _)| {
+                    provider != &state.provider_id || fingerprint != &configuration_fingerprint
+                },
+            );
+            if identity_changed {
+                delete_credential_dependents(transaction, &state.credential_id)?;
+            }
             transaction
                 .execute(
                     "INSERT INTO credentials
@@ -3916,6 +4681,220 @@ impl Store for SqliteStore {
             configuration_fingerprint,
             revision,
             ..state
+        })
+    }
+
+    fn activate_credential_configurations(
+        &self,
+        activations: &[CredentialConfigurationActivation],
+    ) -> StoreResult<Vec<ActivatedCredentialState>> {
+        let mut credential_ids = BTreeSet::new();
+        for activation in activations {
+            let desired = activation.desired();
+            non_empty("credential_id", &desired.credential_id)?;
+            non_empty("provider_id", &desired.provider_id)?;
+            validate_fingerprint(&desired.configuration_fingerprint)?;
+            if desired.configuration_fingerprint.is_empty()
+                || !credential_ids.insert(desired.credential_id.as_str())
+            {
+                return Err(StoreError::CredentialFingerprintConflict);
+            }
+        }
+        let cipher = if activations
+            .iter()
+            .any(|activation| activation.retirement().is_some())
+        {
+            Some(
+                self.encryption_read()?
+                    .clone()
+                    .ok_or(StoreError::EncryptionRequired)?,
+            )
+        } else {
+            None
+        };
+
+        self.with_immediate_transaction(|transaction| {
+            if let Some(cipher) = &cipher {
+                assert_cipher_current_transaction(transaction, cipher)?;
+            }
+            let mut observed = Vec::with_capacity(activations.len());
+            for activation in activations {
+                let desired = activation.desired();
+                let current = transaction
+                    .query_row(
+                        "SELECT credential_id, provider_id, configuration_fingerprint,
+                                enabled, updated_at, revision
+                         FROM credentials WHERE credential_id = ?1",
+                        [&desired.credential_id],
+                        credential_from_row,
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?;
+                if current.as_ref() != activation.expected() {
+                    return Err(StoreError::CredentialRevisionConflict);
+                }
+                let envelope = transaction
+                    .query_row(
+                        "SELECT envelope FROM credential_payloads WHERE credential_id = ?1",
+                        [&desired.credential_id],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?;
+
+                if let Some(retirement) = activation.retirement() {
+                    let current = current.as_ref().ok_or_else(|| {
+                        StoreError::CredentialNotFound(desired.credential_id.clone())
+                    })?;
+                    if current.provider_id != retirement.provider_id()
+                        || (current.configuration_fingerprint != retirement.expected_fingerprint()
+                            && current.configuration_fingerprint
+                                != retirement.replacement_fingerprint())
+                    {
+                        return Err(StoreError::CredentialFingerprintConflict);
+                    }
+                    if current.configuration_fingerprint == retirement.expected_fingerprint() {
+                        if let Some(envelope) = &envelope {
+                            let aad = credential_payload_aad(
+                                retirement.credential_id(),
+                                retirement.expected_fingerprint(),
+                            );
+                            cipher
+                                .as_ref()
+                                .ok_or(StoreError::EncryptionRequired)?
+                                .open_for(envelope, &aad)?;
+                        }
+                    }
+                } else if current.as_ref().is_some_and(|state| {
+                    state.provider_id != desired.provider_id
+                        || state.configuration_fingerprint != desired.configuration_fingerprint
+                }) && envelope.is_some()
+                {
+                    return Err(StoreError::CredentialFingerprintConflict);
+                }
+                observed.push((current, envelope.is_some()));
+            }
+
+            let mut activated = Vec::with_capacity(activations.len());
+            for (activation, (current, _payload_present)) in
+                activations.iter().zip(observed.into_iter())
+            {
+                let desired = activation.desired();
+                let exact_identity = current.as_ref().is_some_and(|state| {
+                    state.provider_id == desired.provider_id
+                        && state.configuration_fingerprint == desired.configuration_fingerprint
+                });
+                let retiring = activation.retirement().is_some_and(|retirement| {
+                    current.as_ref().is_some_and(|state| {
+                        state.configuration_fingerprint == retirement.expected_fingerprint()
+                    })
+                });
+                let state = if exact_identity {
+                    current.expect("exact identity requires a current credential")
+                } else {
+                    let safe_legacy_identity = current.as_ref().is_some_and(|state| {
+                        state.provider_id == desired.provider_id
+                            && state.configuration_fingerprint.is_empty()
+                    });
+                    let current_revision = current.as_ref().map_or(0, |state| state.revision);
+                    let revision = next_credential_revision(
+                        transaction,
+                        &desired.credential_id,
+                        current_revision,
+                    )?;
+                    if current.is_some() {
+                        delete_credential_dependents(transaction, &desired.credential_id)?;
+                    }
+                    if retiring {
+                        transaction
+                            .execute(
+                                "DELETE FROM credential_payloads WHERE credential_id = ?1",
+                                [&desired.credential_id],
+                            )
+                            .map_err(sqlite_error)?;
+                    }
+                    let enabled = if retiring {
+                        false
+                    } else if safe_legacy_identity {
+                        current.as_ref().is_some_and(|state| state.enabled)
+                    } else {
+                        desired.enabled
+                    };
+                    let revision_i64 = i64::try_from(revision)
+                        .map_err(|_| StoreError::CredentialRevisionConflict)?;
+                    if let Some(current) = &current {
+                        let changed = transaction
+                            .execute(
+                                "UPDATE credentials
+                                 SET provider_id = ?1, configuration_fingerprint = ?2,
+                                     enabled = ?3, updated_at = ?4, revision = ?5
+                                 WHERE credential_id = ?6 AND revision = ?7",
+                                params![
+                                    &desired.provider_id,
+                                    &desired.configuration_fingerprint,
+                                    i64::from(enabled),
+                                    desired.updated_at,
+                                    revision_i64,
+                                    &desired.credential_id,
+                                    i64::try_from(current.revision)
+                                        .map_err(|_| StoreError::CredentialRevisionConflict)?,
+                                ],
+                            )
+                            .map_err(sqlite_error)?;
+                        if changed != 1 {
+                            return Err(StoreError::CredentialRevisionConflict);
+                        }
+                    } else {
+                        transaction
+                            .execute(
+                                "INSERT INTO credentials
+                                 (credential_id, provider_id, configuration_fingerprint,
+                                  enabled, updated_at, revision)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                params![
+                                    &desired.credential_id,
+                                    &desired.provider_id,
+                                    &desired.configuration_fingerprint,
+                                    i64::from(enabled),
+                                    desired.updated_at,
+                                    revision_i64,
+                                ],
+                            )
+                            .map_err(sqlite_error)?;
+                    }
+                    if retiring {
+                        transaction
+                            .execute(
+                                "INSERT INTO credential_health
+                                 (credential_id, status, failure_count, cooldown_until, updated_at)
+                                 VALUES (?1, 'disabled', 0, NULL, ?2)
+                                 ON CONFLICT(credential_id) DO UPDATE SET
+                                   status = 'disabled', failure_count = 0,
+                                   cooldown_until = NULL, updated_at = excluded.updated_at",
+                                params![&desired.credential_id, desired.updated_at],
+                            )
+                            .map_err(sqlite_error)?;
+                    }
+                    CredentialState {
+                        enabled,
+                        revision,
+                        ..desired.clone()
+                    }
+                };
+                let health_disabled = transaction
+                    .query_row(
+                        "SELECT status = 'disabled' FROM credential_health
+                         WHERE credential_id = ?1",
+                        [&state.credential_id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?
+                    .unwrap_or(false);
+                activated.push(ActivatedCredentialState::new(state, health_disabled));
+            }
+            evict_credentials(transaction, self.retention.max_credentials)?;
+            Ok(activated)
         })
     }
 
@@ -3956,8 +4935,85 @@ impl Store for SqliteStore {
         updated_at: Timestamp,
     ) -> StoreResult<CredentialState> {
         non_empty("credential_id", credential_id)?;
-        self.with_transaction(|transaction| {
+        self.with_immediate_transaction(|transaction| {
             set_credential_enabled_tx(transaction, credential_id, enabled, updated_at)
+        })
+    }
+
+    fn set_credential_enabled_if_identity(
+        &self,
+        identity: &CredentialConfigurationIdentity,
+        enabled: bool,
+        updated_at: Timestamp,
+    ) -> StoreResult<ConditionalCredentialMutation> {
+        self.with_immediate_transaction(|transaction| {
+            let current = transaction
+                .query_row(
+                    "SELECT credential_id, provider_id, configuration_fingerprint,
+                            enabled, updated_at, revision
+                     FROM credentials WHERE credential_id = ?1",
+                    [identity.credential_id()],
+                    credential_from_row,
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            let Some(current) = current else {
+                return Ok(ConditionalCredentialMutation::Missing);
+            };
+            if !identity.matches(&current) {
+                return Ok(ConditionalCredentialMutation::Stale {
+                    current,
+                    credential_payload_present: None,
+                    credential_payload_generation: None,
+                });
+            }
+            set_credential_enabled_tx(transaction, identity.credential_id(), enabled, updated_at)
+                .map(ConditionalCredentialMutation::Applied)
+        })
+    }
+
+    fn set_credential_enabled_if_current(
+        &self,
+        credential_id: &str,
+        expected_revision: u64,
+        expected_provider_id: &str,
+        expected_configuration_fingerprint: &str,
+        enabled: bool,
+        updated_at: Timestamp,
+    ) -> StoreResult<ConditionalCredentialMutation> {
+        non_empty("credential_id", credential_id)?;
+        non_empty("expected_provider_id", expected_provider_id)?;
+        validate_fingerprint(expected_configuration_fingerprint)?;
+        self.with_immediate_transaction(|transaction| {
+            set_credential_enabled_if_current_tx(
+                transaction,
+                credential_id,
+                expected_revision,
+                expected_provider_id,
+                expected_configuration_fingerprint,
+                enabled,
+                updated_at,
+            )
+        })
+    }
+
+    fn set_credential_enabled_if_newer_payload(
+        &self,
+        identity: &CredentialConfigurationIdentity,
+        expected_metadata_revision: u64,
+        previous_generation: u64,
+        enabled: bool,
+        updated_at: Timestamp,
+    ) -> StoreResult<ConditionalCredentialMutation> {
+        self.with_immediate_transaction(|transaction| {
+            set_credential_enabled_if_newer_payload_tx(
+                transaction,
+                identity,
+                expected_metadata_revision,
+                previous_generation,
+                enabled,
+                updated_at,
+            )
         })
     }
 
@@ -3968,6 +5024,54 @@ impl Store for SqliteStore {
         updated_at: Timestamp,
     ) -> StoreResult<Vec<CredentialState>> {
         SqliteStore::switch_credential(self, selected, siblings, updated_at)
+    }
+
+    fn switch_credential_if_identities(
+        &self,
+        selected: &CredentialConfigurationIdentity,
+        siblings: &[CredentialConfigurationIdentity],
+        updated_at: Timestamp,
+    ) -> StoreResult<Option<Vec<CredentialState>>> {
+        self.with_immediate_transaction(|transaction| {
+            for identity in std::iter::once(selected).chain(siblings) {
+                let current = transaction
+                    .query_row(
+                        "SELECT credential_id, provider_id, configuration_fingerprint,
+                                enabled, updated_at, revision
+                         FROM credentials WHERE credential_id = ?1",
+                        [identity.credential_id()],
+                        credential_from_row,
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?;
+                let Some(current) = current else {
+                    return Ok(None);
+                };
+                if !identity.matches(&current) {
+                    return Ok(None);
+                }
+            }
+
+            let mut states = Vec::with_capacity(siblings.len().saturating_add(1));
+            states.push(set_credential_enabled_tx(
+                transaction,
+                selected.credential_id(),
+                true,
+                updated_at,
+            )?);
+            for sibling in siblings
+                .iter()
+                .filter(|sibling| sibling.credential_id() != selected.credential_id())
+            {
+                states.push(set_credential_enabled_tx(
+                    transaction,
+                    sibling.credential_id(),
+                    false,
+                    updated_at,
+                )?);
+            }
+            Ok(Some(states))
+        })
     }
 
     fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool> {
@@ -4119,6 +5223,21 @@ impl Store for SqliteStore {
         })
     }
 
+    fn cooldowns_snapshot(&self, now: Timestamp) -> StoreResult<Vec<CooldownState>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT scope, scope_key, until_at, reason, updated_at
+                 FROM cooldowns WHERE until_at > ?1
+                 ORDER BY scope ASC, scope_key ASC",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([now], cooldown_from_row)
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
+    }
+
     fn remove_cooldown(&self, scope: &str, key: &str) -> StoreResult<bool> {
         non_empty("scope", scope)?;
         non_empty("key", key)?;
@@ -4219,6 +5338,21 @@ impl Store for SqliteStore {
                 .map_err(sqlite_error)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
         })
+    }
+
+    fn session_affinities_snapshot(&self, now: Timestamp) -> StoreResult<Vec<SessionAffinity>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT key, provider_id, credential_id, upstream_model, created_at, last_used_at, expires_at
+                 FROM affinities WHERE expires_at > ?1
+                 ORDER BY key ASC",
+            )
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([now], legacy_affinity_from_row)
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
     }
 
     fn remove_session_affinity(&self, key: &str) -> StoreResult<bool> {
@@ -4633,6 +5767,444 @@ mod tests {
     }
 
     #[test]
+    fn conditional_enablement_rejects_stale_sqlite_generation_and_identity() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let fingerprint = "a".repeat(64);
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                true,
+                1,
+            ))
+            .expect("credential insert");
+        let replacement_fingerprint = "b".repeat(64);
+        for (revision, provider, candidate_fingerprint) in [
+            (0, "provider", fingerprint.as_str()),
+            (1, "replacement-provider", fingerprint.as_str()),
+            (1, "provider", replacement_fingerprint.as_str()),
+        ] {
+            assert!(matches!(
+                store
+                    .set_credential_enabled_if_current(
+                        "credential",
+                        revision,
+                        provider,
+                        candidate_fingerprint,
+                        false,
+                        2,
+                    )
+                    .expect("conditional mutation"),
+                ConditionalCredentialMutation::Stale { .. }
+            ));
+        }
+        assert!(
+            store
+                .credential_state("credential")
+                .expect("credential state")
+                .expect("credential exists")
+                .enabled
+        );
+
+        let disabled = store
+            .set_credential_enabled_if_current("credential", 1, "provider", &fingerprint, false, 3)
+            .expect("current generation disables")
+            .into_applied()
+            .expect("fence matches");
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.revision, 2);
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_current(
+                    "credential",
+                    1,
+                    "provider",
+                    &fingerprint,
+                    false,
+                    4,
+                )
+                .expect("stale repeated mutation"),
+            ConditionalCredentialMutation::Stale { .. }
+        ));
+        assert_eq!(
+            store
+                .credential_state("credential")
+                .expect("credential state")
+                .expect("credential exists")
+                .revision,
+            2
+        );
+        assert!(store
+            .remove_credential_state("credential")
+            .expect("remove credential"));
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_current(
+                    "credential",
+                    2,
+                    "provider",
+                    &fingerprint,
+                    false,
+                    5,
+                )
+                .expect("missing conditional mutation is stale"),
+            ConditionalCredentialMutation::Missing
+        ));
+    }
+
+    #[test]
+    fn newer_payload_enablement_rechecks_payload_presence_atomically() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"newer-payload-enablement-key").expect("key"),
+        )
+        .expect("store");
+        let fingerprint = "a".repeat(64);
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                false,
+                1,
+            ))
+            .expect("credential");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "credential",
+                &fingerprint,
+                &CredentialPayload::new(b"failed-token").expect("payload"),
+                2,
+            )
+            .expect("failed generation");
+        let failed_generation = store
+            .credential_payload_compare_generation_for_fingerprint("credential", &fingerprint)
+            .expect("failed generation");
+        let login = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "credential",
+                failed_generation,
+                &fingerprint,
+                &CredentialPayload::new(b"new-login-token").expect("payload"),
+                3,
+            )
+            .expect("new login generation");
+        let identity = CredentialConfigurationIdentity::new("credential", "provider", &fingerprint)
+            .expect("identity");
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_newer_payload(
+                    &identity,
+                    login.revision,
+                    failed_generation,
+                    true,
+                    4,
+                )
+                .expect("enable newer login"),
+            ConditionalCredentialMutation::Applied(_)
+        ));
+
+        store
+            .set_credential_enabled("credential", false, 5)
+            .expect("disable before next login");
+        let replacement = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "credential",
+                login.revision,
+                &fingerprint,
+                &CredentialPayload::new(b"replacement-login-token").expect("payload"),
+                6,
+            )
+            .expect("replacement login generation");
+        assert!(replacement.revision > login.revision);
+        assert!(store
+            .remove_credential_payload("credential")
+            .expect("concurrent revoke"));
+
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_newer_payload(
+                    &identity,
+                    replacement.revision,
+                    login.revision,
+                    true,
+                    7,
+                )
+                .expect("recheck removed payload"),
+            ConditionalCredentialMutation::Stale {
+                credential_payload_present: Some(false),
+                ..
+            }
+        ));
+        assert!(
+            !store
+                .credential_state("credential")
+                .expect("credential state")
+                .expect("credential exists")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn newer_payload_enablement_does_not_override_a_concurrent_disable() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"newer-payload-disable-fence-key").expect("key"),
+        )
+        .expect("store");
+        let fingerprint = "b".repeat(64);
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                true,
+                1,
+            ))
+            .expect("credential");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "credential",
+                &fingerprint,
+                &CredentialPayload::new(b"failed-token").expect("payload"),
+                2,
+            )
+            .expect("failed generation");
+        let failed_generation = store
+            .credential_payload_compare_generation_for_fingerprint("credential", &fingerprint)
+            .expect("failed generation");
+        let login = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "credential",
+                failed_generation,
+                &fingerprint,
+                &CredentialPayload::new(b"new-login-token").expect("payload"),
+                3,
+            )
+            .expect("new login generation");
+        let observed = match store
+            .set_credential_enabled_if_current(
+                "credential",
+                failed_generation,
+                "provider",
+                &fingerprint,
+                true,
+                4,
+            )
+            .expect("stale failed-generation mutation")
+        {
+            ConditionalCredentialMutation::Stale {
+                current,
+                credential_payload_present: Some(true),
+                credential_payload_generation: Some(generation),
+            } => {
+                assert_eq!(generation, login.revision);
+                assert!(current.enabled);
+                current
+            }
+            outcome => panic!("unexpected mutation outcome: {outcome:?}"),
+        };
+        let disabled = store
+            .set_credential_enabled("credential", false, 5)
+            .expect("concurrent operator disable");
+        assert!(disabled.revision > observed.revision);
+
+        let identity = CredentialConfigurationIdentity::new("credential", "provider", &fingerprint)
+            .expect("identity");
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_newer_payload(
+                    &identity,
+                    observed.revision,
+                    failed_generation,
+                    true,
+                    6,
+                )
+                .expect("metadata-fenced newer login"),
+            ConditionalCredentialMutation::Stale { current, .. } if !current.enabled
+        ));
+        assert!(
+            !store
+                .credential_state("credential")
+                .expect("credential state")
+                .expect("credential exists")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn newer_payload_enablement_accepts_a_benign_concurrent_refresh() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"newer-payload-refresh-fence-key").expect("key"),
+        )
+        .expect("store");
+        let fingerprint = "c".repeat(64);
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                false,
+                1,
+            ))
+            .expect("credential");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "credential",
+                &fingerprint,
+                &CredentialPayload::new(b"failed-token").expect("payload"),
+                2,
+            )
+            .expect("failed generation");
+        let failed_generation = store
+            .credential_payload_compare_generation_for_fingerprint("credential", &fingerprint)
+            .expect("failed generation");
+        let login = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "credential",
+                failed_generation,
+                &fingerprint,
+                &CredentialPayload::new(b"new-login-token").expect("payload"),
+                3,
+            )
+            .expect("new login generation");
+        let observed = match store
+            .set_credential_enabled_if_current(
+                "credential",
+                failed_generation,
+                "provider",
+                &fingerprint,
+                true,
+                4,
+            )
+            .expect("stale failed-generation mutation")
+        {
+            ConditionalCredentialMutation::Stale { current, .. } => current,
+            outcome => panic!("unexpected mutation outcome: {outcome:?}"),
+        };
+        assert!(!observed.enabled);
+        let refreshed = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "credential",
+                login.revision,
+                &fingerprint,
+                &CredentialPayload::new(b"refreshed-token").expect("payload"),
+                5,
+            )
+            .expect("concurrent refresh");
+        assert!(refreshed.revision > observed.revision);
+
+        let identity = CredentialConfigurationIdentity::new("credential", "provider", &fingerprint)
+            .expect("identity");
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_newer_payload(
+                    &identity,
+                    observed.revision,
+                    failed_generation,
+                    true,
+                    6,
+                )
+                .expect("refresh-compatible newer login"),
+            ConditionalCredentialMutation::Applied(current) if current.enabled
+        ));
+    }
+
+    #[test]
+    fn credential_generation_domain_requires_the_same_sqlite_database() {
+        let first = SqliteStore::open_in_memory().expect("first store");
+        let shared = first.clone();
+        let second = SqliteStore::open_in_memory().expect("second store");
+        assert!(first.shares_credential_generation_domain(&shared));
+        assert!(!first.shares_credential_generation_domain(&second));
+
+        let directory = private_tempdir();
+        let path = directory.path().join("shared-generation.sqlite");
+        let first = SqliteStore::open(&path).expect("first file-backed store");
+        let second = SqliteStore::open(&path).expect("second file-backed store");
+        assert!(first.shares_credential_generation_domain(&second));
+
+        let alias_directory = directory.path().join("alias");
+        fs::create_dir(&alias_directory).expect("alias directory");
+        let aliased = SqliteStore::open(alias_directory.join("../shared-generation.sqlite"))
+            .expect("lexically aliased store");
+        assert!(first.shares_credential_generation_domain(&aliased));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_generation_domain_rejects_a_raw_database_copy() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = private_tempdir();
+        let original_path = directory.path().join("original.sqlite");
+        let copied_path = directory.path().join("copied.sqlite");
+        {
+            let original = SqliteStore::open(&original_path).expect("seed original store");
+            original
+                .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+                .expect("seed credential");
+        }
+        fs::copy(&original_path, &copied_path).expect("raw database copy");
+        fs::set_permissions(&copied_path, fs::Permissions::from_mode(0o600))
+            .expect("private copied database");
+
+        let original = SqliteStore::open(&original_path).expect("open original store");
+        let copied = SqliteStore::open(&copied_path).expect("open copied store");
+        assert!(!original.shares_credential_generation_domain(&copied));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_generation_domain_rejects_a_database_replaced_at_the_same_path() {
+        let directory = private_tempdir();
+        let path = directory.path().join("replaceable.sqlite");
+        let original = SqliteStore::open(&path).expect("original store");
+        let displaced = directory.path().join("displaced.sqlite");
+        fs::rename(&path, &displaced).expect("displace original database");
+        for suffix in ["-wal", "-shm"] {
+            let mut source = path.as_os_str().to_owned();
+            source.push(suffix);
+            let source = PathBuf::from(source);
+            if source.exists() {
+                let mut destination = displaced.as_os_str().to_owned();
+                destination.push(suffix);
+                fs::rename(source, PathBuf::from(destination)).expect("displace sidecar");
+            }
+        }
+        let replacement = SqliteStore::open(&path).expect("replacement store");
+        assert!(!original.shares_credential_generation_domain(&replacement));
+    }
+
+    #[test]
+    fn credential_revision_clock_remains_constant_space_after_unique_deletions() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        for index in 0..256 {
+            let credential_id = format!("credential-{index}");
+            store
+                .upsert_credential_state(CredentialState::new(
+                    &credential_id,
+                    "provider",
+                    true,
+                    index,
+                ))
+                .expect("credential insert");
+            assert!(store
+                .remove_credential_state(&credential_id)
+                .expect("credential removal"));
+        }
+        let connection = store.connection.lock().expect("connection");
+        let (rows, revision): (usize, u64) = connection
+            .query_row(
+                "SELECT COUNT(*), MAX(revision) FROM credential_revision_clock",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("revision clock");
+        assert_eq!(rows, 1);
+        assert_eq!(revision, 256);
+    }
+
+    #[test]
     fn account_switch_is_atomic_and_survives_reopen() {
         let directory = private_tempdir();
         let path = directory.path().join("switch.sqlite");
@@ -4737,6 +6309,71 @@ mod tests {
         );
         assert!(
             store
+                .credential_state("backup")
+                .expect("backup state")
+                .expect("backup exists")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn identity_fenced_sqlite_switch_validates_every_account_atomically() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let current_fingerprint = "a".repeat(64);
+        let stale_fingerprint = "b".repeat(64);
+        for (credential_id, enabled) in [("primary", false), ("backup", true)] {
+            store
+                .upsert_credential_state(CredentialState::new_with_fingerprint(
+                    credential_id,
+                    "provider",
+                    &current_fingerprint,
+                    enabled,
+                    1,
+                ))
+                .expect("credential");
+        }
+        let primary =
+            CredentialConfigurationIdentity::new("primary", "provider", &current_fingerprint)
+                .expect("primary identity");
+        let backup =
+            CredentialConfigurationIdentity::new("backup", "provider", &current_fingerprint)
+                .expect("backup identity");
+        let stale_backup =
+            CredentialConfigurationIdentity::new("backup", "provider", &stale_fingerprint)
+                .expect("stale backup identity");
+
+        assert!(store
+            .switch_credential_if_identities(&primary, std::slice::from_ref(&stale_backup), 2,)
+            .expect("stale switch")
+            .is_none());
+        assert!(
+            !store
+                .credential_state("primary")
+                .expect("primary state")
+                .expect("primary exists")
+                .enabled
+        );
+        assert!(
+            store
+                .credential_state("backup")
+                .expect("backup state")
+                .expect("backup exists")
+                .enabled
+        );
+
+        assert!(store
+            .switch_credential_if_identities(&primary, std::slice::from_ref(&backup), 3)
+            .expect("current switch")
+            .is_some());
+        assert!(
+            store
+                .credential_state("primary")
+                .expect("primary state")
+                .expect("primary exists")
+                .enabled
+        );
+        assert!(
+            !store
                 .credential_state("backup")
                 .expect("backup state")
                 .expect("backup exists")
@@ -4998,6 +6635,39 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_snapshots_filter_without_mutating_durable_state() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        store
+            .upsert_credential_state(CredentialState::new("credential", "provider", true, 1))
+            .expect("credential");
+        store
+            .upsert_cooldown(CooldownState::new("provider", "provider", 10, 1))
+            .expect("cooldown");
+        store
+            .upsert_session_affinity(affinity("session", 1, 10))
+            .expect("affinity");
+
+        assert!(store
+            .cooldowns_snapshot(10)
+            .expect("cooldown snapshot")
+            .is_empty());
+        assert!(store
+            .session_affinities_snapshot(10)
+            .expect("affinity snapshot")
+            .is_empty());
+
+        assert!(store
+            .cooldown("provider", "provider", 9)
+            .expect("cooldown lookup")
+            .is_some());
+        let affinity = store
+            .session_affinity("session", 2)
+            .expect("affinity lookup")
+            .expect("affinity");
+        assert_eq!(affinity.last_used_at, 2);
+    }
+
+    #[test]
     fn encrypted_payload_is_opaque_and_survives_restart() {
         let directory = private_tempdir();
         let path = directory.path().join("pooler.sqlite");
@@ -5053,7 +6723,28 @@ mod tests {
                 2,
             )
             .expect("payload");
+        let state_before = store
+            .credential_state("credential")
+            .expect("state before rotation")
+            .expect("credential before rotation");
+        let generation_before = store
+            .credential_payload_compare_generation_for_fingerprint("credential", "")
+            .expect("generation before rotation");
+
         assert_eq!(store.rotate_master_key(new_key.clone()).expect("rotate"), 1);
+        assert_eq!(
+            store
+                .credential_state("credential")
+                .expect("state after rotation")
+                .expect("credential after rotation"),
+            state_before
+        );
+        assert_eq!(
+            store
+                .credential_payload_compare_generation_for_fingerprint("credential", "")
+                .expect("generation after rotation"),
+            generation_before
+        );
         assert_eq!(
             store
                 .credential_payload("credential")
@@ -5062,6 +6753,26 @@ mod tests {
                 .as_bytes(),
             b"refresh-token-value"
         );
+        {
+            let connection = store.connection.lock().expect("connection");
+            let guard_active: i64 = connection
+                .query_row(
+                    "SELECT active FROM credential_payload_reencryption_guard WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("re-encryption guard");
+            assert_eq!(guard_active, 0);
+            let rejected = connection.execute(
+                "UPDATE credential_payloads SET envelope = envelope
+                 WHERE credential_id = 'credential'",
+                [],
+            );
+            assert!(rejected
+                .expect_err("generation-unaware envelope update must be rejected")
+                .to_string()
+                .contains("credential payload generation must advance"));
+        }
         drop(store);
 
         assert!(matches!(
@@ -5563,6 +7274,90 @@ mod tests {
     }
 
     #[test]
+    fn recreated_credential_cannot_reuse_an_old_payload_generation() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"credential incarnation generation key").expect("key"),
+        )
+        .expect("store");
+        let fingerprint = "a".repeat(64);
+        let first = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                true,
+                1,
+            ))
+            .expect("first credential incarnation");
+        let old_generation = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "credential",
+                first.revision,
+                &fingerprint,
+                &CredentialPayload::new(b"old-token").expect("old payload"),
+                2,
+            )
+            .expect("persist old token")
+            .revision;
+
+        assert!(store
+            .remove_credential_payload("credential")
+            .expect("remove old payload"));
+        assert!(store
+            .remove_credential_state("credential")
+            .expect("remove old metadata"));
+
+        let recreated = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                true,
+                3,
+            ))
+            .expect("recreate credential");
+        let fresh = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "credential",
+                recreated.revision,
+                &fingerprint,
+                &CredentialPayload::new(b"fresh-token").expect("fresh payload"),
+                4,
+            )
+            .expect("persist fresh token");
+        assert!(fresh.revision > old_generation);
+
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_current(
+                    "credential",
+                    old_generation,
+                    "provider",
+                    &fingerprint,
+                    false,
+                    5,
+                )
+                .expect("stale mutation"),
+            ConditionalCredentialMutation::Stale { .. }
+        ));
+        assert!(
+            store
+                .credential_state("credential")
+                .expect("credential state")
+                .expect("recreated credential exists")
+                .enabled
+        );
+        assert_eq!(
+            store
+                .credential_payload("credential")
+                .expect("payload lookup")
+                .expect("fresh payload")
+                .as_bytes(),
+            b"fresh-token"
+        );
+    }
+
+    #[test]
     fn cas_payload_failure_rolls_back_metadata_revision() {
         let directory = private_tempdir();
         let path = directory.path().join("pooler.sqlite");
@@ -5593,7 +7388,7 @@ mod tests {
         assert!(matches!(
             store.compare_and_swap_credential_payload(
                 "credential",
-                1,
+                2,
                 &CredentialPayload::new(b"replacement-token").expect("payload"),
                 2,
             ),
@@ -5605,7 +7400,7 @@ mod tests {
                 .expect("state lookup")
                 .expect("state")
                 .revision,
-            1
+            2
         );
         assert_eq!(
             store
@@ -5650,7 +7445,7 @@ mod tests {
                 .expect("state lookup")
                 .expect("state")
                 .revision,
-            1
+            2
         );
         assert_eq!(
             store
@@ -5691,7 +7486,9 @@ mod tests {
         let last = envelope.len() - 1;
         envelope[last] ^= 1;
         raw.execute(
-            "UPDATE credential_payloads SET envelope = ?1 WHERE credential_id = 'credential'",
+            "UPDATE credential_payloads
+             SET envelope = ?1, generation = generation + 1
+             WHERE credential_id = 'credential'",
             params![envelope],
         )
         .expect("tamper");
@@ -5794,6 +7591,376 @@ mod tests {
             .optional()
             .expect("inspect schema");
         assert!(health_exists.is_none());
+    }
+
+    #[test]
+    fn v10_upgrade_backfills_payload_generation_and_allows_metadata_races() {
+        let directory = private_tempdir();
+        let path = directory.path().join("v10-payload-generation.sqlite");
+        let key = MasterKey::from_bytes(b"v10-payload-generation-key").expect("key");
+        let cipher = CredentialCipher::new(key.clone());
+        let fingerprint = "a".repeat(64);
+        let connection = Connection::open(&path).expect("create database");
+        for &(version, sql) in MIGRATIONS.iter().take(10) {
+            connection
+                .execute_batch(sql)
+                .expect("apply legacy migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("set legacy version");
+        }
+        connection
+            .execute(
+                "INSERT INTO credentials
+                 (credential_id, provider_id, enabled, updated_at, revision,
+                  configuration_fingerprint)
+                 VALUES ('credential', 'provider', 1, 1, 7, ?1)",
+                [&fingerprint],
+            )
+            .expect("credential");
+        let envelope = cipher
+            .seal_for(
+                &CredentialPayload::new(b"legacy-token").expect("payload"),
+                &credential_payload_aad("credential", &fingerprint),
+            )
+            .expect("envelope");
+        connection
+            .execute(
+                "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
+                 VALUES ('credential', ?1, 1)",
+                params![envelope],
+            )
+            .expect("payload");
+        drop(connection);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("database permissions");
+        }
+
+        let store = SqliteStore::open_encrypted(&path, key).expect("upgrade");
+        assert_eq!(
+            store
+                .credential_payload_compare_generation_for_fingerprint("credential", &fingerprint,)
+                .expect("backfilled generation"),
+            7
+        );
+        let disabled = store
+            .set_credential_enabled("credential", false, 2)
+            .expect("metadata-only disable");
+        assert!(disabled.revision > 7);
+        assert_eq!(
+            store
+                .credential_payload_compare_generation_for_fingerprint("credential", &fingerprint,)
+                .expect("unchanged payload generation"),
+            7
+        );
+        let rotated = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "credential",
+                7,
+                &fingerprint,
+                &CredentialPayload::new(b"fresh-token").expect("fresh payload"),
+                3,
+            )
+            .expect("payload CAS after metadata mutation");
+        assert!(rotated.revision > disabled.revision);
+        assert_eq!(
+            store
+                .credential_payload_compare_generation_for_fingerprint("credential", &fingerprint,)
+                .expect("rotated generation"),
+            rotated.revision
+        );
+    }
+
+    #[test]
+    fn v11_upgrade_backfills_payload_generation_from_metadata_revision() {
+        let directory = private_tempdir();
+        let path = directory.path().join("v11-payload-generation.sqlite");
+        let connection = Connection::open(&path).expect("create database");
+        for &(version, sql) in MIGRATIONS.iter().take(10) {
+            connection
+                .execute_batch(sql)
+                .expect("apply legacy migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("set legacy version");
+        }
+        connection
+            .execute(
+                "INSERT INTO credentials
+                 (credential_id, provider_id, enabled, updated_at, revision,
+                  configuration_fingerprint)
+                 VALUES ('credential', 'provider', 1, 1, 41, '')",
+                [],
+            )
+            .expect("credential");
+        connection
+            .execute(
+                "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
+                 VALUES ('credential', X'01', 1)",
+                [],
+            )
+            .expect("payload");
+        connection
+            .execute_batch(MIGRATIONS[10].1)
+            .expect("apply version 11 migration");
+        connection
+            .pragma_update(None, "user_version", 11)
+            .expect("set version 11");
+        drop(connection);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("database permissions");
+        }
+
+        let store = SqliteStore::open(&path).expect("upgrade");
+        let connection = store.connection.lock().expect("connection");
+        let (
+            schema_version,
+            payload_generation,
+            clock_rows,
+            clock_revision,
+            reencryption_guard_active,
+        ): (i64, u64, usize, u64, i64) = connection
+            .query_row(
+                "SELECT
+                   (SELECT user_version FROM pragma_user_version),
+                   (SELECT generation FROM credential_payloads
+                    WHERE credential_id = 'credential'),
+                   (SELECT COUNT(*) FROM credential_revision_clock),
+                   (SELECT revision FROM credential_revision_clock WHERE singleton = 1),
+                   (SELECT active FROM credential_payload_reencryption_guard WHERE singleton = 1)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("migrated generations");
+        assert_eq!(schema_version, 14);
+        assert_eq!(payload_generation, 41);
+        assert_eq!(clock_rows, 1);
+        assert_eq!(clock_revision, 41);
+        assert_eq!(reencryption_guard_active, 0);
+    }
+
+    #[test]
+    fn v10_upgrade_rejects_already_open_legacy_metadata_recreation() {
+        let directory = private_tempdir();
+        let path = directory.path().join("v10-legacy-metadata-writer.sqlite");
+        let key = MasterKey::from_bytes(b"v10-legacy-metadata-writer-key").expect("key");
+        let cipher = CredentialCipher::new(key.clone());
+        let fingerprint = "a".repeat(64);
+        let mut legacy = Connection::open(&path).expect("open legacy connection");
+        for &(version, sql) in MIGRATIONS.iter().take(10) {
+            legacy.execute_batch(sql).expect("apply legacy migration");
+            legacy
+                .pragma_update(None, "user_version", version)
+                .expect("set legacy version");
+        }
+        legacy
+            .execute(
+                "INSERT INTO credentials
+                 (credential_id, provider_id, enabled, updated_at, revision,
+                  configuration_fingerprint)
+                 VALUES ('credential', 'provider', 1, 1, 7, ?1)",
+                [&fingerprint],
+            )
+            .expect("credential");
+        let original = cipher
+            .seal_for(
+                &CredentialPayload::new(b"original-token").expect("payload"),
+                &credential_payload_aad("credential", &fingerprint),
+            )
+            .expect("original envelope");
+        legacy
+            .execute(
+                "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
+                 VALUES ('credential', ?1, 1)",
+                [&original],
+            )
+            .expect("legacy payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("database permissions");
+        }
+
+        let store = SqliteStore::open_encrypted(&path, key).expect("upgrade");
+        assert_eq!(
+            store
+                .credential_payload_compare_generation_for_fingerprint("credential", &fingerprint,)
+                .expect("backfilled generation"),
+            7
+        );
+
+        let transaction = legacy
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("legacy transaction");
+        transaction
+            .execute(
+                "DELETE FROM credentials WHERE credential_id = 'credential'",
+                [],
+            )
+            .expect("legacy delete");
+        let recreated = transaction.execute(
+            "INSERT INTO credentials
+             (credential_id, provider_id, enabled, updated_at, revision,
+              configuration_fingerprint)
+             VALUES ('credential', 'provider', 1, 2, 1, ?1)",
+            [&fingerprint],
+        );
+        if recreated.is_ok() {
+            transaction.commit().expect("commit legacy recreation");
+        } else {
+            transaction
+                .rollback()
+                .expect("roll back rejected recreation");
+        }
+        assert!(recreated.is_err());
+
+        let state = store
+            .credential_state("credential")
+            .expect("credential state")
+            .expect("credential remains");
+        assert_eq!(state.revision, 7);
+        assert_eq!(
+            store
+                .credential_payload_for_fingerprint("credential", &fingerprint)
+                .expect("payload after rejected recreation")
+                .expect("payload remains")
+                .as_bytes(),
+            b"original-token"
+        );
+    }
+
+    #[test]
+    fn v11_upgrade_rejects_already_open_legacy_payload_writer() {
+        let directory = private_tempdir();
+        let path = directory.path().join("v11-legacy-writer.sqlite");
+        let key = MasterKey::from_bytes(b"v11-legacy-writer-key").expect("key");
+        let cipher = CredentialCipher::new(key.clone());
+        let fingerprint = "a".repeat(64);
+        let mut legacy = Connection::open(&path).expect("open legacy connection");
+        for &(version, sql) in MIGRATIONS.iter().take(11) {
+            legacy.execute_batch(sql).expect("apply legacy migration");
+            legacy
+                .pragma_update(None, "user_version", version)
+                .expect("set legacy version");
+        }
+        legacy
+            .execute(
+                "INSERT INTO credentials
+                 (credential_id, provider_id, enabled, updated_at, revision,
+                  configuration_fingerprint)
+                 VALUES ('credential', 'provider', 1, 1, 7, ?1)",
+                [&fingerprint],
+            )
+            .expect("credential");
+        let original = cipher
+            .seal_for(
+                &CredentialPayload::new(b"original-token").expect("payload"),
+                &credential_payload_aad("credential", &fingerprint),
+            )
+            .expect("original envelope");
+        legacy
+            .execute(
+                "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
+                 VALUES ('credential', ?1, 1)",
+                [&original],
+            )
+            .expect("legacy payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("database permissions");
+        }
+
+        let store = SqliteStore::open_encrypted(&path, key).expect("upgrade");
+        assert_eq!(
+            store
+                .credential_payload_compare_generation_for_fingerprint("credential", &fingerprint,)
+                .expect("backfilled generation"),
+            7
+        );
+        let replacement = cipher
+            .seal_for(
+                &CredentialPayload::new(b"legacy-writer-token").expect("payload"),
+                &credential_payload_aad("credential", &fingerprint),
+            )
+            .expect("replacement envelope");
+        let transaction = legacy
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("legacy transaction");
+        let legacy_metadata_write = transaction.execute(
+            "UPDATE credentials SET updated_at = 2, revision = 8
+             WHERE credential_id = 'credential' AND revision = 7",
+            [],
+        );
+        assert!(legacy_metadata_write
+            .expect_err("generation-unaware metadata update must be rejected")
+            .to_string()
+            .contains("credential revision was not allocated"));
+        let legacy_write = transaction.execute(
+            "INSERT INTO credential_payloads (credential_id, envelope, updated_at)
+             VALUES ('credential', ?1, 2)
+             ON CONFLICT(credential_id) DO UPDATE SET
+               envelope = excluded.envelope,
+               updated_at = excluded.updated_at",
+            [&replacement],
+        );
+        assert!(legacy_write.is_err());
+        transaction.rollback().expect("roll back rejected writer");
+
+        let state = store
+            .credential_state("credential")
+            .expect("credential state")
+            .expect("credential exists");
+        assert_eq!(state.revision, 7);
+        assert_eq!(
+            store
+                .credential_payload_compare_generation_for_fingerprint("credential", &fingerprint,)
+                .expect("generation after rejected writer"),
+            7
+        );
+        assert_eq!(
+            store
+                .credential_payload_for_fingerprint("credential", &fingerprint)
+                .expect("payload after rejected writer")
+                .expect("payload remains")
+                .as_bytes(),
+            b"original-token"
+        );
+
+        let rotated = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "credential",
+                7,
+                &fingerprint,
+                &CredentialPayload::new(b"current-writer-token").expect("payload"),
+                3,
+            )
+            .expect("current generation-aware writer");
+        assert!(rotated.revision > 7);
+        assert_eq!(
+            store
+                .credential_payload_for_fingerprint("credential", &fingerprint)
+                .expect("current payload")
+                .expect("current payload")
+                .as_bytes(),
+            b"current-writer-token"
+        );
     }
 
     #[test]
@@ -6417,8 +8584,14 @@ mod tests {
             provider_profile: "example".to_owned(),
             oauth_client_id: Some("client-a".to_owned()),
             oauth_grant_type: Some("authorization_code".to_owned()),
+            oauth_scopes: vec!["openid".to_owned()],
             authorization_endpoint: Some("https://example.test/authorize".to_owned()),
             token_endpoint: Some("https://example.test/token".to_owned()),
+            revocation_endpoint: None,
+            identity_endpoint: None,
+            callback_endpoint: Some("http://127.0.0.1:8787/callback".to_owned()),
+            oauth_client_secret_reference: None,
+            oauth_additional_identity: Vec::new(),
             auth_placement: "bearer".to_owned(),
         }
         .fingerprint()
@@ -6431,8 +8604,14 @@ mod tests {
             provider_profile: "example".to_owned(),
             oauth_client_id: Some("client-b".to_owned()),
             oauth_grant_type: Some("authorization_code".to_owned()),
+            oauth_scopes: vec!["openid".to_owned()],
             authorization_endpoint: Some("https://example.test/authorize".to_owned()),
             token_endpoint: Some("https://example.test/token".to_owned()),
+            revocation_endpoint: None,
+            identity_endpoint: None,
+            callback_endpoint: Some("http://127.0.0.1:8787/callback".to_owned()),
+            oauth_client_secret_reference: None,
+            oauth_additional_identity: Vec::new(),
             auth_placement: "bearer".to_owned(),
         }
         .fingerprint()
@@ -6508,6 +8687,430 @@ mod tests {
                 .expect("payload")
                 .as_bytes(),
             b"legacy-secret"
+        );
+    }
+
+    #[test]
+    fn credential_configuration_activation_rolls_back_the_batch_on_a_stale_expectation() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let old = "a".repeat(64);
+        let replacement = "b".repeat(64);
+        for credential_id in ["account-a", "account-b"] {
+            store
+                .upsert_credential_state(CredentialState::new_with_fingerprint(
+                    credential_id,
+                    "provider",
+                    &old,
+                    true,
+                    1,
+                ))
+                .expect("credential");
+        }
+        let first_before = store
+            .credential_state("account-a")
+            .expect("first state")
+            .expect("first state");
+        let second_before = store
+            .credential_state("account-b")
+            .expect("second state")
+            .expect("second state");
+        store
+            .set_credential_enabled("account-b", false, 2)
+            .expect("concurrent metadata mutation");
+        let activations = [
+            CredentialConfigurationActivation::new(
+                Some(first_before.clone()),
+                CredentialState::new_with_fingerprint(
+                    "account-a",
+                    "provider",
+                    &replacement,
+                    true,
+                    3,
+                ),
+                None,
+            )
+            .expect("first activation"),
+            CredentialConfigurationActivation::new(
+                Some(second_before),
+                CredentialState::new_with_fingerprint(
+                    "account-b",
+                    "provider",
+                    &replacement,
+                    true,
+                    3,
+                ),
+                None,
+            )
+            .expect("second activation"),
+        ];
+
+        assert_eq!(
+            store.activate_credential_configurations(&activations),
+            Err(StoreError::CredentialRevisionConflict)
+        );
+        assert_eq!(
+            store
+                .credential_state("account-a")
+                .expect("first state after rollback")
+                .expect("first state after rollback"),
+            first_before
+        );
+        let second_after = store
+            .credential_state("account-b")
+            .expect("second state after rollback")
+            .expect("second state after rollback");
+        assert!(!second_after.enabled);
+        assert_eq!(second_after.configuration_fingerprint, old);
+    }
+
+    #[test]
+    fn exact_credential_configuration_activation_preserves_operator_state() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let fingerprint = "c".repeat(64);
+        let current = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "account",
+                "provider",
+                &fingerprint,
+                false,
+                1,
+            ))
+            .expect("credential");
+        store
+            .upsert_credential_health(CredentialHealthState::new(
+                "account",
+                CredentialHealthStatus::Disabled,
+                2,
+            ))
+            .expect("disabled health");
+        let activation = CredentialConfigurationActivation::new(
+            Some(current.clone()),
+            CredentialState::new_with_fingerprint("account", "provider", &fingerprint, true, 99),
+            None,
+        )
+        .expect("activation");
+
+        let activated = store
+            .activate_credential_configurations(&[activation])
+            .expect("activate");
+        assert_eq!(activated.len(), 1);
+        assert_eq!(activated[0].state(), &current);
+        assert!(activated[0].health_disabled());
+        assert!(!activated[0].effectively_enabled());
+    }
+
+    #[test]
+    fn legacy_credential_configuration_adoption_preserves_enablement() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let fingerprint = "d".repeat(64);
+        let legacy = store
+            .upsert_credential_state(CredentialState::new("account", "provider", false, 1))
+            .expect("legacy credential");
+        let activation = CredentialConfigurationActivation::new(
+            Some(legacy.clone()),
+            CredentialState::new_with_fingerprint("account", "provider", &fingerprint, true, 2),
+            None,
+        )
+        .expect("activation");
+
+        let activated = store
+            .activate_credential_configurations(&[activation])
+            .expect("activate");
+        let state = activated[0].state();
+        assert!(!state.enabled);
+        assert_eq!(state.configuration_fingerprint, fingerprint);
+        assert!(state.revision > legacy.revision);
+    }
+
+    #[test]
+    fn replaced_credential_configuration_purges_identity_dependents() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let old = "e".repeat(64);
+        let replacement = "f".repeat(64);
+        let current = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "account", "provider", &old, true, 1,
+            ))
+            .expect("credential");
+        store
+            .upsert_credential_health(CredentialHealthState::new(
+                "account",
+                CredentialHealthStatus::CoolingDown,
+                2,
+            ))
+            .expect("health");
+        store
+            .upsert_cooldown(CooldownState::new("credential", "account", 100, 2))
+            .expect("cooldown");
+        store
+            .upsert_session_affinity(SessionAffinity::new(
+                "session", "provider", "account", "model", 2, 100,
+            ))
+            .expect("affinity");
+        let activation = CredentialConfigurationActivation::new(
+            Some(current),
+            CredentialState::new_with_fingerprint("account", "provider", &replacement, true, 3),
+            None,
+        )
+        .expect("activation");
+
+        let activated = store
+            .activate_credential_configurations(&[activation])
+            .expect("activate");
+        assert_eq!(activated[0].state().configuration_fingerprint, replacement);
+        assert!(store
+            .credential_health("account")
+            .expect("health after replacement")
+            .is_none());
+        assert!(store
+            .cooldown("credential", "account", 3)
+            .expect("cooldown after replacement")
+            .is_none());
+        assert!(store
+            .session_affinity("session", 3)
+            .expect("affinity after replacement")
+            .is_none());
+    }
+
+    #[test]
+    fn credential_configuration_activation_retires_historical_oauth_atomically() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"activation-retirement-key").expect("key"),
+        )
+        .expect("store");
+        let old = "1".repeat(64);
+        let replacement = "2".repeat(64);
+        let current = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "account", "provider", &old, true, 1,
+            ))
+            .expect("credential");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "account",
+                &old,
+                &CredentialPayload::new(b"historical-token").expect("payload"),
+                2,
+            )
+            .expect("payload");
+        let expected = store
+            .credential_state("account")
+            .expect("current state")
+            .expect("current state");
+        assert!(expected.revision >= current.revision);
+        let retirement =
+            CredentialFingerprintRetirement::new("account", "provider", &old, &replacement)
+                .expect("retirement");
+        let activation = CredentialConfigurationActivation::new(
+            Some(expected),
+            CredentialState::new_with_fingerprint("account", "provider", &replacement, true, 3),
+            Some(retirement),
+        )
+        .expect("activation");
+
+        let activated = store
+            .activate_credential_configurations(&[activation])
+            .expect("activate");
+        assert!(!activated[0].state().enabled);
+        assert!(activated[0].health_disabled());
+        assert_eq!(activated[0].state().configuration_fingerprint, replacement);
+        assert!(!store
+            .credential_payload_exists("account")
+            .expect("payload existence"));
+    }
+
+    #[test]
+    fn already_applied_retirement_preserves_a_newer_login() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"activation-newer-login-key").expect("key"),
+        )
+        .expect("store");
+        let old = "3".repeat(64);
+        let replacement = "4".repeat(64);
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "account",
+                "provider",
+                &replacement,
+                true,
+                1,
+            ))
+            .expect("credential");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "account",
+                &replacement,
+                &CredentialPayload::new(b"new-login-token").expect("payload"),
+                2,
+            )
+            .expect("new login");
+        let current = store
+            .credential_state("account")
+            .expect("current state")
+            .expect("current state");
+        let retirement =
+            CredentialFingerprintRetirement::new("account", "provider", &old, &replacement)
+                .expect("retirement");
+        let activation = CredentialConfigurationActivation::new(
+            Some(current.clone()),
+            CredentialState::new_with_fingerprint("account", "provider", &replacement, false, 3),
+            Some(retirement),
+        )
+        .expect("activation");
+
+        let activated = store
+            .activate_credential_configurations(&[activation])
+            .expect("activate");
+        assert_eq!(activated[0].state(), &current);
+        assert!(activated[0].effectively_enabled());
+        assert_eq!(
+            store
+                .credential_payload_for_fingerprint("account", &replacement)
+                .expect("payload")
+                .expect("payload")
+                .as_bytes(),
+            b"new-login-token"
+        );
+    }
+
+    #[test]
+    fn fingerprint_retirement_discards_payload_and_disables_credential() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"fingerprint-retirement-key").expect("key"),
+        )
+        .expect("store");
+        let old = "a".repeat(64);
+        let new = "b".repeat(64);
+        let state = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "account", "provider", &old, true, 1,
+            ))
+            .expect("state");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "account",
+                &old,
+                &CredentialPayload::new(b"legacy-secret").expect("payload"),
+                2,
+            )
+            .expect("payload");
+
+        let retired = store
+            .retire_credential_fingerprint("account", &old, &new, 3)
+            .expect("retire legacy identity");
+
+        assert_eq!(retired.configuration_fingerprint, new);
+        assert!(!retired.enabled);
+        assert!(retired.revision > state.revision);
+        assert!(!store
+            .credential_payload_exists("account")
+            .expect("payload existence"));
+        assert_eq!(
+            store.credential_payload_for_fingerprint("account", &old),
+            Err(StoreError::CredentialFingerprintConflict)
+        );
+        assert!(store
+            .credential_payload_for_fingerprint("account", &new)
+            .expect("current fingerprint")
+            .is_none());
+    }
+
+    #[test]
+    fn fingerprint_retirement_batch_rolls_back_when_a_later_identity_is_stale() {
+        let store = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"fingerprint-retirement-batch-key").expect("key"),
+        )
+        .expect("store");
+        let first_old = "a".repeat(64);
+        let first_new = "b".repeat(64);
+        let second_old = "c".repeat(64);
+        let second_new = "d".repeat(64);
+        let stale_second = "e".repeat(64);
+
+        for (credential_id, fingerprint, payload) in [
+            (
+                "account-a",
+                first_old.as_str(),
+                b"first-legacy-secret".as_slice(),
+            ),
+            (
+                "account-b",
+                second_old.as_str(),
+                b"second-legacy-secret".as_slice(),
+            ),
+        ] {
+            store
+                .upsert_credential_state(CredentialState::new_with_fingerprint(
+                    credential_id,
+                    "provider",
+                    fingerprint,
+                    true,
+                    1,
+                ))
+                .expect("state");
+            store
+                .upsert_credential_payload_for_fingerprint(
+                    credential_id,
+                    fingerprint,
+                    &CredentialPayload::new(payload).expect("payload"),
+                    2,
+                )
+                .expect("persist payload");
+        }
+        let first_before = store
+            .credential_state("account-a")
+            .expect("first state")
+            .expect("first state");
+        let second_before = store
+            .credential_state("account-b")
+            .expect("second state")
+            .expect("second state");
+
+        let retirements = [
+            CredentialFingerprintRetirement::new("account-a", "provider", &first_old, &first_new)
+                .expect("first retirement"),
+            CredentialFingerprintRetirement::new(
+                "account-b",
+                "provider",
+                &stale_second,
+                &second_new,
+            )
+            .expect("stale second retirement"),
+        ];
+        assert_eq!(
+            store.retire_credential_fingerprints_atomically(&retirements, 3),
+            Err(StoreError::CredentialFingerprintConflict)
+        );
+
+        assert_eq!(
+            store
+                .credential_state("account-a")
+                .expect("first state after rollback")
+                .expect("first state after rollback"),
+            first_before
+        );
+        assert_eq!(
+            store
+                .credential_state("account-b")
+                .expect("second state after rollback")
+                .expect("second state after rollback"),
+            second_before
+        );
+        assert_eq!(
+            store
+                .credential_payload_for_fingerprint("account-a", &first_old)
+                .expect("first payload after rollback")
+                .expect("first payload after rollback")
+                .as_bytes(),
+            b"first-legacy-secret"
+        );
+        assert_eq!(
+            store
+                .credential_payload_for_fingerprint("account-b", &second_old)
+                .expect("second payload after rollback")
+                .expect("second payload after rollback")
+                .as_bytes(),
+            b"second-legacy-secret"
         );
     }
 

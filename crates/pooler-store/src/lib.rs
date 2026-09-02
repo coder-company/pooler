@@ -5,7 +5,7 @@
 //! process clock; expiry and retention are therefore deterministic and easy to
 //! test. Secret values are deliberately absent from every type in this crate.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{PoisonError, RwLock};
 
 use ring::digest::{digest, SHA256};
@@ -169,15 +169,24 @@ pub struct CredentialFingerprintInput {
     pub provider_profile: String,
     pub oauth_client_id: Option<String>,
     pub oauth_grant_type: Option<String>,
+    pub oauth_scopes: Vec<String>,
     pub authorization_endpoint: Option<String>,
     pub token_endpoint: Option<String>,
+    pub revocation_endpoint: Option<String>,
+    pub identity_endpoint: Option<String>,
+    pub callback_endpoint: Option<String>,
+    pub oauth_client_secret_reference: Option<String>,
+    /// Additional non-secret provider behavior that affects OAuth identity.
+    ///
+    /// Entries are canonicalized by key and value. An empty collection retains
+    /// the exact version-2 fingerprint used before provider-profile behavior
+    /// was represented explicitly.
+    pub oauth_additional_identity: Vec<(String, String)>,
     pub auth_placement: String,
 }
 
 impl CredentialFingerprintInput {
-    /// Return a stable SHA-256 hex fingerprint over canonical, length-prefixed
-    /// identity fields. Secret values are not accepted by this type.
-    pub fn fingerprint(&self) -> StoreResult<String> {
+    fn validate_legacy_fields(&self) -> StoreResult<()> {
         for (field, value) in [
             ("account_id", self.account_id.as_str()),
             ("provider_instance_id", self.provider_instance_id.as_str()),
@@ -208,6 +217,10 @@ impl CredentialFingerprintInput {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn legacy_fingerprint_unchecked(&self) -> String {
         let mut canonical = String::from("pooler-credential-fingerprint:v1\n");
         for value in [
             Some(self.account_id.as_str()),
@@ -226,6 +239,128 @@ impl CredentialFingerprintInput {
             canonical.push(':');
             canonical.push_str(value);
             canonical.push('|');
+        }
+        hex_digest(canonical.as_bytes())
+    }
+
+    /// Return the version-1 fingerprint used before OAuth scope and endpoint
+    /// identity was added. This exists only for fail-closed store upgrades;
+    /// new OAuth payloads must use [`Self::fingerprint`].
+    pub fn legacy_fingerprint(&self) -> StoreResult<String> {
+        self.validate_legacy_fields()?;
+        Ok(self.legacy_fingerprint_unchecked())
+    }
+
+    /// Return a stable SHA-256 hex fingerprint over canonical, length-prefixed
+    /// identity fields. Secret values are not accepted by this type.
+    pub fn fingerprint(&self) -> StoreResult<String> {
+        self.validate_legacy_fields()?;
+        for value in [
+            self.revocation_endpoint.as_deref(),
+            self.identity_endpoint.as_deref(),
+            self.callback_endpoint.as_deref(),
+            self.oauth_client_secret_reference.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if value.is_empty() || value.len() > 1_024 {
+                return Err(StoreError::Serialization(
+                    "credential fingerprint field exceeds metadata bounds".to_owned(),
+                ));
+            }
+        }
+        if self.oauth_scopes.len() > 256
+            || self
+                .oauth_scopes
+                .iter()
+                .any(|scope| scope.is_empty() || scope.len() > 1_024)
+        {
+            return Err(StoreError::Serialization(
+                "credential fingerprint OAuth scopes exceed metadata bounds".to_owned(),
+            ));
+        }
+        if self.oauth_additional_identity.len() > 256
+            || self.oauth_additional_identity.iter().any(|(key, value)| {
+                key.is_empty() || key.len() > 256 || value.is_empty() || value.len() > 1_024
+            })
+        {
+            return Err(StoreError::Serialization(
+                "credential fingerprint OAuth provider behavior exceeds metadata bounds".to_owned(),
+            ));
+        }
+
+        // API-key identities keep the exact version-1 digest. OAuth-only
+        // fields do not affect an API-key binding, and changing its digest
+        // would force an unnecessary credential migration.
+        if !self.auth_kind.eq_ignore_ascii_case("oauth") {
+            return Ok(self.legacy_fingerprint_unchecked());
+        }
+
+        let mut oauth_scopes = self
+            .oauth_scopes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        oauth_scopes.sort_unstable();
+        oauth_scopes.dedup();
+
+        let has_additional_identity = !self.oauth_additional_identity.is_empty();
+        let mut canonical = if has_additional_identity {
+            String::from("pooler-credential-fingerprint:v3\n")
+        } else {
+            String::from("pooler-credential-fingerprint:v2\n")
+        };
+        for value in [
+            Some(self.account_id.as_str()),
+            Some(self.provider_instance_id.as_str()),
+            Some(self.provider_origin.as_str()),
+            Some(self.auth_kind.as_str()),
+            Some(self.provider_profile.as_str()),
+            self.oauth_client_id.as_deref(),
+            self.oauth_grant_type.as_deref(),
+            self.authorization_endpoint.as_deref(),
+            self.token_endpoint.as_deref(),
+            self.revocation_endpoint.as_deref(),
+            self.identity_endpoint.as_deref(),
+            self.callback_endpoint.as_deref(),
+            self.oauth_client_secret_reference.as_deref(),
+            Some(self.auth_placement.as_str()),
+        ] {
+            let value = value.unwrap_or("");
+            canonical.push_str(&value.len().to_string());
+            canonical.push(':');
+            canonical.push_str(value);
+            canonical.push('|');
+        }
+        canonical.push_str(&oauth_scopes.len().to_string());
+        canonical.push(':');
+        for scope in oauth_scopes {
+            canonical.push_str(&scope.len().to_string());
+            canonical.push(':');
+            canonical.push_str(scope);
+            canonical.push('|');
+        }
+        if has_additional_identity {
+            let mut additional_identity = self
+                .oauth_additional_identity
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            additional_identity.sort_unstable();
+            additional_identity.dedup();
+            canonical.push_str(&additional_identity.len().to_string());
+            canonical.push(':');
+            for (key, value) in additional_identity {
+                canonical.push_str(&key.len().to_string());
+                canonical.push(':');
+                canonical.push_str(key);
+                canonical.push('|');
+                canonical.push_str(&value.len().to_string());
+                canonical.push(':');
+                canonical.push_str(value);
+                canonical.push('|');
+            }
         }
         Ok(hex_digest(canonical.as_bytes()))
     }
@@ -270,6 +405,233 @@ pub struct CredentialState {
     pub updated_at: Timestamp,
     /// Store-assigned revision, starting at one.
     pub revision: u64,
+}
+
+/// Immutable, non-secret identity used to fence credential metadata mutations.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CredentialConfigurationIdentity {
+    credential_id: String,
+    provider_id: String,
+    configuration_fingerprint: String,
+}
+
+impl CredentialConfigurationIdentity {
+    pub fn new(
+        credential_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        configuration_fingerprint: impl Into<String>,
+    ) -> StoreResult<Self> {
+        let identity = Self {
+            credential_id: credential_id.into(),
+            provider_id: provider_id.into(),
+            configuration_fingerprint: configuration_fingerprint.into(),
+        };
+        non_empty("credential_id", &identity.credential_id)?;
+        non_empty("provider_id", &identity.provider_id)?;
+        validate_fingerprint(&identity.configuration_fingerprint)?;
+        Ok(identity)
+    }
+
+    #[must_use]
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    #[must_use]
+    pub fn configuration_fingerprint(&self) -> &str {
+        &self.configuration_fingerprint
+    }
+
+    fn matches(&self, state: &CredentialState) -> bool {
+        self.credential_id == state.credential_id
+            && self.provider_id == state.provider_id
+            && self.configuration_fingerprint == state.configuration_fingerprint
+    }
+}
+
+/// One fail-closed credential fingerprint retirement in an atomic migration batch.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CredentialFingerprintRetirement {
+    credential_id: String,
+    provider_id: String,
+    expected_fingerprint: String,
+    replacement_fingerprint: String,
+}
+
+impl CredentialFingerprintRetirement {
+    pub fn new(
+        credential_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        expected_fingerprint: impl Into<String>,
+        replacement_fingerprint: impl Into<String>,
+    ) -> StoreResult<Self> {
+        let retirement = Self {
+            credential_id: credential_id.into(),
+            provider_id: provider_id.into(),
+            expected_fingerprint: expected_fingerprint.into(),
+            replacement_fingerprint: replacement_fingerprint.into(),
+        };
+        non_empty("credential_id", &retirement.credential_id)?;
+        non_empty("provider_id", &retirement.provider_id)?;
+        validate_fingerprint(&retirement.expected_fingerprint)?;
+        validate_fingerprint(&retirement.replacement_fingerprint)?;
+        if retirement.replacement_fingerprint.is_empty()
+            || retirement.expected_fingerprint == retirement.replacement_fingerprint
+        {
+            return Err(StoreError::InvalidCredentialFingerprint);
+        }
+        Ok(retirement)
+    }
+
+    #[must_use]
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    #[must_use]
+    pub fn expected_fingerprint(&self) -> &str {
+        &self.expected_fingerprint
+    }
+
+    #[must_use]
+    pub fn replacement_fingerprint(&self) -> &str {
+        &self.replacement_fingerprint
+    }
+}
+
+/// One prepared credential configuration transition for runtime publication.
+///
+/// `expected` is the exact metadata row observed while building the candidate.
+/// The store commits every transition in one transaction or rejects the full
+/// batch if any row changed. `desired` carries the compiled provider identity
+/// and configured enablement used for a new or replaced identity. A retirement
+/// removes an authenticated historical OAuth payload instead of blessing it
+/// under the replacement fingerprint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialConfigurationActivation {
+    expected: Option<CredentialState>,
+    desired: CredentialState,
+    retirement: Option<CredentialFingerprintRetirement>,
+}
+
+impl CredentialConfigurationActivation {
+    pub fn new(
+        expected: Option<CredentialState>,
+        desired: CredentialState,
+        retirement: Option<CredentialFingerprintRetirement>,
+    ) -> StoreResult<Self> {
+        non_empty("credential_id", &desired.credential_id)?;
+        non_empty("provider_id", &desired.provider_id)?;
+        validate_fingerprint(&desired.configuration_fingerprint)?;
+        if desired.configuration_fingerprint.is_empty() {
+            return Err(StoreError::InvalidCredentialFingerprint);
+        }
+        if expected
+            .as_ref()
+            .is_some_and(|state| state.credential_id != desired.credential_id)
+        {
+            return Err(StoreError::CredentialFingerprintConflict);
+        }
+        if retirement.as_ref().is_some_and(|retirement| {
+            retirement.credential_id() != desired.credential_id
+                || retirement.provider_id() != desired.provider_id
+                || retirement.replacement_fingerprint() != desired.configuration_fingerprint
+        }) {
+            return Err(StoreError::CredentialFingerprintConflict);
+        }
+        Ok(Self {
+            expected,
+            desired,
+            retirement,
+        })
+    }
+
+    #[must_use]
+    pub fn expected(&self) -> Option<&CredentialState> {
+        self.expected.as_ref()
+    }
+
+    #[must_use]
+    pub fn desired(&self) -> &CredentialState {
+        &self.desired
+    }
+
+    #[must_use]
+    pub fn retirement(&self) -> Option<&CredentialFingerprintRetirement> {
+        self.retirement.as_ref()
+    }
+}
+
+/// Metadata and effective enablement produced by one atomic runtime activation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActivatedCredentialState {
+    state: CredentialState,
+    health_disabled: bool,
+}
+
+impl ActivatedCredentialState {
+    #[must_use]
+    pub const fn new(state: CredentialState, health_disabled: bool) -> Self {
+        Self {
+            state,
+            health_disabled,
+        }
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &CredentialState {
+        &self.state
+    }
+
+    #[must_use]
+    pub const fn health_disabled(&self) -> bool {
+        self.health_disabled
+    }
+
+    #[must_use]
+    pub const fn effectively_enabled(&self) -> bool {
+        self.state.enabled && !self.health_disabled
+    }
+}
+
+/// Atomic result of a generation- and identity-fenced credential mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConditionalCredentialMutation {
+    /// The fence matched and the requested state is current.
+    Applied(CredentialState),
+    /// A credential exists, but its generation or immutable identity changed.
+    Stale {
+        current: CredentialState,
+        /// Whether the same transaction observed a durable credential payload.
+        /// Non-SQLite stores may not have a payload domain and return `None`.
+        credential_payload_present: Option<bool>,
+        /// Token-payload generation observed by the same transaction.
+        /// Metadata-only revisions do not advance this value.
+        credential_payload_generation: Option<u64>,
+    },
+    /// The credential was removed before the mutation acquired its lock.
+    Missing,
+}
+
+impl ConditionalCredentialMutation {
+    /// Return the applied state, if the generation and identity fence matched.
+    #[must_use]
+    pub fn into_applied(self) -> Option<CredentialState> {
+        match self {
+            Self::Applied(state) => Some(state),
+            Self::Stale { .. } | Self::Missing => None,
+        }
+    }
 }
 
 impl CredentialState {
@@ -1226,7 +1588,21 @@ pub type StoreResult<T> = Result<T, StoreError>;
 pub trait Store: Send + Sync {
     fn retention(&self) -> RetentionPolicy;
 
+    /// Whether this metadata store and an OAuth token store use the same
+    /// credential revision domain. Implementations that cannot prove shared
+    /// transactional identity must return `false`.
+    fn shares_credential_generation_domain(&self, _store: &SqliteStore) -> bool {
+        false
+    }
+
     fn upsert_credential_state(&self, state: CredentialState) -> StoreResult<CredentialState>;
+    /// Atomically reconcile every candidate account identity at the runtime
+    /// publication boundary. Any changed expectation aborts the whole batch.
+    fn activate_credential_configurations(
+        &self,
+        activations: &[CredentialConfigurationActivation],
+    ) -> StoreResult<Vec<ActivatedCredentialState>>;
+
     fn credential_state(&self, credential_id: &str) -> StoreResult<Option<CredentialState>>;
     fn credential_states(&self) -> StoreResult<Vec<CredentialState>>;
     fn set_credential_enabled(
@@ -1235,12 +1611,54 @@ pub trait Store: Send + Sync {
         enabled: bool,
         updated_at: Timestamp,
     ) -> StoreResult<CredentialState>;
+    /// Enable or disable a credential only while its immutable configuration
+    /// identity matches. Payload-generation changes do not invalidate this
+    /// owner-directed metadata mutation.
+    fn set_credential_enabled_if_identity(
+        &self,
+        identity: &CredentialConfigurationIdentity,
+        enabled: bool,
+        updated_at: Timestamp,
+    ) -> StoreResult<ConditionalCredentialMutation>;
+
+    fn set_credential_enabled_if_current(
+        &self,
+        credential_id: &str,
+        expected_revision: u64,
+        expected_provider_id: &str,
+        expected_configuration_fingerprint: &str,
+        enabled: bool,
+        updated_at: Timestamp,
+    ) -> StoreResult<ConditionalCredentialMutation>;
+
+    /// Enable or disable a credential only when its immutable identity and
+    /// metadata revision still match and an encrypted payload generation newer
+    /// than the caller's failed generation remains present at the mutation
+    /// transaction. The metadata revision fences owner-directed changes between
+    /// a stale-generation probe and this mutation.
+    fn set_credential_enabled_if_newer_payload(
+        &self,
+        identity: &CredentialConfigurationIdentity,
+        expected_metadata_revision: u64,
+        previous_generation: u64,
+        enabled: bool,
+        updated_at: Timestamp,
+    ) -> StoreResult<ConditionalCredentialMutation>;
+
     fn switch_credential(
         &self,
         selected: &str,
         siblings: &[String],
         updated_at: Timestamp,
     ) -> StoreResult<Vec<CredentialState>>;
+    /// Atomically switch credentials only if every selected configuration
+    /// identity still matches. `None` means one identity was stale or missing.
+    fn switch_credential_if_identities(
+        &self,
+        selected: &CredentialConfigurationIdentity,
+        siblings: &[CredentialConfigurationIdentity],
+        updated_at: Timestamp,
+    ) -> StoreResult<Option<Vec<CredentialState>>>;
     fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool>;
 
     fn upsert_credential_health(
@@ -1258,11 +1676,15 @@ pub trait Store: Send + Sync {
         now: Timestamp,
     ) -> StoreResult<Option<CooldownState>>;
     fn cooldowns(&self, now: Timestamp) -> StoreResult<Vec<CooldownState>>;
+    /// Read unexpired cooldowns without pruning durable state.
+    fn cooldowns_snapshot(&self, now: Timestamp) -> StoreResult<Vec<CooldownState>>;
     fn remove_cooldown(&self, scope: &str, key: &str) -> StoreResult<bool>;
 
     fn upsert_session_affinity(&self, affinity: SessionAffinity) -> StoreResult<SessionAffinity>;
     fn session_affinity(&self, key: &str, now: Timestamp) -> StoreResult<Option<SessionAffinity>>;
     fn session_affinities(&self, now: Timestamp) -> StoreResult<Vec<SessionAffinity>>;
+    /// Read unexpired affinities without pruning or updating last-used state.
+    fn session_affinities_snapshot(&self, now: Timestamp) -> StoreResult<Vec<SessionAffinity>>;
     fn remove_session_affinity(&self, key: &str) -> StoreResult<bool>;
 
     fn append_decision(&self, record: DecisionRecord) -> StoreResult<DecisionRecord>;
@@ -1281,6 +1703,7 @@ pub trait Store: Send + Sync {
 #[derive(Debug, Default)]
 struct Inner {
     credentials: BTreeMap<String, CredentialState>,
+    credential_revision: u64,
     health: BTreeMap<String, CredentialHealthState>,
     cooldowns: BTreeMap<(String, String), CooldownState>,
     affinities: BTreeMap<String, SessionAffinity>,
@@ -1325,6 +1748,14 @@ impl MemoryStore {
 
     pub fn is_empty(&self) -> StoreResult<bool> {
         Ok(self.len()?.is_empty())
+    }
+
+    fn next_credential_revision(inner: &mut Inner, _credential_id: &str) -> StoreResult<u64> {
+        inner.credential_revision = inner
+            .credential_revision
+            .checked_add(1)
+            .ok_or(StoreError::CredentialRevisionConflict)?;
+        Ok(inner.credential_revision)
     }
 
     fn validate_credential(state: &CredentialState) -> StoreResult<()> {
@@ -1541,6 +1972,34 @@ impl MemoryStore {
         inner.cooldowns.retain(|_, cooldown| cooldown.until > now);
     }
 
+    fn reconcile_credential_health(
+        inner: &mut Inner,
+        credential_id: &str,
+        enabled: bool,
+        updated_at: Timestamp,
+    ) {
+        if enabled {
+            if let Some(health) = inner.health.get_mut(credential_id) {
+                if health.status == CredentialHealthStatus::Disabled {
+                    health.status = CredentialHealthStatus::Healthy;
+                    health.cooldown_until = None;
+                    health.updated_at = updated_at;
+                }
+            }
+        } else {
+            inner.health.insert(
+                credential_id.to_owned(),
+                CredentialHealthState {
+                    credential_id: credential_id.to_owned(),
+                    status: CredentialHealthStatus::Disabled,
+                    failure_count: 0,
+                    cooldown_until: None,
+                    updated_at,
+                },
+            );
+        }
+    }
+
     fn evict_cooldowns(inner: &mut Inner) {
         while inner.cooldowns.len() > 4_096 {
             let key = inner
@@ -1577,21 +2036,19 @@ impl Store for MemoryStore {
     fn upsert_credential_state(&self, mut state: CredentialState) -> StoreResult<CredentialState> {
         Self::validate_credential(&state)?;
         let mut inner = self.inner.write().map_err(lock_error)?;
-        if let Some(previous) = inner.credentials.get(&state.credential_id) {
-            if !state.configuration_fingerprint.is_empty()
-                && !previous.configuration_fingerprint.is_empty()
-                && previous.configuration_fingerprint != state.configuration_fingerprint
-            {
-                return Err(StoreError::CredentialFingerprintConflict);
-            }
+        let identity_changed = if let Some(previous) = inner.credentials.get(&state.credential_id) {
             if state.configuration_fingerprint.is_empty() {
                 state.configuration_fingerprint = previous.configuration_fingerprint.clone();
             }
+            previous.provider_id != state.provider_id
+                || previous.configuration_fingerprint != state.configuration_fingerprint
+        } else {
+            false
+        };
+        if identity_changed {
+            Self::purge_credential_dependents(&mut inner, &state.credential_id);
         }
-        state.revision = inner
-            .credentials
-            .get(&state.credential_id)
-            .map_or(1, |old| old.revision.saturating_add(1));
+        state.revision = Self::next_credential_revision(&mut inner, &state.credential_id)?;
         inner
             .credentials
             .insert(state.credential_id.clone(), state.clone());
@@ -1609,6 +2066,101 @@ impl Store for MemoryStore {
         }
         Self::evict_credentials(&mut inner, self.retention.max_credentials);
         Ok(state)
+    }
+
+    fn activate_credential_configurations(
+        &self,
+        activations: &[CredentialConfigurationActivation],
+    ) -> StoreResult<Vec<ActivatedCredentialState>> {
+        let mut credential_ids = BTreeSet::new();
+        for activation in activations {
+            Self::validate_credential(activation.desired())?;
+            if activation.retirement().is_some()
+                || !credential_ids.insert(activation.desired().credential_id.as_str())
+            {
+                return Err(StoreError::CredentialFingerprintConflict);
+            }
+        }
+
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        for activation in activations {
+            if inner.credentials.get(&activation.desired().credential_id) != activation.expected() {
+                return Err(StoreError::CredentialRevisionConflict);
+            }
+        }
+
+        let writes = activations
+            .iter()
+            .filter(|activation| {
+                let desired = activation.desired();
+                inner
+                    .credentials
+                    .get(&desired.credential_id)
+                    .is_none_or(|current| {
+                        current.provider_id != desired.provider_id
+                            || current.configuration_fingerprint
+                                != desired.configuration_fingerprint
+                    })
+            })
+            .count();
+        inner
+            .credential_revision
+            .checked_add(u64::try_from(writes).unwrap_or(u64::MAX))
+            .ok_or(StoreError::CredentialRevisionConflict)?;
+
+        let mut activated = Vec::with_capacity(activations.len());
+        for activation in activations {
+            let desired = activation.desired();
+            let current = inner.credentials.get(&desired.credential_id).cloned();
+            let exact_identity = current.as_ref().is_some_and(|state| {
+                state.provider_id == desired.provider_id
+                    && state.configuration_fingerprint == desired.configuration_fingerprint
+            });
+            let state = if exact_identity {
+                current.expect("exact identity requires a current credential")
+            } else {
+                let safe_legacy_identity = current.as_ref().is_some_and(|state| {
+                    state.provider_id == desired.provider_id
+                        && state.configuration_fingerprint.is_empty()
+                });
+                if current.is_some() {
+                    Self::purge_credential_dependents(&mut inner, &desired.credential_id);
+                }
+                let revision = Self::next_credential_revision(&mut inner, &desired.credential_id)?;
+                let state = CredentialState {
+                    enabled: if safe_legacy_identity {
+                        current.as_ref().is_some_and(|state| state.enabled)
+                    } else {
+                        desired.enabled
+                    },
+                    revision,
+                    ..desired.clone()
+                };
+                inner
+                    .credentials
+                    .insert(state.credential_id.clone(), state.clone());
+                if !state.enabled {
+                    inner.health.insert(
+                        state.credential_id.clone(),
+                        CredentialHealthState {
+                            credential_id: state.credential_id.clone(),
+                            status: CredentialHealthStatus::Disabled,
+                            failure_count: 0,
+                            cooldown_until: None,
+                            updated_at: state.updated_at,
+                        },
+                    );
+                }
+                state
+            };
+            let health_disabled = inner
+                .health
+                .get(&state.credential_id)
+                .is_some_and(|health| health.status == CredentialHealthStatus::Disabled);
+            activated.push(ActivatedCredentialState::new(state, health_disabled));
+        }
+        Self::evict_credentials(&mut inner, self.retention.max_credentials);
+        Ok(activated)
     }
 
     fn credential_state(&self, credential_id: &str) -> StoreResult<Option<CredentialState>> {
@@ -1630,14 +2182,18 @@ impl Store for MemoryStore {
     ) -> StoreResult<CredentialState> {
         non_empty("credential_id", credential_id)?;
         let mut inner = self.inner.write().map_err(lock_error)?;
+        if !inner.credentials.contains_key(credential_id) {
+            return Err(StoreError::CredentialNotFound(credential_id.to_owned()));
+        }
+        let revision = Self::next_credential_revision(&mut inner, credential_id)?;
         let state = {
             let state = inner
                 .credentials
                 .get_mut(credential_id)
-                .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?;
+                .expect("credential existence checked while write lock is held");
             state.enabled = enabled;
             state.updated_at = updated_at;
-            state.revision = state.revision.saturating_add(1);
+            state.revision = revision;
             state.clone()
         };
         if !enabled {
@@ -1659,6 +2215,105 @@ impl Store for MemoryStore {
             }
         }
         Ok(state)
+    }
+
+    fn set_credential_enabled_if_identity(
+        &self,
+        identity: &CredentialConfigurationIdentity,
+        enabled: bool,
+        updated_at: Timestamp,
+    ) -> StoreResult<ConditionalCredentialMutation> {
+        let credential_id = identity.credential_id();
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        let Some(current) = inner.credentials.get(credential_id).cloned() else {
+            return Ok(ConditionalCredentialMutation::Missing);
+        };
+        if !identity.matches(&current) {
+            return Ok(ConditionalCredentialMutation::Stale {
+                current,
+                credential_payload_present: None,
+                credential_payload_generation: None,
+            });
+        }
+        Self::reconcile_credential_health(&mut inner, credential_id, enabled, updated_at);
+        if current.enabled == enabled {
+            return Ok(ConditionalCredentialMutation::Applied(current));
+        }
+        let revision = Self::next_credential_revision(&mut inner, credential_id)?;
+        let state = {
+            let state = inner
+                .credentials
+                .get_mut(credential_id)
+                .expect("credential identity checked while write lock is held");
+            state.enabled = enabled;
+            state.updated_at = updated_at;
+            state.revision = revision;
+            state.clone()
+        };
+        Ok(ConditionalCredentialMutation::Applied(state))
+    }
+
+    fn set_credential_enabled_if_current(
+        &self,
+        credential_id: &str,
+        expected_revision: u64,
+        expected_provider_id: &str,
+        expected_configuration_fingerprint: &str,
+        enabled: bool,
+        updated_at: Timestamp,
+    ) -> StoreResult<ConditionalCredentialMutation> {
+        non_empty("credential_id", credential_id)?;
+        non_empty("expected_provider_id", expected_provider_id)?;
+        validate_fingerprint(expected_configuration_fingerprint)?;
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        let Some(current) = inner.credentials.get(credential_id).cloned() else {
+            return Ok(ConditionalCredentialMutation::Missing);
+        };
+        if current.revision != expected_revision
+            || current.provider_id != expected_provider_id
+            || current.configuration_fingerprint != expected_configuration_fingerprint
+        {
+            return Ok(ConditionalCredentialMutation::Stale {
+                current,
+                credential_payload_present: None,
+                credential_payload_generation: None,
+            });
+        }
+        Self::reconcile_credential_health(&mut inner, credential_id, enabled, updated_at);
+        if current.enabled == enabled {
+            return Ok(ConditionalCredentialMutation::Applied(current));
+        }
+        let revision = Self::next_credential_revision(&mut inner, credential_id)?;
+        let state = {
+            let state = inner
+                .credentials
+                .get_mut(credential_id)
+                .expect("credential existence checked while write lock is held");
+            state.enabled = enabled;
+            state.updated_at = updated_at;
+            state.revision = revision;
+            state.clone()
+        };
+        Ok(ConditionalCredentialMutation::Applied(state))
+    }
+
+    fn set_credential_enabled_if_newer_payload(
+        &self,
+        identity: &CredentialConfigurationIdentity,
+        _expected_metadata_revision: u64,
+        _previous_generation: u64,
+        _enabled: bool,
+        _updated_at: Timestamp,
+    ) -> StoreResult<ConditionalCredentialMutation> {
+        let inner = self.inner.read().map_err(lock_error)?;
+        let Some(current) = inner.credentials.get(identity.credential_id()).cloned() else {
+            return Ok(ConditionalCredentialMutation::Missing);
+        };
+        Ok(ConditionalCredentialMutation::Stale {
+            current,
+            credential_payload_present: Some(false),
+            credential_payload_generation: None,
+        })
     }
 
     fn switch_credential(
@@ -1685,13 +2340,23 @@ impl Store for MemoryStore {
                 .filter(|sibling| sibling.as_str() != selected)
                 .map(|sibling| (sibling.as_str(), false)),
         ) {
-            let Some(state) = inner.credentials.get_mut(credential_id) else {
-                return Err(StoreError::CredentialNotFound(credential_id.to_owned()));
-            };
-            if state.enabled != enabled {
+            let changed = inner
+                .credentials
+                .get(credential_id)
+                .ok_or_else(|| StoreError::CredentialNotFound(credential_id.to_owned()))?
+                .enabled
+                != enabled;
+            let revision = changed
+                .then(|| Self::next_credential_revision(&mut inner, credential_id))
+                .transpose()?;
+            let state = inner
+                .credentials
+                .get_mut(credential_id)
+                .expect("credential existence checked while write lock is held");
+            if let Some(revision) = revision {
                 state.enabled = enabled;
                 state.updated_at = updated_at;
-                state.revision = state.revision.saturating_add(1);
+                state.revision = revision;
             }
             states.push(state.clone());
             if enabled {
@@ -1716,6 +2381,73 @@ impl Store for MemoryStore {
             }
         }
         Ok(states)
+    }
+
+    fn switch_credential_if_identities(
+        &self,
+        selected: &CredentialConfigurationIdentity,
+        siblings: &[CredentialConfigurationIdentity],
+        updated_at: Timestamp,
+    ) -> StoreResult<Option<Vec<CredentialState>>> {
+        let mut inner = self.inner.write().map_err(lock_error)?;
+        for identity in std::iter::once(selected).chain(siblings) {
+            let Some(current) = inner.credentials.get(identity.credential_id()) else {
+                return Ok(None);
+            };
+            if !identity.matches(current) {
+                return Ok(None);
+            }
+        }
+
+        let mut states = Vec::with_capacity(siblings.len().saturating_add(1));
+        for (identity, enabled) in std::iter::once((selected, true)).chain(
+            siblings
+                .iter()
+                .filter(|sibling| sibling.credential_id() != selected.credential_id())
+                .map(|sibling| (sibling, false)),
+        ) {
+            let credential_id = identity.credential_id();
+            let changed = inner
+                .credentials
+                .get(credential_id)
+                .expect("credential identities checked while write lock is held")
+                .enabled
+                != enabled;
+            let revision = changed
+                .then(|| Self::next_credential_revision(&mut inner, credential_id))
+                .transpose()?;
+            let state = inner
+                .credentials
+                .get_mut(credential_id)
+                .expect("credential identities checked while write lock is held");
+            if let Some(revision) = revision {
+                state.enabled = enabled;
+                state.updated_at = updated_at;
+                state.revision = revision;
+            }
+            states.push(state.clone());
+            if enabled {
+                if let Some(health) = inner.health.get_mut(credential_id) {
+                    if health.status == CredentialHealthStatus::Disabled {
+                        health.status = CredentialHealthStatus::Healthy;
+                        health.cooldown_until = None;
+                        health.updated_at = updated_at;
+                    }
+                }
+            } else {
+                inner.health.insert(
+                    credential_id.to_owned(),
+                    CredentialHealthState {
+                        credential_id: credential_id.to_owned(),
+                        status: CredentialHealthStatus::Disabled,
+                        failure_count: 0,
+                        cooldown_until: None,
+                        updated_at,
+                    },
+                );
+            }
+        }
+        Ok(Some(states))
     }
 
     fn remove_credential_state(&self, credential_id: &str) -> StoreResult<bool> {
@@ -1790,6 +2522,16 @@ impl Store for MemoryStore {
         Ok(inner.cooldowns.values().cloned().collect())
     }
 
+    fn cooldowns_snapshot(&self, now: Timestamp) -> StoreResult<Vec<CooldownState>> {
+        let inner = self.inner.read().map_err(lock_error)?;
+        Ok(inner
+            .cooldowns
+            .values()
+            .filter(|cooldown| cooldown.until > now)
+            .cloned()
+            .collect())
+    }
+
     fn remove_cooldown(&self, scope: &str, key: &str) -> StoreResult<bool> {
         non_empty("scope", scope)?;
         non_empty("key", key)?;
@@ -1828,6 +2570,16 @@ impl Store for MemoryStore {
         let mut inner = self.inner.write().map_err(lock_error)?;
         Self::purge_expired(&mut inner, now);
         Ok(inner.affinities.values().cloned().collect())
+    }
+
+    fn session_affinities_snapshot(&self, now: Timestamp) -> StoreResult<Vec<SessionAffinity>> {
+        let inner = self.inner.read().map_err(lock_error)?;
+        Ok(inner
+            .affinities
+            .values()
+            .filter(|affinity| affinity.expires_at > now)
+            .cloned()
+            .collect())
     }
 
     fn remove_session_affinity(&self, key: &str) -> StoreResult<bool> {
@@ -2020,6 +2772,120 @@ mod tests {
     }
 
     #[test]
+    fn credential_fingerprint_covers_oauth_identity_and_normalizes_scope_order() {
+        let baseline = CredentialFingerprintInput {
+            account_id: "account".to_owned(),
+            provider_instance_id: "provider".to_owned(),
+            provider_origin: "https://api.example.test/".to_owned(),
+            auth_kind: "oauth".to_owned(),
+            provider_profile: "codex".to_owned(),
+            oauth_client_id: Some("client".to_owned()),
+            oauth_grant_type: Some("authorization_code".to_owned()),
+            oauth_scopes: vec!["openid".to_owned(), "profile".to_owned()],
+            authorization_endpoint: Some("https://auth.example.test/authorize".to_owned()),
+            token_endpoint: Some("https://auth.example.test/token".to_owned()),
+            revocation_endpoint: Some("https://auth.example.test/revoke".to_owned()),
+            identity_endpoint: Some("https://auth.example.test/me".to_owned()),
+            callback_endpoint: Some("http://127.0.0.1:8787/callback".to_owned()),
+            oauth_client_secret_reference: Some("env:OAUTH_CLIENT_SECRET".to_owned()),
+            oauth_additional_identity: Vec::new(),
+            auth_placement: "bearer_secret".to_owned(),
+        };
+        let expected = baseline.fingerprint().expect("baseline fingerprint");
+
+        let reordered = CredentialFingerprintInput {
+            oauth_scopes: vec!["profile".to_owned(), "openid".to_owned()],
+            ..baseline.clone()
+        };
+        assert_eq!(reordered.fingerprint().expect("reordered scopes"), expected);
+
+        let provider_behavior = CredentialFingerprintInput {
+            oauth_additional_identity: vec![
+                ("request_encoding".to_owned(), "form".to_owned()),
+                ("device_grant".to_owned(), "codex_accounts".to_owned()),
+            ],
+            ..baseline.clone()
+        };
+        let reordered_provider_behavior = CredentialFingerprintInput {
+            oauth_additional_identity: vec![
+                ("device_grant".to_owned(), "codex_accounts".to_owned()),
+                ("request_encoding".to_owned(), "form".to_owned()),
+            ],
+            ..baseline.clone()
+        };
+        let provider_behavior_fingerprint = provider_behavior
+            .fingerprint()
+            .expect("provider behavior fingerprint");
+        assert_ne!(provider_behavior_fingerprint, expected);
+        assert_eq!(
+            reordered_provider_behavior
+                .fingerprint()
+                .expect("reordered provider behavior"),
+            provider_behavior_fingerprint
+        );
+
+        let variants = [
+            CredentialFingerprintInput {
+                oauth_scopes: vec!["openid".to_owned(), "email".to_owned()],
+                ..baseline.clone()
+            },
+            CredentialFingerprintInput {
+                revocation_endpoint: Some("https://auth.example.test/revoke-v2".to_owned()),
+                ..baseline.clone()
+            },
+            CredentialFingerprintInput {
+                identity_endpoint: Some("https://auth.example.test/userinfo".to_owned()),
+                ..baseline.clone()
+            },
+            CredentialFingerprintInput {
+                callback_endpoint: Some("http://127.0.0.1:8788/callback".to_owned()),
+                ..baseline.clone()
+            },
+            CredentialFingerprintInput {
+                oauth_additional_identity: vec![("request_encoding".to_owned(), "json".to_owned())],
+                ..baseline.clone()
+            },
+            CredentialFingerprintInput {
+                oauth_client_secret_reference: Some("env:OTHER_CLIENT_SECRET".to_owned()),
+                ..baseline
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                variant.fingerprint().expect("variant fingerprint"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn api_key_fingerprint_remains_on_the_version_one_identity() {
+        let input = CredentialFingerprintInput {
+            account_id: "account".to_owned(),
+            provider_instance_id: "provider".to_owned(),
+            provider_origin: "https://api.example.test/".to_owned(),
+            auth_kind: "api_key".to_owned(),
+            provider_profile: "compatible".to_owned(),
+            oauth_client_id: Some("unused-client".to_owned()),
+            oauth_grant_type: Some("authorization_code".to_owned()),
+            oauth_scopes: vec!["unused-scope".to_owned()],
+            authorization_endpoint: Some("https://auth.example.test/authorize".to_owned()),
+            token_endpoint: Some("https://auth.example.test/token".to_owned()),
+            revocation_endpoint: Some("https://auth.example.test/revoke".to_owned()),
+            identity_endpoint: Some("https://auth.example.test/me".to_owned()),
+            callback_endpoint: Some("http://127.0.0.1:8787/callback".to_owned()),
+            oauth_client_secret_reference: Some("env:UNUSED_SECRET".to_owned()),
+            oauth_additional_identity: vec![("ignored".to_owned(), "value".to_owned())],
+            auth_placement: "bearer_secret".to_owned(),
+        };
+
+        assert_eq!(
+            input.fingerprint().expect("current fingerprint"),
+            input.legacy_fingerprint().expect("legacy fingerprint")
+        );
+    }
+
+    #[test]
     fn credentials_are_versioned_sorted_and_bounded() {
         let store = MemoryStore::with_retention(policy(2, 2, 2));
         for id in ["z", "a", "b"] {
@@ -2036,11 +2902,187 @@ mod tests {
             ["b", "z"]
         );
         assert_eq!(states[1].revision, 1);
+        let latest_revision = states
+            .iter()
+            .map(|state| state.revision)
+            .max()
+            .expect("retained credential revision");
         let updated = store
             .set_credential_enabled("z", false, 2)
             .expect("toggle succeeds");
         assert!(!updated.enabled);
-        assert_eq!(updated.revision, 2);
+        assert!(updated.revision > latest_revision);
+    }
+
+    #[test]
+    fn conditional_enablement_rejects_stale_generation_and_identity() {
+        let store = MemoryStore::new();
+        let fingerprint = "a".repeat(64);
+        let inserted = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                true,
+                1,
+            ))
+            .expect("credential insert");
+        assert_eq!(inserted.revision, 1);
+
+        let replacement_fingerprint = "b".repeat(64);
+        for (revision, provider, candidate_fingerprint) in [
+            (0, "provider", fingerprint.as_str()),
+            (1, "replacement-provider", fingerprint.as_str()),
+            (1, "provider", replacement_fingerprint.as_str()),
+        ] {
+            assert!(matches!(
+                store
+                    .set_credential_enabled_if_current(
+                        "credential",
+                        revision,
+                        provider,
+                        candidate_fingerprint,
+                        false,
+                        2,
+                    )
+                    .expect("conditional mutation"),
+                ConditionalCredentialMutation::Stale { .. }
+            ));
+        }
+        assert!(
+            store
+                .credential_state("credential")
+                .expect("credential state")
+                .expect("credential exists")
+                .enabled
+        );
+
+        let disabled = store
+            .set_credential_enabled_if_current("credential", 1, "provider", &fingerprint, false, 3)
+            .expect("current generation disables")
+            .into_applied()
+            .expect("fence matches");
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.revision, 2);
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_current(
+                    "credential",
+                    1,
+                    "provider",
+                    &fingerprint,
+                    false,
+                    4,
+                )
+                .expect("stale repeated mutation"),
+            ConditionalCredentialMutation::Stale { .. }
+        ));
+        assert_eq!(
+            store
+                .credential_state("credential")
+                .expect("credential state")
+                .expect("credential exists")
+                .revision,
+            2
+        );
+        assert!(store
+            .remove_credential_state("credential")
+            .expect("remove credential"));
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_current(
+                    "credential",
+                    2,
+                    "provider",
+                    &fingerprint,
+                    false,
+                    5,
+                )
+                .expect("missing conditional mutation is stale"),
+            ConditionalCredentialMutation::Missing
+        ));
+    }
+
+    #[test]
+    fn credential_revision_clock_remains_constant_space_after_unique_deletions() {
+        let store = MemoryStore::new();
+        for index in 0..256 {
+            let credential_id = format!("credential-{index}");
+            store
+                .upsert_credential_state(CredentialState::new(
+                    &credential_id,
+                    "provider",
+                    true,
+                    index,
+                ))
+                .expect("credential insert");
+            assert!(store
+                .remove_credential_state(&credential_id)
+                .expect("credential removal"));
+        }
+        let inner = store.inner.read().expect("store lock");
+        assert!(inner.credentials.is_empty());
+        assert_eq!(inner.credential_revision, 256);
+    }
+
+    #[test]
+    fn credential_generation_is_not_reused_after_removal() {
+        let store = MemoryStore::new();
+        let fingerprint = "a".repeat(64);
+        let first = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                true,
+                1,
+            ))
+            .expect("first credential incarnation");
+        let old_generation = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                true,
+                2,
+            ))
+            .expect("advance first incarnation")
+            .revision;
+        assert!(old_generation > first.revision);
+        assert!(store
+            .remove_credential_state("credential")
+            .expect("remove first incarnation"));
+
+        let recreated = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                true,
+                3,
+            ))
+            .expect("recreate credential");
+        assert!(recreated.revision > old_generation);
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_current(
+                    "credential",
+                    old_generation,
+                    "provider",
+                    &fingerprint,
+                    false,
+                    4,
+                )
+                .expect("stale mutation"),
+            ConditionalCredentialMutation::Stale { .. }
+        ));
+        assert!(
+            store
+                .credential_state("credential")
+                .expect("credential state")
+                .expect("recreated credential exists")
+                .enabled
+        );
     }
 
     #[test]
@@ -2149,6 +3191,197 @@ mod tests {
         assert!(collision_store
             .cooldown("credential_model", "v2:3:5:a:bmodel", 2)
             .expect("removed cooldown lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn memory_identity_fences_enablement_and_atomic_switches() {
+        let store = MemoryStore::new();
+        let current_fingerprint = "a".repeat(64);
+        let stale_fingerprint = "b".repeat(64);
+        for (credential_id, enabled) in [("primary", false), ("backup", true)] {
+            store
+                .upsert_credential_state(CredentialState::new_with_fingerprint(
+                    credential_id,
+                    "provider",
+                    &current_fingerprint,
+                    enabled,
+                    1,
+                ))
+                .expect("credential");
+        }
+        let primary =
+            CredentialConfigurationIdentity::new("primary", "provider", &current_fingerprint)
+                .expect("primary identity");
+        let backup =
+            CredentialConfigurationIdentity::new("backup", "provider", &current_fingerprint)
+                .expect("backup identity");
+        let stale_primary =
+            CredentialConfigurationIdentity::new("primary", "provider", &stale_fingerprint)
+                .expect("stale primary identity");
+        let stale_backup =
+            CredentialConfigurationIdentity::new("backup", "provider", &stale_fingerprint)
+                .expect("stale backup identity");
+
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_identity(&stale_primary, true, 2)
+                .expect("stale enablement result"),
+            ConditionalCredentialMutation::Stale { .. }
+        ));
+        assert!(store
+            .switch_credential_if_identities(&stale_primary, std::slice::from_ref(&backup), 2)
+            .expect("stale selected switch")
+            .is_none());
+        assert!(store
+            .switch_credential_if_identities(&primary, std::slice::from_ref(&stale_backup), 2)
+            .expect("stale sibling switch")
+            .is_none());
+        assert!(
+            !store
+                .credential_state("primary")
+                .expect("primary state")
+                .expect("primary exists")
+                .enabled
+        );
+        assert!(
+            store
+                .credential_state("backup")
+                .expect("backup state")
+                .expect("backup exists")
+                .enabled
+        );
+
+        assert!(store
+            .switch_credential_if_identities(&primary, std::slice::from_ref(&backup), 3)
+            .expect("current switch")
+            .is_some());
+        assert!(
+            store
+                .credential_state("primary")
+                .expect("primary state")
+                .expect("primary exists")
+                .enabled
+        );
+        assert!(
+            !store
+                .credential_state("backup")
+                .expect("backup state")
+                .expect("backup exists")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn memory_same_state_fences_reconcile_disabled_health() {
+        let store = MemoryStore::new();
+        let fingerprint = "a".repeat(64);
+        let state = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider",
+                &fingerprint,
+                true,
+                1,
+            ))
+            .expect("credential");
+        let identity = CredentialConfigurationIdentity::new("credential", "provider", &fingerprint)
+            .expect("identity");
+
+        for use_generation_fence in [false, true] {
+            store
+                .upsert_credential_health(CredentialHealthState::new(
+                    "credential",
+                    CredentialHealthStatus::Disabled,
+                    2,
+                ))
+                .expect("disabled health");
+            let result = if use_generation_fence {
+                store.set_credential_enabled_if_current(
+                    "credential",
+                    state.revision,
+                    "provider",
+                    &fingerprint,
+                    true,
+                    3,
+                )
+            } else {
+                store.set_credential_enabled_if_identity(&identity, true, 3)
+            }
+            .expect("fenced enablement");
+            assert!(matches!(
+                result,
+                ConditionalCredentialMutation::Applied(ref current)
+                    if current.revision == state.revision
+            ));
+            assert_eq!(
+                store
+                    .credential_health("credential")
+                    .expect("health")
+                    .expect("health exists")
+                    .status,
+                CredentialHealthStatus::Healthy
+            );
+        }
+    }
+
+    #[test]
+    fn memory_identity_replacement_clears_dependent_state() {
+        let store = MemoryStore::new();
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider-a",
+                "a".repeat(64),
+                true,
+                1,
+            ))
+            .expect("original credential");
+        store
+            .upsert_credential_health(CredentialHealthState::new(
+                "credential",
+                CredentialHealthStatus::CoolingDown,
+                2,
+            ))
+            .expect("health");
+        store
+            .upsert_cooldown(CooldownState::new("credential", "credential", 100, 2))
+            .expect("cooldown");
+        store
+            .upsert_session_affinity(SessionAffinity::new(
+                "session",
+                "provider-a",
+                "credential",
+                "model",
+                2,
+                100,
+            ))
+            .expect("affinity");
+
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "credential",
+                "provider-b",
+                "b".repeat(64),
+                false,
+                3,
+            ))
+            .expect("replacement credential");
+        assert_eq!(
+            store
+                .credential_health("credential")
+                .expect("replacement health")
+                .expect("disabled replacement health")
+                .status,
+            CredentialHealthStatus::Disabled
+        );
+        assert!(store
+            .cooldown("credential", "credential", 3)
+            .expect("replacement cooldown")
+            .is_none());
+        assert!(store
+            .session_affinity("session", 3)
+            .expect("replacement affinity")
             .is_none());
     }
 

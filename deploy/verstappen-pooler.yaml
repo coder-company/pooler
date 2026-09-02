@@ -1,0 +1,130 @@
+version: 2
+
+management:
+  bind: 127.0.0.1:18477
+  auth:
+    secret: file:/home/chony/.config/pooler/management.token
+
+listeners:
+  codex:
+    bind: 127.0.0.1:8400
+
+upstreams:
+  codex-subscription:
+    known_provider: openai
+    native: {kind: codex}
+  codex-subscription-websocket:
+    known_provider: openai
+    url: wss://chatgpt.com
+    native: {kind: codex}
+
+accounts:
+  codex-account:
+    provider: codex-subscription
+    auth_kind: oauth
+  codex-websocket-account:
+    provider: codex-subscription-websocket
+    auth_kind: oauth
+
+account_pools:
+  codex-accounts:
+    provider: codex-subscription
+    accounts: [codex-account]
+  codex-websocket-accounts:
+    provider: codex-subscription-websocket
+    accounts: [codex-websocket-account]
+
+policies:
+  codex-reliable:
+    selection:
+      strategy: fill_first
+    retry:
+      maximum_attempts: 4
+      maximum_credentials: 1
+      maximum_upstreams: 1
+      statuses: [408, 429, 500, 502, 503, 504]
+      before_commit_only: true
+      base_delay: 250ms
+      maximum_delay: 5s
+      maximum_total_delay: 15s
+      maximum_elapsed: 10m
+
+routes:
+  - id: models
+    listen: codex
+    match: {methods: [GET], path: /backend-api/codex/models}
+    ingress: {mode: opaque}
+    target:
+      provider: codex-subscription
+      path: /v1/models
+      policy: codex-reliable
+    response: {mode: opaque}
+
+  - id: responses-websocket
+    listen: codex
+    match:
+      methods: [GET]
+      path: /backend-api/codex/responses
+      websocket: true
+    limits:
+      max_frame_bytes: 67108864
+      max_queue_bytes: 134217728
+      max_queue_items: 512
+      request_timeout: null
+    ingress: {mode: opaque}
+    target:
+      endpoint_family: responses
+      provider: codex-subscription-websocket
+      path: /backend-api/codex/responses
+      capabilities: [web_socket]
+      policy: codex-reliable
+    response: {mode: opaque}
+
+  - id: responses
+    listen: codex
+    match:
+      methods: [POST]
+      path: /backend-api/codex/responses
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 67108864
+      max_frame_bytes: 67108864
+      max_event_bytes: 67108864
+      max_queue_bytes: 134217728
+      max_queue_items: 512
+      request_timeout: null
+    ingress:
+      mode: semantic
+      decoder: decode.openai.responses
+      encoder: encode.openai.responses
+    target:
+      endpoint_family: responses
+      provider: codex-subscription
+      model_from: request.model
+      policy: codex-reliable
+    response:
+      mode: semantic
+      decoder: decode.openai.responses.events
+      encoder: encode.openai.responses.events
+    loss_policy: reject
+
+  - id: responses-compact
+    listen: codex
+    match:
+      methods: [POST]
+      path: /backend-api/codex/responses/compact
+      content_types: [application/json]
+    limits:
+      max_request_body_bytes: 67108864
+      max_response_body_bytes: 67108864
+      max_frame_bytes: 67108864
+      request_timeout: null
+    ingress:
+      mode: patch
+      inspectors: [inspect.openai.model]
+    target:
+      endpoint_family: responses_compact
+      provider: codex-subscription
+      model_from: request.model
+      policy: codex-reliable
+    response: {mode: opaque}

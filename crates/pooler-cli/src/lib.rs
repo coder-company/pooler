@@ -819,17 +819,22 @@ fn runtime_resources(
         SqliteStore::open_encrypted(store_path, master_key)
             .context("could not open encrypted credential store")?,
     );
-    let pooling = Arc::new(PoolingCoordinator::with_store(config, store.clone())?);
-    let native = if has_native_oauth || durable_management_requested {
+    let (native, pooling) = if has_native_oauth || durable_management_requested {
         let token_store = Arc::new(SqliteOAuthTokenStore::new((*store).clone()));
-        Arc::new(NativeRuntime::new_with_sqlite(config, token_store)?)
-    } else if has_native {
-        Arc::new(NativeRuntime::new(
-            config,
-            Arc::new(MemoryOAuthTokenStore::new()),
-        )?)
+        let native = Arc::new(NativeRuntime::new_with_sqlite(config, token_store)?);
+        let pooling = Arc::new(native.pooling_coordinator(config)?);
+        (native, pooling)
     } else {
-        Arc::new(NativeRuntime::disabled())
+        let pooling = Arc::new(PoolingCoordinator::with_store(config, store.clone())?);
+        let native = if has_native {
+            Arc::new(NativeRuntime::new(
+                config,
+                Arc::new(MemoryOAuthTokenStore::new()),
+            )?)
+        } else {
+            Arc::new(NativeRuntime::disabled())
+        };
+        (native, pooling)
     };
     Ok(RuntimeResources {
         native,

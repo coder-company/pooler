@@ -321,7 +321,7 @@ def main() -> int:
         pooler_config = temp / "pooler.yaml"
         cliproxy_config = temp / "cliproxy.yaml"
         pooler_config.write_text(
-            f"""version: 1
+            f"""version: 2
 listeners:
   benchmark:
     bind: 127.0.0.1:{pooler_port}

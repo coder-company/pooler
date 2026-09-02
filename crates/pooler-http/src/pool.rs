@@ -30,14 +30,17 @@ use pooler_model_catalog::{CatalogService, CatalogSnapshot, RequestOverlay};
 use pooler_policy::{
     AffinityKey, BindingKey, CandidateFacts, CommitmentState, CooldownScope,
     CredentialRegistration, CredentialRegistry, FailureClassification, FailureClassifier,
-    HealthMutation, HealthSubject, HttpFailureClassifier, ObservedFailure, PersistedQuotaSnapshot,
-    ProviderNeutralQuotaClassifier, QuotaClassification, QuotaClassifier, QuotaObservation,
-    QuotaProjectKey, QuotaScope, QuotaSignal, QuotaUnit, ReplayCheck, RetryContext, RetryDecision,
-    RetryPolicy, RetryStopReason, RetryTargetChange, RoutingRequirements, RoutingTelemetry,
-    SelectionError, SelectionExplanation, SelectionLease, SelectionRequest, TelemetrySample,
+    HealthMutation, HealthMutationReason, HealthSubject, HttpFailureClassifier, ObservedFailure,
+    PersistedQuotaSnapshot, ProviderNeutralQuotaClassifier, QuotaClassification, QuotaClassifier,
+    QuotaObservation, QuotaProjectKey, QuotaScope, QuotaSignal, QuotaUnit, ReplayCheck,
+    RetryContext, RetryDecision, RetryPolicy, RetryStopReason, RetryTargetChange,
+    RoutingRequirements, RoutingTelemetry, SelectionError, SelectionExplanation, SelectionLease,
+    SelectionRequest, TelemetrySample,
 };
 use pooler_store::{
-    AffinityBindingIdentity, CooldownState, CredentialHealthState, CredentialHealthStatus,
+    ActivatedCredentialState, AffinityBindingIdentity, ConditionalCredentialMutation,
+    CooldownState, CredentialConfigurationActivation, CredentialConfigurationIdentity,
+    CredentialFingerprintRetirement, CredentialHealthState, CredentialHealthStatus,
     CredentialState, DecisionCandidate, DecisionRecord, MemoryStore, SessionAffinity, Store,
     StoreError,
 };
@@ -436,15 +439,45 @@ type RegistryView = (
     BTreeMap<BindingKey, Arc<RuntimeBinding>>,
 );
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AccountMutationIdentity {
+    account_id: String,
+    provider_id: String,
+    configuration_fingerprint: String,
+}
+
+impl AccountMutationIdentity {
+    fn store_identity(&self) -> Result<CredentialConfigurationIdentity, PoolError> {
+        CredentialConfigurationIdentity::new(
+            &self.account_id,
+            &self.provider_id,
+            &self.configuration_fingerprint,
+        )
+        .map_err(|_| PoolError::InvalidCredential)
+    }
+}
+
+#[derive(Clone)]
+struct AccountEnablementChange {
+    credential: CredentialId,
+    identity: AccountMutationIdentity,
+    enabled: bool,
+}
+
 #[derive(Default)]
 struct AccountMutationState {
     gate: Mutex<Vec<RegisteredRegistryView>>,
-    enablement: RwLock<BTreeMap<String, bool>>,
+    enablement: RwLock<BTreeMap<AccountMutationIdentity, bool>>,
 }
 
 struct RegisteredRegistryView {
     registries: Weak<RegistryMap>,
-    accounts: BTreeSet<String>,
+    accounts: BTreeSet<AccountMutationIdentity>,
+}
+
+struct LiveRegistryView {
+    registries: Vec<Arc<CredentialRegistry>>,
+    accounts: BTreeSet<AccountMutationIdentity>,
 }
 
 impl RuntimeBinding {
@@ -932,6 +965,27 @@ impl PoolFailure {
     pub(crate) fn take_replacement(&mut self) -> Option<PoolSelection> {
         self.replacement.take()
     }
+
+    /// Return the stable metadata-only reason for a no-change health mutation.
+    pub(crate) fn health_mutation_reason(&self) -> Option<&'static str> {
+        let HealthMutation::NoChange { reason } = &self.mutation else {
+            return None;
+        };
+        Some(match reason {
+            HealthMutationReason::CredentialDisabled => "credential_disabled",
+            HealthMutationReason::CredentialDisableNotPersisted => {
+                "credential_disable_not_persisted"
+            }
+            HealthMutationReason::CredentialGenerationChanged => "credential_generation_changed",
+            HealthMutationReason::CredentialUnavailable => "credential_unavailable",
+            HealthMutationReason::NoCooldownRequested => "no_cooldown_requested",
+            HealthMutationReason::InvalidRequestCannotCooldownCredential => {
+                "invalid_request_cannot_cooldown_credential"
+            }
+            HealthMutationReason::MissingCooldownTarget => "missing_cooldown_target",
+            HealthMutationReason::ZeroCooldown => "zero_cooldown",
+        })
+    }
 }
 
 /// Inputs for one pre-commit failure decision.
@@ -949,6 +1003,38 @@ pub(crate) struct FailureInput<'a> {
     pub commitment: CommitmentState,
     pub idempotency_key_present: bool,
     pub attempt: u32,
+    pub credentials_used: &'a BTreeSet<CredentialId>,
+    pub providers_used: &'a BTreeSet<ProviderId>,
+    pub elapsed_retry_delay: Duration,
+    pub elapsed_recovery_wait: Duration,
+    pub started: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OAuthCredentialMutation {
+    Applied,
+    DisableNotPersisted,
+    GenerationAdvanced,
+    Unavailable,
+}
+
+/// Inputs for replacing one native OAuth credential that requires interactive reauthentication.
+pub(crate) struct NativeReauthInput<'a> {
+    pub config: &'a CompiledConfig,
+    pub route: &'a RoutePlan,
+    pub selection: &'a mut PoolSelection,
+    pub replay: ReplayCheck,
+    pub commitment: CommitmentState,
+    pub idempotency_key_present: bool,
+    pub attempt: u32,
+    /// Token generation whose provider response required reauthorization.
+    pub failed_generation: u64,
+    /// Whether token and metadata generations share a durable CAS domain.
+    pub generation_fenced: bool,
+    /// Runtime-specific provider bindings that recovery candidates must support.
+    pub native_runtime: Option<&'a crate::NativeRuntime>,
+    /// Whether the failed authorization followed a physical provider send.
+    pub outbound_attempt_consumed: bool,
     pub credentials_used: &'a BTreeSet<CredentialId>,
     pub providers_used: &'a BTreeSet<ProviderId>,
     pub elapsed_retry_delay: Duration,
@@ -1000,6 +1086,49 @@ pub enum PoolError {
     InvalidUpstreamUri,
 }
 
+/// A fully built pooling generation that has not entered shared account
+/// topology and has not changed durable credential identity state.
+pub struct PreparedPoolingCoordinator {
+    coordinator: Arc<PoolingCoordinator>,
+    activations: Vec<CredentialConfigurationActivation>,
+    activated: AtomicBool,
+}
+
+impl PreparedPoolingCoordinator {
+    /// Borrow the candidate coordinator while constructing generation proxies.
+    #[must_use]
+    pub fn coordinator(&self) -> Arc<PoolingCoordinator> {
+        Arc::clone(&self.coordinator)
+    }
+
+    /// Commit the exact prepared credential identities and publish this
+    /// candidate into the shared account-mutation topology.
+    pub fn activate(&self) -> Result<(), PoolError> {
+        if self.activated.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut views = self
+            .coordinator
+            .account_mutations
+            .gate
+            .lock()
+            .map_err(|_| PoolError::Selection)?;
+        if self.activated.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let activated = self
+            .coordinator
+            .store
+            .activate_credential_configurations(&self.activations)
+            .map_err(|_| PoolError::Store)?;
+        self.coordinator
+            .apply_activated_account_states(&activated)?;
+        self.coordinator.register_registry_view_locked(&mut views)?;
+        self.activated.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
 /// Shared mutable account-pooling state for one compiled configuration.
 #[derive(Clone)]
 pub struct PoolingCoordinator {
@@ -1008,6 +1137,7 @@ pub struct PoolingCoordinator {
     registry_view_gate: Arc<RwLock<()>>,
     interaction_affinity_registries: Arc<BTreeMap<String, BTreeSet<String>>>,
     accounts: Arc<BTreeMap<String, AccountPlan>>,
+    account_identities: Arc<BTreeMap<String, AccountMutationIdentity>>,
     config: Arc<CompiledConfig>,
     store: Arc<dyn Store>,
     catalog: Option<Arc<CatalogService>>,
@@ -1070,6 +1200,7 @@ impl PoolingCoordinator {
             config,
             store,
             Arc::new(AccountMutationState::default()),
+            true,
         )
     }
 
@@ -1077,12 +1208,36 @@ impl PoolingCoordinator {
         config: &CompiledConfig,
         store: Arc<dyn Store>,
         account_mutations: Arc<AccountMutationState>,
+        activate: bool,
     ) -> Result<Self, PoolError> {
         let accounts = config
             .accounts()
             .values()
             .map(|account| (account.id().to_owned(), account.clone()))
             .collect::<BTreeMap<_, _>>();
+        let account_identities = accounts
+            .values()
+            .map(|account| {
+                let upstream = config
+                    .upstreams()
+                    .get(account.provider())
+                    .ok_or(PoolError::InvalidUpstreamUri)?;
+                let configuration_fingerprint = crate::account_configuration_fingerprint(
+                    upstream,
+                    account.id(),
+                    account.auth_kind(),
+                )
+                .map_err(|_| PoolError::InvalidCredential)?;
+                Ok((
+                    account.id().to_owned(),
+                    AccountMutationIdentity {
+                        account_id: account.id().to_owned(),
+                        provider_id: upstream.id().to_owned(),
+                        configuration_fingerprint,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, PoolError>>()?;
         let mut registries = BTreeMap::new();
         let mut binding_index = BTreeMap::new();
 
@@ -1144,6 +1299,7 @@ impl PoolingCoordinator {
             registry_view_gate: Arc::new(RwLock::new(())),
             interaction_affinity_registries: Arc::new(interaction_affinity_registries),
             accounts: Arc::new(accounts),
+            account_identities: Arc::new(account_identities),
             config: Arc::new(config.clone()),
             store,
             catalog: None,
@@ -1153,7 +1309,9 @@ impl PoolingCoordinator {
             telemetry: RoutingTelemetry::default(),
             account_mutations,
         };
-        coordinator.register_and_restore_runtime_state()?;
+        if activate {
+            coordinator.register_and_restore_runtime_state()?;
+        }
         Ok(coordinator)
     }
 
@@ -1166,6 +1324,7 @@ impl PoolingCoordinator {
             config,
             Arc::clone(&self.store),
             Arc::clone(&self.account_mutations),
+            true,
         )?;
         coordinator.catalog.clone_from(&self.catalog);
         if coordinator.catalog.is_some() {
@@ -1175,6 +1334,129 @@ impl PoolingCoordinator {
         coordinator.persistence = self.persistence.clone();
         coordinator.telemetry = self.telemetry.clone();
         Ok(coordinator)
+    }
+
+    /// Build a reload candidate without mutating credential identities or
+    /// registering unpublished account topology.
+    pub fn prepare_reconfigure(
+        &self,
+        config: &CompiledConfig,
+        retirements: &[CredentialFingerprintRetirement],
+        catalog: Option<Arc<CatalogService>>,
+    ) -> Result<PreparedPoolingCoordinator, PoolError> {
+        let mut coordinator = Self::with_store_and_account_mutations(
+            config,
+            Arc::clone(&self.store),
+            Arc::clone(&self.account_mutations),
+            false,
+        )?;
+        coordinator.catalog = catalog;
+        coordinator.disabled_models = Arc::clone(&self.disabled_models);
+        coordinator.persistence = self.persistence.clone();
+        coordinator.telemetry = self.telemetry.clone();
+
+        if let Some(catalog) = coordinator.catalog.as_ref() {
+            let snapshot = catalog.snapshot();
+            let (registries, bindings) =
+                coordinator.build_registry_view(Some(snapshot.as_ref()))?;
+            *coordinator
+                .registries
+                .write()
+                .map_err(|_| PoolError::Selection)? = registries;
+            *coordinator
+                .binding_index
+                .write()
+                .map_err(|_| PoolError::Selection)? = bindings;
+            coordinator
+                .catalog_generation
+                .store(snapshot.generation(), Ordering::Release);
+        }
+        // These restorations are read-only with respect to durable state and
+        // happen while the candidate registries remain unpublished.
+        coordinator.restore_cooldowns()?;
+        coordinator.restore_quota_states()?;
+        coordinator.restore_affinities()?;
+
+        let mut retirement_map = BTreeMap::new();
+        for retirement in retirements {
+            if retirement_map
+                .insert(retirement.credential_id().to_owned(), retirement.clone())
+                .is_some()
+            {
+                return Err(PoolError::InvalidCredential);
+            }
+        }
+        let now = timestamp_now();
+        let mut activations = Vec::with_capacity(coordinator.accounts.len());
+        for account in coordinator.accounts.values() {
+            let identity = coordinator.account_mutation_identity(account.id())?;
+            let expected = coordinator
+                .store
+                .credential_state(account.id())
+                .map_err(|_| PoolError::Store)?;
+            let retirement = retirement_map.remove(account.id());
+            let desired = CredentialState::new_with_fingerprint(
+                account.id(),
+                &identity.provider_id,
+                &identity.configuration_fingerprint,
+                account.enabled(),
+                now,
+            );
+            activations.push(
+                CredentialConfigurationActivation::new(expected, desired, retirement)
+                    .map_err(|_| PoolError::InvalidCredential)?,
+            );
+        }
+        if !retirement_map.is_empty() {
+            return Err(PoolError::InvalidCredential);
+        }
+        Ok(PreparedPoolingCoordinator {
+            coordinator: Arc::new(coordinator),
+            activations,
+            activated: AtomicBool::new(false),
+        })
+    }
+
+    fn apply_activated_account_states(
+        &self,
+        activated: &[ActivatedCredentialState],
+    ) -> Result<(), PoolError> {
+        if activated.len() != self.accounts.len() {
+            return Err(PoolError::Store);
+        }
+        let mut changes = Vec::with_capacity(activated.len());
+        for activated in activated {
+            let state = activated.state();
+            let identity = self.account_mutation_identity(&state.credential_id)?;
+            if state.provider_id != identity.provider_id
+                || state.configuration_fingerprint != identity.configuration_fingerprint
+            {
+                return Err(PoolError::Store);
+            }
+            let credential = CredentialId::new(&state.credential_id)
+                .map_err(|_| PoolError::InvalidCredential)?;
+            changes.push((credential, identity, activated.effectively_enabled()));
+        }
+        let credential_changes = changes
+            .iter()
+            .map(|(credential, _, enabled)| (credential.clone(), *enabled))
+            .collect::<Vec<_>>();
+        let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
+        for registry in registries.values() {
+            registry
+                .set_credentials_enabled(&credential_changes)
+                .map_err(|_| PoolError::Selection)?;
+        }
+        drop(registries);
+        let mut enablement = self
+            .account_mutations
+            .enablement
+            .write()
+            .map_err(|_| PoolError::Selection)?;
+        for (_, identity, enabled) in changes {
+            enablement.insert(identity, enabled);
+        }
+        Ok(())
     }
 
     /// Attach the atomically refreshed catalog used by request model selection.
@@ -1297,6 +1579,21 @@ impl PoolingCoordinator {
     #[must_use]
     pub fn store(&self) -> Arc<dyn Store> {
         Arc::clone(&self.store)
+    }
+
+    /// Whether the supplied OAuth token store shares this coordinator's
+    /// credential revision domain. A caller-selected or process-local store
+    /// must fail closed to unfenced ID-based disablement instead of comparing
+    /// unrelated generations.
+    #[must_use]
+    pub(crate) fn shares_credential_generation_domain(
+        &self,
+        token_store: Option<&pooler_store::SqliteOAuthTokenStore>,
+    ) -> bool {
+        token_store.is_some_and(|token_store| {
+            self.store
+                .shares_credential_generation_domain(token_store.store())
+        })
     }
 
     /// Return the process-local status for request and usage persistence.
@@ -1423,21 +1720,178 @@ impl PoolingCoordinator {
         if !self.accounts.contains_key(account_id) {
             return Err(PoolError::InvalidCredential);
         }
-        let credential = CredentialId::new(account_id).map_err(|_| PoolError::InvalidCredential)?;
-        let changes = vec![(credential, enabled)];
-        let account_ids = BTreeSet::from([account_id.to_owned()]);
+        let changes = vec![self.account_enablement_change(account_id, enabled)?];
+        let account_identities = changes
+            .iter()
+            .map(|change| change.identity.clone())
+            .collect::<BTreeSet<_>>();
         let mut views = self
             .account_mutations
             .gate
             .lock()
             .map_err(|_| PoolError::Selection)?;
         self.register_registry_view_locked(&mut views)?;
-        let registries = self.live_registries_for_accounts_locked(&mut views, &account_ids)?;
+        let registry_views =
+            self.live_registries_for_accounts_locked(&mut views, &account_identities)?;
 
-        self.store
-            .set_credential_enabled(account_id, enabled, timestamp_now())
+        let identity = changes[0].identity.store_identity()?;
+        match self
+            .store
+            .set_credential_enabled_if_identity(&identity, enabled, timestamp_now())
+            .map_err(|_| PoolError::Store)?
+        {
+            ConditionalCredentialMutation::Applied(_) => {
+                self.publish_account_changes_locked(&registry_views, &changes)
+            }
+            ConditionalCredentialMutation::Stale { .. }
+            | ConditionalCredentialMutation::Missing => Err(PoolError::InvalidCredential),
+        }
+    }
+
+    /// Enable or disable an OAuth account only while its persisted token
+    /// generation and immutable provider identity match the caller's
+    /// observation. The matching live registry state is published only after
+    /// the durable mutation commits.
+    pub fn set_oauth_account_enabled_if_current(
+        &self,
+        config: &CompiledConfig,
+        account_id: &str,
+        expected_generation: u64,
+        enabled: bool,
+    ) -> Result<bool, PoolError> {
+        self.mutate_oauth_account_enabled_if_current(
+            config,
+            account_id,
+            expected_generation,
+            enabled,
+        )
+        .map(|outcome| {
+            outcome == OAuthCredentialMutation::Applied
+                || (enabled && outcome == OAuthCredentialMutation::GenerationAdvanced)
+        })
+    }
+
+    fn mutate_oauth_account_enabled_if_current(
+        &self,
+        config: &CompiledConfig,
+        account_id: &str,
+        expected_generation: u64,
+        enabled: bool,
+    ) -> Result<OAuthCredentialMutation, PoolError> {
+        self.sync_catalog_snapshot()?;
+        let account = config
+            .accounts()
+            .get(account_id)
+            .filter(|account| account.auth_kind() == AccountAuthKind::OAuth)
+            .ok_or(PoolError::InvalidCredential)?;
+        if !self.accounts.contains_key(account_id) {
+            return Err(PoolError::InvalidCredential);
+        }
+        let upstream = config
+            .upstreams()
+            .get(account.provider())
+            .ok_or(PoolError::InvalidUpstreamUri)?;
+        let credential = CredentialId::new(account_id).map_err(|_| PoolError::InvalidCredential)?;
+        let fingerprint =
+            crate::account_configuration_fingerprint(upstream, account_id, AccountAuthKind::OAuth)
+                .map_err(|_| PoolError::InvalidCredential)?;
+        let mutation_identity = AccountMutationIdentity {
+            account_id: account_id.to_owned(),
+            provider_id: upstream.id().to_owned(),
+            configuration_fingerprint: fingerprint.clone(),
+        };
+        if self.account_identities.get(account_id) != Some(&mutation_identity) {
+            return Err(PoolError::InvalidCredential);
+        }
+        let changes = vec![AccountEnablementChange {
+            credential: credential.clone(),
+            identity: mutation_identity.clone(),
+            enabled,
+        }];
+        let account_identities = BTreeSet::from([mutation_identity]);
+        let mut views = self
+            .account_mutations
+            .gate
+            .lock()
+            .map_err(|_| PoolError::Selection)?;
+        self.register_registry_view_locked(&mut views)?;
+        let registry_views =
+            self.live_registries_for_accounts_locked(&mut views, &account_identities)?;
+        let outcome = self
+            .store
+            .set_credential_enabled_if_current(
+                account_id,
+                expected_generation,
+                upstream.id(),
+                &fingerprint,
+                enabled,
+                timestamp_now(),
+            )
             .map_err(|_| PoolError::Store)?;
-        self.publish_account_changes_locked(&registries, &changes)
+        match outcome {
+            ConditionalCredentialMutation::Applied(_) => {
+                self.publish_account_changes_locked(&registry_views, &changes)?;
+                Ok(OAuthCredentialMutation::Applied)
+            }
+            ConditionalCredentialMutation::Stale {
+                current,
+                credential_payload_present: Some(true),
+                credential_payload_generation: Some(newer_generation),
+            } if (current.enabled || (enabled && current.revision == newer_generation))
+                && current.provider_id == upstream.id()
+                && current.configuration_fingerprint == fingerprint
+                && newer_generation > expected_generation =>
+            {
+                if enabled {
+                    let identity = changes[0].identity.store_identity()?;
+                    match self
+                        .store
+                        .set_credential_enabled_if_newer_payload(
+                            &identity,
+                            current.revision,
+                            expected_generation,
+                            true,
+                            timestamp_now(),
+                        )
+                        .map_err(|_| PoolError::Store)?
+                    {
+                        ConditionalCredentialMutation::Applied(_) => {
+                            self.publish_account_changes_locked(&registry_views, &changes)?;
+                        }
+                        ConditionalCredentialMutation::Stale { .. }
+                        | ConditionalCredentialMutation::Missing => {
+                            return Ok(OAuthCredentialMutation::Unavailable);
+                        }
+                    }
+                }
+                Ok(OAuthCredentialMutation::GenerationAdvanced)
+            }
+            ConditionalCredentialMutation::Stale { .. }
+            | ConditionalCredentialMutation::Missing => Ok(OAuthCredentialMutation::Unavailable),
+        }
+    }
+
+    /// Disable a selected OAuth credential only while the persisted token
+    /// generation and immutable provider identity still match the failed
+    /// authorization. A concurrent login or refresh preserves the newer
+    /// generation, while removal or replacement makes the failed binding
+    /// unavailable for this request.
+    fn disable_selected_oauth_credential_if_current(
+        &self,
+        config: &CompiledConfig,
+        selection: &PoolSelection,
+        expected_generation: u64,
+    ) -> Result<OAuthCredentialMutation, PoolError> {
+        let credential = selection.credential().ok_or(PoolError::InvalidCredential)?;
+        if selection.account_auth_kind() != Some(AccountAuthKind::OAuth) {
+            return Err(PoolError::InvalidCredential);
+        }
+        self.mutate_oauth_account_enabled_if_current(
+            config,
+            credential.as_str(),
+            expected_generation,
+            false,
+        )
     }
 
     /// Atomically select one account and disable its same-provider siblings.
@@ -1456,19 +1910,13 @@ impl PoolingCoordinator {
             .map(|account| account.id().to_owned())
             .collect::<Vec<_>>();
         let mut changes = Vec::with_capacity(siblings.len().saturating_add(1));
-        changes.push((
-            CredentialId::new(account_id).map_err(|_| PoolError::InvalidCredential)?,
-            true,
-        ));
+        changes.push(self.account_enablement_change(account_id, true)?);
         for sibling in &siblings {
-            changes.push((
-                CredentialId::new(sibling).map_err(|_| PoolError::InvalidCredential)?,
-                false,
-            ));
+            changes.push(self.account_enablement_change(sibling, false)?);
         }
-        let account_ids = changes
+        let account_identities = changes
             .iter()
-            .map(|(credential, _)| credential.as_str().to_owned())
+            .map(|change| change.identity.clone())
             .collect::<BTreeSet<_>>();
         let mut views = self
             .account_mutations
@@ -1476,48 +1924,97 @@ impl PoolingCoordinator {
             .lock()
             .map_err(|_| PoolError::Selection)?;
         self.register_registry_view_locked(&mut views)?;
-        let registries = self.live_registries_for_accounts_locked(&mut views, &account_ids)?;
+        let registry_views =
+            self.live_registries_for_accounts_locked(&mut views, &account_identities)?;
 
-        self.store
-            .switch_credential(account_id, &siblings, timestamp_now())
-            .map_err(|_| PoolError::Store)?;
-        self.publish_account_changes_locked(&registries, &changes)
+        let selected_identity = changes[0].identity.store_identity()?;
+        let sibling_identities = changes[1..]
+            .iter()
+            .map(|change| change.identity.store_identity())
+            .collect::<Result<Vec<_>, _>>()?;
+        match self
+            .store
+            .switch_credential_if_identities(
+                &selected_identity,
+                &sibling_identities,
+                timestamp_now(),
+            )
+            .map_err(|_| PoolError::Store)?
+        {
+            Some(_) => self.publish_account_changes_locked(&registry_views, &changes),
+            None => Err(PoolError::InvalidCredential),
+        }
+    }
+
+    fn account_mutation_identity(
+        &self,
+        account_id: &str,
+    ) -> Result<AccountMutationIdentity, PoolError> {
+        self.account_identities
+            .get(account_id)
+            .cloned()
+            .ok_or(PoolError::InvalidCredential)
+    }
+
+    fn account_enablement_change(
+        &self,
+        account_id: &str,
+        enabled: bool,
+    ) -> Result<AccountEnablementChange, PoolError> {
+        Ok(AccountEnablementChange {
+            credential: CredentialId::new(account_id).map_err(|_| PoolError::InvalidCredential)?,
+            identity: self.account_mutation_identity(account_id)?,
+            enabled,
+        })
     }
 
     fn live_registries_for_accounts_locked(
         &self,
         views: &mut Vec<RegisteredRegistryView>,
-        account_ids: &BTreeSet<String>,
-    ) -> Result<Vec<Arc<CredentialRegistry>>, PoolError> {
-        let mut registries = Vec::new();
+        account_identities: &BTreeSet<AccountMutationIdentity>,
+    ) -> Result<Vec<LiveRegistryView>, PoolError> {
+        let mut live_views = Vec::new();
         views.retain(|view| view.registries.upgrade().is_some());
         for view in views.iter() {
-            if view.accounts.is_disjoint(account_ids) {
+            if view.accounts.is_disjoint(account_identities) {
                 continue;
             }
             let Some(registry_map) = view.registries.upgrade() else {
                 continue;
             };
-            registries.extend(
-                registry_map
-                    .read()
-                    .map_err(|_| PoolError::Selection)?
-                    .values()
-                    .cloned(),
-            );
+            let registries = registry_map
+                .read()
+                .map_err(|_| PoolError::Selection)?
+                .values()
+                .cloned()
+                .collect();
+            live_views.push(LiveRegistryView {
+                registries,
+                accounts: view.accounts.clone(),
+            });
         }
-        Ok(registries)
+        Ok(live_views)
     }
 
     fn publish_account_changes_locked(
         &self,
-        registries: &[Arc<CredentialRegistry>],
-        changes: &[(CredentialId, bool)],
+        registry_views: &[LiveRegistryView],
+        changes: &[AccountEnablementChange],
     ) -> Result<(), PoolError> {
         let mut registry_failed = false;
-        for registry in registries {
-            if registry.set_credentials_enabled(changes).is_err() {
-                registry_failed = true;
+        for view in registry_views {
+            let matching_changes = changes
+                .iter()
+                .filter(|change| view.accounts.contains(&change.identity))
+                .map(|change| (change.credential.clone(), change.enabled))
+                .collect::<Vec<_>>();
+            if matching_changes.is_empty() {
+                continue;
+            }
+            for registry in &view.registries {
+                if registry.set_credentials_enabled(&matching_changes).is_err() {
+                    registry_failed = true;
+                }
             }
         }
 
@@ -1526,8 +2023,8 @@ impl PoolingCoordinator {
             .enablement
             .write()
             .map_err(|_| PoolError::Selection)?;
-        for (credential, enabled) in changes {
-            enablement.insert(credential.as_str().to_owned(), *enabled);
+        for change in changes {
+            enablement.insert(change.identity.clone(), change.enabled);
         }
         if registry_failed {
             Err(PoolError::Selection)
@@ -1834,8 +2331,9 @@ impl PoolingCoordinator {
                 .iter()
                 .filter(|target| {
                     target.account.as_ref().is_none_or(|account| {
-                        enablement
+                        self.account_identities
                             .get(account.id())
+                            .and_then(|identity| enablement.get(identity))
                             .copied()
                             .unwrap_or(account.enabled())
                     })
@@ -2276,6 +2774,223 @@ impl PoolingCoordinator {
             decision,
             replacement,
         }
+    }
+
+    /// Fence a native OAuth reauthentication failure against durable state
+    /// and reserve one policy-bounded retry target for this request.
+    pub(crate) fn classify_native_reauth(
+        &self,
+        input: NativeReauthInput<'_>,
+    ) -> Result<PoolFailure, PoolError> {
+        let NativeReauthInput {
+            config,
+            route,
+            selection,
+            replay,
+            commitment,
+            idempotency_key_present,
+            attempt,
+            failed_generation,
+            generation_fenced,
+            native_runtime,
+            outbound_attempt_consumed,
+            credentials_used,
+            providers_used,
+            elapsed_retry_delay,
+            elapsed_recovery_wait,
+            started,
+        } = input;
+        let failed_credential = selection
+            .credential()
+            .cloned()
+            .ok_or(PoolError::InvalidCredential)?;
+        let credential_mutation = if generation_fenced {
+            match self.disable_selected_oauth_credential_if_current(
+                config,
+                selection,
+                failed_generation,
+            ) {
+                Ok(mutation) => mutation,
+                Err(PoolError::Store) => OAuthCredentialMutation::DisableNotPersisted,
+                Err(error) => return Err(error),
+            }
+        } else {
+            // A token generation observed in another store cannot fence this
+            // metadata mutation. Disabling by account ID could race a newer
+            // login and publish that fresh credential as disabled. Keep the
+            // failure request-local and reserve a different retry target.
+            OAuthCredentialMutation::DisableNotPersisted
+        };
+        let failed_binding_unavailable =
+            credential_mutation != OAuthCredentialMutation::GenerationAdvanced;
+
+        let classification = FailureClassification::for_class(ErrorClass::ProviderAuthentication)
+            .with_credential_causation(pooler_policy::CredentialCausation::Proven);
+        let mutation = HealthMutation::NoChange {
+            reason: match credential_mutation {
+                OAuthCredentialMutation::Applied => HealthMutationReason::CredentialDisabled,
+                OAuthCredentialMutation::DisableNotPersisted => {
+                    HealthMutationReason::CredentialDisableNotPersisted
+                }
+                OAuthCredentialMutation::GenerationAdvanced => {
+                    HealthMutationReason::CredentialGenerationChanged
+                }
+                OAuthCredentialMutation::Unavailable => HealthMutationReason::CredentialUnavailable,
+            },
+        };
+        let _view = self
+            .registry_view_gate
+            .read()
+            .map_err(|_| PoolError::Selection)?;
+        let registry = self.registry_for(selection);
+        let retry_policy = selection.policy().map(configured_retry_policy);
+        let decision_policy = retry_policy.as_ref().map(|policy| {
+            let mut policy = policy.clone();
+            if !outbound_attempt_consumed {
+                policy.max_attempts = policy.max_attempts.saturating_add(1);
+            }
+            policy
+        });
+        let retry_context = RetryContext::new(attempt, commitment, replay)
+            .with_elapsed(started.elapsed())
+            .with_used_targets(
+                u32::try_from(credentials_used.len()).unwrap_or(u32::MAX),
+                u32::try_from(providers_used.len()).unwrap_or(u32::MAX),
+            )
+            .with_elapsed_retry_delay(elapsed_retry_delay)
+            .with_elapsed_recovery_wait(elapsed_recovery_wait)
+            .with_idempotency_key(idempotency_key_present)
+            .with_target_change(RetryTargetChange::DifferentCredential);
+        let mut decision = decision_policy.as_ref().map_or(
+            RetryDecision::DoNotRetry {
+                reason: RetryStopReason::ClassificationNotRetryable,
+            },
+            |policy| policy.decide(&classification, retry_context),
+        );
+        let mut replacement = None;
+        let replacement_may_reuse_budgeted_credential = decision.is_retry()
+            || matches!(
+                decision,
+                RetryDecision::DoNotRetry {
+                    reason: RetryStopReason::CredentialsExhausted
+                }
+            );
+
+        if replacement_may_reuse_budgeted_credential {
+            if let (Some(registry), Some(retry_policy), Some(decision_policy), Some(mut request)) = (
+                registry.as_ref(),
+                retry_policy.as_ref(),
+                decision_policy.as_ref(),
+                selection.retry_selection_request(),
+            ) {
+                request.attempt = attempt.saturating_add(u32::from(outbound_attempt_consumed));
+                request.now = Instant::now();
+                let credential_budget_full =
+                    credentials_used.len() >= retry_policy.max_credentials as usize;
+                let provider_budget_full =
+                    providers_used.len() >= retry_policy.max_providers as usize;
+                let bindings = self
+                    .binding_index
+                    .read()
+                    .map_err(|_| PoolError::Selection)?;
+                let transient = registry
+                    .registrations()
+                    .map_err(|_| PoolError::Selection)?
+                    .into_iter()
+                    .filter(|registration| {
+                        let unsupported_native = native_runtime.is_some_and(|runtime| {
+                            bindings
+                                .get(registration.binding())
+                                .and_then(|binding| config.upstreams().get(&binding.upstream_id))
+                                .is_none_or(|upstream| {
+                                    upstream.native().is_some() && !runtime.supports(upstream)
+                                })
+                        });
+                        unsupported_native
+                            || (failed_binding_unavailable
+                                && registration.credential() == &failed_credential)
+                            || (credential_budget_full
+                                && !credentials_used.contains(registration.credential()))
+                            || (provider_budget_full
+                                && !providers_used.contains(registration.provider()))
+                    })
+                    .map(|registration| registration.binding().clone())
+                    .collect::<BTreeSet<_>>();
+                drop(bindings);
+                // Authorization failures happen before a provider send. Keep every
+                // request-local failed or ineligible binding excluded for the rest
+                // of this request; one-hop transport exclusions would allow two
+                // unfenced credentials to cycle until the request deadline.
+                request.excluded_bindings.extend(transient);
+                drop(selection.take_lease());
+
+                match registry.select(request.clone()) {
+                    Ok(lease) => {
+                        let candidate_credential = lease.registration().credential();
+                        let candidate_provider = lease.registration().provider();
+                        let credential_was_used = credentials_used.contains(candidate_credential);
+                        let provider_was_used = providers_used.contains(candidate_provider);
+                        let target_change = if candidate_credential == &failed_credential {
+                            RetryTargetChange::SameTarget
+                        } else if candidate_provider == selection.provider() {
+                            RetryTargetChange::DifferentCredential
+                        } else {
+                            RetryTargetChange::DifferentProvider
+                        };
+                        let candidate_context = retry_context
+                            .with_used_targets(
+                                if credential_was_used {
+                                    retry_context.credentials_used.saturating_sub(1)
+                                } else {
+                                    retry_context.credentials_used
+                                },
+                                if provider_was_used {
+                                    retry_context.providers_used.saturating_sub(1)
+                                } else {
+                                    retry_context.providers_used
+                                },
+                            )
+                            .with_target_change(target_change);
+                        decision = decision_policy.decide(&classification, candidate_context);
+                        if decision.is_retry() {
+                            replacement = Some(self.selection_from_recovery(
+                                config,
+                                route,
+                                selection,
+                                request,
+                                lease,
+                                BTreeSet::new(),
+                            ));
+                        }
+                    }
+                    Err(SelectionError::NoEligible { .. }) => {
+                        decision = RetryDecision::DoNotRetry {
+                            reason: RetryStopReason::NoAlternateTarget,
+                        };
+                    }
+                    Err(_) => return Err(PoolError::Selection),
+                }
+            } else {
+                decision = RetryDecision::DoNotRetry {
+                    reason: RetryStopReason::NoAlternateTarget,
+                };
+            }
+        }
+
+        self.record_failure(
+            route,
+            selection,
+            attempt,
+            config.generation(),
+            &classification,
+            decision,
+        );
+        Ok(PoolFailure {
+            classification,
+            mutation,
+            decision,
+            replacement,
+        })
     }
 
     fn insert_network_retry_exclusions(
@@ -2754,7 +3469,7 @@ impl PoolingCoordinator {
         {
             views.push(RegisteredRegistryView {
                 registries: Arc::downgrade(&self.registries),
-                accounts: self.accounts.keys().cloned().collect(),
+                accounts: self.account_identities.values().cloned().collect(),
             });
         }
 
@@ -2766,7 +3481,7 @@ impl PoolingCoordinator {
             .enablement
             .write()
             .map_err(|_| PoolError::Selection)?
-            .retain(|account, _| live_accounts.contains(account));
+            .retain(|identity, _| live_accounts.contains(identity));
         Ok(())
     }
 
@@ -2781,18 +3496,30 @@ impl PoolingCoordinator {
     fn restore_account_enablement_locked(&self) -> Result<(), PoolError> {
         let mut changes = Vec::with_capacity(self.accounts.len());
         for account in self.accounts.values() {
+            let identity = self.account_mutation_identity(account.id())?;
             let current = self
                 .store
                 .credential_state(account.id())
                 .map_err(|_| PoolError::Store)?;
-            let enabled = current
-                .as_ref()
-                .map_or(account.enabled(), |state| state.enabled);
-            if current.is_none() {
+            let exact_identity = current.as_ref().is_some_and(|state| {
+                state.provider_id == identity.provider_id
+                    && state.configuration_fingerprint == identity.configuration_fingerprint
+            });
+            let safe_legacy_identity = current.as_ref().is_some_and(|state| {
+                state.provider_id == identity.provider_id
+                    && state.configuration_fingerprint.is_empty()
+            });
+            let enabled = if exact_identity || safe_legacy_identity {
+                current.as_ref().is_some_and(|state| state.enabled)
+            } else {
+                account.enabled()
+            };
+            if !exact_identity {
                 self.store
-                    .upsert_credential_state(CredentialState::new(
+                    .upsert_credential_state(CredentialState::new_with_fingerprint(
                         account.id(),
-                        account.provider(),
+                        &identity.provider_id,
+                        &identity.configuration_fingerprint,
                         enabled,
                         timestamp_now(),
                     ))
@@ -2822,7 +3549,8 @@ impl PoolingCoordinator {
             .write()
             .map_err(|_| PoolError::Selection)?;
         for (credential, enabled) in changes {
-            enablement.insert(credential.as_str().to_owned(), enabled);
+            let identity = self.account_mutation_identity(credential.as_str())?;
+            enablement.insert(identity, enabled);
         }
         Ok(())
     }
@@ -2833,7 +3561,7 @@ impl PoolingCoordinator {
         let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
         for cooldown in self
             .store
-            .cooldowns(now_wall)
+            .cooldowns_snapshot(now_wall)
             .map_err(|_| PoolError::Store)?
         {
             let remaining = cooldown.until.saturating_sub(now_wall);
@@ -2868,7 +3596,7 @@ impl PoolingCoordinator {
         let registries = self.registries.read().map_err(|_| PoolError::Selection)?;
         for cooldown in self
             .store
-            .cooldowns(now_wall)
+            .cooldowns_snapshot(now_wall)
             .map_err(|_| PoolError::Store)?
             .into_iter()
             .filter(|cooldown| cooldown.scope == TYPED_QUOTA_STORE_SCOPE)
@@ -2898,7 +3626,7 @@ impl PoolingCoordinator {
             .map_err(|_| PoolError::Selection)?;
         for affinity in self
             .store
-            .session_affinities(now_wall)
+            .session_affinities_snapshot(now_wall)
             .map_err(|_| PoolError::Store)?
         {
             let Some((registry_key, target_id, redacted_key)) =
@@ -3125,7 +3853,7 @@ fn configured_retry_policy(policy: &PolicyPlan) -> RetryPolicy {
             .maximum_recovery_wait()
             .unwrap_or(retry.maximum_total_delay()),
     )
-    .unwrap_or_default()
+    .expect("compiled retry budgets satisfy runtime policy invariants")
     .with_max_elapsed(retry.maximum_elapsed())
 }
 
@@ -3236,6 +3964,16 @@ fn quota_store_key(record: &PersistedQuotaSnapshot) -> Result<String, serde_json
     serde_json::to_string(record)
 }
 
+fn account_is_selectable_for_upstream(
+    upstream: Option<&pooler_config::UpstreamPlan>,
+    account: &AccountPlan,
+) -> bool {
+    upstream.is_none_or(|upstream| {
+        upstream.native().is_none()
+            || crate::native::account_auth_kind_compatible(upstream, account.auth_kind())
+    })
+}
+
 fn register_model_accounts(
     registry: &CredentialRegistry,
     model: &str,
@@ -3252,7 +3990,9 @@ fn register_model_accounts(
             let Some(account) = accounts.get(account_id) else {
                 continue;
             };
-            if account.provider() != target.provider() {
+            if account.provider() != target.provider()
+                || !account_is_selectable_for_upstream(upstreams.get(account.provider()), account)
+            {
                 continue;
             }
             let fingerprint = upstreams
@@ -3353,10 +4093,10 @@ fn register_route_accounts(
     binding_index: &mut BTreeMap<BindingKey, Arc<RuntimeBinding>>,
 ) -> Result<(), PoolError> {
     let model = ModelId::new(route_key.to_owned()).map_err(|_| PoolError::InvalidModel)?;
-    for account in accounts
-        .values()
-        .filter(|account| account.provider() == upstream)
-    {
+    for account in accounts.values().filter(|account| {
+        account.provider() == upstream
+            && account_is_selectable_for_upstream(upstreams.get(account.provider()), account)
+    }) {
         let fingerprint = upstreams
             .get(account.provider())
             .map(|upstream| {
@@ -3480,7 +4220,9 @@ fn register_catalog_model(
             let Some(account) = accounts.get(&account_id) else {
                 continue;
             };
-            if account.provider() != target.provider().as_str() {
+            if account.provider() != target.provider().as_str()
+                || !account_is_selectable_for_upstream(Some(upstream), account)
+            {
                 continue;
             }
             let fingerprint = crate::account_configuration_fingerprint(
@@ -4328,7 +5070,7 @@ mod tests {
         CatalogSourceConfig, DiscoveredModel, DiscoveryFuture, DiscoveryResponse, ModelDiscovery,
         RefreshConfig, RegisteredSource,
     };
-    use pooler_store::SqliteStore;
+    use pooler_store::{CredentialPayload, MasterKey, SqliteStore};
     use std::io::Write;
     use tempfile::{tempdir, NamedTempFile};
 
@@ -4573,6 +5315,1578 @@ routes:
         .expect("account mutation config")
     }
 
+    fn native_reauth_budget_config(
+        maximum_credentials: u32,
+        maximum_upstreams: u32,
+    ) -> CompiledConfig {
+        compile_yaml(
+            "native-reauth-budget.yaml",
+            &format!(
+                r#"
+version: 2
+listeners: {{local: {{bind: 127.0.0.1:0}}}}
+upstreams:
+  first:
+    url: http://127.0.0.1:1
+    native: {{kind: codex}}
+    oauth: {{authorization_endpoint: https://oauth.example/authorize, token_endpoint: https://oauth.example/token, client_id: first-client, scopes: [openid]}}
+  second:
+    url: http://127.0.0.1:2
+    native: {{kind: codex}}
+    oauth: {{authorization_endpoint: https://oauth.example/authorize, token_endpoint: https://oauth.example/token, client_id: second-client, scopes: [openid]}}
+accounts:
+  first: {{provider: first, auth_kind: oauth, max_concurrency: 1}}
+  second: {{provider: second, auth_kind: oauth}}
+models:
+  - id: public
+    targets:
+      - {{id: first-target, provider: first, account: first, priority: 1, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}}
+      - {{id: second-target, provider: second, account: second, priority: 2, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}}
+policies:
+  pooled:
+    selection: {{strategy: ordered_fallback}}
+    retry: {{maximum_attempts: 2, maximum_credentials: {maximum_credentials}, maximum_upstreams: {maximum_upstreams}, statuses: [503], before_commit_only: true, base_delay: 25ms, maximum_delay: 25ms, maximum_total_delay: 25ms}}
+routes:
+  - id: pooled
+    listen: local
+    ingress: {{mode: patch}}
+    target: {{provider: first, model_from: request.model, policy: pooled}}
+    response: {{mode: opaque}}
+"#
+            ),
+        )
+        .expect("native reauthentication budget config")
+    }
+
+    fn fingerprinted_native_reauth_coordinator(config: &CompiledConfig) -> PoolingCoordinator {
+        let coordinator = PoolingCoordinator::new(config).expect("coordinator");
+        for account_id in ["first", "second"] {
+            let upstream = &config.upstreams()[account_id];
+            let fingerprint = crate::account_configuration_fingerprint(
+                upstream,
+                account_id,
+                AccountAuthKind::OAuth,
+            )
+            .expect("OAuth account fingerprint");
+            coordinator
+                .store
+                .upsert_credential_state(CredentialState::new_with_fingerprint(
+                    account_id,
+                    account_id,
+                    fingerprint,
+                    true,
+                    timestamp_now(),
+                ))
+                .expect("fingerprinted OAuth account state");
+        }
+        coordinator
+    }
+
+    fn classify_native_reauth_budget_case(
+        maximum_credentials: u32,
+        maximum_upstreams: u32,
+    ) -> (PoolingCoordinator, PoolFailure) {
+        let config = native_reauth_budget_config(maximum_credentials, maximum_upstreams);
+        let coordinator = fingerprinted_native_reauth_coordinator(&config);
+        let route = config.route("pooled").expect("route");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        let failed_generation = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential")
+            .revision;
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+        let failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: true,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("reauthentication classification");
+        (coordinator, failure)
+    }
+
+    #[test]
+    fn native_reauth_replacement_honors_distinct_credential_and_provider_budgets() {
+        for (credentials, providers) in [(1, 2), (2, 1)] {
+            let (coordinator, failure) = classify_native_reauth_budget_case(credentials, providers);
+            assert!(!failure.decision.is_retry());
+            assert!(failure.replacement.is_none());
+            let states = coordinator
+                .credential_states()
+                .expect("credential states remain readable");
+            assert!(states
+                .iter()
+                .any(|state| state.credential_id == "first" && !state.enabled));
+            assert!(states
+                .iter()
+                .any(|state| state.credential_id == "second" && state.enabled));
+        }
+
+        let (_coordinator, mut failure) = classify_native_reauth_budget_case(2, 2);
+        assert!(failure.decision.is_retry());
+        let replacement = failure
+            .take_replacement()
+            .expect("both budgets admit the alternate target");
+        assert_eq!(
+            replacement.credential().map(CredentialId::as_str),
+            Some("second")
+        );
+        assert_eq!(replacement.provider().as_str(), "second");
+    }
+
+    #[test]
+    fn native_selection_and_recovery_skip_non_oauth_candidates() {
+        let config = compile_yaml(
+            "native-reauth-auth-kind.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  provider:
+    url: http://127.0.0.1:1
+    native: {kind: kimi}
+    oauth: {authorization_endpoint: https://oauth.example/authorize, token_endpoint: https://oauth.example/token, client_id: client, scopes: [openid]}
+accounts:
+  first: {provider: provider, auth_kind: oauth}
+  middle: {provider: provider, auth_kind: api_key, secret: env:MIDDLE_KEY}
+  last: {provider: provider, auth_kind: oauth}
+models:
+  - id: public
+    targets:
+      - {id: first-target, provider: provider, account: first, priority: 1, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+      - {id: middle-target, provider: provider, account: middle, priority: 2, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+      - {id: last-target, provider: provider, account: last, priority: 3, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+policies:
+  pooled:
+    selection: {strategy: ordered_fallback}
+    retry: {maximum_attempts: 3, maximum_credentials: 3, maximum_upstreams: 1, statuses: [429, 503], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}
+routes:
+  - id: pooled
+    listen: local
+    ingress: {mode: patch}
+    target: {provider: provider, model_from: request.model, policy: pooled}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("mixed authentication-kind config");
+        let route = config.route("pooled").expect("route");
+
+        let initial_coordinator = PoolingCoordinator::new(&config).expect("initial coordinator");
+        initial_coordinator
+            .set_account_enabled("first", false)
+            .expect("disable first account");
+        let initial = initial_coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("compatible initial selection");
+        assert_eq!(
+            initial.credential().map(CredentialId::as_str),
+            Some("last"),
+            "initial selection must skip the incompatible API-key account",
+        );
+
+        let quota_coordinator = PoolingCoordinator::new(&config).expect("quota coordinator");
+        let mut quota_selection = quota_coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first quota selection");
+        let (quota_credentials, quota_providers) = used_target_sets(&quota_selection);
+        let mut quota_failure = quota_coordinator.classify_failure(FailureInput {
+            config: &config,
+            route,
+            selection: &mut quota_selection,
+            status: Some(429),
+            provider_code: Some("insufficient_quota".to_owned()),
+            message: None,
+            native_codex: false,
+            quota_observations: &[],
+            retry_after: Some(Duration::from_secs(30)),
+            replay: ReplayCheck::for_http_method("POST", true),
+            commitment: CommitmentState::Uncommitted,
+            idempotency_key_present: true,
+            attempt: 1,
+            credentials_used: &quota_credentials,
+            providers_used: &quota_providers,
+            elapsed_retry_delay: Duration::ZERO,
+            elapsed_recovery_wait: Duration::ZERO,
+            started: Instant::now(),
+        });
+        assert_eq!(
+            quota_failure
+                .take_replacement()
+                .expect("compatible quota replacement")
+                .credential()
+                .map(CredentialId::as_str),
+            Some("last"),
+            "quota recovery must skip the incompatible API-key account",
+        );
+
+        let coordinator = PoolingCoordinator::new(&config).expect("reauth coordinator");
+        let upstream = &config.upstreams()["provider"];
+        for account_id in ["first", "last"] {
+            let fingerprint = crate::account_configuration_fingerprint(
+                upstream,
+                account_id,
+                AccountAuthKind::OAuth,
+            )
+            .expect("OAuth account fingerprint");
+            coordinator
+                .store
+                .upsert_credential_state(CredentialState::new_with_fingerprint(
+                    account_id,
+                    "provider",
+                    fingerprint,
+                    true,
+                    timestamp_now(),
+                ))
+                .expect("fingerprinted OAuth account state");
+        }
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        assert_eq!(
+            selection.credential().map(CredentialId::as_str),
+            Some("first")
+        );
+        let failed_generation = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential")
+            .revision;
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: true,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("reauthentication classification");
+
+        let replacement = failure.take_replacement().expect("OAuth replacement");
+        assert_eq!(
+            replacement.credential().cloned(),
+            Some(CredentialId::new("last").expect("credential"))
+        );
+        assert!(
+            !coordinator
+                .binding_index
+                .read()
+                .expect("binding index")
+                .values()
+                .any(|binding| binding.binding.account_id().as_str() == "middle"),
+            "authentication-incompatible targets must never enter a selectable registry",
+        );
+    }
+
+    #[test]
+    fn native_reauth_preserves_compatible_cross_provider_api_key_fallback() {
+        let config = compile_yaml(
+            "native-reauth-api-key-fallback.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  native:
+    url: http://127.0.0.1:1
+    native: {kind: codex}
+    oauth: {authorization_endpoint: https://oauth.example/authorize, token_endpoint: https://oauth.example/token, client_id: client, scopes: [openid]}
+  api: {url: http://127.0.0.1:2}
+accounts:
+  native: {provider: native, auth_kind: oauth}
+  api: {provider: api, auth_kind: api_key, secret: env:API_KEY}
+models:
+  - id: public
+    targets:
+      - {id: native-target, provider: native, account: native, priority: 1, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+      - {id: api-target, provider: api, account: api, priority: 2, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+policies:
+  pooled:
+    selection: {strategy: ordered_fallback}
+    retry: {maximum_attempts: 2, maximum_credentials: 2, maximum_upstreams: 2, statuses: [503], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}
+routes:
+  - id: pooled
+    listen: local
+    ingress: {mode: patch}
+    target: {provider: native, model_from: request.model, policy: pooled}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("cross-provider authentication config");
+        let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
+        let upstream = &config.upstreams()["native"];
+        let fingerprint =
+            crate::account_configuration_fingerprint(upstream, "native", AccountAuthKind::OAuth)
+                .expect("OAuth account fingerprint");
+        let native = coordinator
+            .store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "native",
+                "native",
+                fingerprint,
+                true,
+                timestamp_now(),
+            ))
+            .expect("fingerprinted OAuth account state");
+        let route = config.route("pooled").expect("route");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("native selection");
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation: native.revision,
+                generation_fenced: true,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("reauthentication classification");
+
+        let replacement = failure.take_replacement().expect("API-key fallback");
+        assert_eq!(
+            replacement.credential().map(CredentialId::as_str),
+            Some("api")
+        );
+        assert_eq!(
+            replacement.account_auth_kind(),
+            Some(AccountAuthKind::ApiKey)
+        );
+    }
+
+    #[test]
+    fn native_reauth_store_failure_keeps_disable_local_and_fails_over() {
+        let config = native_reauth_budget_config(2, 2);
+        let directory = tempdir().expect("temporary SQLite directory");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private SQLite directory");
+        let path = directory.path().join("reauth-store-failure.db");
+        let store = Arc::new(
+            SqliteStore::open_encrypted(
+                &path,
+                MasterKey::from_bytes(b"native reauth store failure key").expect("master key"),
+            )
+            .expect("encrypted store"),
+        );
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        let route = config.route("pooled").expect("route");
+        let initial = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential");
+        let expected_fingerprint = crate::account_configuration_fingerprint(
+            &config.upstreams()["first"],
+            "first",
+            AccountAuthKind::OAuth,
+        )
+        .expect("configured fingerprint");
+        let first = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "first",
+                "first",
+                &expected_fingerprint,
+                initial.enabled,
+                timestamp_now(),
+            ))
+            .expect("adopt configured fingerprint");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "first",
+                &first.configuration_fingerprint,
+                &CredentialPayload::new(b"failed refresh token").expect("payload"),
+                timestamp_now(),
+            )
+            .expect("failed payload generation");
+        let failed_generation = store
+            .credential_payload_compare_generation_for_fingerprint(
+                "first",
+                &first.configuration_fingerprint,
+            )
+            .expect("failed generation");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        assert_eq!(first.configuration_fingerprint, expected_fingerprint);
+        assert!(matches!(
+            store
+                .set_credential_enabled_if_current(
+                    "first",
+                    failed_generation,
+                    "first",
+                    &expected_fingerprint,
+                    true,
+                    timestamp_now(),
+                )
+                .expect("matching precondition probe"),
+            ConditionalCredentialMutation::Applied(_)
+        ));
+        let connection = rusqlite::Connection::open(&path).expect("failure injection connection");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_credential_disable                  BEFORE UPDATE OF enabled ON credentials                  WHEN NEW.enabled = 0                  BEGIN SELECT RAISE(FAIL, 'injected disable failure'); END;",
+            )
+            .expect("install disable failure trigger");
+        drop(connection);
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: true,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("store failure remains request-local");
+
+        assert_eq!(
+            failure.mutation,
+            HealthMutation::NoChange {
+                reason: HealthMutationReason::CredentialDisableNotPersisted,
+            }
+        );
+        assert_eq!(
+            failure.health_mutation_reason(),
+            Some("credential_disable_not_persisted")
+        );
+        assert_eq!(
+            failure
+                .take_replacement()
+                .and_then(|replacement| replacement.credential().cloned()),
+            Some(CredentialId::new("second").expect("credential"))
+        );
+        assert!(failure.decision.is_retry());
+        assert!(
+            coordinator
+                .store
+                .credential_state("first")
+                .expect("credential state")
+                .expect("first credential")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn native_reauth_recovery_skips_runtime_unsupported_candidate() {
+        #[derive(Debug)]
+        struct NeedsReauthRefresher;
+
+        impl pooler_auth::OAuthRefresher for NeedsReauthRefresher {
+            fn refresh<'a>(
+                &'a self,
+                _refresh_token: &'a pooler_auth::SecretValue,
+                _cancellation: tokio_util::sync::CancellationToken,
+            ) -> pooler_auth::OAuthFuture<'a, pooler_auth::OAuthTokens> {
+                Box::pin(async { Err(pooler_auth::OAuthError::NeedsReauth) })
+            }
+        }
+
+        let config = compile_yaml(
+            "native-runtime-support-recovery.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  first:
+    url: http://127.0.0.1:1
+    native: {kind: codex}
+    oauth: {authorization_endpoint: https://oauth.example/authorize, token_endpoint: https://oauth.example/token, client_id: first-client, scopes: [openid]}
+  unsupported:
+    url: http://127.0.0.1:2
+    native: {kind: codex}
+    oauth: {authorization_endpoint: https://oauth.example/authorize, token_endpoint: https://oauth.example/token, client_id: unsupported-client, scopes: [openid]}
+  api: {url: http://127.0.0.1:3}
+accounts:
+  first: {provider: first, auth_kind: oauth}
+  unsupported: {provider: unsupported, auth_kind: oauth}
+  api: {provider: api, auth_kind: api_key, secret: env:API_KEY}
+models:
+  - id: public
+    targets:
+      - {id: first-target, provider: first, account: first, priority: 1, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+      - {id: unsupported-target, provider: unsupported, account: unsupported, priority: 2, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+      - {id: api-target, provider: api, account: api, priority: 3, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+policies:
+  pooled:
+    selection: {strategy: ordered_fallback}
+    retry: {maximum_attempts: 3, maximum_credentials: 3, maximum_upstreams: 3, statuses: [503], before_commit_only: true, base_delay: 0ms, maximum_delay: 1ms, maximum_total_delay: 1s}
+routes:
+  - id: pooled
+    listen: local
+    ingress: {mode: patch}
+    target: {provider: first, model_from: request.model, policy: pooled}
+    response: {mode: opaque}
+"#,
+        )
+        .expect("native support recovery config");
+        let coordinator = PoolingCoordinator::new(&config).expect("coordinator");
+        for account_id in ["first", "unsupported"] {
+            let upstream = &config.upstreams()[account_id];
+            let fingerprint = crate::account_configuration_fingerprint(
+                upstream,
+                account_id,
+                AccountAuthKind::OAuth,
+            )
+            .expect("OAuth account fingerprint");
+            coordinator
+                .store
+                .upsert_credential_state(CredentialState::new_with_fingerprint(
+                    account_id,
+                    account_id,
+                    fingerprint,
+                    true,
+                    timestamp_now(),
+                ))
+                .expect("fingerprinted OAuth state");
+        }
+        let runtime = crate::NativeRuntime::with_codex_provider(
+            Arc::new(pooler_auth::MemoryOAuthTokenStore::new()),
+            "first",
+            Arc::new(NeedsReauthRefresher),
+        );
+        assert!(runtime.supports(&config.upstreams()["first"]));
+        assert!(!runtime.supports(&config.upstreams()["unsupported"]));
+        let route = config.route("pooled").expect("route");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        let failed_generation = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential")
+            .revision;
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: true,
+                native_runtime: Some(&runtime),
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("reauthentication classification");
+
+        let replacement = failure
+            .take_replacement()
+            .expect("supported API-key fallback");
+        assert_eq!(replacement.provider().as_str(), "api");
+        assert_eq!(
+            replacement.credential().map(CredentialId::as_str),
+            Some("api")
+        );
+        assert_eq!(
+            replacement.account_auth_kind(),
+            Some(AccountAuthKind::ApiKey)
+        );
+    }
+
+    #[test]
+    fn successful_oauth_login_reenables_exact_generation_and_live_registry() {
+        let config = native_reauth_budget_config(2, 2);
+        let coordinator = fingerprinted_native_reauth_coordinator(&config);
+        coordinator
+            .set_account_enabled("first", false)
+            .expect("disable account");
+        let disabled = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("disabled credential");
+        let login = coordinator
+            .store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "first",
+                "first",
+                disabled.configuration_fingerprint,
+                false,
+                timestamp_now(),
+            ))
+            .expect("persisted login generation");
+
+        assert!(coordinator
+            .set_oauth_account_enabled_if_current(&config, "first", login.revision, true,)
+            .expect("enable exact login generation"));
+        let enabled = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("enabled credential");
+        assert!(enabled.enabled);
+        assert_eq!(enabled.revision, login.revision.saturating_add(1));
+
+        let selection = coordinator
+            .select(
+                &config,
+                config.route("pooled").expect("route"),
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("re-enabled account is selectable");
+        assert_eq!(
+            selection.credential().map(CredentialId::as_str),
+            Some("first")
+        );
+        assert!(!coordinator
+            .set_oauth_account_enabled_if_current(&config, "first", login.revision, false,)
+            .expect("stale login cannot mutate newer state"));
+    }
+
+    #[test]
+    fn successful_oauth_login_rebases_enablement_after_concurrent_refresh() {
+        let config = native_reauth_budget_config(2, 2);
+        let store = Arc::new(
+            SqliteStore::open_in_memory_encrypted(
+                MasterKey::from_bytes(b"OAuth login enable rebase regression key")
+                    .expect("master key"),
+            )
+            .expect("encrypted store"),
+        );
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        coordinator
+            .set_account_enabled("first", false)
+            .expect("disable account before login");
+        let fingerprint = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential")
+            .configuration_fingerprint;
+        let expected_generation = store
+            .credential_payload_compare_generation_for_fingerprint("first", &fingerprint)
+            .expect("initial compare generation");
+        let login = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "first",
+                expected_generation,
+                &fingerprint,
+                &CredentialPayload::new(b"login token").expect("login payload"),
+                timestamp_now(),
+            )
+            .expect("persist login");
+        let refresh = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "first",
+                login.revision,
+                &fingerprint,
+                &CredentialPayload::new(b"refreshed token").expect("refresh payload"),
+                timestamp_now(),
+            )
+            .expect("concurrent refresh");
+        assert!(refresh.revision > login.revision);
+        assert!(
+            !store
+                .credential_state("first")
+                .expect("disabled state")
+                .expect("first credential")
+                .enabled
+        );
+
+        assert!(coordinator
+            .set_oauth_account_enabled_if_current(&config, "first", login.revision, true)
+            .expect("rebase login enablement"));
+        assert!(
+            store
+                .credential_state("first")
+                .expect("enabled state")
+                .expect("first credential")
+                .enabled
+        );
+        let selected = coordinator
+            .select(
+                &config,
+                config.route("pooled").expect("route"),
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("rebased account is selectable");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn stale_native_reauth_retries_newer_login_generation_on_same_credential() {
+        let config = native_reauth_budget_config(1, 1);
+        let store = Arc::new(
+            SqliteStore::open_in_memory_encrypted(
+                MasterKey::from_bytes(b"native reauth newer login generation key")
+                    .expect("master key"),
+            )
+            .expect("encrypted store"),
+        );
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        let route = config.route("pooled").expect("route");
+        let fingerprint = crate::account_configuration_fingerprint(
+            config.upstreams().get("first").expect("first upstream"),
+            "first",
+            AccountAuthKind::OAuth,
+        )
+        .expect("OAuth account fingerprint");
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "first",
+                "first",
+                &fingerprint,
+                true,
+                timestamp_now(),
+            ))
+            .expect("fingerprinted login metadata");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "first",
+                &fingerprint,
+                &CredentialPayload::new(b"failed refresh token").expect("payload"),
+                timestamp_now(),
+            )
+            .expect("failed login generation");
+        let failed_generation = store
+            .credential_payload_compare_generation_for_fingerprint("first", &fingerprint)
+            .expect("failed payload generation");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        let login = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "first",
+                failed_generation,
+                &fingerprint,
+                &CredentialPayload::new(b"new login refresh token").expect("payload"),
+                timestamp_now(),
+            )
+            .expect("concurrent login generation");
+        assert!(login.revision > failed_generation);
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: true,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("stale reauthentication classification");
+
+        let preserved = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential");
+        assert!(preserved.enabled);
+        assert_eq!(preserved.revision, login.revision);
+        assert_eq!(
+            failure.mutation,
+            HealthMutation::NoChange {
+                reason: HealthMutationReason::CredentialGenerationChanged,
+            }
+        );
+        assert_eq!(
+            failure
+                .take_replacement()
+                .and_then(|replacement| replacement.credential().cloned()),
+            Some(CredentialId::new("first").expect("credential"))
+        );
+        assert_eq!(failure.decision.delay(), Duration::from_millis(25));
+        assert!(failure.decision.is_retry());
+    }
+
+    #[test]
+    fn unfenced_native_reauth_never_disables_a_potentially_newer_login() {
+        let config = native_reauth_budget_config(2, 2);
+        let coordinator = fingerprinted_native_reauth_coordinator(&config);
+        let route = config.route("pooled").expect("route");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        let failed_generation = 1;
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: false,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("unfenced reauthentication classification");
+
+        assert!(
+            coordinator
+                .store
+                .credential_state("first")
+                .expect("credential state")
+                .expect("first credential")
+                .enabled
+        );
+        assert_eq!(
+            failure.mutation,
+            HealthMutation::NoChange {
+                reason: HealthMutationReason::CredentialDisableNotPersisted,
+            }
+        );
+        assert_eq!(
+            failure
+                .take_replacement()
+                .and_then(|replacement| replacement.credential().cloned()),
+            Some(CredentialId::new("second").expect("credential"))
+        );
+        assert!(failure.decision.is_retry());
+    }
+
+    #[test]
+    fn unfenced_pre_send_reauth_does_not_cycle_between_failed_credentials() {
+        let config = native_reauth_budget_config(2, 2);
+        let coordinator = fingerprinted_native_reauth_coordinator(&config);
+        let route = config.route("pooled").expect("route");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        let (mut credentials_used, mut providers_used) = used_target_sets(&selection);
+
+        let mut first_failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation: 1,
+                generation_fenced: false,
+                native_runtime: None,
+                outbound_attempt_consumed: false,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("first request-local reauthentication classification");
+        assert!(first_failure.decision.is_retry());
+        selection = first_failure
+            .take_replacement()
+            .expect("second credential is selected once");
+        credentials_used.insert(selection.credential().expect("credential").clone());
+        providers_used.insert(selection.provider().clone());
+        assert_eq!(
+            selection.credential().map(CredentialId::as_str),
+            Some("second")
+        );
+
+        let second_failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation: 1,
+                generation_fenced: false,
+                native_runtime: None,
+                outbound_attempt_consumed: false,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("second request-local reauthentication classification");
+
+        assert!(!second_failure.decision.is_retry());
+        assert!(second_failure.replacement.is_none());
+        assert_eq!(
+            second_failure.decision,
+            RetryDecision::DoNotRetry {
+                reason: RetryStopReason::NoAlternateTarget,
+            }
+        );
+        assert!(coordinator
+            .credential_states()
+            .expect("credential states remain readable")
+            .into_iter()
+            .all(|state| state.enabled));
+    }
+
+    #[test]
+    fn metadata_only_disable_and_reenable_does_not_masquerade_as_a_new_login() {
+        let config = native_reauth_budget_config(2, 2);
+        let store = Arc::new(
+            SqliteStore::open_in_memory_encrypted(
+                MasterKey::from_bytes(b"native reauth metadata toggle key").expect("master key"),
+            )
+            .expect("encrypted store"),
+        );
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        let route = config.route("pooled").expect("route");
+        let fingerprint = crate::account_configuration_fingerprint(
+            config.upstreams().get("first").expect("first upstream"),
+            "first",
+            AccountAuthKind::OAuth,
+        )
+        .expect("OAuth account fingerprint");
+        store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "first",
+                "first",
+                &fingerprint,
+                true,
+                timestamp_now(),
+            ))
+            .expect("fingerprinted login metadata");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "first",
+                &fingerprint,
+                &CredentialPayload::new(b"invalid refresh token").expect("payload"),
+                timestamp_now(),
+            )
+            .expect("failed payload generation");
+        let failed_generation = store
+            .credential_payload_compare_generation_for_fingerprint("first", &fingerprint)
+            .expect("failed payload generation");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        coordinator
+            .store
+            .set_credential_enabled("first", false, timestamp_now())
+            .expect("metadata-only disable");
+        coordinator
+            .store
+            .set_credential_enabled("first", true, timestamp_now())
+            .expect("metadata-only re-enable");
+        assert_eq!(
+            store
+                .credential_payload_compare_generation_for_fingerprint("first", &fingerprint,)
+                .expect("unchanged payload generation"),
+            failed_generation
+        );
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: true,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("metadata toggle classification");
+
+        assert_eq!(
+            failure.mutation,
+            HealthMutation::NoChange {
+                reason: HealthMutationReason::CredentialDisabled,
+            }
+        );
+        assert_eq!(
+            failure
+                .take_replacement()
+                .and_then(|replacement| replacement.credential().cloned()),
+            Some(CredentialId::new("second").expect("credential"))
+        );
+        assert!(
+            !coordinator
+                .store
+                .credential_state("first")
+                .expect("credential state")
+                .expect("first credential")
+                .enabled
+        );
+        assert!(failure.decision.is_retry());
+    }
+
+    #[test]
+    fn externally_disabled_newer_generation_is_not_retried_as_a_fresh_login() {
+        let config = native_reauth_budget_config(2, 2);
+        let store = Arc::new(
+            SqliteStore::open_in_memory_encrypted(
+                MasterKey::from_bytes(b"disabled newer login generation key").expect("master key"),
+            )
+            .expect("encrypted store"),
+        );
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        let route = config.route("pooled").expect("route");
+        let first = store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "first",
+                &first.configuration_fingerprint,
+                &CredentialPayload::new(b"failed login token").expect("payload"),
+                timestamp_now(),
+            )
+            .expect("failed login generation");
+        let failed_generation = store
+            .credential_payload_compare_generation_for_fingerprint(
+                "first",
+                &first.configuration_fingerprint,
+            )
+            .expect("failed payload generation");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        let newer = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "first",
+                failed_generation,
+                &first.configuration_fingerprint,
+                &CredentialPayload::new(b"new login token").expect("payload"),
+                timestamp_now(),
+            )
+            .expect("newer login generation");
+        assert!(newer.revision > failed_generation);
+        store
+            .set_credential_enabled("first", false, timestamp_now())
+            .expect("external disable after login");
+        assert!(
+            !store
+                .credential_state("first")
+                .expect("disabled credential state")
+                .expect("first credential")
+                .enabled
+        );
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: true,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("disabled newer credential classification");
+
+        assert_eq!(
+            failure.mutation,
+            HealthMutation::NoChange {
+                reason: HealthMutationReason::CredentialUnavailable,
+            }
+        );
+        assert_eq!(
+            failure
+                .take_replacement()
+                .and_then(|replacement| replacement.credential().cloned()),
+            Some(CredentialId::new("second").expect("credential"))
+        );
+        assert!(failure.decision.is_retry());
+        assert!(
+            !store
+                .credential_state("first")
+                .expect("final credential state")
+                .expect("first credential")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn revoked_native_payload_fails_over_during_metadata_tombstone_window() {
+        let config = native_reauth_budget_config(2, 2);
+        let store = Arc::new(
+            SqliteStore::open_in_memory_encrypted(
+                MasterKey::from_bytes(b"native reauth tombstone test key").expect("master key"),
+            )
+            .expect("encrypted store"),
+        );
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        let first = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential");
+        store
+            .upsert_credential_payload_for_fingerprint(
+                "first",
+                &first.configuration_fingerprint,
+                &CredentialPayload::new(b"refresh token").expect("payload"),
+                timestamp_now(),
+            )
+            .expect("credential payload");
+        let failed_generation = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential")
+            .revision;
+        let route = config.route("pooled").expect("route");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        assert!(store
+            .remove_credential_payload("first")
+            .expect("revoke credential payload"));
+        let tombstone = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("tombstoned credential");
+        assert!(tombstone.revision > failed_generation);
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: true,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("tombstoned credential classification");
+
+        assert_eq!(
+            failure.mutation,
+            HealthMutation::NoChange {
+                reason: HealthMutationReason::CredentialUnavailable,
+            }
+        );
+        assert_eq!(
+            failure
+                .take_replacement()
+                .and_then(|replacement| replacement.credential().cloned()),
+            Some(CredentialId::new("second").expect("credential"))
+        );
+        assert!(failure.decision.is_retry());
+    }
+
+    #[test]
+    fn stale_native_reauth_cannot_disable_a_recreated_login_at_the_same_account_id() {
+        let config = native_reauth_budget_config(1, 1);
+        let store = Arc::new(
+            SqliteStore::open_in_memory_encrypted(
+                MasterKey::from_bytes(b"native reauth credential incarnation key")
+                    .expect("master key"),
+            )
+            .expect("encrypted store"),
+        );
+        let coordinator =
+            PoolingCoordinator::with_store(&config, store.clone()).expect("coordinator");
+        let initial = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential");
+        let account = config.accounts().get("first").expect("account");
+        let upstream = config
+            .upstreams()
+            .get(account.provider())
+            .expect("upstream");
+        let fingerprint =
+            crate::account_configuration_fingerprint(upstream, "first", AccountAuthKind::OAuth)
+                .expect("fingerprint");
+        let first = coordinator
+            .store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "first",
+                upstream.id(),
+                &fingerprint,
+                true,
+                timestamp_now(),
+            ))
+            .expect("fingerprinted old login metadata");
+        assert!(first.revision > initial.revision);
+        let old = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "first",
+                first.revision,
+                &fingerprint,
+                &CredentialPayload::new(b"old refresh token").expect("old payload"),
+                timestamp_now(),
+            )
+            .expect("old login generation");
+        let failed_generation = old.revision;
+        let route = config.route("pooled").expect("route");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("old login selection");
+
+        assert!(store
+            .remove_credential_payload("first")
+            .expect("remove old payload"));
+        assert!(coordinator
+            .store
+            .remove_credential_state("first")
+            .expect("remove old metadata"));
+        let recreated = coordinator
+            .store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "first",
+                upstream.id(),
+                &fingerprint,
+                true,
+                timestamp_now(),
+            ))
+            .expect("recreated account metadata");
+        let fresh = store
+            .compare_and_swap_credential_payload_for_fingerprint(
+                "first",
+                recreated.revision,
+                &fingerprint,
+                &CredentialPayload::new(b"fresh refresh token").expect("fresh payload"),
+                timestamp_now(),
+            )
+            .expect("fresh login generation");
+        assert!(fresh.revision > failed_generation);
+        let durable = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("fresh credential");
+        assert!(store
+            .credential_payload_exists("first")
+            .expect("payload presence"));
+        assert!(durable.enabled);
+        assert_eq!(durable.provider_id, upstream.id());
+        assert_eq!(durable.configuration_fingerprint, fingerprint);
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: true,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("stale reauthentication classification");
+
+        let preserved = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("recreated credential");
+        assert!(preserved.enabled);
+        assert_eq!(preserved.revision, fresh.revision);
+        assert_eq!(
+            failure.mutation,
+            HealthMutation::NoChange {
+                reason: HealthMutationReason::CredentialGenerationChanged,
+            }
+        );
+        assert_eq!(
+            failure
+                .take_replacement()
+                .and_then(|replacement| replacement.credential().cloned()),
+            Some(CredentialId::new("first").expect("credential"))
+        );
+        assert!(failure.decision.is_retry());
+    }
+
+    #[test]
+    fn removed_native_credential_fails_over_instead_of_reselecting_stale_binding() {
+        let config = native_reauth_budget_config(2, 2);
+        let coordinator = fingerprinted_native_reauth_coordinator(&config);
+        let route = config.route("pooled").expect("route");
+        let mut selection = coordinator
+            .select(
+                &config,
+                route,
+                Some("public"),
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("first selection");
+        let failed_generation = coordinator
+            .store
+            .credential_state("first")
+            .expect("credential state")
+            .expect("first credential")
+            .revision;
+        assert!(coordinator
+            .store
+            .remove_credential_state("first")
+            .expect("remove failed credential"));
+        let (credentials_used, providers_used) = used_target_sets(&selection);
+
+        let mut failure = coordinator
+            .classify_native_reauth(NativeReauthInput {
+                config: &config,
+                route,
+                selection: &mut selection,
+                replay: ReplayCheck::safe(),
+                commitment: CommitmentState::Uncommitted,
+                idempotency_key_present: true,
+                attempt: 1,
+                failed_generation,
+                generation_fenced: true,
+                native_runtime: None,
+                outbound_attempt_consumed: true,
+                credentials_used: &credentials_used,
+                providers_used: &providers_used,
+                elapsed_retry_delay: Duration::ZERO,
+                elapsed_recovery_wait: Duration::ZERO,
+                started: Instant::now(),
+            })
+            .expect("removed credential classification");
+
+        assert_eq!(
+            failure.mutation,
+            HealthMutation::NoChange {
+                reason: HealthMutationReason::CredentialUnavailable,
+            }
+        );
+        assert_eq!(failure.decision.delay(), Duration::ZERO);
+        assert_eq!(
+            failure
+                .take_replacement()
+                .and_then(|replacement| replacement.credential().cloned()),
+            Some(CredentialId::new("second").expect("credential"))
+        );
+        assert!(failure.decision.is_retry());
+    }
+
     fn request_headers(session: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if let Some(session) = session {
@@ -4682,7 +6996,7 @@ models:
 
         assert!(matches!(
             coordinator.switch_account("beta"),
-            Err(PoolError::Store)
+            Err(PoolError::InvalidCredential)
         ));
         let selected = coordinator
             .select(
@@ -4815,6 +7129,323 @@ routes:
             selected.credential().map(CredentialId::as_str),
             Some("alpha")
         );
+    }
+
+    #[test]
+    fn account_mutations_do_not_cross_reused_ids_with_changed_identity() {
+        let retired_config = compile_yaml(
+            "retired-account-identity.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  provider: {url: http://127.0.0.1:1}
+accounts:
+  shared: {provider: provider, secret: env:POOLER_SHARED, enabled: true}
+account_pools:
+  accounts: {provider: provider, strategy: ordered_fallback, accounts: [shared]}
+policies:
+  pooled: {selection: {strategy: ordered_fallback}}
+models:
+  - id: public
+    targets:
+      - {id: public-target, provider: provider, account_pool: accounts, priority: 1, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+routes:
+  - id: pooled
+    listen: local
+    match: {path: /pooled}
+    target: {provider: provider, policy: pooled}
+  - id: static
+    listen: local
+    match: {path: /static}
+    ingress: {mode: patch}
+    target: {provider: provider, model_from: request.model}
+"#,
+        )
+        .expect("retired account config");
+        let current_config = compile_yaml(
+            "current-account-identity.yaml",
+            r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  provider:
+    url: http://127.0.0.1:2
+    native: {kind: codex}
+    oauth: {authorization_endpoint: https://oauth.example/authorize, token_endpoint: https://oauth.example/token, client_id: current-client, scopes: [openid]}
+accounts:
+  shared: {provider: provider, auth_kind: oauth, enabled: false}
+account_pools:
+  accounts: {provider: provider, strategy: ordered_fallback, accounts: [shared]}
+policies:
+  pooled: {selection: {strategy: ordered_fallback}}
+models:
+  - id: public
+    targets:
+      - {id: public-target, provider: provider, account_pool: accounts, priority: 1, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+routes:
+  - id: pooled
+    listen: local
+    match: {path: /pooled}
+    target: {provider: provider, policy: pooled}
+  - id: static
+    listen: local
+    match: {path: /static}
+    ingress: {mode: patch}
+    target: {provider: provider, model_from: request.model}
+"#,
+        )
+        .expect("current account config");
+        let store = Arc::new(MemoryStore::new());
+        let retired = PoolingCoordinator::with_store(&retired_config, store.clone())
+            .expect("retired coordinator");
+        let current = retired
+            .reconfigure(&current_config)
+            .expect("current coordinator");
+        assert_ne!(
+            retired.account_identities.get("shared"),
+            current.account_identities.get("shared")
+        );
+
+        let account = current_config
+            .accounts()
+            .get("shared")
+            .expect("current account");
+        let upstream = current_config
+            .upstreams()
+            .get(account.provider())
+            .expect("current upstream");
+        let fingerprint =
+            crate::account_configuration_fingerprint(upstream, account.id(), account.auth_kind())
+                .expect("current account fingerprint");
+        let restored = store
+            .credential_state(account.id())
+            .expect("restored current state")
+            .expect("current state exists");
+        assert_eq!(restored.provider_id, upstream.id());
+        assert_eq!(restored.configuration_fingerprint, fingerprint);
+        assert!(
+            !restored.enabled,
+            "replacement must not inherit old enablement"
+        );
+        let adopted = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                account.id(),
+                upstream.id(),
+                &fingerprint,
+                false,
+                timestamp_now(),
+            ))
+            .expect("adopt current account identity");
+        assert!(current
+            .set_oauth_account_enabled_if_current(
+                &current_config,
+                account.id(),
+                adopted.revision,
+                true,
+            )
+            .expect("enable current login"));
+
+        let enabled_state = store
+            .credential_state(account.id())
+            .expect("enabled current state")
+            .expect("current state exists");
+        assert!(matches!(
+            retired.set_account_enabled(account.id(), false),
+            Err(PoolError::InvalidCredential)
+        ));
+        assert_eq!(
+            store
+                .credential_state(account.id())
+                .expect("state after stale disable")
+                .expect("current state exists"),
+            enabled_state
+        );
+
+        current
+            .set_account_enabled(account.id(), false)
+            .expect("disable current identity");
+        let disabled_state = store
+            .credential_state(account.id())
+            .expect("disabled current state")
+            .expect("current state exists");
+        assert!(!disabled_state.enabled);
+        assert!(matches!(
+            retired.switch_account(account.id()),
+            Err(PoolError::InvalidCredential)
+        ));
+        assert_eq!(
+            store
+                .credential_state(account.id())
+                .expect("state after stale switch")
+                .expect("current state exists"),
+            disabled_state
+        );
+        current
+            .set_account_enabled(account.id(), true)
+            .expect("reenable current identity");
+
+        let selected = current
+            .select(
+                &current_config,
+                current_config.route("pooled").expect("current route"),
+                None,
+                &HeaderMap::new(),
+                0,
+                Instant::now(),
+            )
+            .expect("current generation selects its login");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("shared")
+        );
+
+        let retired_selection = retired
+            .select(
+                &retired_config,
+                retired_config.route("pooled").expect("retired route"),
+                None,
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            )
+            .expect("retired identity retains its own enablement");
+        assert_eq!(
+            retired_selection.credential().map(CredentialId::as_str),
+            Some("shared")
+        );
+
+        let reloaded = current
+            .reconfigure(&current_config)
+            .expect("reload current identity");
+        let reloaded_selection = reloaded
+            .select(
+                &current_config,
+                current_config.route("pooled").expect("reloaded route"),
+                None,
+                &HeaderMap::new(),
+                0,
+                Instant::now(),
+            )
+            .expect("reload preserves current durable enablement");
+        assert_eq!(
+            reloaded_selection.credential().map(CredentialId::as_str),
+            Some("shared")
+        );
+    }
+
+    #[test]
+    fn account_mutations_do_not_cross_reused_oauth_ids_with_changed_scopes() {
+        let retired_yaml = r#"
+version: 2
+listeners: {local: {bind: 127.0.0.1:0}}
+upstreams:
+  provider:
+    url: http://127.0.0.1:1
+    native: {kind: codex}
+    oauth: {authorization_endpoint: https://oauth.example/authorize, token_endpoint: https://oauth.example/token, client_id: shared-client, scopes: [openid]}
+accounts:
+  shared: {provider: provider, auth_kind: oauth, enabled: false}
+account_pools:
+  accounts: {provider: provider, strategy: ordered_fallback, accounts: [shared]}
+policies:
+  pooled: {selection: {strategy: ordered_fallback}}
+models:
+  - id: public
+    targets:
+      - {id: public-target, provider: provider, account_pool: accounts, priority: 1, upstream_model: private, capabilities: [text], codecs: [openai], wire_family: openai}
+routes:
+  - id: pooled
+    listen: local
+    match: {path: /pooled}
+    target: {provider: provider, policy: pooled}
+"#;
+        let current_yaml = retired_yaml.replace("scopes: [openid]", "scopes: [profile]");
+        let retired_config =
+            compile_yaml("retired-oauth-scopes.yaml", retired_yaml).expect("retired config");
+        let current_config =
+            compile_yaml("current-oauth-scopes.yaml", &current_yaml).expect("current config");
+        let store = Arc::new(MemoryStore::new());
+        let retired = PoolingCoordinator::with_store(&retired_config, store.clone())
+            .expect("retired coordinator");
+        let current = retired
+            .reconfigure(&current_config)
+            .expect("current coordinator");
+        assert_ne!(
+            retired.account_identities.get("shared"),
+            current.account_identities.get("shared")
+        );
+
+        let account = current_config
+            .accounts()
+            .get("shared")
+            .expect("current account");
+        let upstream = current_config
+            .upstreams()
+            .get(account.provider())
+            .expect("current upstream");
+        let fingerprint =
+            crate::account_configuration_fingerprint(upstream, account.id(), account.auth_kind())
+                .expect("current account fingerprint");
+        let adopted = store
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                account.id(),
+                upstream.id(),
+                &fingerprint,
+                false,
+                timestamp_now(),
+            ))
+            .expect("adopt current OAuth identity");
+        assert!(current
+            .set_oauth_account_enabled_if_current(
+                &current_config,
+                account.id(),
+                adopted.revision,
+                true,
+            )
+            .expect("enable current OAuth login"));
+
+        let current_state = store
+            .credential_state(account.id())
+            .expect("current OAuth state")
+            .expect("current OAuth state exists");
+        assert!(matches!(
+            retired.set_account_enabled(account.id(), false),
+            Err(PoolError::InvalidCredential)
+        ));
+        assert_eq!(
+            store
+                .credential_state(account.id())
+                .expect("state after stale scope mutation")
+                .expect("current OAuth state exists"),
+            current_state
+        );
+
+        let selected = current
+            .select(
+                &current_config,
+                current_config.route("pooled").expect("current route"),
+                None,
+                &HeaderMap::new(),
+                0,
+                Instant::now(),
+            )
+            .expect("current generation selects its OAuth login");
+        assert_eq!(
+            selected.credential().map(CredentialId::as_str),
+            Some("shared")
+        );
+        assert!(matches!(
+            retired.select(
+                &retired_config,
+                retired_config.route("pooled").expect("retired route"),
+                None,
+                &HeaderMap::new(),
+                1,
+                Instant::now(),
+            ),
+            Err(PoolError::NoEligible { .. })
+        ));
     }
 
     #[test]

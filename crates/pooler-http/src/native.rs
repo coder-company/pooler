@@ -25,13 +25,16 @@ use pooler_config::{
     AccountAuthKind, AccountPlan, AuthPlan, CompiledConfig, OAuthGrantType, OAuthPlan, SecretRef,
     UpstreamPlan, DEFAULT_OAUTH_CALLBACK,
 };
-use pooler_store::{credential_configuration_fingerprint, CredentialFingerprintInput};
+use pooler_store::{
+    credential_configuration_fingerprint, CredentialFingerprintInput,
+    CredentialFingerprintRetirement,
+};
 use pooler_store::{CredentialState, SqliteOAuthTokenStore, Store};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::{RuntimeResourceSnapshot, RuntimeResources};
+use crate::{PoolError, PoolingCoordinator, RuntimeResourceSnapshot, RuntimeResources};
 
 const DEVICE_AUTHORIZATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const OAUTH_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -49,9 +52,10 @@ pub enum NativeRuntimeError {
     /// Persisted credential fields could not be converted to safe headers.
     #[error("native authorization could not be materialized")]
     Authorization,
-    /// Refresh failed because interactive login is required.
+    /// Refresh failed because interactive login is required for the observed
+    /// token generation. The generation is non-secret and fences health changes.
     #[error("native credential needs reauthorization")]
-    NeedsReauth,
+    NeedsReauth { generation: u64 },
     /// Refresh failed for a provider or transport reason.
     #[error("native credential refresh failed")]
     Refresh,
@@ -184,6 +188,14 @@ pub struct NativeOAuthLoginResult {
     target: NativeOAuthLoginTarget,
     tokens: OAuthTokens,
     identity: Option<OAuthIdentity>,
+}
+
+impl NativeOAuthLoginResult {
+    /// Return the non-secret configured account identifier receiving the login.
+    #[must_use]
+    pub fn credential(&self) -> &CredentialId {
+        &self.target.credential
+    }
 }
 
 impl std::fmt::Debug for NativeOAuthLoginResult {
@@ -391,6 +403,31 @@ pub struct NativeRuntime {
     resources: RuntimeResources,
 }
 
+/// A fully constructed native runtime candidate whose durable OAuth identity
+/// retirements have not yet been committed.
+///
+/// The runtime and retirement plan contain no credential payloads. Callers may
+/// finish every fallible generation build step before combining the retirement
+/// plan with pooling identity activation at the publication boundary.
+pub struct PreparedNativeRuntime {
+    runtime: NativeRuntime,
+    retirements: Vec<CredentialFingerprintRetirement>,
+}
+
+impl PreparedNativeRuntime {
+    /// Borrow the non-secret historical identity retirement plan.
+    #[must_use]
+    pub fn retirements(&self) -> &[CredentialFingerprintRetirement] {
+        &self.retirements
+    }
+
+    /// Consume the candidate after its retirement plan has been activated.
+    #[must_use]
+    pub fn into_runtime(self) -> NativeRuntime {
+        self.runtime
+    }
+}
+
 impl std::fmt::Debug for NativeRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -478,14 +515,30 @@ impl NativeRuntime {
         config: &CompiledConfig,
         token_store: Arc<SqliteOAuthTokenStore>,
     ) -> Result<Self, NativeRuntimeError> {
-        let mut runtime = Self::build(config, token_store.clone(), Some(Arc::clone(&token_store)))?;
-        hydrate_account_ids(&mut runtime, config, |credential, fingerprint| {
-            token_store
-                .account_id_for_fingerprint(credential, fingerprint)
-                .map_err(|_| NativeRuntimeError::CredentialUnavailable)
-        })?;
-        validate_store_fingerprints(&runtime, config)?;
-        Ok(runtime)
+        let prepared = Self::prepare_with_sqlite(config, token_store)?;
+        if let Some(store) = prepared.runtime.sqlite_token_store.as_ref() {
+            store
+                .store()
+                .retire_credential_fingerprints_atomically(
+                    &prepared.retirements,
+                    crate::pool::timestamp_now(),
+                )
+                .map_err(|_| NativeRuntimeError::CredentialUnavailable)?;
+        }
+        Ok(prepared.runtime)
+    }
+
+    fn prepare_with_sqlite(
+        config: &CompiledConfig,
+        token_store: Arc<SqliteOAuthTokenStore>,
+    ) -> Result<PreparedNativeRuntime, NativeRuntimeError> {
+        let mut runtime = Self::build(config, token_store.clone(), Some(token_store))?;
+        let preparation = prepare_sqlite_runtime_state(&runtime, config)?;
+        runtime.account_ids = Arc::new(preparation.account_ids);
+        Ok(PreparedNativeRuntime {
+            runtime,
+            retirements: preparation.retirements,
+        })
     }
 
     /// Build an immutable provider runtime for a new compiled generation.
@@ -495,11 +548,38 @@ impl NativeRuntime {
     /// application bindings are retained only when the candidate keeps the
     /// same upstream/native kind; all removed bindings disappear with the old
     /// generation.
-    pub fn rebuild_for_config(&self, config: &CompiledConfig) -> Result<Self, NativeRuntimeError> {
-        let mut runtime = match &self.sqlite_token_store {
-            Some(store) => Self::new_with_sqlite(config, Arc::clone(store))?,
-            None => Self::new(config, Arc::clone(&self.token_store))?,
+    pub fn rebuild_for_config(
+        &self,
+        previous_config: &CompiledConfig,
+        config: &CompiledConfig,
+    ) -> Result<Self, NativeRuntimeError> {
+        let prepared = self.prepare_rebuild_for_config(previous_config, config)?;
+        if let Some(store) = prepared.runtime.sqlite_token_store.as_ref() {
+            store
+                .store()
+                .retire_credential_fingerprints_atomically(
+                    &prepared.retirements,
+                    crate::pool::timestamp_now(),
+                )
+                .map_err(|_| NativeRuntimeError::CredentialUnavailable)?;
+        }
+        Ok(prepared.runtime)
+    }
+
+    /// Construct a reload candidate without mutating durable OAuth state.
+    pub fn prepare_rebuild_for_config(
+        &self,
+        previous_config: &CompiledConfig,
+        config: &CompiledConfig,
+    ) -> Result<PreparedNativeRuntime, NativeRuntimeError> {
+        let mut prepared = match &self.sqlite_token_store {
+            Some(store) => Self::prepare_with_sqlite(config, Arc::clone(store))?,
+            None => PreparedNativeRuntime {
+                runtime: Self::new(config, Arc::clone(&self.token_store))?,
+                retirements: Vec::new(),
+            },
         };
+        let runtime = &mut prepared.runtime;
         for (upstream_id, binding) in self.bindings.iter() {
             if !self.injected_bindings.contains(upstream_id) {
                 continue;
@@ -513,18 +593,37 @@ impl NativeRuntime {
             {
                 Arc::make_mut(&mut runtime.bindings)
                     .insert(upstream_id.clone(), Arc::clone(binding));
+                Arc::make_mut(&mut runtime.injected_bindings).insert(upstream_id.clone());
             }
         }
-        if self.sqlite_token_store.is_some() {
-            validate_store_fingerprints(&runtime, config)?;
-        }
         for account in config.accounts().values() {
-            if let Some(account_id) = self.account_ids.get(account.id()) {
+            let Some(account_id) = self.account_ids.get(account.id()) else {
+                continue;
+            };
+            let Some(previous_account) = previous_config.accounts().get(account.id()) else {
+                continue;
+            };
+            let Some(previous_upstream) =
+                previous_config.upstreams().get(previous_account.provider())
+            else {
+                continue;
+            };
+            let Some(upstream) = config.upstreams().get(account.provider()) else {
+                continue;
+            };
+            let previous_fingerprint = account_configuration_fingerprint(
+                previous_upstream,
+                previous_account.id(),
+                previous_account.auth_kind(),
+            )?;
+            let fingerprint =
+                account_configuration_fingerprint(upstream, account.id(), account.auth_kind())?;
+            if previous_fingerprint == fingerprint {
                 Arc::make_mut(&mut runtime.account_ids)
                     .insert(account.id().to_owned(), account_id.clone());
             }
         }
-        Ok(runtime)
+        Ok(prepared)
     }
 
     /// Construct a runtime with one injected Codex refresher. This is useful
@@ -566,6 +665,38 @@ impl NativeRuntime {
             account_ids: Arc::new(BTreeMap::new()),
             resources: RuntimeResources::new(),
         }
+    }
+
+    /// Build account pooling in the same credential generation domain as this
+    /// native runtime. The encrypted SQLite handle remains encapsulated inside
+    /// the returned coordinator.
+    pub fn pooling_coordinator(
+        &self,
+        config: &CompiledConfig,
+    ) -> Result<PoolingCoordinator, PoolError> {
+        match &self.sqlite_token_store {
+            Some(token_store) => {
+                PoolingCoordinator::with_store(config, Arc::new(token_store.store().clone()))
+            }
+            None => PoolingCoordinator::new(config),
+        }
+    }
+
+    /// Whether caller-supplied pooling is safe to combine with this runtime.
+    /// Runtimes without durable OAuth have no cross-store generation fence to
+    /// satisfy; SQLite-backed runtimes must prove one transactional domain.
+    #[must_use]
+    pub fn pooling_generation_domain_is_compatible(&self, pooling: &PoolingCoordinator) -> bool {
+        self.sqlite_token_store.as_ref().is_none_or(|token_store| {
+            pooling.shares_credential_generation_domain(Some(token_store.as_ref()))
+        })
+    }
+
+    /// Return the durable OAuth store whose token generations may share a
+    /// compare-and-swap domain with account metadata.
+    #[must_use]
+    pub(crate) fn sqlite_token_store(&self) -> Option<&SqliteOAuthTokenStore> {
+        self.sqlite_token_store.as_deref()
     }
 
     /// Add a non-secret provider account identifier override.
@@ -758,21 +889,24 @@ impl NativeRuntime {
                     cancellation.clone(),
                 )
                 .await
-                .map_err(map_refresh_error)?;
+                .map_err(|error| map_refresh_error(error, snapshot.generation()))?;
         }
-        let persisted_account_id = self.sqlite_token_store.as_ref().and_then(|store| {
-            store
+        // A completed login can replace the provider subject without changing
+        // the immutable configuration fingerprint. SQLite-backed runtimes must
+        // therefore read the live encrypted profile on every attempt rather
+        // than preferring the subject hydrated when this generation was built.
+        // In-memory injected runtimes still use their explicit override map.
+        let account_id = match &self.sqlite_token_store {
+            Some(store) => store
                 .account_id_for_fingerprint(credential, &fingerprint)
-                .ok()
-                .flatten()
-        });
-        let account_id = self
-            .account_ids
-            .get(credential.as_str())
-            .map(String::as_str)
-            .or(persisted_account_id.as_deref());
-        let authorization =
-            binding.materialize_oauth_authorization(&snapshot, account_id, request_headers)?;
+                .map_err(|_| NativeRuntimeError::CredentialUnavailable)?,
+            None => self.account_ids.get(credential.as_str()).cloned(),
+        };
+        let authorization = binding.materialize_oauth_authorization(
+            &snapshot,
+            account_id.as_deref(),
+            request_headers,
+        )?;
         if cancellation.is_cancelled() {
             return Err(NativeRuntimeError::CredentialUnavailable);
         }
@@ -982,7 +1116,7 @@ impl NativeRuntime {
             cancellation,
         )
         .await
-        .map_err(map_refresh_error)
+        .map_err(|error| map_refresh_error(error, expected_generation))
     }
 
     /// Start a configured authorization-code login while retaining state and
@@ -1192,7 +1326,7 @@ impl NativeRuntime {
             .ok_or(NativeRuntimeError::CredentialUnavailable)?;
         let configuration_fingerprint =
             account_configuration_fingerprint(upstream, account.id(), account.auth_kind())?;
-        let expected_generation = match store
+        match store
             .store()
             .credential_state(account.id())
             .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
@@ -1218,12 +1352,9 @@ impl NativeRuntime {
                             state.enabled,
                             state.updated_at,
                         ))
-                        .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
-                        .revision
+                        .map_err(|_| NativeRuntimeError::CredentialUnavailable)?;
                 } else if state.configuration_fingerprint != configuration_fingerprint {
                     return Err(NativeRuntimeError::CredentialUnavailable);
-                } else {
-                    state.revision
                 }
             }
             None => {
@@ -1241,10 +1372,16 @@ impl NativeRuntime {
                         account.enabled(),
                         now,
                     ))
-                    .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
-                    .revision
+                    .map_err(|_| NativeRuntimeError::CredentialUnavailable)?;
             }
-        };
+        }
+        let expected_generation = store
+            .store()
+            .credential_payload_compare_generation_for_fingerprint(
+                account.id(),
+                &configuration_fingerprint,
+            )
+            .map_err(|_| NativeRuntimeError::CredentialUnavailable)?;
         Ok(NativeOAuthLoginTarget {
             credential: CredentialId::new(account.id())
                 .map_err(|_| NativeRuntimeError::Configuration)?,
@@ -1441,6 +1578,102 @@ impl NativeRuntime {
     }
 }
 
+struct SqliteRuntimePreparation {
+    retirements: Vec<CredentialFingerprintRetirement>,
+    account_ids: BTreeMap<String, String>,
+}
+
+fn prepare_sqlite_runtime_state(
+    runtime: &NativeRuntime,
+    config: &CompiledConfig,
+) -> Result<SqliteRuntimePreparation, NativeRuntimeError> {
+    let Some(store) = runtime.sqlite_token_store.as_ref() else {
+        return Ok(SqliteRuntimePreparation {
+            retirements: Vec::new(),
+            account_ids: BTreeMap::new(),
+        });
+    };
+    let mut retirements = Vec::new();
+    let mut account_ids = BTreeMap::new();
+    for account in config.accounts().values() {
+        let Some(upstream) = config.upstreams().get(account.provider()) else {
+            return Err(NativeRuntimeError::Configuration);
+        };
+        if let Some(SecretRef::Managed(secret_id)) = account.secret() {
+            store
+                .store()
+                .managed_secret_payload(secret_id)
+                .map_err(|_| NativeRuntimeError::CredentialUnavailable)?;
+        }
+        let Some(state) = store
+            .store()
+            .credential_state(account.id())
+            .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
+        else {
+            continue;
+        };
+        if state.provider_id != upstream.id() {
+            return Err(NativeRuntimeError::CredentialUnavailable);
+        }
+        let current =
+            account_configuration_fingerprint(upstream, account.id(), account.auth_kind())?;
+        if state.configuration_fingerprint.is_empty() {
+            if store
+                .store()
+                .credential_payload_exists(account.id())
+                .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
+            {
+                return Err(NativeRuntimeError::CredentialUnavailable);
+            }
+            continue;
+        }
+        if state.configuration_fingerprint == current {
+            let refreshable = account.auth_kind() == AccountAuthKind::OAuth
+                && runtime
+                    .binding_for(upstream)
+                    .is_some_and(|binding| binding.refresh_provider().is_some());
+            if refreshable {
+                let credential = CredentialId::new(account.id())
+                    .map_err(|_| NativeRuntimeError::Configuration)?;
+                if let Some(account_id) = store
+                    .account_id_for_fingerprint(&credential, &current)
+                    .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
+                {
+                    if !account_id.trim().is_empty() {
+                        account_ids.insert(account.id().to_owned(), account_id);
+                    }
+                }
+            }
+            continue;
+        }
+        if account.auth_kind() != AccountAuthKind::OAuth {
+            return Err(NativeRuntimeError::CredentialUnavailable);
+        }
+        let migration_candidates = account_configuration_fingerprint_migration_candidates(
+            upstream,
+            account.id(),
+            account.auth_kind(),
+        )?;
+        if !migration_candidates.contains(&state.configuration_fingerprint) {
+            return Err(NativeRuntimeError::CredentialUnavailable);
+        }
+        retirements.push(
+            CredentialFingerprintRetirement::new(
+                account.id(),
+                upstream.id(),
+                state.configuration_fingerprint,
+                current,
+            )
+            .map_err(|_| NativeRuntimeError::CredentialUnavailable)?,
+        );
+    }
+    Ok(SqliteRuntimePreparation {
+        retirements,
+        account_ids,
+    })
+}
+
+#[cfg(test)]
 fn hydrate_account_ids(
     runtime: &mut NativeRuntime,
     config: &CompiledConfig,
@@ -1467,50 +1700,6 @@ fn hydrate_account_ids(
             if !account_id.trim().is_empty() {
                 Arc::make_mut(&mut runtime.account_ids).insert(account.id().to_owned(), account_id);
             }
-        }
-    }
-    Ok(())
-}
-
-fn validate_store_fingerprints(
-    runtime: &NativeRuntime,
-    config: &CompiledConfig,
-) -> Result<(), NativeRuntimeError> {
-    let Some(store) = runtime.sqlite_token_store.as_ref() else {
-        return Ok(());
-    };
-    for account in config.accounts().values() {
-        let Some(upstream) = config.upstreams().get(account.provider()) else {
-            return Err(NativeRuntimeError::Configuration);
-        };
-        let Some(state) = store
-            .store()
-            .credential_state(account.id())
-            .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
-        else {
-            continue;
-        };
-        if state.provider_id != upstream.id() {
-            return Err(NativeRuntimeError::CredentialUnavailable);
-        }
-        let fingerprint =
-            account_configuration_fingerprint(upstream, account.id(), account.auth_kind())?;
-        if state.configuration_fingerprint.is_empty() {
-            if store
-                .store()
-                .credential_payload_exists(account.id())
-                .map_err(|_| NativeRuntimeError::CredentialUnavailable)?
-            {
-                return Err(NativeRuntimeError::CredentialUnavailable);
-            }
-        } else if state.configuration_fingerprint != fingerprint {
-            return Err(NativeRuntimeError::CredentialUnavailable);
-        }
-        if let Some(SecretRef::Managed(secret_id)) = account.secret() {
-            store
-                .store()
-                .managed_secret_payload(secret_id)
-                .map_err(|_| NativeRuntimeError::CredentialUnavailable)?;
         }
     }
     Ok(())
@@ -1721,6 +1910,27 @@ fn is_configured_native_kind(kind: &str) -> bool {
         .any(|candidate| kind.eq_ignore_ascii_case(candidate))
 }
 
+pub(crate) fn account_auth_kind_compatible(
+    upstream: &UpstreamPlan,
+    auth_kind: AccountAuthKind,
+) -> bool {
+    let Some(native) = upstream.native() else {
+        return auth_kind == AccountAuthKind::ApiKey;
+    };
+    if !native.kind().eq_ignore_ascii_case("codex") && !is_configured_native_kind(native.kind()) {
+        return false;
+    }
+    let refreshable = native.kind().eq_ignore_ascii_case("codex")
+        || ((native.kind().eq_ignore_ascii_case("kimi")
+            || native.kind().eq_ignore_ascii_case("vertex")
+            || native.kind().eq_ignore_ascii_case("palantir_aip"))
+            && upstream.oauth().is_some());
+    match auth_kind {
+        AccountAuthKind::OAuth => refreshable,
+        AccountAuthKind::ApiKey => !refreshable,
+    }
+}
+
 /// Kimi Code checks the same client identity headers emitted by CLIProxyAPI.
 ///
 /// Device names and IDs in the reference implementation are machine-local
@@ -1804,12 +2014,11 @@ fn resolve_protected_secret(
     Ok(secret)
 }
 
-/// Compute the stable non-secret identity fence for one compiled account.
-pub fn account_configuration_fingerprint(
+fn configured_account_configuration_fingerprint_input(
     upstream: &UpstreamPlan,
     account_id: &str,
     auth_kind: AccountAuthKind,
-) -> Result<String, NativeRuntimeError> {
+) -> CredentialFingerprintInput {
     let provider_profile = upstream
         .native()
         .map(|native| native.kind())
@@ -1831,7 +2040,7 @@ pub fn account_configuration_fingerprint(
         },
     );
     let oauth = upstream.oauth();
-    credential_configuration_fingerprint(&CredentialFingerprintInput {
+    CredentialFingerprintInput {
         account_id: account_id.to_owned(),
         provider_instance_id: upstream.id().to_owned(),
         provider_origin: provider_origin.to_string(),
@@ -1839,11 +2048,167 @@ pub fn account_configuration_fingerprint(
         provider_profile: provider_profile.to_owned(),
         oauth_client_id: oauth.map(|value| value.client_id().to_owned()),
         oauth_grant_type: oauth.map(|value| value.grant_type().as_str().to_owned()),
+        oauth_scopes: oauth.map_or_else(Vec::new, |value| {
+            value.scopes().iter().map(ToString::to_string).collect()
+        }),
         authorization_endpoint: oauth.map(|value| value.authorization_endpoint().to_string()),
         token_endpoint: oauth.map(|value| value.token_endpoint().to_string()),
+        revocation_endpoint: oauth
+            .and_then(OAuthPlan::revocation_endpoint)
+            .map(ToString::to_string),
+        identity_endpoint: oauth
+            .and_then(OAuthPlan::identity_endpoint)
+            .map(ToString::to_string),
+        callback_endpoint: oauth.map(|value| value.callback().to_string()),
+        oauth_client_secret_reference: oauth
+            .and_then(OAuthPlan::client_secret)
+            .map(SecretRef::redacted),
+        oauth_additional_identity: Vec::new(),
         auth_placement,
-    })
+    }
+}
+
+fn builtin_codex_oauth_config() -> Result<OAuthClientConfig, NativeRuntimeError> {
+    let definition = ProviderLoginRegistry::builtin()
+        .require("openai")
+        .map_err(|_| NativeRuntimeError::Configuration)?;
+    let callback = DEFAULT_OAUTH_CALLBACK
+        .parse()
+        .map_err(|_| NativeRuntimeError::Configuration)?;
+    definition
+        .build_oauth_config(
+            ProviderLoginMethod::AuthorizationCodePkce,
+            ProviderOAuthSettings::new(String::new(), callback),
+        )
+        .map_err(|_| NativeRuntimeError::Configuration)
+}
+
+fn oauth_grant_type_identity(grant_type: pooler_auth::OAuthGrantType) -> &'static str {
+    match grant_type {
+        pooler_auth::OAuthGrantType::AuthorizationCode => "authorization_code",
+        pooler_auth::OAuthGrantType::ClientCredentials => "client_credentials",
+    }
+}
+
+fn oauth_request_encoding_identity(encoding: pooler_auth::OAuthRequestEncoding) -> &'static str {
+    match encoding {
+        pooler_auth::OAuthRequestEncoding::Form => "form",
+        pooler_auth::OAuthRequestEncoding::Json => "json",
+    }
+}
+
+fn oauth_device_grant_identity(grant: pooler_auth::DeviceAuthorizationGrant) -> &'static str {
+    match grant {
+        pooler_auth::DeviceAuthorizationGrant::Rfc8628 => "rfc8628",
+        pooler_auth::DeviceAuthorizationGrant::CodexAccounts => "codex_accounts",
+    }
+}
+
+fn apply_builtin_codex_oauth_identity(
+    input: &mut CredentialFingerprintInput,
+    oauth: &OAuthClientConfig,
+) {
+    input.oauth_client_id = Some(oauth.client_id.clone());
+    input.oauth_grant_type = Some(oauth_grant_type_identity(oauth.grant_type).to_owned());
+    input.oauth_scopes = oauth.scopes.clone();
+    input.authorization_endpoint = Some(oauth.authorization_endpoint.to_string());
+    input.token_endpoint = Some(oauth.token_endpoint.to_string());
+    input.revocation_endpoint = oauth.revocation_endpoint.as_ref().map(ToString::to_string);
+    input.identity_endpoint = oauth.identity_endpoint.as_ref().map(ToString::to_string);
+    input.callback_endpoint = Some(oauth.redirect_uri.to_string());
+    input.oauth_additional_identity = vec![
+        ("provider_definition".to_owned(), "openai".to_owned()),
+        (
+            "request_encoding".to_owned(),
+            oauth_request_encoding_identity(oauth.request_encoding).to_owned(),
+        ),
+        (
+            "device_grant".to_owned(),
+            oauth_device_grant_identity(oauth.device_grant).to_owned(),
+        ),
+    ];
+    if let Some(endpoint) = &oauth.device_authorization_endpoint {
+        input.oauth_additional_identity.push((
+            "device_authorization_endpoint".to_owned(),
+            endpoint.to_string(),
+        ));
+    }
+    input.oauth_additional_identity.extend(
+        oauth
+            .authorization_parameters
+            .iter()
+            .map(|(name, value)| (format!("authorization_parameter:{name}"), value.clone())),
+    );
+}
+
+fn account_configuration_fingerprint_input(
+    upstream: &UpstreamPlan,
+    account_id: &str,
+    auth_kind: AccountAuthKind,
+) -> Result<CredentialFingerprintInput, NativeRuntimeError> {
+    let mut input =
+        configured_account_configuration_fingerprint_input(upstream, account_id, auth_kind);
+    let uses_builtin_codex_oauth = auth_kind == AccountAuthKind::OAuth
+        && upstream.oauth().is_none()
+        && upstream
+            .native()
+            .is_some_and(|native| native.kind().eq_ignore_ascii_case("codex"));
+    if uses_builtin_codex_oauth {
+        apply_builtin_codex_oauth_identity(&mut input, &builtin_codex_oauth_config()?);
+    }
+    Ok(input)
+}
+
+/// Compute the stable non-secret identity fence for one compiled account.
+pub fn account_configuration_fingerprint(
+    upstream: &UpstreamPlan,
+    account_id: &str,
+    auth_kind: AccountAuthKind,
+) -> Result<String, NativeRuntimeError> {
+    credential_configuration_fingerprint(&account_configuration_fingerprint_input(
+        upstream, account_id, auth_kind,
+    )?)
     .map_err(|_| NativeRuntimeError::Configuration)
+}
+
+/// Compute exact historical identities that may be retired during a
+/// fail-closed store migration.
+///
+/// The candidates retain the version-1 identity and the version-2 identity
+/// that preceded effective built-in provider behavior. They never authorize a
+/// payload under the current configuration; callers may only use them as the
+/// expected side of an atomic retirement or login replacement.
+pub fn account_configuration_fingerprint_migration_candidates(
+    upstream: &UpstreamPlan,
+    account_id: &str,
+    auth_kind: AccountAuthKind,
+) -> Result<Vec<String>, NativeRuntimeError> {
+    let historical =
+        configured_account_configuration_fingerprint_input(upstream, account_id, auth_kind);
+    let current = account_configuration_fingerprint(upstream, account_id, auth_kind)?;
+    let mut candidates = vec![
+        historical
+            .legacy_fingerprint()
+            .map_err(|_| NativeRuntimeError::Configuration)?,
+        credential_configuration_fingerprint(&historical)
+            .map_err(|_| NativeRuntimeError::Configuration)?,
+    ];
+    candidates.retain(|candidate| candidate != &current);
+    candidates.sort_unstable();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+/// Compute the exact version-1 account identity for fail-closed store
+/// migration. New payloads must always use [`account_configuration_fingerprint`].
+pub fn legacy_account_configuration_fingerprint(
+    upstream: &UpstreamPlan,
+    account_id: &str,
+    auth_kind: AccountAuthKind,
+) -> Result<String, NativeRuntimeError> {
+    configured_account_configuration_fingerprint_input(upstream, account_id, auth_kind)
+        .legacy_fingerprint()
+        .map_err(|_| NativeRuntimeError::Configuration)
 }
 
 fn build_configured_oauth_provider(
@@ -1917,25 +2282,14 @@ fn build_codex_provider(
         return Ok(Arc::new(provider));
     }
 
-    let definition = ProviderLoginRegistry::builtin()
-        .require("openai")
-        .map_err(|_| NativeRuntimeError::Configuration)?;
-    let callback = DEFAULT_OAUTH_CALLBACK
-        .parse()
-        .map_err(|_| NativeRuntimeError::Configuration)?;
-    let provider = definition
-        .build_oauth_provider(
-            ProviderLoginMethod::AuthorizationCodePkce,
-            ProviderOAuthSettings::new(String::new(), callback),
-            transport,
-        )
+    let provider = StandardOAuthProvider::new("openai", builtin_codex_oauth_config()?, transport)
         .map_err(|_| NativeRuntimeError::Configuration)?;
     Ok(Arc::new(provider))
 }
 
-fn map_refresh_error(error: OAuthError) -> NativeRuntimeError {
+fn map_refresh_error(error: OAuthError, generation: u64) -> NativeRuntimeError {
     match error {
-        OAuthError::NeedsReauth => NativeRuntimeError::NeedsReauth,
+        OAuthError::NeedsReauth => NativeRuntimeError::NeedsReauth { generation },
         OAuthError::Cancelled => NativeRuntimeError::CredentialUnavailable,
         OAuthError::Store(_) | OAuthError::NoRefreshToken => {
             NativeRuntimeError::CredentialUnavailable
@@ -2235,6 +2589,22 @@ upstreams:
         .expect("native kind config")
     }
 
+    fn builtin_codex_config() -> CompiledConfig {
+        pooler_config::compile_yaml(
+            "native-builtin-codex-test.yaml",
+            r#"
+version: 2
+upstreams:
+  codex:
+    url: https://chatgpt.com/backend-api/codex
+    native: {kind: codex}
+accounts:
+  codex-account: {provider: codex, auth_kind: oauth}
+"#,
+        )
+        .expect("built-in Codex config")
+    }
+
     fn config() -> CompiledConfig {
         pooler_config::compile_yaml(
             "native-test.yaml",
@@ -2522,6 +2892,329 @@ accounts:
         assert_secret_value(
             persisted.tokens().access_token().expose_secret(),
             "winner-access",
+        );
+    }
+
+    #[test]
+    fn builtin_codex_fingerprint_covers_effective_oauth_identity() {
+        let config = builtin_codex_config();
+        let account = &config.accounts()["codex-account"];
+        let upstream = &config.upstreams()[account.provider()];
+        let effective = builtin_codex_oauth_config().expect("effective built-in OAuth config");
+        let input =
+            account_configuration_fingerprint_input(upstream, account.id(), account.auth_kind())
+                .expect("effective fingerprint input");
+
+        assert_eq!(
+            input.oauth_client_id.as_deref(),
+            Some(effective.client_id.as_str())
+        );
+        assert_eq!(
+            input.authorization_endpoint.as_deref(),
+            Some(effective.authorization_endpoint.as_str())
+        );
+        assert_eq!(
+            input.token_endpoint.as_deref(),
+            Some(effective.token_endpoint.as_str())
+        );
+        assert_eq!(input.oauth_scopes, effective.scopes);
+        assert!(input.oauth_additional_identity.iter().any(|(key, value)| {
+            key == "device_authorization_endpoint"
+                && effective
+                    .device_authorization_endpoint
+                    .as_ref()
+                    .is_some_and(|endpoint| endpoint.as_str() == value)
+        }));
+        assert!(input
+            .oauth_additional_identity
+            .iter()
+            .any(|(key, value)| key == "device_grant" && value == "codex_accounts"));
+
+        let current = input.fingerprint().expect("current fingerprint");
+        let historical = configured_account_configuration_fingerprint_input(
+            upstream,
+            account.id(),
+            account.auth_kind(),
+        );
+        let historical_v1 = historical
+            .legacy_fingerprint()
+            .expect("historical version-one fingerprint");
+        let historical_v2 = historical
+            .fingerprint()
+            .expect("historical version-two fingerprint");
+        assert_ne!(current, historical_v1);
+        assert_ne!(current, historical_v2);
+        let migration_candidates = account_configuration_fingerprint_migration_candidates(
+            upstream,
+            account.id(),
+            account.auth_kind(),
+        )
+        .expect("migration candidates");
+        assert!(migration_candidates.contains(&historical_v1));
+        assert!(migration_candidates.contains(&historical_v2));
+
+        let mut changed_effective = effective;
+        changed_effective.token_endpoint =
+            Url::parse("https://auth.openai.com/oauth/token-v2").expect("changed endpoint");
+        let mut changed_input = historical.clone();
+        apply_builtin_codex_oauth_identity(&mut changed_input, &changed_effective);
+        assert_ne!(
+            changed_input.fingerprint().expect("changed fingerprint"),
+            current
+        );
+
+        let explicit = hydration_filter_config();
+        let explicit_account = &explicit.accounts()["oauth-codex"];
+        let explicit_upstream = &explicit.upstreams()[explicit_account.provider()];
+        let explicit_input = account_configuration_fingerprint_input(
+            explicit_upstream,
+            explicit_account.id(),
+            explicit_account.auth_kind(),
+        )
+        .expect("explicit fingerprint input");
+        assert!(explicit_input.oauth_additional_identity.is_empty());
+        assert_eq!(
+            explicit_input.fingerprint().expect("explicit fingerprint"),
+            configured_account_configuration_fingerprint_input(
+                explicit_upstream,
+                explicit_account.id(),
+                explicit_account.auth_kind(),
+            )
+            .fingerprint()
+            .expect("historical explicit fingerprint")
+        );
+    }
+
+    #[test]
+    fn sqlite_runtime_retires_pre_effective_codex_payload_for_reauthentication() {
+        let config = builtin_codex_config();
+        let account = &config.accounts()["codex-account"];
+        let upstream = &config.upstreams()[account.provider()];
+        let old_fingerprint = configured_account_configuration_fingerprint_input(
+            upstream,
+            account.id(),
+            account.auth_kind(),
+        )
+        .fingerprint()
+        .expect("pre-effective fingerprint");
+        let current =
+            account_configuration_fingerprint(upstream, account.id(), account.auth_kind())
+                .expect("current fingerprint");
+        assert_ne!(old_fingerprint, current);
+
+        let sqlite = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"builtin-codex-fingerprint-migration-key").expect("master key"),
+        )
+        .expect("encrypted store");
+        let state = sqlite
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                account.id(),
+                account.provider(),
+                &old_fingerprint,
+                true,
+                1,
+            ))
+            .expect("old credential state");
+        let credential = CredentialId::new(account.id()).expect("credential");
+        let token_store = Arc::new(SqliteOAuthTokenStore::new(sqlite));
+        token_store
+            .compare_and_swap_profile_for_fingerprint(
+                &credential,
+                &old_fingerprint,
+                state.revision,
+                &OAuthCredentialProfile::new(
+                    "openai",
+                    OAuthTokens::bearer("old-access", Some("old-refresh"), None),
+                )
+                .with_account_id("old-chatgpt-account"),
+            )
+            .expect("old OAuth payload");
+
+        let runtime = NativeRuntime::new_with_sqlite(&config, Arc::clone(&token_store))
+            .expect("runtime starts after fail-closed retirement");
+        let migrated = token_store
+            .store()
+            .credential_state(account.id())
+            .expect("credential state")
+            .expect("credential exists");
+        assert_eq!(migrated.configuration_fingerprint, current);
+        assert!(!migrated.enabled);
+        assert!(!token_store
+            .store()
+            .credential_payload_exists(account.id())
+            .expect("payload existence"));
+        assert!(!runtime.account_ids.contains_key(account.id()));
+    }
+
+    #[test]
+    fn sqlite_runtime_retires_version_one_oauth_payload_for_reauthentication() {
+        let config = kimi_oauth_config();
+        let account = &config.accounts()["kimi-subscription"];
+        let upstream = &config.upstreams()[account.provider()];
+        let legacy =
+            legacy_account_configuration_fingerprint(upstream, account.id(), account.auth_kind())
+                .expect("legacy fingerprint");
+        let current =
+            account_configuration_fingerprint(upstream, account.id(), account.auth_kind())
+                .expect("current fingerprint");
+        assert_ne!(legacy, current);
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("owner-private directory");
+        let path = directory.path().join("credentials.db");
+        {
+            let store = SqliteStore::open_encrypted(
+                &path,
+                MasterKey::from_bytes(b"legacy-fingerprint-upgrade-key").expect("master key"),
+            )
+            .expect("legacy encrypted store");
+            let state = store
+                .upsert_credential_state(CredentialState::new_with_fingerprint(
+                    account.id(),
+                    account.provider(),
+                    &legacy,
+                    true,
+                    1,
+                ))
+                .expect("legacy credential state");
+            let credential = CredentialId::new(account.id()).expect("credential");
+            SqliteOAuthTokenStore::new(store)
+                .compare_and_swap_profile_for_fingerprint(
+                    &credential,
+                    &legacy,
+                    state.revision,
+                    &OAuthCredentialProfile::new(
+                        "kimi",
+                        OAuthTokens::bearer("legacy-access", Some("legacy-refresh"), None),
+                    )
+                    .with_account_id("legacy-provider-subject"),
+                )
+                .expect("legacy OAuth payload");
+        }
+
+        let store = Arc::new(SqliteOAuthTokenStore::new(
+            SqliteStore::open_encrypted(
+                &path,
+                MasterKey::from_bytes(b"legacy-fingerprint-upgrade-key").expect("master key"),
+            )
+            .expect("reopened encrypted store"),
+        ));
+        let runtime = NativeRuntime::new_with_sqlite(&config, Arc::clone(&store))
+            .expect("runtime starts after fail-closed upgrade");
+
+        let migrated = store
+            .store()
+            .credential_state(account.id())
+            .expect("credential state")
+            .expect("credential exists");
+        assert_eq!(migrated.configuration_fingerprint, current);
+        assert!(!migrated.enabled);
+        assert!(!store
+            .store()
+            .credential_payload_exists(account.id())
+            .expect("payload existence"));
+        assert!(!runtime.account_ids.contains_key(account.id()));
+    }
+
+    #[tokio::test]
+    async fn sqlite_runtime_preflight_failure_preserves_every_pending_retirement() {
+        let config = pooler_config::compile_yaml(
+            "native-atomic-retirement-rollback-test.yaml",
+            r#"
+version: 2
+upstreams:
+  kimi-coding:
+    url: http://127.0.0.1:8334
+    native: {kind: kimi}
+    oauth:
+      authorization_endpoint: https://auth.kimi.com/api/oauth/authorize
+      token_endpoint: https://auth.kimi.com/api/oauth/token
+      client_id: operator-owned-client
+      scopes: [operator-registered-scope]
+accounts:
+  legacy-a: {provider: kimi-coding, auth_kind: oauth}
+  invalid-z: {provider: kimi-coding, auth_kind: oauth}
+"#,
+        )
+        .expect("atomic retirement rollback config");
+        let legacy_account = &config.accounts()["legacy-a"];
+        let upstream = &config.upstreams()[legacy_account.provider()];
+        let legacy = legacy_account_configuration_fingerprint(
+            upstream,
+            legacy_account.id(),
+            legacy_account.auth_kind(),
+        )
+        .expect("legacy fingerprint");
+
+        let sqlite = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"native-atomic-retirement-rollback-key").expect("master key"),
+        )
+        .expect("encrypted store");
+        let state = sqlite
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                legacy_account.id(),
+                legacy_account.provider(),
+                &legacy,
+                true,
+                1,
+            ))
+            .expect("legacy credential state");
+        let legacy_credential = CredentialId::new(legacy_account.id()).expect("credential");
+        let token_store = Arc::new(SqliteOAuthTokenStore::new(sqlite));
+        token_store
+            .compare_and_swap_profile_for_fingerprint(
+                &legacy_credential,
+                &legacy,
+                state.revision,
+                &OAuthCredentialProfile::new(
+                    "kimi",
+                    OAuthTokens::bearer("legacy-access", Some("legacy-refresh"), None),
+                )
+                .with_account_id("legacy-provider-subject"),
+            )
+            .expect("legacy OAuth payload");
+        token_store
+            .store()
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                "invalid-z",
+                "wrong-provider",
+                "f".repeat(64),
+                true,
+                2,
+            ))
+            .expect("later invalid state");
+        let legacy_before = token_store
+            .store()
+            .credential_state(legacy_account.id())
+            .expect("legacy state")
+            .expect("legacy state");
+
+        assert!(matches!(
+            NativeRuntime::new_with_sqlite(&config, Arc::clone(&token_store)),
+            Err(NativeRuntimeError::CredentialUnavailable)
+        ));
+
+        assert_eq!(
+            token_store
+                .store()
+                .credential_state(legacy_account.id())
+                .expect("legacy state after failed preflight")
+                .expect("legacy state after failed preflight"),
+            legacy_before
+        );
+        let persisted = token_store
+            .load(&legacy_credential)
+            .await
+            .expect("load legacy profile")
+            .expect("legacy profile remains");
+        assert_secret_value(
+            persisted.tokens().access_token().expose_secret(),
+            "legacy-access",
         );
     }
 
@@ -2963,6 +3656,84 @@ accounts:
     }
 
     #[test]
+    fn runtime_rebuild_preserves_injected_binding_across_generations() {
+        let config = config();
+        let runtime = NativeRuntime::with_codex_provider(
+            Arc::new(MemoryOAuthTokenStore::new()),
+            "codex",
+            Arc::new(MockRefresher {
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        let injected = runtime.bindings["codex"].clone();
+
+        let first = runtime
+            .rebuild_for_config(&config, &config)
+            .expect("first runtime rebuild");
+        assert!(first.injected_bindings.contains("codex"));
+        assert!(Arc::ptr_eq(&first.bindings["codex"], &injected));
+
+        let second = first
+            .rebuild_for_config(&config, &config)
+            .expect("second runtime rebuild");
+        assert!(second.injected_bindings.contains("codex"));
+        assert!(Arc::ptr_eq(&second.bindings["codex"], &injected));
+    }
+
+    #[test]
+    fn runtime_rebuild_drops_account_identity_when_oauth_configuration_changes() {
+        let compile = |scope: &str| {
+            pooler_config::compile_yaml(
+                "native-account-identity-rebuild-test.yaml",
+                &format!(
+                    r#"
+version: 2
+upstreams:
+  codex:
+    url: https://api.example.test
+    native: {{kind: codex}}
+    oauth:
+      authorization_endpoint: https://auth.example.test/authorize
+      token_endpoint: https://auth.example.test/token
+      client_id: registered-client
+      scopes: [{scope}]
+accounts:
+  account-a: {{provider: codex, auth_kind: oauth}}
+"#,
+                ),
+            )
+            .expect("native account identity config")
+        };
+        let previous = compile("scope-a");
+        let unchanged = compile("scope-a");
+        let changed = compile("scope-b");
+        let runtime = NativeRuntime::with_codex_provider(
+            Arc::new(MemoryOAuthTokenStore::new()),
+            "codex",
+            Arc::new(MockRefresher {
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .with_account_id("account-a", "chatgpt-account-a");
+
+        let unchanged_runtime = runtime
+            .rebuild_for_config(&previous, &unchanged)
+            .expect("unchanged runtime rebuild");
+        assert_eq!(
+            unchanged_runtime
+                .account_ids
+                .get("account-a")
+                .map(String::as_str),
+            Some("chatgpt-account-a")
+        );
+
+        let changed_runtime = runtime
+            .rebuild_for_config(&previous, &changed)
+            .expect("changed runtime rebuild");
+        assert!(!changed_runtime.account_ids.contains_key("account-a"));
+    }
+
+    #[test]
     fn provider_binding_does_not_match_same_id_with_different_native_kind() {
         let runtime = NativeRuntime::new(&config(), Arc::new(MemoryOAuthTokenStore::new()))
             .expect("native runtime");
@@ -3331,6 +4102,90 @@ accounts:
             .quota_evidence(&upstream, 429, &HeaderMap::new(), body)
             .0
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn sqlite_authorization_uses_live_provider_subject_after_same_identity_login() {
+        let config = builtin_codex_config();
+        let account = &config.accounts()["codex-account"];
+        let upstream = &config.upstreams()[account.provider()];
+        let fingerprint =
+            account_configuration_fingerprint(upstream, account.id(), account.auth_kind())
+                .expect("configuration fingerprint");
+        let sqlite = SqliteStore::open_in_memory_encrypted(
+            MasterKey::from_bytes(b"live-provider-subject-test-key").expect("master key"),
+        )
+        .expect("encrypted store");
+        let state = sqlite
+            .upsert_credential_state(CredentialState::new_with_fingerprint(
+                account.id(),
+                account.provider(),
+                &fingerprint,
+                true,
+                1,
+            ))
+            .expect("credential state");
+        let credential = CredentialId::new(account.id()).expect("credential");
+        let token_store = Arc::new(SqliteOAuthTokenStore::new(sqlite));
+        token_store
+            .compare_and_swap_profile_for_fingerprint(
+                &credential,
+                &fingerprint,
+                state.revision,
+                &OAuthCredentialProfile::new(
+                    "openai",
+                    OAuthTokens::bearer("old-access", Some("old-refresh"), None),
+                )
+                .with_account_id("old-chatgpt-account"),
+            )
+            .expect("old OAuth profile");
+
+        let runtime = NativeRuntime::new_with_sqlite(&config, Arc::clone(&token_store))
+            .expect("native runtime");
+        assert_eq!(
+            runtime.account_ids.get(account.id()).map(String::as_str),
+            Some("old-chatgpt-account")
+        );
+        let target = runtime
+            .prepare_oauth_login_target(account, upstream, "openai")
+            .expect("replacement login target");
+        runtime
+            .persist_oauth_login(NativeOAuthLoginResult {
+                target,
+                tokens: OAuthTokens::bearer("new-access", Some("new-refresh"), None),
+                identity: Some(OAuthIdentity {
+                    subject: "new-chatgpt-account".to_owned(),
+                    email: None,
+                    name: None,
+                }),
+            })
+            .expect("replacement OAuth profile");
+
+        for candidate in [
+            runtime,
+            NativeRuntime::new_with_sqlite(&config, Arc::clone(&token_store))
+                .expect("unchanged runtime rebuild"),
+        ] {
+            let authorization = candidate
+                .authorize(
+                    upstream,
+                    &credential,
+                    &HeaderMap::new(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("Codex authorization");
+            let mut headers = HeaderMap::new();
+            authorization
+                .apply_once(&mut headers)
+                .expect("apply authorization");
+            assert_header_value(&headers, "chatgpt-account-id", b"new-chatgpt-account");
+            assert_header_value(
+                &headers,
+                header::AUTHORIZATION.as_str(),
+                b"Bearer new-access",
+            );
+        }
     }
 
     #[tokio::test]

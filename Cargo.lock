@@ -1587,6 +1587,7 @@ dependencies = [
  "pooler-protocol",
  "pooler-store",
  "ring",
+ "rusqlite",
  "rustls",
  "rustls-native-certs",
  "serde_json",
@@ -1718,6 +1719,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "zeroize",
 ]
 

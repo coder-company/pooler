@@ -646,13 +646,11 @@ async fn serve_http_fault(
             }
         }
         HttpFault::Sse(fault) => write_sse_fault(stream, fault).await,
-        HttpFault::RefreshThenSuccess => {
-            if attempt == 1 {
-                write_response(stream, 401, "Unauthorized", &[], b"").await;
-            } else {
-                write_response(stream, 200, "OK", &[], b"ok").await;
-            }
-        }
+        HttpFault::RefreshThenSuccess => match attempt {
+            1 => write_response(stream, 401, "Unauthorized", &[], b"").await,
+            2 => write_response(stream, 404, "Not Found", &[], b"").await,
+            _ => write_response(stream, 200, "OK", &[], b"ok").await,
+        },
         HttpFault::Success => write_response(stream, 200, "OK", &[], b"ok").await,
     }
 }
@@ -1174,9 +1172,8 @@ async fn execute_native_refresh(case: &Case, counters: LeakCounters) {
     let upstream = spawn_http_upstream(HttpFault::RefreshThenSuccess, counters.clone(), None).await;
     let account_secret = TestSecret::new("unused-native-secret", &counters);
     let yaml = format!(
-        "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  account-a: {{provider: codex, secret: {}}}\naccount_pools:\n  faults-pool: {{provider: codex, accounts: [account-a]}}\npolicies:\n  faults:\n    selection: {{strategy: fill_first}}\n    retry: {{maximum_attempts: 2, maximum_credentials: 1, statuses: [429], before_commit_only: true}}\nroutes:\n  - id: fault\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: codex, policy: faults}}\n    response: {{mode: opaque}}\n",
+        "version: 2\nlisteners: {{local: {{bind: 127.0.0.1:0}}}}\nupstreams:\n  codex:\n    url: http://{}\n    native: {{kind: codex}}\n    oauth:\n      authorization_endpoint: https://oauth.example/authorize\n      token_endpoint: https://oauth.example/token\n      identity_endpoint: https://oauth.example/me\n      client_id: pooler-test\n      scopes: [openid]\naccounts:\n  account-a: {{provider: codex, auth_kind: oauth}}\naccount_pools:\n  faults-pool: {{provider: codex, accounts: [account-a]}}\npolicies:\n  faults:\n    selection: {{strategy: fill_first}}\n    retry: {{maximum_attempts: 3, maximum_credentials: 1, statuses: [429], before_commit_only: true}}\nroutes:\n  - id: fault\n    listen: local\n    match: {{method: POST, path: /responses, content_types: [application/json]}}\n    ingress: {{mode: patch}}\n    target: {{provider: codex, policy: faults}}\n    response: {{mode: opaque}}\n",
         upstream.address,
-        account_secret.reference(),
     );
     let config = compile_yaml("fault-refresh.yaml", &yaml).expect("refresh config compiles");
     let token_store = Arc::new(pooler_auth::MemoryOAuthTokenStore::new());
@@ -1203,7 +1200,38 @@ async fn execute_native_refresh(case: &Case, counters: LeakCounters) {
         false,
     )
     .await;
-    assert_eq!(response_status(&response), 200);
+    let status = response_status(&response);
+    if status != 200 {
+        let events = running
+            .server
+            .pooling()
+            .request_events()
+            .expect("refresh request history")
+            .into_iter()
+            .map(|event| {
+                (
+                    event.kind,
+                    event.attempt,
+                    event.status,
+                    event.error_class,
+                    event.retry_reason,
+                )
+            })
+            .collect::<Vec<_>>();
+        let decisions = running
+            .server
+            .pooling()
+            .recent_decisions(16)
+            .expect("refresh decisions")
+            .into_iter()
+            .map(|decision| (decision.attempt, decision.reason))
+            .collect::<Vec<_>>();
+        panic!(
+            "unexpected refresh response status {status}; physical_attempts={}; refresh_calls={}; events={events:?}; decisions={decisions:?}",
+            upstream.attempts.load(Ordering::SeqCst),
+            refresher.calls.load(Ordering::SeqCst),
+        );
+    }
     wait_for_attempts(&upstream.attempts, case.expected_attempts, &case.id).await;
     assert_eq!(refresher.calls.load(Ordering::SeqCst), 1);
     let resources = running.server.resource_snapshot();
