@@ -60,7 +60,7 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf
         with:
           tool: cargo-fuzz
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
