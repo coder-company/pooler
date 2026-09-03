@@ -132,7 +132,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependency policy tools
-        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
 
