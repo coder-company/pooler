@@ -132,7 +132,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependency policy tools
-        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
 
@@ -479,7 +479,7 @@ jobs:
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Download platform artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: release-*
           path: release
@@ -559,7 +559,7 @@ jobs:
 
     steps:
       - name: Download the assembled release
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: release-bundle
           path: release
