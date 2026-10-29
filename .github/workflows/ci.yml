@@ -44,7 +44,7 @@ jobs:
         with:
           toolchain: 1.88.0
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: cargo fmt --all --check
       - name: Install workflow checker dependencies
         run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
@@ -88,7 +88,7 @@ jobs:
         with:
           toolchain: 1.88.0
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: cargo fmt --all --check
       - name: Install workflow checker dependencies
         run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
@@ -112,7 +112,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: cargo test --workspace --all-features --locked -- --test-threads=1
       - run: ./scripts/verify-compatibility-fixtures.py
       - run: cargo test --manifest-path fuzz/Cargo.toml --locked --no-run
@@ -139,7 +139,7 @@ jobs:
           # as security-framework; keep the product MSRV separate from the
           # toolchain used solely for dependency auditing.
           toolchain: 1.88.0
-      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       - name: Record dependency and license evidence

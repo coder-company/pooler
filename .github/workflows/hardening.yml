@@ -45,7 +45,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: scripts/deep-test.sh --no-fuzz
 
   fuzz:
@@ -60,10 +60,10 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: >-
           RUSTUP_TOOLCHAIN=nightly POOLER_FUZZ_TOOLCHAIN=nightly
           POOLER_REQUIRE_FUZZ=1
@@ -81,7 +81,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: 1.88.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Run bounded smoke workload
         shell: bash
         run: >-
@@ -106,7 +106,7 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: >-
           POOLER_REQUIRE_SANITIZER=1 POOLER_SANITIZER=address
           scripts/deep-test.sh --sanitize --no-fuzz
